@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
+# Author: Haomeng Wang <chang_yun@outlook.com>
+# SPDX-License-Identifier: MPL-2.0
+#
+# Pre-commit hook for Chronon
+#   1. File length: reject staged C++ files exceeding MAX_FILE_LINES (default 1000)
+#   2. clang-format: auto-format staged C++ files
+#   3. Build (Debug)
+#   4. Run ctest
+#
+# Auto-installed by CMake. Manual install:
+#   git config --local core.hooksPath scripts/hooks
+#
+# Environment variables:
+#   CHRONON_BUILD_DIR   - build directory (default: build)
+#   MAX_FILE_LINES      - per-file line limit (default: 1000)
+#   SKIP_LENGTH         - set to 1 to skip file-length check
+#   SKIP_FORMAT         - set to 1 to skip clang-format
+#   SKIP_BUILD          - set to 1 to skip build
+#   SKIP_TEST           - set to 1 to skip tests
+
+set -eo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+BUILD_DIR="${CHRONON_BUILD_DIR:-build}"
+
+# ── 0. Branch guard ──────────────────────────────────────────────────────────
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+case "$CURRENT_BRANCH" in
+    master|main)
+        echo ""
+        echo -e "${RED}ERROR${NC}: direct commits to \"$CURRENT_BRANCH\" are forbidden."
+        echo "  Create a feature branch first:  git checkout -b feature/<topic>"
+        echo "  (Emergency bypass: git commit --no-verify)"
+        echo ""
+        exit 1
+        ;;
+esac
+
+echo ""
+echo -e "${CYAN}=== Chronon Pre-Commit Hook ===${NC}"
+echo ""
+
+# ── 1. File length ──────────────────────────────────────────────────────────
+MAX_LINES="${MAX_FILE_LINES:-1000}"
+if [ "${SKIP_LENGTH:-0}" = "1" ]; then
+    echo -e "${YELLOW}[1/4] File length: SKIPPED${NC}"
+else
+    STAGED_CPP=$(git diff --cached --name-only --diff-filter=ACM -- '*.cpp' '*.hpp' '*.h')
+    TOOLONG=""
+    for file in $STAGED_CPP; do
+        [ -f "$file" ] || continue
+        LINES=$(git show :"$file" | wc -l)
+        if [ "$LINES" -gt "$MAX_LINES" ]; then
+            TOOLONG="${TOOLONG}  ${RED}${LINES}${NC} lines: ${file}\n"
+        fi
+    done
+    if [ -n "$TOOLONG" ]; then
+        echo -e "${RED}[1/4] File length: FAILED${NC} (limit: $MAX_LINES lines)"
+        echo -e "$TOOLONG"
+        echo "  Override: MAX_FILE_LINES=1500 git commit"
+        echo "  Skip:     SKIP_LENGTH=1 git commit"
+        exit 1
+    fi
+    echo -e "${GREEN}[1/4] File length: all files ≤ $MAX_LINES lines.${NC}"
+fi
+
+# ── 2. clang-format ──────────────────────────────────────────────────────────
+if [ "${SKIP_FORMAT:-0}" = "1" ]; then
+    echo -e "${YELLOW}[2/4] clang-format: SKIPPED${NC}"
+else
+    CLANG_FORMAT="${CLANG_FORMAT:-clang-format}"
+
+    if ! command -v "$CLANG_FORMAT" &>/dev/null; then
+        echo -e "${RED}[2/4] clang-format: '$CLANG_FORMAT' not found${NC}"
+        echo "  Install: brew install clang-format  /  apt install clang-format"
+        exit 1
+    fi
+
+    STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM -- '*.cpp' '*.hpp' '*.h')
+
+    if [ -n "$STAGED_FILES" ]; then
+        FORMATTED=0
+        for file in $STAGED_FILES; do
+            if ! "$CLANG_FORMAT" --dry-run --Werror "$file" &>/dev/null; then
+                "$CLANG_FORMAT" -i "$file"
+                git add "$file"
+                echo -e "  ${GREEN}formatted${NC}: $file"
+                FORMATTED=$((FORMATTED + 1))
+            fi
+        done
+
+        if [ "$FORMATTED" -gt 0 ]; then
+            echo -e "${GREEN}[2/4] clang-format: $FORMATTED file(s) formatted and re-staged.${NC}"
+        else
+            echo -e "${GREEN}[2/4] clang-format: all files already formatted.${NC}"
+        fi
+    else
+        echo -e "${GREEN}[2/4] clang-format: no staged C++ files.${NC}"
+    fi
+fi
+
+# ── 2. Build ─────────────────────────────────────────────────────────────────
+if [ "${SKIP_BUILD:-0}" = "1" ]; then
+    echo -e "${YELLOW}[3/4] Build: SKIPPED${NC}"
+else
+    if [ ! -f "$REPO_ROOT/$BUILD_DIR/CMakeCache.txt" ]; then
+        echo "  Configuring (Debug)..."
+        cmake -B "$REPO_ROOT/$BUILD_DIR" -DCMAKE_BUILD_TYPE=Debug -S "$REPO_ROOT"
+    fi
+
+    echo "[3/4] Building (Debug)..."
+    if ! cmake --build "$REPO_ROOT/$BUILD_DIR" -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" 2>&1 | tail -5; then
+        echo -e "${RED}[3/4] Build: FAILED${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}[3/4] Build: passed.${NC}"
+fi
+
+# ── 3. Tests ─────────────────────────────────────────────────────────────────
+if [ "${SKIP_TEST:-0}" = "1" ]; then
+    echo -e "${YELLOW}[4/4] Tests: SKIPPED${NC}"
+else
+    echo "[4/4] Running tests..."
+    if ! ctest --test-dir "$REPO_ROOT/$BUILD_DIR" --output-on-failure --parallel "$(nproc 2>/dev/null || sysctl -n hw.ncpu)" --timeout 120; then
+        echo -e "${RED}[4/4] Tests: FAILED${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}[4/4] Tests: passed.${NC}"
+fi
+
+echo ""
+echo -e "${GREEN}=== All pre-commit checks passed ===${NC}"
+echo ""

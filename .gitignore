@@ -1,0 +1,36 @@
+# Build directories
+build/
+build*/
+cmake-build-*/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Compiled files
+*.o
+*.a
+*.so
+*.dylib
+
+# Generated files
+compile_commands.json
+*.pyc
+__pycache__/
+.cache/
+out/
+
+# Pixi
+.pixi/
+
+# AI agent config
+.claude/
+CLAUDE.md
+
+# OS
+.DS_Store
+Thumbs.db
+.serena

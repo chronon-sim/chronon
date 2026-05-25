@@ -1,0 +1,10 @@
+CompileFlags:
+  Remove:
+    - -fcoroutines
+    - -fconcepts-diagnostics-depth=*
+
+Diagnostics:
+  UnusedIncludes: None
+
+Index:
+  Background: Build

@@ -1,0 +1,218 @@
+Chronon - Third-Party Software Notices
+======================================
+
+This file records third-party software used by Chronon, along with license
+identifiers and copyright notices where available.
+
+Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
+
+Chronon itself is licensed under the Mozilla Public License 2.0
+(SPDX expression: MPL-2.0).
+See LICENSE for details.
+
+This notice file is provided for attribution and license tracking. Consult each
+upstream project for the authoritative license text.
+
+================================================================================
+
+
+1. stdexec - NVIDIA C++ std::execution Reference Implementation
+--------------------------------------------------------------------------------
+
+  Project:   https://github.com/NVIDIA/stdexec
+  Version:   nvhpc-25.09
+  License:   Apache License 2.0 with LLVM Exceptions
+  SPDX:      Apache-2.0 WITH LLVM-exception
+  Copyright: Copyright (c) 2025 NVIDIA Corporation
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+  --- LLVM Exceptions to the Apache 2.0 License ---
+
+  As an exception, if, as a result of your compiling your source code,
+  portions of this Software are embedded into an Object form of such source
+  code, you may redistribute such embedded portions in such Object form
+  without complying with the conditions of Sections 4(a), 4(b) and 4(d) of
+  the License.
+
+  In addition, if you combine or link compiled forms of this Software with
+  software that is licensed under the GPLv2 ("Combined Software") and if a
+  court of competent jurisdiction determines that the patent provision
+  (Section 3), the indemnity provision (Section 9) or other Section of the
+  License conflicts with the conditions of the GPLv2, you may retroactively
+  and prospectively choose to deem waived or otherwise exclude such
+  Section(s) of the License, but only in their entirety and only with
+  respect to the Combined Software.
+
+
+2. FlatBuffers - Google Serialization Library
+--------------------------------------------------------------------------------
+
+  Project:   https://github.com/google/flatbuffers
+  Version:   v25.12.19
+  License:   Apache License 2.0
+  SPDX:      Apache-2.0
+  Copyright: Copyright 2014 Google Inc. All rights reserved.
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+
+3. FTXUI - Functional Terminal User Interface
+--------------------------------------------------------------------------------
+
+  Project:   https://github.com/ArthurSonzogni/FTXUI
+  Version:   v5.0.0
+  License:   MIT License
+  SPDX:      MIT
+  Copyright: Copyright (c) 2019 Arthur Sonzogni
+  Note:      Optional dependency, only used when built with -DCHRONON_BUILD_VIS=ON
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+
+4. CPM.cmake - CMake Package Manager
+--------------------------------------------------------------------------------
+
+  Project:   https://github.com/cpm-cmake/CPM.cmake
+  Version:   0.40.2
+  License:   MIT License
+  SPDX:      MIT
+  Copyright: Copyright (c) 2019-2023 Lars Melchior and contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+
+5. rapids-cmake - NVIDIA RAPIDS CMake Modules
+--------------------------------------------------------------------------------
+
+  Project:   https://github.com/rapidsai/rapids-cmake
+  License:   Apache License 2.0
+  SPDX:      Apache-2.0
+  Copyright: Copyright 2021 NVIDIA Corporation
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+
+6. icm - iboB's CMake Modules
+--------------------------------------------------------------------------------
+
+  Project:   https://github.com/iboB/icm
+  Version:   v1.5.0
+  License:   MIT License
+  SPDX:      MIT
+  Copyright: Copyright (c) 2020-2023 Borislav Stanimirov
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+
+Optional System Dependencies
+================================================================================
+
+The following libraries are optional system dependencies. They are not bundled
+with Chronon and are dynamically linked at build time if available on the system.
+
+7. yaml-cpp
+--------------------------------------------------------------------------------
+
+  Project:   https://github.com/jbeder/yaml-cpp
+  License:   MIT License
+  SPDX:      MIT
+  Copyright: Copyright (c) 2008-2015 Jesse Beder
+  Note:      Optional. Used for YAML configuration file parsing.
+
+8. fmt
+--------------------------------------------------------------------------------
+
+  Project:   https://github.com/fmtlib/fmt
+  License:   MIT License
+  SPDX:      MIT
+  Copyright: Copyright (c) 2012-present Victor Zverovich and {fmt} contributors
+  Note:      Optional. Used for string formatting in observability output.
+
+9. zstd - Zstandard Compression
+--------------------------------------------------------------------------------
+
+  Project:   https://github.com/facebook/zstd
+  License:   BSD 3-Clause License / GNU GPL v2 (dual-licensed)
+  SPDX:      BSD-3-Clause OR GPL-2.0-only
+  Copyright: Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+  Note:      Optional. Used for binary trace compression. Chronon uses zstd
+             under the BSD 3-Clause license terms.

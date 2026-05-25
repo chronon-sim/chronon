@@ -1,0 +1,15 @@
+{
+  "copyImages": true,
+  "sort": true,
+  "linkSuffix": "",
+  "indexInFolders": true,
+  "mainPageInRoot": false,
+  "baseUrl": "/docs/api/",
+  "indexClassesName": "Classes",
+  "indexFilesName": "Files",
+  "indexNamespacesName": "Namespaces",
+  "indexTitle": "API Reference",
+  "templateConfig": {
+    "copyImages": true
+  }
+}

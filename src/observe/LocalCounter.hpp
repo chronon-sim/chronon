@@ -1,0 +1,179 @@
+// Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
+// Author: Haomeng Wang <chang_yun@outlook.com>
+// SPDX-License-Identifier: MPL-2.0
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+// LocalCounter.hpp
+//
+// Per-instance counter for hierarchical counter system.
+// Allows counter declarations as unit members with automatic registration.
+
+#pragma once
+
+#include <string>
+#include <string_view>
+
+#include "Counter.hpp"
+#include "ObservationContext.hpp"
+#include "Types.hpp"
+
+namespace chronon::observe {
+
+// Forward declaration
+class ObservableUnit;
+
+/**
+ * Counter - Per-instance counter declared as a unit member.
+ *
+ * Each unit instance has its own counter with separate values:
+ * - Counter names include the unit's hierarchical path (e.g., "cpu0.alu0.ops")
+ * - Fast increment path (~2-3ns) via direct context access
+ *
+ * Usage:
+ * @code
+ *   class ALU : public TickableUnit, public ObservableUnit {
+ *       Counter ops_{this, "ops", "Operations executed"};
+ *       Counter stalls_{this, "stalls", "Stall cycles"};
+ *
+ *       void tick() override {
+ *           ++ops_;          // Fast: ~2-3ns
+ *           stalls_ += 5;    // Add 5
+ *       }
+ *   };
+ * @endcode
+ *
+ * Output (CSV):
+ * @code
+ *   cycle,unit_name,counter_name,value
+ *   10000,cpu0.alu0,ops,2500
+ *   10000,cpu0.alu1,ops,2400
+ *   10000,cpu1.alu0,ops,2550
+ * @endcode
+ */
+class Counter {
+public:
+    /**
+     * Construct a counter.
+     *
+     * @param owner The ObservableUnit that owns this counter
+     * @param name Counter name (will be prefixed with unit path)
+     * @param description Counter description
+     * @param unit Unit of measurement (e.g., "ops", "cycles", "bytes")
+     */
+    Counter(ObservableUnit* owner, std::string_view name, std::string_view description = "",
+            std::string_view unit = "");
+
+    // Non-copyable (tied to specific unit instance)
+    Counter(const Counter&) = delete;
+    Counter& operator=(const Counter&) = delete;
+
+    // Movable
+    Counter(Counter&& other) noexcept;
+    Counter& operator=(Counter&& other) noexcept;
+
+    ~Counter() = default;
+
+    // =========================================================================
+    // Hot-Path Operations (~2-3ns)
+    // =========================================================================
+
+    /**
+     * Pre-increment operator.
+     */
+    [[gnu::always_inline]] Counter& operator++() noexcept {
+        if (registered_ && ctx_) {
+            ctx_->count(id_, 1);
+        }
+        return *this;
+    }
+
+    /**
+     * Post-increment operator.
+     */
+    Counter operator++(int) noexcept {
+        Counter tmp = std::move(*this);
+        ++(*this);
+        return tmp;
+    }
+
+    /**
+     * Add-assign operator.
+     */
+    [[gnu::always_inline]] Counter& operator+=(uint64_t delta) noexcept {
+        if (registered_ && ctx_) {
+            ctx_->count(id_, delta);
+        }
+        return *this;
+    }
+
+    /**
+     * Get current value.
+     */
+    [[gnu::always_inline]] uint64_t get() const noexcept {
+        if (registered_ && ctx_) {
+            return ctx_->counters().getUnchecked(id_).get();
+        }
+        return 0;
+    }
+
+    /**
+     * Reset value to zero.
+     */
+    void reset() noexcept {
+        if (registered_ && ctx_) {
+            ctx_->counters().getUnchecked(id_).reset();
+        }
+    }
+
+    // =========================================================================
+    // Accessors
+    // =========================================================================
+
+    /**
+     * Get the counter name.
+     */
+    const std::string& name() const noexcept { return name_; }
+
+    /**
+     * Get the counter description.
+     */
+    const std::string& description() const noexcept { return description_; }
+
+    /**
+     * Get the counter unit.
+     */
+    const std::string& unit() const noexcept { return unit_; }
+
+    /**
+     * Check if the counter is registered.
+     */
+    bool isRegistered() const noexcept { return registered_; }
+
+    /**
+     * Get the counter ID (only valid if registered).
+     */
+    CounterId id() const noexcept { return id_; }
+
+private:
+    friend class ObservableUnit;
+
+    /**
+     * Called by ObservableUnit when observation context is attached.
+     *
+     * Registers the counter with the context and caches the ID for fast access.
+     */
+    void onContextAttached(ObservationContext* ctx);
+
+    ObservableUnit* owner_ = nullptr;
+    std::string name_;
+    std::string description_;
+    std::string unit_;
+    ObservationContext* ctx_ = nullptr;
+    CounterId id_{};
+    bool registered_ = false;
+};
+
+}  // namespace chronon::observe

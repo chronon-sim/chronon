@@ -1,0 +1,205 @@
+# Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
+# Author: Haomeng Wang <chang_yun@outlook.com>
+# SPDX-License-Identifier: MPL-2.0
+#
+# 4-Wide Superscalar CPU Pipeline Simulation Configuration
+#
+# Pipeline Architecture:
+#   Frontend:   Fetch (with branch prediction) -> Decode (4-wide)
+#   Execute:    ALU0, ALU1, ALU2, ALU3 (4 parallel ALUs)
+#   Backend:    Writeback (4-wide)
+#   Memory:     I-Cache -> L2
+#   Flush:      ALUs -> FlushEngine -> All units
+
+simulation:
+    name: cpu_pipeline_4wide
+    num_workers: 2
+    enable_lookahead: true
+    max_lookahead_cycles: 256
+    epoch_size: 1024
+    run_cycles: 0 # 0 = run until completion
+
+    # Observation configuration (automatic setup)
+    observation:
+        enabled: true
+        output_dir: "out"
+        queue_capacity: 262144 # 256KB
+        backpressure: bounded_wait # drop | spin_wait | bounded_wait
+        backpressure_max_spins: 256 # only used for bounded_wait
+
+        # Counter collection
+        counters:
+            enabled: true
+            csv_output: true
+            periodic_dump_cycles: 10000 # Dump every 10K cycles (0 = disabled)
+            dump_on_shutdown: true # Emit final snapshot on shutdown
+
+        # Unified logging configuration
+        logging:
+            enabled: true
+            debug:
+                enabled: true
+                format: text
+                file: debug.log
+                backpressure: bounded_wait
+                backpressure_max_spins: 32
+            info:
+                enabled: true
+                format: text
+                file: info.log
+            warn:
+                enabled: true
+                format: text
+            error:
+                enabled: true
+                format: text
+            trace:
+                enabled: true
+                format: binary
+                # backpressure: spin_wait  # Optional per-channel override
+            temporal:
+                - range: [0, 100000] # Observe first 100K cycles
+            categories:
+                # Trace all icache events for first 2.5K cycles
+                - pattern: "icache_*"
+                  temporal:
+                      - range: [0, 2500]
+
+                # Trace branch prediction periodically (first 1K every 10K cycles)
+                - pattern: "branch_pred"
+                  temporal:
+                      - periodic:
+                            window: 1000
+                            period: 10000
+
+                # Trace flush events always
+                - pattern: "flush"
+
+        # Per-unit overrides
+        unit_overrides:
+            fetch:
+                logging:
+                    debug:
+                        enabled: true # More verbose logging for fetch
+
+    unit:
+        # Fetch unit: retrieves instructions with branch prediction
+        fetch:
+            type: FetchUnit
+            params:
+                max_instructions: 1000000
+                icache_lines: 50
+            port:
+                out_instr:
+                    to: decode.in_instr
+                    delay: 1
+                out_icache_miss:
+                    to: l2cache.in_req
+                    delay: 1
+
+        # Decode unit: 4-wide decode with round-robin dispatch to ALUs
+        decode:
+            type: DecodeUnit
+            params:
+                decode_width: 4
+            port:
+                out_decoded_0:
+                    to: alu0.in_op
+                    delay: 1
+                out_decoded_1:
+                    to: alu1.in_op
+                    delay: 1
+                out_decoded_2:
+                    to: alu2.in_op
+                    delay: 1
+                out_decoded_3:
+                    to: alu3.in_op
+                    delay: 1
+
+        # 4 ALU units for parallel execution
+        alu0:
+            type: ALUUnit
+            params:
+                alu_id: 0
+                flush_probability: 0.001
+            port:
+                out_result:
+                    to: writeback.in_result_0
+                    delay: 1
+                out_flush_request:
+                    to: flush_engine.in_flush_request
+                    delay: 1
+
+        alu1:
+            type: ALUUnit
+            params:
+                alu_id: 1
+                flush_probability: 0.001
+            port:
+                out_result:
+                    to: writeback.in_result_1
+                    delay: 1
+                out_flush_request:
+                    to: flush_engine.in_flush_request
+                    delay: 1
+
+        alu2:
+            type: ALUUnit
+            params:
+                alu_id: 2
+                flush_probability: 0.001
+            port:
+                out_result:
+                    to: writeback.in_result_2
+                    delay: 1
+                out_flush_request:
+                    to: flush_engine.in_flush_request
+                    delay: 1
+
+        alu3:
+            type: ALUUnit
+            params:
+                alu_id: 3
+                flush_probability: 0.001
+            port:
+                out_result:
+                    to: writeback.in_result_3
+                    delay: 1
+                out_flush_request:
+                    to: flush_engine.in_flush_request
+                    delay: 1
+
+        # Writeback unit: 4-wide result commit
+        writeback:
+            type: WritebackUnit
+
+        # L2 Cache unit: handles I-Cache misses
+        l2cache:
+            type: L2CacheUnit
+            params:
+                latency: 10
+                cache_lines: 1000
+            port:
+                out_resp:
+                    to: fetch.in_l2_resp
+                    delay: 1
+
+        # Flush engine: broadcasts flush to all units
+        flush_engine:
+            type: FlushEngine
+            port:
+                out_flush_broadcast:
+                    - to: fetch.in_flush
+                      delay: 1
+                    - to: decode.in_flush
+                      delay: 1
+                    - to: alu0.in_flush
+                      delay: 1
+                    - to: alu1.in_flush
+                      delay: 1
+                    - to: alu2.in_flush
+                      delay: 1
+                    - to: alu3.in_flush
+                      delay: 1
+                    - to: writeback.in_flush
+                      delay: 1

@@ -1,0 +1,394 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'test/**'
+      - 'examples/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/**'
+      - 'cmake/**'
+
+jobs:
+  # ================================================================
+  # Fast gate: format check (~30s, no build needed)
+  # ================================================================
+  clang-format:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install clang-format
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-format
+
+    - name: Check formatting
+      run: |
+        find src/ test/ -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
+          -print0 | xargs -0 clang-format --dry-run --Werror
+
+  # ================================================================
+  # Core checks: GCC Debug + ASan + TSan (always runs on push and PR)
+  # ================================================================
+  build-and-test:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+
+    strategy:
+      matrix:
+        include:
+          - build_type: Debug
+            sanitizer: none
+            cmake_flags: "-DCHRONON_ENABLE_WERROR=ON"
+          - build_type: Debug
+            sanitizer: asan
+            cmake_flags: "-DCHRONON_ENABLE_ASAN=ON"
+          - build_type: Debug
+            sanitizer: tsan
+            cmake_flags: "-DCHRONON_ENABLE_TSAN=ON"
+      fail-fast: false
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake \
+          ninja-build \
+          ccache \
+          libyaml-cpp-dev \
+          libflatbuffers-dev \
+          libfmt-dev \
+          g++-12
+
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ runner.os }}-gcc-12-${{ matrix.build_type }}-${{ matrix.sanitizer }}
+
+    - name: Configure CMake
+      env:
+        CC: gcc-12
+        CXX: g++-12
+      run: |
+        cmake -B build \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          ${{ matrix.cmake_flags }}
+
+    - name: Build
+      run: cmake --build build --parallel $(nproc)
+
+    - name: Run tests
+      working-directory: build
+      env:
+        ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+        UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+      run: ctest --output-on-failure --parallel $(nproc)
+
+    - name: Upload test results on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ matrix.build_type }}-${{ matrix.sanitizer }}
+        path: build/Testing/Temporary/
+        retention-days: 5
+
+  # ================================================================
+  # Push-only: GCC Release
+  # ================================================================
+  build-and-test-full:
+    if: github.event_name == 'push'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+
+    strategy:
+      matrix:
+        include:
+          - build_type: Release
+            sanitizer: none
+            cmake_flags: "-DCHRONON_ENABLE_WERROR=ON"
+      fail-fast: false
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake \
+          ninja-build \
+          ccache \
+          libyaml-cpp-dev \
+          libflatbuffers-dev \
+          libfmt-dev \
+          g++-12
+
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ runner.os }}-gcc-12-${{ matrix.build_type }}-${{ matrix.sanitizer }}
+
+    - name: Configure CMake
+      env:
+        CC: gcc-12
+        CXX: g++-12
+      run: |
+        cmake -B build \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          ${{ matrix.cmake_flags }}
+
+    - name: Build
+      run: cmake --build build --parallel $(nproc)
+
+    - name: Run tests
+      working-directory: build
+      env:
+        TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+      run: ctest --output-on-failure --parallel $(nproc)
+
+    - name: Upload test results on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-full-${{ matrix.build_type }}-${{ matrix.sanitizer }}
+        path: build/Testing/Temporary/
+        retention-days: 5
+
+  # ================================================================
+  # Clang builds: runs on both push and PR
+  # ================================================================
+  build-and-test-clang:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+
+    strategy:
+      matrix:
+        include:
+          - build_type: Debug
+            sanitizer: none
+            cmake_flags: "-DCHRONON_ENABLE_WERROR=ON"
+          - build_type: Release
+            sanitizer: none
+            cmake_flags: "-DCHRONON_ENABLE_WERROR=ON"
+          - build_type: Debug
+            sanitizer: asan
+            cmake_flags: "-DCHRONON_ENABLE_ASAN=ON"
+          - build_type: Debug
+            sanitizer: tsan
+            cmake_flags: "-DCHRONON_ENABLE_TSAN=ON"
+      fail-fast: false
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+        sudo add-apt-repository -y "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main"
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake \
+          ninja-build \
+          ccache \
+          libyaml-cpp-dev \
+          libflatbuffers-dev \
+          libfmt-dev \
+          clang-20 \
+          libc++-20-dev \
+          libc++abi-20-dev
+
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ runner.os }}-clang-20-${{ matrix.build_type }}-${{ matrix.sanitizer }}
+
+    - name: Configure CMake
+      env:
+        CC: clang-20
+        CXX: clang++-20
+      run: |
+        cmake -B build \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          ${{ matrix.cmake_flags }}
+
+    - name: Build
+      run: cmake --build build --parallel $(nproc)
+
+    - name: Run tests
+      working-directory: build
+      env:
+        ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+        UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+      run: ctest --output-on-failure --parallel $(nproc)
+
+    - name: Upload test results on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: clang-test-results-${{ matrix.build_type }}-${{ matrix.sanitizer }}
+        path: build/Testing/Temporary/
+        retention-days: 5
+
+  # ================================================================
+  # Static analysis: clang-tidy (always runs on push and PR)
+  # ================================================================
+  clang-tidy:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake \
+          ninja-build \
+          libyaml-cpp-dev \
+          libflatbuffers-dev \
+          libfmt-dev \
+          g++-12 \
+          clang-tidy
+
+    - name: Configure CMake
+      env:
+        CC: gcc-12
+        CXX: g++-12
+      run: |
+        cmake -B build \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCHRONON_ENABLE_CLANG_TIDY=ON
+
+    - name: Build (with clang-tidy)
+      run: cmake --build build --parallel $(nproc)
+
+  # ================================================================
+  # Code coverage (gcov + lcov, always runs on push and PR)
+  # ================================================================
+  coverage:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake \
+          ninja-build \
+          ccache \
+          libyaml-cpp-dev \
+          libflatbuffers-dev \
+          libfmt-dev \
+          g++-12 \
+          lcov
+
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ runner.os }}-gcc-12-coverage
+
+    - name: Configure CMake
+      env:
+        CC: gcc-12
+        CXX: g++-12
+      run: |
+        cmake -B build \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          -DCHRONON_ENABLE_COVERAGE=ON
+
+    - name: Build
+      run: cmake --build build --parallel $(nproc)
+
+    - name: Run tests
+      working-directory: build
+      run: ctest --output-on-failure --parallel $(nproc)
+
+    - name: Capture coverage
+      run: |
+        LCOV_IGNORE="negative,mismatch,inconsistent,unsupported,format,count"
+        GENHTML_IGNORE="$LCOV_IGNORE,category"
+
+        lcov --capture \
+          --directory build \
+          --output-file coverage.info \
+          --gcov-tool gcov-12 \
+          --rc geninfo_unexecuted_blocks=1 \
+          --ignore-errors $LCOV_IGNORE
+
+        lcov --remove coverage.info \
+          '*/build/_deps/*' \
+          '*/test/*' \
+          '/usr/*' \
+          --output-file coverage_filtered.info \
+          --ignore-errors $LCOV_IGNORE
+
+        genhtml coverage_filtered.info \
+          --output-directory coverage_html \
+          --title "Chronon Coverage" \
+          --legend \
+          --ignore-errors $GENHTML_IGNORE
+
+        # Extract coverage percentages for job summary
+        SUMMARY=$(lcov --summary coverage_filtered.info --ignore-errors $LCOV_IGNORE 2>&1)
+        LINES_PCT=$(echo "$SUMMARY" | grep 'lines' | sed 's/.*: //' | sed 's/%.*//')
+        LINES_HIT=$(echo "$SUMMARY" | grep 'lines' | grep -o '[0-9]* of [0-9]*')
+        FUNC_PCT=$(echo "$SUMMARY" | grep 'functions' | sed 's/.*: //' | sed 's/%.*//')
+        FUNC_HIT=$(echo "$SUMMARY" | grep 'functions' | grep -o '[0-9]* of [0-9]*')
+
+        echo "## 📊 Coverage Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Coverage | Hit / Total |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|----------|-------------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Lines | ${LINES_PCT}% | ${LINES_HIT} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Functions | ${FUNC_PCT}% | ${FUNC_HIT} |" >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload coverage report
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: coverage_html/
+        retention-days: 30
+
+    - name: Upload coverage data
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-lcov
+        path: coverage_filtered.info
+        retention-days: 30

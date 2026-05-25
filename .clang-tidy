@@ -1,0 +1,42 @@
+---
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -bugprone-exception-escape,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-slicing,
+  misc-const-correctness,
+  misc-redundant-expression,
+  misc-unused-using-decls,
+  modernize-use-override,
+  modernize-use-nullptr,
+  modernize-use-emplace,
+  modernize-use-using,
+  modernize-use-nodiscard,
+  modernize-loop-convert,
+  modernize-make-unique,
+  modernize-make-shared,
+  modernize-concat-nested-namespaces,
+  performance-*,
+  readability-braces-around-statements,
+  readability-const-return-type,
+  readability-container-size-empty,
+  readability-implicit-bool-conversion,
+  readability-redundant-string-cstr,
+  readability-simplify-boolean-expr,
+  readability-string-compare,
+
+WarningsAsErrors: ''
+
+HeaderFilterRegex: '.*/src/.*\.(hpp|h)$'
+
+FormatStyle: file
+
+CheckOptions:
+  readability-braces-around-statements.ShortStatementLines: '2'
+  performance-move-const-arg.CheckTriviallyCopyableMove: 'false'
+  misc-const-correctness.TransformValues: 'true'
+  misc-const-correctness.WarnPointersAsValues: 'false'
+...

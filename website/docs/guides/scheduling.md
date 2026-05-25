@@ -1,0 +1,393 @@
+---
+sidebar_label: "Scheduling and Parallelization"
+---
+
+# Scheduling and Parallelization
+
+## Overview
+
+Chronon automatically parallelizes simulation based on dependency analysis and lookahead scheduling.
+
+For wall-clock scheduler diagnosis, Chronon can also emit a Perfetto/Chrome
+Trace timeline of logical execution streams, unit tick slices, cross-thread
+dependency spin waits, epoch spans, and MPSC arbitration. See
+[Scheduler Timeline Trace](scheduler-timeline.md).
+
+## Dependency Graph
+
+The dependency graph captures unit interconnections using Floyd-Warshall for all-pairs shortest path analysis:
+
+```cpp
+class DependencyGraph {
+public:
+    // Build from units and connections
+    void build(const std::vector<Unit*>& units,
+               const std::vector<ConnectionBase*>& connections);
+
+    // Lookahead queries
+    uint32_t lookahead(Unit* source, Unit* dest) const;  // Min path delay
+    bool hasPath(Unit* source, Unit* dest) const;
+
+    // Dependency queries
+    std::vector<Unit*> getDependencies(Unit* unit) const;  // All predecessors
+    std::vector<Unit*> getDependents(Unit* unit) const;     // All successors
+
+    // Direct neighbor queries (returns pairs of Unit* and delay)
+    std::vector<std::pair<Unit*, uint32_t>> predecessors(Unit* unit) const;
+    std::vector<std::pair<Unit*, uint32_t>> successors(Unit* unit) const;
+
+    // Graph access
+    size_t unitIndex(Unit* unit) const;
+    Unit* unitAt(size_t index) const;
+    const std::vector<std::vector<uint32_t>>& distances() const;
+
+    // Modification
+    void addConnection(Unit* source, Unit* dest, uint32_t delay);
+    void recomputeLookahead();
+};
+```
+
+## Cycle Classification
+
+Cycles are classified based on total delay:
+
+| Type | Total Delay | Handling | Example |
+|------|-------------|----------|---------|
+| Tight | = 0 | Delta cycles (sequential) | A <--(0)--> B |
+| Loose | > 0 | Lookahead (parallel) | A <--(3,2)--> B |
+
+### Tight Cycles (Delta Cycles)
+
+When total delay = 0, units must execute sequentially within each cycle via delta cycle convergence:
+
+```wavedrom
+{ "signal": [
+  { "name": "clk",             "wave": "p.........." },
+  {},
+  ["Cycle N (delta iterations)",
+    { "name": "A.tick()",       "wave": "x=x..=x..=x", "data": ["δ0","δ2","δ4"] },
+    { "name": "A→B (delay=0)", "wave": "x.=..=..=..", "data": ["v0","v1","v1"] },
+    { "name": "B.tick()",       "wave": "x..=x..=x..", "data": ["δ1","δ3"] },
+    { "name": "B→A (delay=0)", "wave": "x...=..=...", "data": ["w0","w0"] },
+    {},
+    { "name": "converged",      "wave": "0........1." }
+  ]
+],
+  "head": { "text": "Tight cycle: delta iterations within one simulation cycle" },
+  "config": { "hscale": 1.5 }
+}
+```
+
+### Loose Cycles (Lookahead)
+
+When total delay > 0, units can run ahead within the lookahead window:
+
+```wavedrom
+{ "signal": [
+  { "name": "clk",            "wave": "p.........." },
+  {},
+  ["A ──(3)──▶ B ──(2)──▶ A",
+    { "name": "A.localCycle", "wave": "=.=.=.=.=.=", "data": ["0","1","2","3","4","5"] },
+    { "name": "A.send()",    "wave": "x=.=.=.=.=.", "data": ["d0","d1","d2","d3","d4"] },
+    {},
+    { "name": "B.localCycle", "wave": "=.=.=.=.=.=", "data": ["0","1","2","3","4","5"] },
+    { "name": "B.receive()",  "wave": "x...=.=.=.=", "data": ["d0","d1","d2","d3"] }
+  ]
+],
+  "head": { "text": "Loose cycle: A and B run in parallel (lookahead = delay)" },
+  "foot": { "text": "B is at most 3 cycles behind A (delay A→B = 3). A is at most 2 behind B (delay B→A = 2)." },
+  "config": { "hscale": 1.5 }
+}
+```
+
+## Cycle Analyzer
+
+Uses Tarjan's SCC and Johnson's algorithm to detect and classify cycles:
+
+```cpp
+struct CycleInfo {
+    std::vector<Unit*> units;     // Units in cycle order
+    std::vector<uint32_t> delays; // Delays between consecutive units
+    uint32_t total_delay;          // Sum of all delays
+
+    bool isTight() const { return total_delay == 0; }
+    uint32_t minEdgeDelay() const;  // Minimum delay on any edge
+    bool contains(Unit* unit) const;
+};
+
+struct AnalysisResult {
+    // All detected cycles
+    std::vector<CycleInfo> all_cycles;
+
+    // Cycles classified by type
+    std::vector<CycleInfo> tight_cycles;   // delay = 0, need delta cycles
+    std::vector<CycleInfo> loose_cycles;   // delay > 0, can use lookahead
+
+    // Units involved in tight cycles (need special handling)
+    std::set<Unit*> tight_cycle_units;
+
+    // Independent groups (no dependencies between groups)
+    std::vector<std::vector<Unit*>> independent_groups;
+
+    // Strongly connected components
+    std::vector<std::vector<Unit*>> sccs;
+
+    // Lookahead map: {source, dest} -> minimum path delay
+    std::map<std::pair<Unit*, Unit*>, uint32_t> lookahead;
+
+    // Query methods
+    bool inTightCycle(Unit* unit) const;
+    uint32_t safeLookahead(Unit* source, Unit* dest) const;
+    bool canParallelize(Unit* a, Unit* b) const;
+};
+
+// CycleAnalyzer - static analysis methods
+class CycleAnalyzer {
+public:
+    static AnalysisResult analyze(const DependencyGraph& dep_graph,
+                                   size_t max_cycles = 1000);
+    static bool hasSelfLoop(const DependencyGraph& dep_graph, Unit* unit);
+    static uint32_t minCycleLength(const DependencyGraph& dep_graph, Unit* unit);
+
+    enum class Strategy {
+        FullParallel,    // All units can run independently
+        Lookahead,       // Use lookahead-based scheduling
+        DeltaCycle,      // Must use delta cycle execution
+        Hybrid           // Mix of lookahead and delta cycles
+    };
+    static Strategy suggestStrategy(const AnalysisResult& result);
+};
+```
+
+## Delta Cycle Handling
+
+Units with zero-delay feedback loops execute sequentially within each cycle. Tight clusters (groups of units connected by delay=0 edges) are detected during initialization and always assigned to the same thread. Within a cluster, units execute in their fixed order because delay=0 dependencies must remain atomic.
+
+## TickSimulation Execution Model
+
+TickSimulation uses stdexec::static_thread_pool for parallel execution. All scheduling logic (sequential, barrier, and lookahead modes) lives inside `TickSimulation` — there is no separate scheduler class.
+
+```cpp
+// TickSimulation uses stdexec
+::exec::static_thread_pool pool_{num_threads};
+
+// Barrier mode: per-cycle sync
+auto work = stdexec::bulk(
+    stdexec::just(),
+    stdexec::par,
+    units_.size(),
+    [this](std::size_t idx) {
+        unit_ptrs_[idx]->executeTick();
+    }
+);
+auto scheduled_work = stdexec::starts_on(sched, std::move(work));
+stdexec::sync_wait(std::move(scheduled_work));
+
+// Lookahead mode: iterate until convergence
+while (made_progress) {
+    compute_targets_for_all_units();
+    stdexec::bulk(...);  // Execute units to targets
+    stdexec::sync_wait(...);
+    update_progress();
+}
+```
+
+### Execution Modes
+
+TickSimulation selects execution mode based on topology:
+
+| Mode | Condition | Description |
+|------|-----------|-------------|
+| Sequential | Single-threaded or not beneficial | Units execute in order per cycle |
+| Barrier | Tight connections present | Per-cycle sync with stdexec::bulk |
+| Lookahead | No tight connections | Units run ahead within safe boundaries |
+| Cluster-aware | Tight intra-cluster only | Groups on same thread, lookahead between |
+
+## Scheduler Timeline Diagnostics
+
+In progress-based lookahead mode, each tight-coupling cluster publishes its
+completed cycle in a cache-line-aligned progress atomic. A worker stream scans
+the clusters assigned to it and executes any cluster whose direct predecessor
+clusters have reached the required cycle. If no local cluster is ready, the
+stream spins until one becomes ready. The scheduler timeline records that time
+as `cluster dependency` events and includes the blocking predecessor cluster in
+the event detail.
+
+This keeps delay=0 groups atomic while allowing independent clusters assigned
+to the same stream to advance out of order. Dynamic rebalance, when enabled,
+migrates whole clusters at epoch boundaries; it does not split delay=0 clusters
+or migrate units in the middle of an epoch.
+
+Typical investigation workflow:
+
+1. Capture a short window with `simulation.timeline_trace.enabled=true`.
+2. Open the JSON in `ui.perfetto.dev` or `chrome://tracing`.
+3. Inspect whether `stream N` lanes overlap tightly.
+4. Identify streams with long `cluster dependency` slices.
+5. Correlate the waiting streams with unit placement and connection delays.
+
+Timeline `stream N` lane names are zero-based Chronon logical stream ids. The
+Chrome Trace `tid` values are intentionally 1-based for Perfetto compatibility;
+use each slice's `args.stream` field when correlating viewer output back to
+Chronon stream ids. The `scheduler` lane is separate from worker streams and
+only records scheduler-side spans.
+
+Example:
+
+```bash
+./my_sim config.yaml --no-observe \
+  -p simulation.timeline_trace.enabled=true \
+  -p simulation.timeline_trace.file=out/chronon_timeline.json \
+  -p simulation.timeline_trace.end_cycle=2000
+```
+
+Long wait slices usually indicate that one predecessor cluster is on the
+critical path, that low-delay edges are forcing near-lockstep execution, or that
+the current partition assigned too much work to a dependency anchor stream.
+
+## Configuration
+
+```cpp
+struct TickSimulationConfig {
+    // Thread pool configuration
+    size_t num_threads = std::thread::hardware_concurrency();
+
+    // Scheduler selection (placement is always cluster-aware: cluster.size()==1
+    // is the no-tight-coupling fallback).
+    //   enable_parallel=false              -> Sequential
+    //   enable_parallel && !enable_lookahead -> Barrier (per-cycle sync across clusters)
+    //   enable_parallel &&  enable_lookahead -> Lookahead (per-cluster progress atomics)
+    bool enable_parallel = true;
+    bool enable_lookahead = true;
+
+    // Lookahead configuration
+    uint32_t max_lookahead_cycles = 100;    // Max cycles a unit can run ahead
+    uint64_t epoch_size = 64;               // Cycles per epoch before sync
+
+    // Debug options
+    bool trace_execution = false;           // Log execution mode selection
+
+    // Cost-aware weighted partitioning (default: enabled)
+    bool enable_weighted_partitioning = true;
+    uint64_t profiling_warmup_cycles = 512;       // Warmup before measuring
+    uint64_t profiling_measurement_cycles = 1024; // Measurement window
+
+    // Dynamic rebalancing
+    bool enable_dynamic_rebalance = true;
+    double rebalance_imbalance_threshold = 1.3;
+    uint64_t rebalance_check_interval_cycles = 8192;
+    double rebalance_min_gain = 0.05;
+    uint64_t rebalance_cooldown_cycles = 0;
+};
+```
+
+These settings can be configured via YAML (`enable_parallel`, `enable_lookahead`) or set directly in code. All scheduling modes produce identical cycle-accurate results — they differ only in wall-clock performance.
+
+Dynamic rebalance is enabled by default for throughput-oriented runs. It samples
+unit tick cost periodically, computes per-stream total sampled work, and
+migrates whole tight clusters at epoch boundaries when the heaviest stream is
+more than `rebalance_imbalance_threshold` above the active-stream average. Set
+`enable_dynamic_rebalance: false` for deterministic partitioning studies or
+A/B runs that must preserve a fixed initial assignment.
+`rebalance_min_gain` can suppress migrations with too little predicted speedup,
+and `rebalance_cooldown_cycles` can enforce a minimum cycle gap between applied
+rebalances.
+
+### Exception Handling in Execution Paths
+
+All execution modes wrap tick calls with try-catch to capture exceptions with crash context:
+
+| Mode | Strategy | Overhead |
+|------|----------|----------|
+| Sequential | try-catch outside outer loop | Zero (Itanium zero-cost ABI) |
+| Parallel (bulk) | try-catch inside each lambda body; stdexec propagates exceptions natively via `set_error` / `sync_wait` | Zero per non-exception iteration |
+| Progress-based (stdexec::bulk) | try-catch around inner loop; on exception, calls `stop_source_->request_stop()` to break spin-waits, then rethrows for stdexec native propagation | Zero per non-exception iteration |
+
+A unified `stdexec::inplace_stop_source` handles both exception-driven abort and unit-initiated termination. Worker spin-waits check `token.stop_requested()` to exit promptly on either condition. Exceptions are wrapped as `TickException` with unit name and cycle, then rethrown on the main thread by `stdexec::sync_wait`.
+
+## Cost-Aware Weighted Partitioning
+
+When `enable_weighted_partitioning = true` (default) and at least 4 units exist, TickSimulation uses a unified cluster-aware + cost-aware partitioning pipeline:
+
+### Algorithm Pipeline
+
+1. **Platform benchmarking**: Measures atomic round-trip sync cost (~36ns typical)
+2. **Tick cost profiling**: Runs each unit for `profiling_warmup_cycles` + `profiling_measurement_cycles` to measure per-unit tick latency (mean/median in nanoseconds)
+3. **Tight cluster detection**: Groups units with delay=0 connections into clusters (units within a cluster must share a thread)
+4. **Cluster-level graph partitioning**: Treats each cluster as a super-node with aggregated cost and runs `WeightedPartitioner` to minimize max thread time
+5. **Thread assignment**: Maps cluster assignments back to per-unit thread assignments
+6. **Queue optimization**: Selects optimal queue type per connection based on thread placement
+
+### WeightedPartitioner
+
+Four-phase algorithm in `src/sender/schedule/WeightedPartitioner.hpp`:
+
+- **Phase 1 (LPT)**: Longest Processing Time first — sorts units by decreasing cost and assigns each to the thread with the minimum current load. Pure makespan minimization (no coupling considered). Provides a 4/3-OPT approximation for the multiprocessor scheduling problem.
+- **Phase 2 (FM Refinement)**: Iteratively moves units from heaviest to lightest thread when the move reduces max thread time (up to 5 passes). Accounts for sync cost changes from the move.
+- **Phase 3 (Pairwise Swap)**: Tries swapping units between all pairs of threads to escape local minima (handles balanced-but-suboptimal assignments where tightly coupled units were arbitrarily separated by LPT).
+- **Phase 4 (Multi-Unit Relocate)**: Tries removing pairs of units from the heaviest thread and distributing them to the two lightest threads. Handles cases where no single move or swap improves the makespan.
+
+### Delay-Aware Sync Cost Model
+
+The partition adjacency graph uses **directed edges** — each `Connection` object creates one adjacency entry (source → destination). For bidirectional communication (e.g., wakeup buses), separate `Connection` objects in each direction naturally produce edges in both directions. This avoids double-counting bus connections, which expand to N×M individual connections at config load time.
+
+Cross-thread synchronization cost scales inversely with connection delay:
+
+```
+sync_cost(edge) = platform_sync_ns * num_connections * delay_factor(min_delay)
+```
+
+| Delay | Factor | Rationale |
+|-------|--------|-----------|
+| 0 | 100.0 | Inline/same-cycle: prohibitively expensive to split |
+| 1 | 1.0 | Tight spin-waiting every cycle |
+| N > 1 | 1/N | Higher delay = less frequent synchronization |
+
+This ensures delay=0 connections force co-location, while high-delay connections can tolerate cross-thread placement.
+
+### Parallel Execution Decision
+
+With weighted partitioning, parallel execution is beneficial when:
+
+```
+max_thread_cost * 1.10 < total_sequential_cost
+```
+
+The 10% overhead factor accounts for synchronization costs. This heuristic correctly accepts parallelization at moderate imbalance (e.g., 1.75x speedup) while rejecting extreme cases where one thread dominates.
+
+### Fallback Paths
+
+When weighted partitioning is disabled or fewer than 4 units exist:
+
+| Condition | Path |
+|-----------|------|
+| `tight_connections` present | Topology-only cluster assignment |
+| Otherwise | Greedy thread assignment with unit-count heuristic |
+
+The unit-count heuristic requires: no thread has >50% of units AND >= 3 units per active thread.
+
+## Queue Optimization
+
+Based on thread assignment, connections are optimized:
+
+| Connection Type | Queue Implementation | Overhead |
+|-----------------|---------------------|----------|
+| Same thread (intra-cluster) | SingleThreadMessageQueue | Zero (no synchronization) |
+| Cross-thread SPSC | LockFreeMessageQueue | Atomics only |
+| Cross-thread MPSC | MultiProducerQueueAdapter | Per-thread queues + merge |
+
+**Impact**: Eliminates ~18% mutex overhead from message queues when units are properly clustered.
+
+When parallelism is not beneficial, simulation falls back to optimized sequential execution with single-thread queues and non-atomic cycle counters.
+
+See `port-system.md` for detailed queue implementation and performance characteristics.
+
+## Performance
+
+| Threads | Throughput |
+|---------|------------|
+| 1 | ~9.35 Mcycles/sec |
+| 2 | ~10.00 Mcycles/sec (7% faster with lock-free) |
+| 4+ | Workload dependent |
+
+Multi-thread performance depends on dependency structure. Tight coupling (delay=0) must execute on same thread.

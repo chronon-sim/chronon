@@ -1,0 +1,140 @@
+name: Deploy Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - 'src/**/*.hpp'
+      - 'Doxyfile'
+  pull_request:
+    paths:
+      - 'website/**'
+      - 'src/**/*.hpp'
+      - 'Doxyfile'
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Doxygen
+        run: sudo apt-get install -y doxygen
+
+      - name: Install doxybook2
+        continue-on-error: true
+        id: install-doxybook2
+        run: |
+          curl -fsSL https://github.com/matusnovak/doxybook2/releases/download/v1.5.0/doxybook2-linux-amd64-v1.5.0.zip -o doxybook2.zip
+          unzip doxybook2.zip -d /tmp/doxybook2
+          sudo mv /tmp/doxybook2/bin/doxybook2 /usr/local/bin/
+          doxybook2 --version
+
+      - name: Generate Doxygen XML
+        continue-on-error: true
+        id: doxygen
+        run: |
+          mkdir -p build/doxygen
+          doxygen Doxyfile
+
+      - name: Generate API Markdown
+        if: steps.doxygen.outcome == 'success' && steps.install-doxybook2.outcome == 'success'
+        continue-on-error: true
+        run: |
+          rm -rf website/docs/api/Classes website/docs/api/Namespaces website/docs/api/Files
+          doxybook2 \
+            --input build/doxygen/xml \
+            --output website/docs/api \
+            --config website/.doxybook2.json
+
+      - name: Fix doxybook2 frontmatter
+        if: steps.doxygen.outcome == 'success' && steps.install-doxybook2.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python3 -c "
+          import os, re
+          api_dir = 'website/docs/api'
+          for root, dirs, files in os.walk(api_dir):
+              for f in files:
+                  if not f.endswith('.md'): continue
+                  path = os.path.join(root, f)
+                  with open(path) as fh: content = fh.read()
+                  m = re.match(r'^---\n(.*?)\n---', content, re.DOTALL)
+                  if not m: continue
+                  fm = m.group(1)
+                  new_lines, changed = [], False
+                  for line in fm.split('\n'):
+                      kv = re.match(r'^(\w+):\s+(.+)$', line)
+                      if kv:
+                          key, val = kv.group(1), kv.group(2)
+                          if not (val.startswith('\"') and val.endswith('\"')):
+                              val_esc = val.replace('\\\\', '\\\\\\\\').replace('\"', '\\\\\"')
+                              new_lines.append(f'{key}: \"{val_esc}\"')
+                              changed = True
+                              continue
+                      new_lines.append(line)
+                  if changed:
+                      new_fm = '\n'.join(new_lines)
+                      with open(path, 'w') as fh:
+                          fh.write('---\n' + new_fm + '\n---' + content[m.end():])
+          "
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install dependencies
+        working-directory: website
+        run: npm ci
+
+      - name: Build site
+        working-directory: website
+        run: npm run build
+
+      - name: Deploy to Cloudflare Pages
+        id: deploy
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy website/build --project-name=chronon-docs --branch=${{ github.head_ref || github.ref_name }}
+
+      - name: Comment PR with preview URL
+        if: github.event_name == 'pull_request' && steps.deploy.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `📖 **Docs preview**: ${process.env.DEPLOYMENT_URL}`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes('Docs preview'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+        env:
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.deployment-url }}

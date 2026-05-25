@@ -1,0 +1,134 @@
+# Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
+# Author: Haomeng Wang <chang_yun@outlook.com>
+# SPDX-License-Identifier: MPL-2.0
+
+# Chronon - High-Performance Event-Driven Simulation Framework
+# A fast, multithreaded simulation framework for CPU microarchitecture modeling
+
+cmake_minimum_required(VERSION 3.25)
+project(chronon VERSION 1.0.0 LANGUAGES CXX)
+
+# Auto-configure git hooks (requires Git 2.9+)
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} config --local core.hooksPath scripts/hooks
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        RESULT_VARIABLE GIT_HOOKS_RESULT
+    )
+    if(GIT_HOOKS_RESULT EQUAL 0)
+        message(STATUS "Git hooks: using scripts/hooks/ (core.hooksPath)")
+    endif()
+endif()
+
+# C++20 required
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Download CPM.cmake
+set(CPM_DOWNLOAD_VERSION 0.40.2)
+if(CPM_SOURCE_CACHE)
+    set(CPM_DOWNLOAD_LOCATION "${CPM_SOURCE_CACHE}/cpm/CPM_${CPM_DOWNLOAD_VERSION}.cmake")
+elseif(DEFINED ENV{CPM_SOURCE_CACHE})
+    set(CPM_DOWNLOAD_LOCATION "$ENV{CPM_SOURCE_CACHE}/cpm/CPM_${CPM_DOWNLOAD_VERSION}.cmake")
+else()
+    set(CPM_DOWNLOAD_LOCATION "${CMAKE_BINARY_DIR}/cmake/CPM_${CPM_DOWNLOAD_VERSION}.cmake")
+endif()
+if(NOT (EXISTS ${CPM_DOWNLOAD_LOCATION}))
+    message(STATUS "Downloading CPM.cmake to ${CPM_DOWNLOAD_LOCATION}")
+    file(DOWNLOAD
+        https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_DOWNLOAD_VERSION}/CPM.cmake
+        ${CPM_DOWNLOAD_LOCATION}
+    )
+endif()
+include(${CPM_DOWNLOAD_LOCATION})
+
+# Options
+option(CHRONON_BUILD_TESTS "Build Chronon tests" ON)
+option(CHRONON_INSTALL "Generate install/export rules (requires exportable deps)" OFF)
+
+# Centralized compile options (warnings, -Werror, sanitizers, clang-tidy)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ChrononCompileOptions.cmake)
+
+# Use ccache if available
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
+    message(STATUS "Using ccache: ${CCACHE_PROGRAM}")
+endif()
+
+# Dependencies
+find_package(Threads REQUIRED)
+find_package(yaml-cpp QUIET)
+
+if(NOT yaml-cpp_FOUND)
+    message(STATUS "yaml-cpp not found, some features may be disabled")
+endif()
+
+# Add stdexec (C++ std::execution reference implementation)
+CPMAddPackage(
+    NAME stdexec
+    GITHUB_REPOSITORY NVIDIA/stdexec
+    GIT_TAG nvhpc-25.09
+    GIT_SHALLOW ON
+    OPTIONS
+        "STDEXEC_BUILD_TESTS OFF"
+        "STDEXEC_BUILD_EXAMPLES OFF"
+        "BUILD_TESTING OFF"
+)
+
+# Mark stdexec includes as SYSTEM to isolate from -Werror
+if(TARGET stdexec)
+    set_target_properties(stdexec PROPERTIES SYSTEM TRUE)
+endif()
+
+# Add FlatBuffers (header-only, for binary trace format)
+CPMAddPackage(
+    NAME flatbuffers
+    GITHUB_REPOSITORY google/flatbuffers
+    GIT_TAG v25.12.19
+    GIT_SHALLOW ON
+    OPTIONS
+        "FLATBUFFERS_BUILD_TESTS OFF"
+        "FLATBUFFERS_BUILD_FLATC ON"
+        "FLATBUFFERS_BUILD_FLATHASH OFF"
+)
+
+# Mark flatbuffers includes as SYSTEM and suppress -Werror (third-party code)
+if(TARGET flatbuffers)
+    get_target_property(FB_INC flatbuffers INTERFACE_INCLUDE_DIRECTORIES)
+    set_target_properties(flatbuffers PROPERTIES
+        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${FB_INC}"
+    )
+    target_compile_options(flatbuffers PRIVATE -Wno-error)
+endif()
+
+if(TARGET flatc)
+    target_compile_options(flatc PRIVATE -Wno-error)
+endif()
+
+# Add the main framework library
+add_subdirectory(src)
+
+# Tests and examples
+if(CHRONON_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(test)
+    add_subdirectory(examples)
+endif()
+
+# Summary
+message(STATUS "")
+message(STATUS "Chronon Configuration Summary:")
+message(STATUS "  Version: ${PROJECT_VERSION}")
+message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "  C++ Standard: C++${CMAKE_CXX_STANDARD}")
+message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "  Build Tests/Examples: ${CHRONON_BUILD_TESTS}")
+message(STATUS "  Werror: ${CHRONON_ENABLE_WERROR}")
+message(STATUS "  ASan+UBSan: ${CHRONON_ENABLE_ASAN}")
+message(STATUS "  TSan: ${CHRONON_ENABLE_TSAN}")
+message(STATUS "  Coverage: ${CHRONON_ENABLE_COVERAGE}")
+message(STATUS "  clang-tidy: ${CHRONON_ENABLE_CLANG_TIDY}")
+message(STATUS "")
