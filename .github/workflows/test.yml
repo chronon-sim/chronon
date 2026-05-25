@@ -17,7 +17,7 @@ jobs:
   # Fast gate: format check (~30s, no build needed)
   # ================================================================
   clang-format:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -36,7 +36,7 @@ jobs:
   # Core checks: GCC Debug + ASan + TSan (always runs on push and PR)
   # ================================================================
   build-and-test:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
 
     strategy:
       matrix:
@@ -111,7 +111,7 @@ jobs:
   # ================================================================
   build-and-test-full:
     if: github.event_name == 'push'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
 
     strategy:
       matrix:
@@ -177,7 +177,7 @@ jobs:
   # Clang builds: runs on both push and PR
   # ================================================================
   build-and-test-clang:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
 
     strategy:
       matrix:
@@ -258,7 +258,7 @@ jobs:
   # Static analysis: clang-tidy (always runs on push and PR)
   # ================================================================
   clang-tidy:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
 
     steps:
     - name: Checkout code
@@ -295,7 +295,7 @@ jobs:
   # Code coverage (gcov + lcov, always runs on push and PR)
   # ================================================================
   coverage:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
 
     steps:
     - name: Checkout code
