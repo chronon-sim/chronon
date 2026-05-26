@@ -49,10 +49,14 @@ jobs:
         continue-on-error: true
         run: |
           rm -rf website/docs/api/Classes website/docs/api/Namespaces website/docs/api/Files
+
+          # Remove STL stubs that crash doxybook2
+          rm -f build/doxygen/xml/classstd_*.xml build/doxygen/xml/structstd_*.xml
+
           doxybook2 \
             --input build/doxygen/xml \
             --output website/docs/api \
-            --config website/.doxybook2.json
+            --config website/.doxybook2.json || true
 
       - name: Fix doxybook2 frontmatter
         if: steps.doxygen.outcome == 'success' && steps.install-doxybook2.outcome == 'success'
