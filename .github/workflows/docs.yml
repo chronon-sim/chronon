@@ -7,11 +7,13 @@ on:
       - 'website/**'
       - 'src/**/*.hpp'
       - 'Doxyfile'
+      - '.github/workflows/docs.yml'
   pull_request:
     paths:
       - 'website/**'
       - 'src/**/*.hpp'
       - 'Doxyfile'
+      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 jobs:
