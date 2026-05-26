@@ -24,14 +24,15 @@ Chronon uses a **synchronous, tick-based execution model** where every `Tickable
 
 ```wavedrom
 { "signal": [
-  { "name": "clk",    "wave": "p........" },
+  { "name": "clk",    "wave": "p..." },
   {},
-  { "name": "Unit A", "wave": "=.=.=.=.=", "data": ["tick","tick","tick","tick","tick"] },
-  { "name": "Unit B", "wave": "=.=.=.=.=", "data": ["tick","tick","tick","tick","tick"] },
-  { "name": "Unit C", "wave": "=.=.=.=.=", "data": ["tick","tick","tick","tick","tick"] }
+  { "name": "Unit A", "wave": "====", "data": ["tick","tick","tick","tick","tick"] },
+  { "name": "Unit B", "wave": "====", "data": ["tick","tick","tick","tick","tick"] },
+  { "name": "Unit C", "wave": "====", "data": ["tick","tick","tick","tick","tick"] },
+  {}
 ],
   "head": { "text": "Chronon: every unit ticks every cycle" },
-  "config": { "hscale": 1.5 }
+  "config": { "hscale": 3 }
 }
 ```
 
@@ -49,13 +50,18 @@ gem5 uses a **discrete event simulation** engine where simulation time only adva
 
 ```wavedrom
 { "signal": [
-  { "name": "curTick",    "wave": "x2..x3..x4......x", "data": ["100","150","300"] },
+  { "name": "execution_time",      "wave": "=..=.=.=..=..=.", "data": ["100","200","300","350","500","600"] },
   {},
-  { "name": "CPU event",  "wave": "x=..x...x=......x", "data": ["process","process"] },
-  { "name": "Mem event",  "wave": "x...x=..x.......x", "data": ["process"] },
-  { "name": "Bus event",  "wave": "x...x...x=..=...x", "data": ["hi-pri","lo-pri"] }
+  ["Event Queue",
+    { "name": "CPU",      "wave": "2..x.2.x..x..2.", "data": ["load","ifu","alu2"], "node": "..a..f.g.....h..." },
+    { "name": "Cache",    "wave": "x..3.x.x..3..x.", "data": ["evict","snoop"],           "node": "...b.c....i...." },
+    { "name": "MemCtrl",  "wave": "x..x.x.4..x..x.", "data": ["forward"],                    "node": "e......d......." }
+  ],
+  {},
+  { "name": "cycle",     "wave": "=.........=....", "data": ["1","2","3","4","5","6"] }
 ],
-  "head": { "text": "gem5: time jumps between events, idle periods skipped" },
+  "edge": ["a~>b", "c~>d", "e~>f", "e~>i", "g~>h"],
+  "head": { "text": "gem5 DES: units schedule events for each other on one shared queue" },
   "config": { "hscale": 1.5 }
 }
 ```
@@ -63,7 +69,7 @@ gem5 uses a **discrete event simulation** engine where simulation time only adva
 Key characteristics:
 - **Sparse execution**: Only components with pending events execute; idle components consume zero simulation time
 - **Event-driven**: `SimObject`s schedule `Event` callbacks at future ticks via `schedule(event, when)`
-- **Priority-ordered**: Events at the same tick execute in priority order (e.g., `CPU_Tick_Pri=50` before `Stat_Event_Pri=90`)
+- **Priority-ordered**: Events at the same tick/cycle execute in fixed priority order (e.g., `CPU_Tick_Pri=50` before `Stat_Event_Pri=90`, `evict` before `forward`)
 - **Two-level event queue**: Events organized into time bins (linked list), with in-bin priority ordering
 
 This is efficient for systems with many idle components (e.g., large memory hierarchies) but imposes overhead for densely-active pipelines.
@@ -122,10 +128,10 @@ Chronon performs **static dependency analysis** at initialization time to determ
               │          │          │
               └──────────┼──────────┘
                          ▼
-               WeightedPartitioner
-                    ┌────┼────┐
-                    ▼    ▼    ▼
-             Sequential Barrier  Lookahead
+                WeightedPartitioner
+                         │
+                         ▼
+                     Lookahead
 ```
 
 **Cycle classification** determines scheduling strategy:
@@ -488,25 +494,8 @@ This is not an accidental optimization — it is the direct consequence of choos
 
 ### 7.1 Abstraction Level
 
-```
-                    Low-level                              High-level
-                    (closer to RTL)                       (closer to functional)
-                         │                                      │
-  GPGPU-Sim ─────────────┤                                      │
-  (pipeline stages,       │                                      │
-   explicit buffers)      │                                      │
-                          │                                      │
-         Chronon ─────────┤                                      │
-         (tick-based,     │                                      │
-          typed ports)    │                                      │
-                          │                                      │
-                          │         gem5 ───────────────────────┤
-                          │         (event-driven,              │
-                          │          multi-mode ports)          │
-```
-
 - **GPGPU-Sim**: Closest to hardware — pipeline stages, scoreboard, register files modeled explicitly
-- **Chronon**: Balanced — tick-based like RTL but with higher-level port abstractions and automatic scheduling
+- **Chronon**: Balanced — tick-based like RTL but with higher-level port abstractions and automatic scheduling, providing bit-accuracy for key data
 - **gem5**: Most flexible — event-driven model supports both fast functional and detailed timing simulation
 
 ### 7.2 Extensibility
@@ -550,37 +539,88 @@ This is not an accidental optimization — it is the direct consequence of choos
 - GPU memory system research
 - Studies where single-threaded simulation speed is acceptable
 
-### Fundamental Design Trade-offs
+## 9. Related Work: Parallel Architecture Simulation
 
-```
-              Sparse Execution              Dense Execution
-              (only active units)           (all units every cycle)
-                    │                              │
-                    │     gem5                      │  Chronon, GPGPU-Sim
-                    │  (event-driven)              │  (tick-driven)
-                    │                              │
-    Advantage:     Skip idle cycles          Predictable, parallelizable
-    Disadvantage:  Event overhead,           Wastes time on idle units,
-                   hard to parallelize       cannot skip quiescent periods
-```
+Beyond gem5 and GPGPU-Sim, many projects have tackled parallel architecture simulation. This section surveys the major approaches and contrasts them with Chronon's static-analysis-driven parallelism.
 
-```
-              Static Scheduling             Dynamic Scheduling
-              (predetermined order)         (runtime decisions)
-                    │                              │
-                    │  Chronon                     │  gem5
-                    │  (dependency graph at init)  │  (events scheduled dynamically)
-                    │                              │
-                    │  GPGPU-Sim                   │
-                    │  (hardcoded order)           │
-                    │                              │
-    Advantage:     Low runtime overhead,     Flexible, adapts to workload
-                   enables lookahead
-    Disadvantage:  Cannot adapt topology     Event queue management overhead
-                   at runtime
-```
+### 9.1 Parallelizing gem5
 
-## 9. Summary Table
+Several projects add parallelism to gem5's inherently sequential event queue:
+
+- [**parti-gem5**](https://arxiv.org/abs/2308.09445) (SAMOS 2023) parallelizes gem5's detailed timing mode by assigning each simulated core to a host thread with *temporal decoupling* — threads run independently within a configurable synchronization quantum, then synchronize at barriers. Achieves up to 42.7x speedup for a 120-core ARM MPSoC but introduces up to 15% timing error from the decoupling window.
+- [**par-gem5**](https://ieeexplore.ieee.org/document/10137178/) (DATE 2023) applies the same temporal decoupling idea to gem5's atomic (fast-forward) mode, reaching ~25x speedup on 128 ARM cores.
+- [**dist-gem5**](https://ieeexplore.ieee.org/document/7975287) (ISPASS 2017) takes a multi-process approach: separate gem5 instances simulate different nodes of a distributed system, communicating via conservative PDES synchronization over TCP/MPI. Merged into upstream gem5.
+
+All three rely on *temporal decoupling* or *spatial distribution* — they tolerate timing inaccuracy in exchange for speed, but perform no static analysis of component dependencies to determine safe parallelization boundaries.
+
+### 9.2 Simulators Designed for Parallel Execution
+
+| Simulator | Venue | Parallelization Approach | Source |
+|-----------|-------|--------------------------|--------|
+| **SST** (Sandia) | [SC 2006](https://doi.org/10.1145/1188455.1188618) | Component-based conservative PDES; link latencies provide lookahead; MPI + threads | [GitHub](https://github.com/sstsimulator/sst-core) |
+| **ZSim** (Stanford) | [ISCA 2013](https://doi.org/10.1145/2508148.2485963) | PIN-based bound-weave: parallel "bound" phase runs application code, sequential "weave" resolves memory timing | [GitHub](https://github.com/s5z/zsim) |
+| **Sniper** (Ghent) | [SC 2011](https://doi.org/10.1145/2063384.2063454) | Interval core model — jumps between miss events instead of simulating every cycle; built on Graphite's distributed infrastructure | [GitHub](https://github.com/snipersim/snipersim) |
+| **Manifold** (Georgia Tech) | [ISPASS 2014](https://doi.org/10.1109/ISPASS.2014.6844466) | Component-based PDES with MPI transparent parallelism | [GitHub](https://github.com/gtcasl/manifold) |
+| **SlackSim** | [SIGARCH 2009](https://doi.org/10.1145/1577129.1577134) | Each simulated core in its own pthread; bounded time slack between cores reduces synchronization while keeping error low (~2.1%) | [GitHub](https://github.com/dlkumar/SlackSim) |
+| **HORNET** (Cornell/MIT) | [IEEE TCAD 2012](https://doi.org/10.1109/TCAD.2012.2184760) | Cycle-level NoC simulator with switchable cycle-accurate and periodic-sync modes; >5x on 6 host cores | [Paper](https://cwfletcher.github.io/content/research/2012.tcad.hornet.paper.pdf) |
+| **Prophet** | [IEEE TPDS 2017](https://doi.org/10.1109/TPDS.2017.2700307) | Instruction-oriented (vs. cycle-oriented): each instruction is simulated from its own perspective, enabling speculative decoupling; scales to 4096 cores | [IEEE](https://ieeexplore.ieee.org/document/7917344/) |
+| **MGPUSim** | [ISCA 2019](https://doi.org/10.1145/3307650.3322230) | Go-based GPU simulator with conservative parallel event processing | [GitHub](https://github.com/sarchlab/mgpusim) |
+
+Separately, [**FireSim**](https://github.com/firesim/firesim) ([ISCA 2018](https://doi.org/10.1109/ISCA.2018.00014)) sidesteps software simulation entirely by running cycle-exact RISC-V RTL on cloud FPGAs, achieving orders-of-magnitude speedup through hardware parallelism.
+
+Epoch-based and sampling-based approaches form another family: [**EPSim**](https://ieeexplore.ieee.org/document/8579541/) (IEEE Access 2018) identifies execution intervals with no functional/timing interaction and runs them in parallel (12.8x on 16 cores); [**Pac-Sim**](https://dl.acm.org/doi/full/10.1145/3680548) (ACM TACO 2024) uses online predictors to sample representative regions, reaching up to 523x speedup at the cost of statistical rather than exact results.
+
+### 9.3 How Chronon Differs
+
+The table below compares the parallelization strategy of each major approach against Chronon:
+
+| Technique | Used By | Tradeoff vs. Chronon |
+|-----------|---------|----------------------|
+| **Temporal decoupling** (run ahead within a quantum, sync at barriers) | parti-gem5, par-gem5, Simics | Introduces timing error proportional to quantum size (parti-gem5: up to 15%; SlackSim: ~2.1%); quantum is a global knob requiring manual tuning, not topology-aware |
+| **Distributed multi-process PDES** (MPI between separate simulator instances) | dist-gem5, SST, Graphite, BigSim | Coarse-grained; inter-process communication overhead; designed for multi-node clusters, not intra-core pipeline parallelism |
+| **Bound-weave** (parallel application execution + sequential timing resolution) | ZSim | Application-level parallelism only; the timing "weave" phase is sequential — cannot parallelize the microarchitecture model itself |
+| **Interval / analytical core model** (skip cycles between miss events) | Sniper | Trades cycle-accuracy for speed; not a parallelization of the timing model but an abstraction that avoids simulating it |
+| **Bounded slack** (allow cores to diverge in simulated time by a fixed window) | SlackSim | Closest to Chronon's lookahead, but slack bounds are configured manually per-experiment, not derived from topology |
+| **Link-latency-based conservative PDES** | SST, Manifold | Most architecturally similar — link delays provide lookahead. But synchronization is dynamic (runtime null-message protocol), not statically analyzed; no cost-aware thread partitioning |
+| **Epoch / sampling parallelism** | EPSim, Pac-Sim, LoopPoint | Orthogonal — parallelizes across time (independent intervals), not across components within a cycle. Can be combined with Chronon |
+| **FPGA acceleration** | FireSim, RAMP Gold | Not software simulation; requires FPGA hardware and RTL-level models |
+
+Among all the frameworks above, **SST** and **Manifold** are architecturally closest to Chronon — all three use component connection delays as the basis for parallel scheduling. The differences lie in *how* that delay information is exploited. The following comparison is based on SST-core source and Manifold's published algorithms.
+
+#### Chronon vs. SST vs. Manifold
+
+| Aspect | SST | Manifold | Chronon |
+|--------|-----|----------|---------|
+| **Graph analysis** | Computes a single global min-latency across all cross-partition links (`findSyncInterval`); no per-pair analysis, no cycle detection | Computes global or pairwise lookahead during link setup; no cycle detection or topological analysis | Floyd-Warshall all-pairs shortest paths + Tarjan SCC + Johnson's cycle enumeration; classifies every component pair as tight / loose / independent |
+| **Zero-delay connections** | Prohibited between Components (links must have latency > 0); zero-delay interaction requires SubComponent function calls within the same Component tree | Half-tick minimum for inter-component links; intra-LP links can be zero but require same-LP placement | First-class `delay=0` connections with delta-cycle convergence semantics; CycleAnalyzer automatically detects tight cycles and forces co-location on the same thread |
+| **Partitioning** | 5 built-in strategies; `simple` partitioner maximizes cross-cut latency via pairwise swap; balances component *count*, not computational *cost* | Manual only — user specifies LP assignment per component in driver code | Cost-aware WeightedPartitioner: models per-unit compute cost + sync cost scaled by delay (100x penalty for delay=0, 1/N for delay=N); four-phase optimization (LPT + FM refinement + pairwise swap + multi-unit relocate) minimizes max thread execution time |
+| **Synchronization protocol** | Barrier-based with skip-ahead: `MPI_Allreduce` computes global min next-activity time, then advances by the static lookahead period; no null messages | Chandy-Misra-Bryant null-message protocol with multiple variants (basic CMB, tick-optimized, Forecast Null-Message for dynamic lookahead, LBTS barrier, quantum) | No runtime protocol. Lookahead bounds are precomputed from the dependency graph; progress tracking uses cache-line-aligned atomics. Each unit checks only its direct predecessors' progress — no global barrier or null-message exchange |
+| **Lookahead exploitation** | Single global value (min cross-partition latency); all components sync at the same interval regardless of local topology | Global or pairwise; FNM variant allows runtime forecast-based dynamic lookahead per LP pair | Per-unit direct-edge lookahead: each unit independently advances based on its immediate predecessors' progress. Transitive closure penalties do not propagate — if A→B (delay=5) and B→C (delay=3), C uses 3 from B directly, not min(5,3) from the transitive path |
+| **Execution model adaptation** | Fixed: always event-driven PDES regardless of topology | Fixed: always null-message PDES (choice of 5 variants, but always PDES) | Adaptive: automatically selects Sequential (when parallel overhead exceeds benefit), Barrier (tight connections present), or Lookahead (loose connections dominate) based on topology analysis |
+| **Queue implementation** | Fixed per-link type (polling or callback); no adaptation to thread placement | Fixed per-link; event delivery via LP-local event queue | Topology-aware polymorphism: `InPort` auto-selects LockFreeQueue (SPSC, zero mutex) for single-source or MultiProducerQueue (per-source SPSC rings with deterministic k-way merge) for multi-source, based on thread assignment |
+| **Dynamic rebalancing** | None — partitioning is one-time at initialization | None — LP assignment is fixed | Continuous: per-unit tick costs are sampled into ring buffers; at epoch boundaries, if imbalance exceeds threshold (default 1.3x), the partitioner re-runs at cluster granularity and commits only if gain exceeds minimum |
+| **Parallelism granularity** | MPI rank (inter-process) + pthreads (intra-rank); typically one simulated core or memory controller per thread | MPI rank; one LP per MPI process; typically pairs of cores+caches per LP | Shared-memory threads via stdexec thread pool; parallelism down to individual pipeline stages within a single core |
+| **Configuration** | Python scripting — powerful but requires learning SST's Python module binding, ELI macros, and multi-file project structure | C++ driver code only — no declarative configuration; user writes `main()` to instantiate components, connect links, and assign LPs by hand | Declarative YAML — parameters are auto-registered via `ParameterSet`; a single `.yaml` file describes the full system topology, delays, and queue sizes |
+| **Component authoring boilerplate** | Substantial: register with `SST_ELI_REGISTER_COMPONENT` macro, declare params/ports/stats via ELI macros, implement `setup()`/`finish()` lifecycle, write separate Python module for config-time visibility | Moderate: inherit from `Component`, implement `Tick()` / `Tock()`, manually register clock handler and link handlers; no macro registration but no auto-discovery either | Minimal: inherit from `TickableUnit`, implement `tick()`, declare ports as member variables — dependency analysis, scheduling, and stat collection are automatic |
+| **Build & dependency setup** | Multi-repo: build sst-core first, then sst-elements, then custom element libraries as separate shared-object plugins; requires MPI and Boost | Autotools-based; requires manual `configure`/`make` with dependency on SystemC and MPI; no package manager integration | Single CMake build; all dependencies fetched via `FetchContent` or system packages; no MPI required |
+| **Error diagnostics** | Runtime errors from the PDES engine (deadlocked null-message, unresolved link) can be cryptic; debugging requires understanding of MPI ranks and event queues | Minimal runtime diagnostics; errors typically manifest as segfaults or silent hangs in the null-message protocol; no built-in topology validation | Compile-time type-safe port checking; runtime diagnostics include cycle-level traces, topology visualization, dependency graph export, and descriptive error messages for misconfigured connections |
+| **Documentation & community** | Active open-source community with tutorials, annual workshops (SST Micro), and Sandia support; documentation covers core well but element libraries vary | Academic project (Georgia Tech); last commit ~2016; minimal documentation beyond the ISPASS 2014 paper; effectively unmaintained | Actively developed; integrated documentation site with API reference, tutorials, and architecture guides |
+
+#### Why these differences matter
+
+1. **Zero-delay support enables accurate pipeline modeling.** Real CPU pipelines have combinational paths between stages (e.g., bypass networks, stall signals). SST cannot model these as links — they must be collapsed into a single Component with internal function calls, losing the compositional port abstraction. Manifold's half-tick workaround introduces artificial timing granularity. Chronon handles `delay=0` natively: CycleAnalyzer detects tight cycles, the partitioner forces them onto the same thread, and delta-cycle iteration converges within a single simulation cycle — no special-casing by the model author.
+
+2. **Per-unit direct-edge lookahead admits more parallelism than global sync intervals.** SST's single global `max_period` is bottlenecked by the shortest cross-partition link in the entire system. A 1-cycle link between two components forces *all* components to synchronize every cycle, even if most have 10+ cycle lookahead. Chronon's per-unit progress tracking means each unit advances at its own safe rate — a tight pair syncs frequently while the rest of the system runs ahead freely.
+
+3. **Cost-aware partitioning outperforms count-balanced or manual placement.** SST's `simple` partitioner balances component count and maximizes cross-cut latency, but ignores that a branch predictor's `tick()` costs 10x less than an OOO scheduler's. If both end up on the same thread, the imbalance is invisible to the partitioner. Manifold has no automatic partitioner at all. Chronon's WeightedPartitioner uses measured per-unit tick costs and a delay-scaled sync cost model to directly minimize the metric that determines simulation throughput: max thread execution time.
+
+4. **Adaptive execution mode avoids unnecessary overhead.** A deeply pipelined single-core model with mostly `delay=0` connections has little exploitable parallelism. SST and Manifold would still run the full PDES machinery (barrier reduction or null-message exchange) for negligible benefit. Chronon detects this topology and falls back to Sequential mode — zero synchronization overhead, deterministic, and often faster than parallel execution with its attendant scheduling cost.
+
+5. **Dynamic rebalancing compensates for phase-dependent workload shifts.** Architecture simulations exhibit phase behavior: a memory-intensive phase may bottleneck the LSU thread while a compute-intensive phase shifts load to the execution units. SST and Manifold's static partitioning cannot adapt. Chronon samples per-unit costs continuously and re-partitions at epoch boundaries (at cluster granularity to preserve tight-cycle locality), tracking workload shifts as they happen.
+
+6. **User-friendliness determines adoption velocity.** SST's power comes at the cost of a steep learning curve: users must master Python-side ELI registration macros, multi-repo builds (sst-core → sst-elements → custom plugins), and MPI configuration before simulating a single cycle. Manifold is worse — no declarative configuration exists; the user writes a C++ `main()` that manually instantiates every component, connects every link, and assigns every LP, with no automatic partitioning or topology validation. Chronon replaces all of this with a single YAML file: parameters are auto-registered via `ParameterSet`, ports are type-checked at compile time, dependency analysis and thread partitioning are fully automatic, and the build is a single CMake invocation with no MPI dependency. The practical consequence is that adding a new pipeline stage in SST requires touching 4-5 files (C++ component, ELI macros, Python config, build scripts, and possibly a custom element `Makefile.am`); in Manifold it requires editing the driver `main()` and manually updating LP assignments; in Chronon it requires one `TickableUnit` subclass and one YAML stanza.
+
+## 10. Summary Table
 
 | Feature | Chronon | gem5 | GPGPU-Sim |
 |---------|---------|------|-----------|
