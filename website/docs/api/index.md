@@ -34,7 +34,6 @@ Auto-generated C++ API documentation from source code using Doxygen.
 
 - [**Namespaces**](Namespaces/Namespaces) — `chronon`, `chronon::sender`, `chronon::observe`, `chronon::params`
 - [**Classes**](Classes/Classes) — all documented classes and structs
-- [**Files**](Files/Files) — header file listing
 
 ## Single Include
 
