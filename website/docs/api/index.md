@@ -30,13 +30,15 @@ Auto-generated C++ API documentation from source code using Doxygen.
 | `Param<T>` | `chronon/Params.hpp` | Self-registering parameter wrapper |
 | `SimulationApp` | `chronon/SimulationApp.hpp` | Unified CLI entry point |
 
+## Browse
+
+- [**Namespaces**](Namespaces/Namespaces) — `chronon`, `chronon::sender`, `chronon::observe`, `chronon::params`
+- [**Classes**](Classes/Classes) — all documented classes and structs
+- [**Files**](Files/Files) — header file listing
+
 ## Single Include
 
 ```cpp
 #include "chronon/Chronon.hpp"
 using namespace chronon;
 ```
-
-:::info
-Full Doxygen-generated API documentation will appear here once the documentation build pipeline is configured. Run `scripts/build-docs.sh api` to generate.
-:::

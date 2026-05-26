@@ -56,13 +56,23 @@ jobs:
         run: |
           rm -rf website/docs/api/Classes website/docs/api/Namespaces website/docs/api/Files
 
-          # Remove STL stubs that crash doxybook2
+          # Remove XML that crashes doxybook2 v1.5.0:
+          # - STL stubs (classstd_*, structstd_*)
+          # - C++20 concepts (doxybook2 doesn't recognise the "concept" kind)
           rm -f build/doxygen/xml/classstd_*.xml build/doxygen/xml/structstd_*.xml
+          rm -f build/doxygen/xml/concept*.xml
+          python3 -c "
+          import re
+          idx = 'build/doxygen/xml/index.xml'
+          with open(idx) as f: content = f.read()
+          content = re.sub(r'  <compound refid=\"concept[^\"]*\" kind=\"concept\">.*?</compound>\n', '', content, flags=re.DOTALL)
+          with open(idx, 'w') as f: f.write(content)
+          "
 
           doxybook2 \
             --input build/doxygen/xml \
             --output website/docs/api \
-            --config website/.doxybook2.json || true
+            --config website/.doxybook2.json
 
       - name: Fix doxybook2 frontmatter
         if: steps.doxygen.outcome == 'success' && steps.install-doxybook2.outcome == 'success'
