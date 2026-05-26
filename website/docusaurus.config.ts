@@ -24,6 +24,7 @@ const config: Config = {
 
   markdown: {
     format: 'detect',
+    emoji: false,
   },
 
   plugins: [
