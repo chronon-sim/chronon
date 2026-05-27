@@ -17,7 +17,7 @@
 #include <string_view>
 #include <vector>
 
-#include "ObservationApi.hpp"
+#include "ObserveApi.hpp"
 #include "Types.hpp"
 
 namespace chronon::observe {

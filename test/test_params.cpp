@@ -18,10 +18,6 @@
 
 using namespace chronon::params;
 
-// =======================
-// StandaloneParameter<T> Tests
-// =======================
-
 void test_parameter_basic() {
     std::cout << "Test: Parameter basic functionality" << std::endl;
 
@@ -91,10 +87,6 @@ void test_parameter_validation() {
 
     std::cout << "  PASS" << std::endl;
 }
-
-// =======================
-// Frequency Tests
-// =======================
 
 void test_frequency_parsing() {
     std::cout << "Test: Frequency parsing" << std::endl;
@@ -178,10 +170,6 @@ void test_frequency_with_parameter() {
     std::cout << "  PASS" << std::endl;
 }
 
-// =======================
-// Latency Tests
-// =======================
-
 void test_latency_parsing() {
     std::cout << "Test: Latency parsing" << std::endl;
 
@@ -226,10 +214,6 @@ void test_latency_arithmetic() {
 
     std::cout << "  PASS" << std::endl;
 }
-
-// =======================
-// Size Tests
-// =======================
 
 void test_size_parsing() {
     std::cout << "Test: Size parsing" << std::endl;
@@ -298,10 +282,6 @@ void test_size_comparison() {
     std::cout << "  PASS" << std::endl;
 }
 
-// =======================
-// Bandwidth Tests
-// =======================
-
 void test_bandwidth_parsing() {
     std::cout << "Test: Bandwidth parsing" << std::endl;
 
@@ -316,10 +296,6 @@ void test_bandwidth_parsing() {
 
     std::cout << "  PASS" << std::endl;
 }
-
-// =======================
-// ParameterSet Tests
-// =======================
 
 struct TestParameterSet : public ParameterSet {
     Param<uint32_t> retire_width{this, "retire_width", 4, "Number of instructions to retire"};
@@ -376,10 +352,6 @@ void test_parameter_set_validation() {
 
     std::cout << "  PASS" << std::endl;
 }
-
-// =======================
-// Main Test Runner
-// =======================
 
 int main() {
     std::cout << "\n=== Parameter System Tests ===" << std::endl;

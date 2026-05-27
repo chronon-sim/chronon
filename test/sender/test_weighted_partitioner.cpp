@@ -29,10 +29,6 @@ void assertValidResult(const PartitionResult& result, [[maybe_unused]] size_t nu
     assert(result.imbalance_ratio >= 1.0);
 }
 
-// ========================================================================
-// Test: Uniform costs, no edges -> balanced assignment
-// ========================================================================
-
 void test_uniform_no_edges() {
     std::cout << "Testing uniform costs, no edges... ";
 
@@ -53,10 +49,6 @@ void test_uniform_no_edges() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: Delay-aware sync cost weighting
-// ========================================================================
 
 void test_delay_aware_sync() {
     std::cout << "Testing delay-aware sync cost... ";
@@ -87,10 +79,6 @@ void test_delay_aware_sync() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: Evaluate partition with delay scaling
-// ========================================================================
 
 void test_evaluate_delay_scaling() {
     std::cout << "Testing evaluate with delay scaling... ";
@@ -133,10 +121,6 @@ void test_evaluate_delay_scaling() {
     std::cout << "PASSED\n";
 }
 
-// ========================================================================
-// Test: Heavy unit stays alone on thread
-// ========================================================================
-
 void test_heavy_unit_isolation() {
     std::cout << "Testing heavy unit isolation... ";
 
@@ -161,10 +145,6 @@ void test_heavy_unit_isolation() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: Parallel beneficial heuristic
-// ========================================================================
 
 void test_parallel_beneficial() {
     std::cout << "Testing parallel beneficial heuristic... ";
@@ -214,10 +194,6 @@ void test_parallel_beneficial() {
     std::cout << "PASSED\n";
 }
 
-// ========================================================================
-// Test: Cluster-level partitioning (simulated)
-// ========================================================================
-
 void test_cluster_partition() {
     std::cout << "Testing cluster-level partitioning... ";
 
@@ -242,10 +218,6 @@ void test_cluster_partition() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: Adjacency aggregation correctness
-// ========================================================================
 
 void test_adjacency_aggregation() {
     std::cout << "Testing adjacency aggregation... ";
@@ -296,10 +268,6 @@ void test_adjacency_aggregation() {
     std::cout << "PASSED\n";
 }
 
-// ========================================================================
-// Test: Mixed topology (realistic pipeline-like graph)
-// ========================================================================
-
 void test_mixed_topology() {
     std::cout << "Testing mixed topology... ";
 
@@ -339,10 +307,6 @@ void test_mixed_topology() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: Single unit and edge cases
-// ========================================================================
 
 void test_edge_cases() {
     std::cout << "Testing edge cases... ";
@@ -387,10 +351,6 @@ void test_edge_cases() {
     std::cout << "PASSED\n";
 }
 
-// ========================================================================
-// Test: Delay=0 edges get maximum sync weight
-// ========================================================================
-
 void test_delay_zero_max_weight() {
     std::cout << "Testing delay=0 edges get max sync weight... ";
 
@@ -414,10 +374,6 @@ void test_delay_zero_max_weight() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: LPT isolates dominant unit (Nucleus LSU scenario)
-// ========================================================================
 
 void test_lpt_isolates_dominant_unit() {
     std::cout << "Testing LPT isolates dominant unit... ";
@@ -461,10 +417,6 @@ void test_lpt_isolates_dominant_unit() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: Multi-unit relocate effectiveness
-// ========================================================================
 
 void test_multi_unit_relocate() {
     std::cout << "Testing multi-unit relocate... ";

@@ -24,10 +24,6 @@ enum class Src : uint8_t { FILL, EVICT, IQ, LRQ, RST, PREFETCH, MB_RD };
 using Arbiter = PriorityArbiter<Src, 4>;
 using Req = ArbRequest<Src>;
 
-// ============================================================================
-// Test helpers
-// ============================================================================
-
 static int tests_passed = 0;
 static int tests_failed = 0;
 
@@ -53,10 +49,6 @@ static int tests_failed = 0;
         std::cout << "  PASS: " << name << std::endl; \
         ++tests_passed;                               \
     } while (0)
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 TEST(basic_priority_selection) {
     Arbiter arb;
@@ -445,10 +437,6 @@ TEST(tag_preservation) {
 
     PASS("tag_preservation");
 }
-
-// ============================================================================
-// Main
-// ============================================================================
 
 int main() {
     std::cout << "PriorityArbiter Tests" << std::endl;

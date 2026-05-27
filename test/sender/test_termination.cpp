@@ -22,13 +22,6 @@
 
 using namespace chronon::sender;
 
-// =============================================================================
-// Test Units
-// =============================================================================
-
-/**
- * A unit that terminates after reaching a target count.
- */
 class CountingUnit : public TickableUnit {
 public:
     explicit CountingUnit(std::string name, uint64_t target)
@@ -50,9 +43,6 @@ private:
     uint64_t target_;
 };
 
-/**
- * A unit that terminates with an exit syscall.
- */
 class ExitSyscallUnit : public TickableUnit {
 public:
     explicit ExitSyscallUnit(std::string name, uint64_t trigger_cycle, int exit_code)
@@ -71,9 +61,6 @@ private:
     bool triggered_ = false;
 };
 
-/**
- * A unit that terminates with an error.
- */
 class ErrorUnit : public TickableUnit {
 public:
     explicit ErrorUnit(std::string name, uint64_t trigger_cycle)
@@ -91,9 +78,6 @@ private:
     bool triggered_ = false;
 };
 
-/**
- * A simple unit that never terminates (for testing with other units).
- */
 class InfiniteUnit : public TickableUnit {
 public:
     explicit InfiniteUnit(std::string name) : TickableUnit(std::move(name)) {}
@@ -105,10 +89,6 @@ public:
 private:
     uint64_t count_ = 0;
 };
-
-// =============================================================================
-// TerminationController Tests
-// =============================================================================
 
 void test_termination_controller_basic() {
     std::cout << "Testing TerminationController basic... ";
@@ -244,10 +224,6 @@ void test_termination_reason_strings() {
 
     std::cout << "PASSED\n";
 }
-
-// =============================================================================
-// TickSimulation Termination Tests
-// =============================================================================
 
 void test_simulation_single_unit_termination() {
     std::cout << "Testing single unit termination... ";
@@ -436,10 +412,6 @@ void test_simulation_parallel_termination() {
     std::cout << "PASSED\n";
 }
 
-// =============================================================================
-// Stop Token Integration Tests
-// =============================================================================
-
 void test_stop_token_reflects_termination() {
     std::cout << "Testing stop_token reflects termination... ";
 
@@ -541,10 +513,6 @@ void test_stop_token_parallel_termination() {
 
     std::cout << "PASSED\n";
 }
-
-// =============================================================================
-// Main
-// =============================================================================
 
 int main() {
     std::cout << "=== Termination Tests ===\n\n";

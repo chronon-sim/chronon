@@ -40,10 +40,6 @@ namespace chronon::params {
 template <ParameterType T>
 class Param : public ParamBase {
 public:
-    /**
-     * @brief Construct and self-register with @p owner.
-     * @param owner Owning ParameterSet (non-null).
-     */
     Param(ParameterSet* owner, const std::string& name, T default_val, const std::string& desc);
 
     // Non-copyable, non-movable: the owner stores this address.
@@ -52,10 +48,8 @@ public:
     Param(Param&&) = delete;
     Param& operator=(Param&&) = delete;
 
-    /// Implicit read access: `uint32_t n = params.num_requests;`
     operator const T&() const { return value_; }
 
-    /// Assignment shorthand: `params.num_requests = 50;`
     Param& operator=(const T& v) {
         setValue(v);
         return *this;
@@ -63,10 +57,7 @@ public:
 
     const T& value() const { return value_; }
 
-    /**
-     * @brief Set value, applying validator if installed.
-     * @throws std::invalid_argument if validation fails.
-     */
+    /// @throws std::invalid_argument if validation fails.
     void setValue(const T& v) {
         if (validator_ && !validator_(v)) {
             throw std::invalid_argument("Validation failed for parameter '" + name_ + "'");

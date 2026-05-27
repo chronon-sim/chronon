@@ -28,7 +28,7 @@ namespace chronon::sender {
 
 class TickSimulation;
 
-enum class UnitState { Created, Initialized, Running, Completed, Error };
+enum class UnitState { Created, Initialized };
 
 /**
  * Base class for simulation components.
@@ -116,7 +116,6 @@ protected:
     friend class TickSimulation;
 
     void setId(uint32_t id) { id_ = id; }
-    void setState(UnitState state) { state_ = state; }
 
     void setLocalCycle(uint64_t cycle) {
         local_cycle_ = cycle;

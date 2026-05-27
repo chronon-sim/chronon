@@ -8,16 +8,20 @@
 cmake_minimum_required(VERSION 3.25)
 project(chronon VERSION 1.0.0 LANGUAGES CXX)
 
-# Auto-configure git hooks (requires Git 2.9+)
-find_package(Git QUIET)
-if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
-    execute_process(
-        COMMAND ${GIT_EXECUTABLE} config --local core.hooksPath scripts/hooks
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-        RESULT_VARIABLE GIT_HOOKS_RESULT
-    )
-    if(GIT_HOOKS_RESULT EQUAL 0)
-        message(STATUS "Git hooks: using scripts/hooks/ (core.hooksPath)")
+# Auto-configure git hooks only when built as the top-level project
+# (skip when fetched as a dependency via CPM/FetchContent).
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    find_package(Git QUIET)
+    if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} config --local core.hooksPath scripts/hooks
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            RESULT_VARIABLE GIT_HOOKS_RESULT
+            ERROR_QUIET
+        )
+        if(GIT_HOOKS_RESULT EQUAL 0)
+            message(STATUS "Git hooks: using scripts/hooks/ (core.hooksPath)")
+        endif()
     endif()
 endif()
 

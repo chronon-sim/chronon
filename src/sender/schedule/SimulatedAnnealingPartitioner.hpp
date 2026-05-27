@@ -17,7 +17,7 @@
 #include <random>
 #include <vector>
 
-#include "sender/schedule/WeightedPartitioner.hpp"
+#include "sender/schedule/PartitionUtils.hpp"
 
 namespace chronon::sender {
 
@@ -28,40 +28,10 @@ namespace chronon::sender {
  * stochastic instead of greedy. Initial partitioning only — no dynamic rebalance.
  */
 class SimulatedAnnealingPartitioner {
-    // Cost model is replicated from WeightedPartitioner so both solvers are
-    // directly comparable.
-
-    static double delayFactor_(uint32_t min_delay) noexcept {
-        if (min_delay == 0) return 100.0;
-        return 1.0 / static_cast<double>(min_delay);
-    }
-
-    static void computeThreadTimes_(const PartitionInput& input,
-                                    const std::vector<size_t>& assignment,
-                                    std::vector<double>& thread_times) {
-        std::fill(thread_times.begin(), thread_times.end(), 0.0);
-
-        for (size_t u = 0; u < input.num_units; ++u) {
-            thread_times[assignment[u]] += input.unit_cost_ns[u];
-        }
-
-        for (size_t u = 0; u < input.num_units; ++u) {
-            size_t dst_thread = assignment[u];
-            for (const auto& edge : input.adjacency[u]) {
-                size_t src_thread = assignment[edge.neighbor];
-                if (src_thread != dst_thread) {
-                    double df = delayFactor_(edge.min_delay);
-                    thread_times[dst_thread] +=
-                        input.sync_cost_ns * static_cast<double>(edge.num_connections) * df;
-                }
-            }
-        }
-    }
-
     static double maxThreadTime_(const PartitionInput& input, const std::vector<size_t>& assignment,
                                  size_t num_threads) {
         std::vector<double> times(num_threads, 0.0);
-        computeThreadTimes_(input, assignment, times);
+        partition_utils::computeThreadTimes(input, assignment, times);
         return *std::max_element(times.begin(), times.end());
     }
 
@@ -148,7 +118,7 @@ class SimulatedAnnealingPartitioner {
     static double objective_(const PartitionInput& input, const std::vector<size_t>& assignment,
                              size_t num_threads) {
         std::vector<double> times(num_threads, 0.0);
-        computeThreadTimes_(input, assignment, times);
+        partition_utils::computeThreadTimes(input, assignment, times);
         double max_time = *std::max_element(times.begin(), times.end());
 
         std::vector<double> compute(num_threads, 0.0);
@@ -184,79 +154,6 @@ class SimulatedAnnealingPartitioner {
                 input.critical_path_weight * maxCriticalPathChain_(input, assignment, num_threads);
         }
         return base;
-    }
-
-    static size_t countCrossThreadConnections_(const PartitionInput& input,
-                                               const std::vector<size_t>& assignment) {
-        size_t count = 0;
-        for (size_t u = 0; u < input.num_units; ++u) {
-            for (const auto& edge : input.adjacency[u]) {
-                if (assignment[u] != assignment[edge.neighbor]) {
-                    count += edge.num_connections;
-                }
-            }
-        }
-        return count / 2;
-    }
-
-    /// LPT initial placement — identical to WeightedPartitioner phase 1.
-    static std::vector<size_t> initialLPT_(const PartitionInput& input, size_t num_threads) {
-        std::vector<size_t> assignment(input.num_units, 0);
-
-        std::vector<size_t> order(input.num_units);
-        std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-            return input.unit_cost_ns[a] > input.unit_cost_ns[b];
-        });
-
-        std::vector<double> thread_load(num_threads, 0.0);
-
-        for (size_t idx : order) {
-            size_t best_thread = 0;
-            double min_load = thread_load[0];
-            for (size_t t = 1; t < num_threads; ++t) {
-                if (thread_load[t] < min_load) {
-                    min_load = thread_load[t];
-                    best_thread = t;
-                }
-            }
-            assignment[idx] = best_thread;
-            thread_load[best_thread] += input.unit_cost_ns[idx];
-        }
-
-        return assignment;
-    }
-
-    static PartitionResult buildResult_(const PartitionInput& input,
-                                        const std::vector<size_t>& assignment, size_t num_threads) {
-        PartitionResult result;
-        result.unit_to_thread = assignment;
-        result.thread_units.resize(num_threads);
-
-        for (size_t u = 0; u < input.num_units; ++u) {
-            result.thread_units[assignment[u]].push_back(u);
-        }
-
-        std::vector<double> thread_times(num_threads, 0.0);
-        computeThreadTimes_(input, assignment, thread_times);
-
-        result.estimated_max_thread_time_ns =
-            *std::max_element(thread_times.begin(), thread_times.end());
-
-        double avg_time = 0.0;
-        size_t active_threads = 0;
-        for (double t : thread_times) {
-            if (t > 0.0) {
-                avg_time += t;
-                active_threads++;
-            }
-        }
-        avg_time = (active_threads > 0) ? avg_time / static_cast<double>(active_threads) : 1.0;
-        result.imbalance_ratio = result.estimated_max_thread_time_ns / avg_time;
-
-        result.cross_thread_connections = countCrossThreadConnections_(input, assignment);
-
-        return result;
     }
 
     struct UnionFind {
@@ -525,7 +422,7 @@ public:
         auto& ri = rp.reduced_input;
         size_t reduced_threads = std::min(num_threads, ri.num_units);
 
-        auto group_assignment = initialLPT_(ri, reduced_threads);
+        auto group_assignment = partition_utils::initialLPT(ri, reduced_threads);
 
         auto lpt_assignment = group_assignment;  // Fallback seed for the balance gate.
         group_assignment = saSearch_(ri, std::move(group_assignment), reduced_threads);
@@ -577,7 +474,7 @@ public:
         }
         double avg_c = (act > 0) ? tot / static_cast<double>(act) : 1.0;
 
-        auto result = buildResult_(input, assignment, num_threads);
+        auto result = partition_utils::buildResult(input, assignment, num_threads);
         result.stats.sa_objective = sa_obj;
         result.stats.lpt_fallback = lpt_fb;
         result.stats.active_threads = act;

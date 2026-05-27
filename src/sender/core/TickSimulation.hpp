@@ -15,13 +15,11 @@
 #include "../../observe/ObservationManager.hpp"
 #include "../port/Connection.hpp"
 #include "../port/Port.hpp"
-#include "../schedule/CostProfileCache.hpp"
 #include "../schedule/CycleAnalyzer.hpp"
 #include "../schedule/DependencyGraph.hpp"
 #include "../schedule/PlatformBenchmark.hpp"
 #include "../schedule/SchedulerTimelineTrace.hpp"
 #include "../schedule/SimulatedAnnealingPartitioner.hpp"
-#include "../schedule/TickCostProfiler.hpp"
 #include "../schedule/WeightedPartitioner.hpp"
 #include "TerminationRequest.hpp"
 #include "TickSimulationConfig.hpp"
@@ -246,11 +244,11 @@ public:
         return dynamic_cast<UnitT*>(getUnit(name));
     }
 
-    const std::vector<double>& getProfiledUnitCosts() const { return profiled_unit_costs_; }
+    const std::vector<double>& getUnitCosts() const { return unit_costs_; }
     const PlatformMetrics& getPlatformMetrics() const { return platform_metrics_; }
 
-    /// When set, initialize() skips internal profiling and uses these costs.
-    void setPrecomputedProfilingData(std::vector<double> unit_costs, PlatformMetrics metrics) {
+    /// Provide explicit per-unit costs instead of using uniform-cost initial partitioning.
+    void setPrecomputedUnitCosts(std::vector<double> unit_costs, PlatformMetrics metrics) {
         precomputed_unit_costs_ = std::move(unit_costs);
         precomputed_platform_metrics_ = metrics;
         has_precomputed_costs_ = true;
@@ -373,7 +371,6 @@ private:
     void buildPartitionAdjacency_(const std::unordered_map<Unit*, size_t>& unit_ptr_to_idx,
                                   PartitionInput& input) const;
 
-    void profileAndAssignThreadsClustered_();
     void assignThreadsDeterministic_();
     void assignThreadsFromPrecomputedCosts_();
     void applyClusteredThreadAssignment_(size_t num_threads);
@@ -520,7 +517,7 @@ private:
     PartitionSolver partition_solver_ = &WeightedPartitioner::partition;
     PartitionSolver rebalance_solver_ = &WeightedPartitioner::partition;
     PlatformMetrics platform_metrics_{};
-    std::vector<double> profiled_unit_costs_;
+    std::vector<double> unit_costs_;
 
     std::vector<double> precomputed_unit_costs_;
     PlatformMetrics precomputed_platform_metrics_{};

@@ -34,24 +34,24 @@
 namespace chronon::sender {
 
 /**
- * StageSelective cancellation tracing (NUCLEUS_STAGE_TRACE env).
+ * StageSelective cancellation tracing (CHRONON_STAGE_TRACE env).
  *
  * Permanent diagnostic feature. Emits one line per install/retire/
  * shouldCancel on a StageSelective InPort, for investigating flush
  * and cancellation behavior in production builds.
  *
- * Enable: NUCLEUS_STAGE_TRACE=1 (or any non-empty value)
- * Optional filter: NUCLEUS_STAGE_TRACE_PORT=<substring of port name>
+ * Enable: CHRONON_STAGE_TRACE=1 (or any non-empty value)
+ * Optional filter: CHRONON_STAGE_TRACE_PORT=<substring of port name>
  */
 inline bool stageTraceEnabled_() noexcept {
     static const bool enabled = []() {
-        const char* v = std::getenv("NUCLEUS_STAGE_TRACE");
+        const char* v = std::getenv("CHRONON_STAGE_TRACE");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
     return enabled;
 }
 inline bool stageTracePortMatches_(const std::string& name) noexcept {
-    static const char* filter = std::getenv("NUCLEUS_STAGE_TRACE_PORT");
+    static const char* filter = std::getenv("CHRONON_STAGE_TRACE_PORT");
     if (!filter || filter[0] == '\0') {
         return true;
     }
@@ -142,7 +142,7 @@ struct InPortStageCancelState {
     /// shouldCancel retires slots pop-driven: a single post-flush pop drops
     /// all obsolete slots in one pass.
     std::vector<StagePredicate> slots;
-    /// High-water mark tracking for diagnostics (NUCLEUS_STAGE_TRACE).
+    /// High-water mark tracking for diagnostics (CHRONON_STAGE_TRACE).
     size_t high_water = 0;
 
     void install(uint64_t flush_cycle, uint64_t max_keep) {
@@ -263,14 +263,6 @@ public:
 
     const std::string& name() const noexcept { return name_; }
     Unit* owner() const noexcept { return owner_; }
-
-    /**
-     * Clear all pending messages in this port's queue.
-     *
-     * Used for post-profiling reset to drain queues before simulation
-     * starts. Default no-op for OutPorts; overridden in InPort.
-     */
-    virtual void clearPendingMessages() {}
 
     /**
      * Consumer-tick-driven MPSC arbitration hook

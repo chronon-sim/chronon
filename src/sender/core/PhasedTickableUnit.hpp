@@ -24,7 +24,7 @@ namespace chronon::sender {
  *
  * @code
  * class MyUnit : public PhasedTickableUnit<MyUnit> {
- *     SingleStageReg<Data> reg_;
+ *     StageReg<Data> reg_;
  * public:
  *     MyUnit() : PhasedTickableUnit("my_unit") {}
  *     template<ValidPhase P>

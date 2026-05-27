@@ -20,10 +20,10 @@ namespace chronon::sender {
 /**
  * @brief N-pipe pipeline register with ping-pong slots and runtime write tracking.
  *
- * Eliminates external bool[N] tracking arrays that are otherwise easy to forget to update,
- * a frequent source of silent data-clobber and ghost-entry bugs in pipeline models.
+ * When NumPipes == 1, convenience overloads without a pipe index are available,
+ * making this a drop-in replacement for the former SingleStageReg.
  */
-template <typename T, std::size_t NumPipes>
+template <typename T, std::size_t NumPipes = 1>
 class StageReg {
     struct Slot {
         T data{};
@@ -104,7 +104,9 @@ public:
     bool written(std::size_t pipe) const { return written_[pipe]; }
 
     template <ValidPhase P, typename Func>
-    std::size_t forEachValidConsume(Func&& fn) {
+    std::size_t forEachValidConsume(Func&& fn)
+        requires(NumPipes > 1)
+    {
         constexpr std::size_t ridx = read_slot_index<P>();
         constexpr std::size_t widx = write_slot_index<P>();
         std::size_t count = 0;
@@ -119,6 +121,21 @@ public:
         return count;
     }
 
+    template <ValidPhase P, typename Func>
+    std::size_t forEachValidConsume(Func&& fn)
+        requires(NumPipes == 1)
+    {
+        constexpr std::size_t ridx = read_slot_index<P>();
+        constexpr std::size_t widx = write_slot_index<P>();
+        bool was_valid = slots_[ridx][0].valid;
+        if (was_valid) {
+            fn(slots_[ridx][0].data);
+        }
+        slots_[ridx][0].valid = false;
+        slots_[widx][0].valid = false;
+        return was_valid ? 1 : 0;
+    }
+
     /**
      * @brief Flush pipes whose read slot matches @p pred; invalidates both slots.
      *
@@ -129,7 +146,9 @@ public:
      * flushIfAnySlot only when write-slot entries are guaranteed to be old-path.
      */
     template <ValidPhase P, typename Pred>
-    std::size_t flushIf(Pred&& pred) {
+    std::size_t flushIf(Pred&& pred)
+        requires(NumPipes > 1)
+    {
         constexpr std::size_t ridx = read_slot_index<P>();
         constexpr std::size_t widx = write_slot_index<P>();
         std::size_t flushed = 0;
@@ -143,6 +162,20 @@ public:
         return flushed;
     }
 
+    template <ValidPhase P, typename Pred>
+    std::size_t flushIf(Pred&& pred)
+        requires(NumPipes == 1)
+    {
+        constexpr std::size_t ridx = read_slot_index<P>();
+        constexpr std::size_t widx = write_slot_index<P>();
+        if (slots_[ridx][0].valid && pred(slots_[ridx][0].data)) {
+            slots_[ridx][0].valid = false;
+            slots_[widx][0].valid = false;
+            return 1;
+        }
+        return 0;
+    }
+
     /**
      * @brief Flush pipes matching @p pred in either read or write slot.
      *
@@ -150,7 +183,9 @@ public:
      * monotonic IDs cause new-path data to match and be killed — use flushIf instead.
      */
     template <ValidPhase P, typename Pred>
-    std::size_t flushIfAnySlot(Pred&& pred) {
+    std::size_t flushIfAnySlot(Pred&& pred)
+        requires(NumPipes > 1)
+    {
         constexpr std::size_t ridx = read_slot_index<P>();
         constexpr std::size_t widx = write_slot_index<P>();
         std::size_t flushed = 0;
@@ -164,6 +199,22 @@ public:
             }
         }
         return flushed;
+    }
+
+    template <ValidPhase P, typename Pred>
+    std::size_t flushIfAnySlot(Pred&& pred)
+        requires(NumPipes == 1)
+    {
+        constexpr std::size_t ridx = read_slot_index<P>();
+        constexpr std::size_t widx = write_slot_index<P>();
+        bool match_read = slots_[ridx][0].valid && pred(slots_[ridx][0].data);
+        bool match_write = slots_[widx][0].valid && pred(slots_[widx][0].data);
+        if (match_read || match_write) {
+            slots_[ridx][0].valid = false;
+            slots_[widx][0].valid = false;
+            return 1;
+        }
+        return 0;
     }
 
     void reset() {
@@ -181,6 +232,81 @@ public:
         constexpr std::size_t widx = write_slot_index<P>();
         return slots_[widx][pipe].valid;
     }
+
+    // --- Single-pipe convenience API (available when NumPipes == 1) ---
+
+    template <ValidPhase P>
+    bool valid() const
+        requires(NumPipes == 1)
+    {
+        return valid<P>(0);
+    }
+
+    template <ValidPhase P>
+    const T& read() const
+        requires(NumPipes == 1)
+    {
+        return read<P>(0);
+    }
+
+    template <ValidPhase P>
+    T& read()
+        requires(NumPipes == 1)
+    {
+        return read<P>(0);
+    }
+
+    template <ValidPhase P>
+    void write(T data)
+        requires(NumPipes == 1)
+    {
+        write<P>(0, std::move(data));
+    }
+
+    template <ValidPhase P>
+    void retain()
+        requires(NumPipes == 1)
+    {
+        retain<P>(0);
+    }
+
+    template <ValidPhase P>
+    T consume()
+        requires(NumPipes == 1)
+    {
+        return consume<P>(0);
+    }
+
+    bool written() const
+        requires(NumPipes == 1)
+    {
+        return written_[0];
+    }
+
+    template <ValidPhase P>
+    bool hasWritePending() const
+        requires(NumPipes == 1)
+    {
+        return hasWritePending<P>(0);
+    }
+
+    template <ValidPhase P, typename Func>
+    bool ifValidConsume(Func&& fn)
+        requires(NumPipes == 1)
+    {
+        constexpr std::size_t ridx = read_slot_index<P>();
+        constexpr std::size_t widx = write_slot_index<P>();
+        bool was_valid = slots_[ridx][0].valid;
+        if (was_valid) {
+            fn(slots_[ridx][0].data);
+        }
+        slots_[ridx][0].valid = false;
+        slots_[widx][0].valid = false;
+        return was_valid;
+    }
 };
+
+template <typename T>
+using SingleStageReg = StageReg<T, 1>;
 
 }  // namespace chronon::sender

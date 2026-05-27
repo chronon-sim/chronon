@@ -13,11 +13,9 @@
 #include <concepts>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 
 #include "../../params/ParameterSet.hpp"
@@ -26,6 +24,7 @@
 #include "../core/TickSimulation.hpp"
 #include "../core/TickableUnit.hpp"
 #include "../core/Unit.hpp"
+#include "../util/ThreadSafeRegistry.hpp"
 
 namespace chronon::sender::factory {
 
@@ -93,7 +92,7 @@ private:
 };
 
 /** @brief Thread-safe singleton registry of unit factories keyed by YAML type name. */
-class SenderFactoryRegistry {
+class SenderFactoryRegistry : public chronon::ThreadSafeRegistry<ISenderFactory> {
 public:
     static SenderFactoryRegistry& instance() {
         static SenderFactoryRegistry registry;
@@ -102,55 +101,23 @@ public:
 
     template <SenderFactoryUnit UnitT>
     void registerFactory(const std::string& type_name, const std::string& description) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        factories_[type_name] = std::make_unique<SenderFactory<UnitT>>(type_name, description);
+        insert(type_name, std::make_unique<SenderFactory<UnitT>>(type_name, description));
     }
 
-    /// Returns nullptr if not found.
-    ISenderFactory* getFactory(const std::string& type_name) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = factories_.find(type_name);
-        return it != factories_.end() ? it->second.get() : nullptr;
-    }
-
-    bool hasFactory(const std::string& type_name) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return factories_.count(type_name) > 0;
-    }
-
-    std::vector<std::string> listFactories() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<std::string> names;
-        names.reserve(factories_.size());
-        for (const auto& [name, _] : factories_) {
-            names.push_back(name);
-        }
-        return names;
-    }
+    ISenderFactory* getFactory(const std::string& type_name) { return find(type_name); }
+    bool hasFactory(const std::string& type_name) const { return has(type_name); }
+    std::vector<std::string> listFactories() const { return keys(); }
 
     std::vector<std::pair<std::string, std::string>> listFactoriesWithDescriptions() const {
-        std::lock_guard<std::mutex> lock(mutex_);
         std::vector<std::pair<std::string, std::string>> result;
-        result.reserve(factories_.size());
-        for (const auto& [name, factory] : factories_) {
-            result.emplace_back(name, factory->description());
-        }
+        forEach([&](const std::string& name, const ISenderFactory& f) {
+            result.emplace_back(name, f.description());
+        });
         return result;
-    }
-
-    /// Primarily for testing.
-    void clear() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        factories_.clear();
     }
 
 private:
     SenderFactoryRegistry() = default;
-    SenderFactoryRegistry(const SenderFactoryRegistry&) = delete;
-    SenderFactoryRegistry& operator=(const SenderFactoryRegistry&) = delete;
-
-    mutable std::mutex mutex_;
-    std::unordered_map<std::string, std::unique_ptr<ISenderFactory>> factories_;
 };
 
 /**

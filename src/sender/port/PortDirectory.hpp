@@ -15,13 +15,12 @@
 #pragma once
 
 #include <memory>
-#include <mutex>
 #include <string>
 #include <typeindex>
 #include <typeinfo>
-#include <unordered_map>
 
 #include "../core/Fwd.hpp"
+#include "../util/ThreadSafeRegistry.hpp"
 
 namespace chronon::sender {
 
@@ -127,7 +126,7 @@ private:
  *
  * Thread-safe registration and lookup by full path.
  */
-class PortDirectory {
+class PortDirectory : public chronon::ThreadSafeRegistry<IPortHandle> {
 public:
     static PortDirectory& instance() {
         static PortDirectory dir;
@@ -135,38 +134,14 @@ public:
     }
 
     void registerPort(const std::string& full_path, std::unique_ptr<IPortHandle> handle) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ports_[full_path] = std::move(handle);
+        insert(full_path, std::move(handle));
     }
 
-    IPortHandle* findPort(const std::string& full_path) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = ports_.find(full_path);
-        return it != ports_.end() ? it->second.get() : nullptr;
-    }
-
-    bool hasPort(const std::string& full_path) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return ports_.count(full_path) > 0;
-    }
-
-    void clear() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ports_.clear();
-    }
-
-    size_t size() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return ports_.size();
-    }
+    IPortHandle* findPort(const std::string& full_path) { return find(full_path); }
+    bool hasPort(const std::string& full_path) const { return has(full_path); }
 
 private:
     PortDirectory() = default;
-    PortDirectory(const PortDirectory&) = delete;
-    PortDirectory& operator=(const PortDirectory&) = delete;
-
-    mutable std::mutex mutex_;
-    std::unordered_map<std::string, std::unique_ptr<IPortHandle>> ports_;
 };
 
 /**

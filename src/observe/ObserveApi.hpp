@@ -194,16 +194,4 @@ inline void log_error(ObservationContext* ctx, Args&&... args) {
     }
 }
 
-// Perfetto trace stubs (no-op until perfetto-migration branch is merged).
-// Not deprecated yet: downstream consumers (nucleus) still call these.
-
-template <FixedString Fmt, typename Cat, typename... Args>
-inline void traceEvent(ObservationContext* /*ctx*/, Cat /*cat*/, Args&&... /*args*/) {}
-
-template <FixedString Fmt, typename Cat, typename... Args>
-inline void tracePipe(ObservationContext* /*ctx*/, Cat /*cat*/, const char* /*stage*/,
-                      Args&&... /*args*/) {}
-
-inline void traceCounter(ObservationContext* /*ctx*/, const char* /*name*/, int64_t /*value*/) {}
-
 }  // namespace chronon::observe

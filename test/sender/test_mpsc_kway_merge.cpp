@@ -65,9 +65,7 @@ void seedCanonical(MultiProducerQueueAdapter<int>& q, size_t q0, size_t q1, size
     EXPECT_EQ(q.pushFromThread(q2, 5, 104), true);
 }
 
-// ----------------------------------------------------------------------
 // Test 1: strict cycle-order delivery across producers.
-// ----------------------------------------------------------------------
 void test_strict_cycle_order() {
     MultiProducerQueueAdapter<int> q;
     size_t q0 = q.addProducerThread(/*thread_id=*/10);
@@ -87,9 +85,7 @@ void test_strict_cycle_order() {
     }
 }
 
-// ----------------------------------------------------------------------
 // Test 2: same-cycle tie-break by queue_id.
-// ----------------------------------------------------------------------
 void test_same_cycle_tiebreak_by_queue_id() {
     MultiProducerQueueAdapter<char> q;
     size_t q0 = q.addProducerThread(7);
@@ -110,9 +106,7 @@ void test_same_cycle_tiebreak_by_queue_id() {
     }
 }
 
-// ----------------------------------------------------------------------
 // Test 3: run-to-run stability over 1000 iterations.
-// ----------------------------------------------------------------------
 void test_run_to_run_stability() {
     std::vector<int> golden;
     for (int iter = 0; iter < 1000; ++iter) {
@@ -134,9 +128,7 @@ void test_run_to_run_stability() {
     }
 }
 
-// ----------------------------------------------------------------------
 // Test 4: partial readiness — only ready messages delivered.
-// ----------------------------------------------------------------------
 void test_partial_readiness() {
     MultiProducerQueueAdapter<int> q;
     size_t q0 = q.addProducerThread(1);

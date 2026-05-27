@@ -116,10 +116,6 @@ private:
         sim_config.max_lookahead_cycles = result.config.max_lookahead_cycles;
         sim_config.epoch_size = result.config.epoch_size;
         sim_config.enable_weighted_partitioning = result.config.enable_weighted_partitioning;
-        sim_config.profiling_warmup_cycles = result.config.profiling_warmup_cycles;
-        sim_config.profiling_measurement_cycles = result.config.profiling_measurement_cycles;
-        sim_config.deterministic_partitioning = result.config.deterministic_partitioning;
-        sim_config.cost_profile_cache_path = result.config.cost_profile_cache_path;
         sim_config.enable_dynamic_rebalance = result.config.enable_dynamic_rebalance;
         sim_config.rebalance_imbalance_threshold = result.config.rebalance_imbalance_threshold;
         sim_config.rebalance_check_interval_cycles = result.config.rebalance_check_interval_cycles;
@@ -146,11 +142,8 @@ private:
         for (const auto& [name, unit_config] : result.config.units) {
             auto* factory = registry.getFactory(unit_config.type_name);
             if (!factory) {
-                throw BuildError("CONFIGURING",
-                                 "Unknown unit type '" + unit_config.type_name + "' for unit '" +
-                                     name +
-                                     "'. "
-                                     "Make sure the unit derives from AutoRegisteredUnit<T>.");
+                throw BuildError("CONFIGURING", "Unknown unit type '" + unit_config.type_name +
+                                                    "' for unit '" + name + "'");
             }
 
             Unit* unit =

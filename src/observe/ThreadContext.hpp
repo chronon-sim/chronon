@@ -93,29 +93,15 @@ public:
     ThreadContext(ThreadContext&&) = delete;
     ThreadContext& operator=(ThreadContext&&) = delete;
 
-    // =========================================================================
-    // Accessors
-    // =========================================================================
-
-    /**
-     * Get the thread context ID.
-     */
     [[nodiscard]] uint32_t id() const noexcept { return id_; }
 
-    /**
-     * Get the dedicated SPSC queue for this thread.
-     *
-     * Hot path - direct access, no synchronization needed since queue is
-     * owned by this thread.
-     */
+    // Hot path - direct access, no synchronization needed since queue is
+    // owned by this thread.
     [[nodiscard]] [[gnu::always_inline]] SPSCQueue& queue() noexcept { return queue_; }
-
     [[nodiscard]] const SPSCQueue& queue() const noexcept { return queue_; }
 
     /**
-     * Get the string length cache for this thread.
-     *
-     * Used to cache strlen() results during two-phase encoding:
+     * String length cache for two-phase encoding:
      * 1. Size calculation phase: compute and cache string lengths
      * 2. Encoding phase: use cached lengths (no redundant strlen)
      */
@@ -123,25 +109,12 @@ public:
         return size_cache_;
     }
 
-    // =========================================================================
-    // Statistics
-    // =========================================================================
-
-    /**
-     * Increment dropped event counter.
-     */
     void incrementDropped() noexcept { dropped_count_.fetch_add(1, std::memory_order_relaxed); }
 
-    /**
-     * Get number of dropped events.
-     */
     [[nodiscard]] uint64_t droppedCount() const noexcept {
         return dropped_count_.load(std::memory_order_relaxed);
     }
 
-    /**
-     * Check if this context is active (has written any data).
-     */
     [[nodiscard]] bool isActive() const noexcept { return queue_.bytesWritten() > 0; }
 
 private:

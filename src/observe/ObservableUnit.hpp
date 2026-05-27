@@ -15,8 +15,8 @@
 #include <vector>
 
 #include "Counter.hpp"
-#include "ObservationApi.hpp"
 #include "ObservationContext.hpp"
+#include "ObserveApi.hpp"
 #include "Types.hpp"
 
 namespace chronon::observe {
@@ -57,15 +57,6 @@ public:
      */
     ObservationContext* observationContext() noexcept { return observe_ctx_; }
     const ObservationContext* observationContext() const noexcept { return observe_ctx_; }
-
-    [[deprecated("Use observationContext()")]]
-    ObservationContext* observeCtx() noexcept {
-        return observationContext();
-    }
-    [[deprecated("Use observationContext()")]]
-    const ObservationContext* observeCtx() const noexcept {
-        return observationContext();
-    }
 
     /**
      * Set the observation context.
@@ -114,11 +105,6 @@ public:
         return observe_ctx_ ? observe_ctx_->observationStats() : empty;
     }
 
-    [[deprecated("Use observationStats()")]]
-    const ObservationStats& observeStats() const noexcept {
-        return observationStats();
-    }
-
     /**
      * Get stats for a specific observation channel.
      */
@@ -149,17 +135,6 @@ public:
             chronon::observe::trace<Fmt>(observe_ctx_, category, std::forward<Args>(args)...);
         }
     }
-
-    // Perfetto trace stubs (no-op until perfetto-migration branch is merged).
-    // Not deprecated yet: downstream consumers (nucleus) still call these.
-    template <FixedString Fmt, typename Cat, typename... Args>
-    void tracePipe(Cat /*category*/, const char* /*stage*/, Args&&... /*args*/) {}
-
-    template <FixedString Fmt, typename Cat, typename... Args>
-    void traceEvent(Cat /*category*/, Args&&... /*args*/) {}
-
-    void traceCounter(const char* /*name*/, int64_t /*value*/) {}
-    void traceCounter(const char* /*name*/, uint64_t /*value*/) {}
 
     /**
      * Emit a debug log message.

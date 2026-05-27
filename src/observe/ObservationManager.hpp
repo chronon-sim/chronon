@@ -12,17 +12,18 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "CategoryPatternMatcher.hpp"
 #include "Counter.hpp"
+#include "CounterRegistry.hpp"
 #include "ObservableUnit.hpp"
-#include "ObservationApi.hpp"
 #include "ObservationBackend.hpp"
 #include "ObservationContext.hpp"
 #include "ObservationQueue.hpp"
 #include "ObservationYAMLConfig.hpp"
+#include "ObserveApi.hpp"
+#include "SourceNameRegistry.hpp"
 #include "Types.hpp"
 
 namespace chronon::observe {
@@ -93,32 +94,7 @@ public:
     const std::string& outputDir() const noexcept { return config_.output_dir; }
     const ObservationYAMLConfig& config() const noexcept { return config_; }
 
-    /** @brief Identifies a counter by owning unit and counter ID. */
-    struct CounterKey {
-        std::string unit_name;
-        CounterId id;
-        /// Stored directly to avoid a global-registry lookup later.
-        std::string counter_name;
-
-        bool operator==(const CounterKey& other) const {
-            return unit_name == other.unit_name && id == other.id;
-        }
-    };
-
-    struct CounterKeyHash {
-        size_t operator()(const CounterKey& key) const {
-            return std::hash<std::string>{}(key.unit_name) ^
-                   (std::hash<uint32_t>{}(toIndex(key.id)) << 1);
-        }
-    };
-
-    /**
-     * @brief Register a counter address for later snapshot reading.
-     *
-     * @param counter_ptr Pointer to the SimpleCounter in the unit's storage.
-     */
-    void registerCounter(const std::string& unit_name, CounterId id, SimpleCounter* counter_ptr,
-                         const std::string& counter_name = "");
+    CounterRegistry& counterRegistry() noexcept { return counter_registry_; }
 
     /**
      * @brief Emit COUNTER_SNAPSHOT events for all registered counters at @p cycle.
@@ -175,13 +151,8 @@ private:
 
     std::vector<std::unique_ptr<ObservationContext>> contexts_;
 
-    std::unordered_map<CounterKey, SimpleCounter*, CounterKeyHash> registered_counters_;
-
-    std::vector<DerivedCounterDef> derived_counter_defs_;
-
-    /// Append-only; IDs are 1-based (0 = unknown).
-    std::vector<std::string> source_names_;
-    bool source_registry_frozen_ = false;
+    CounterRegistry counter_registry_;
+    SourceNameRegistry source_registry_;
 
     mutable std::mutex mutex_;
 };

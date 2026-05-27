@@ -31,10 +31,6 @@ struct MockResource {
     }
 };
 
-// =======================
-// TreeNode Basic Tests
-// =======================
-
 void test_constructor_basic() {
     std::cout << "Test: Constructor basic" << std::endl;
 
@@ -93,7 +89,7 @@ void test_add_child() {
     root.addChild("child", std::move(child));
 
     assert(root.children().size() == 1);
-    assert(root.getChild("child") == child_ptr);
+    assert(root.getChildByRelativePath("child") == child_ptr);
     assert(child_ptr->parent() == &root);
 
     std::cout << "  PASS" << std::endl;
@@ -132,10 +128,6 @@ void test_add_child_wrong_phase() {
 
     std::cout << "  PASS" << std::endl;
 }
-
-// =======================
-// Path Navigation Tests
-// =======================
 
 void test_path_single_node() {
     std::cout << "Test: Path single node" << std::endl;
@@ -190,7 +182,7 @@ void test_get_child_nested() {
     [[maybe_unused]] TreeNode* rob_ptr = rob.get();
     core_ptr->addChild("rob", std::move(rob));
 
-    assert(root.getChild("core0.rob") == rob_ptr);
+    assert(root.getChildByRelativePath("core0.rob") == rob_ptr);
     assert(root.getChildByRelativePath("core0.rob") == rob_ptr);
 
     std::cout << "  PASS" << std::endl;
@@ -209,12 +201,12 @@ void test_absolute_path_navigation() {
     [[maybe_unused]] TreeNode* rob_ptr = rob.get();
     core_ptr->addChild("rob", std::move(rob));
 
-    assert(root.findByPath("cpu") == &root);
-    assert(root.findByPath("cpu.core0.rob") == rob_ptr);
+    assert(root.findByAbsolutePath("cpu") == &root);
+    assert(root.findByAbsolutePath("cpu.core0.rob") == rob_ptr);
     assert(core_ptr->findByAbsolutePath("cpu.core0.rob") == rob_ptr);
 
     // Backward-compatible root-relative spelling remains accepted.
-    assert(core_ptr->findByPath("core0.rob") == rob_ptr);
+    assert(core_ptr->findByAbsolutePath("core0.rob") == rob_ptr);
 
     std::cout << "  PASS" << std::endl;
 }
@@ -224,8 +216,8 @@ void test_get_child_not_found() {
 
     TreeNode root("root");
 
-    assert(root.getChild("nonexistent") == nullptr);
-    assert(root.getChild("a.b.c") == nullptr);
+    assert(root.getChildByRelativePath("nonexistent") == nullptr);
+    assert(root.getChildByRelativePath("a.b.c") == nullptr);
 
     std::cout << "  PASS" << std::endl;
 }
@@ -249,10 +241,6 @@ void test_root_navigation() {
 
     std::cout << "  PASS" << std::endl;
 }
-
-// =======================
-// Lifecycle Phase Tests
-// =======================
 
 void test_phase_transitions_valid() {
     std::cout << "Test: Phase transitions valid" << std::endl;
@@ -332,10 +320,6 @@ void test_phase_transition_recursive() {
 
     std::cout << "  PASS" << std::endl;
 }
-
-// =======================
-// ResourceNode Tests
-// =======================
 
 void test_resource_node_constructor() {
     std::cout << "Test: ResourceNode constructor" << std::endl;
@@ -450,10 +434,6 @@ void test_resource_node_parameter_modification() {
     std::cout << "  PASS" << std::endl;
 }
 
-// =======================
-// Integration Test
-// =======================
-
 void test_complete_hierarchy() {
     std::cout << "Test: Complete hierarchy example" << std::endl;
 
@@ -477,9 +457,9 @@ void test_complete_hierarchy() {
     assert(lsu_ptr->path() == "cpu.core0.lsu");
 
     // Test getChild
-    assert(cpu->getChild("core0") == core0_ptr);
-    assert(cpu->getChild("core0.rob") == rob_ptr);
-    assert(cpu->getChild("core0.lsu") == lsu_ptr);
+    assert(cpu->getChildByRelativePath("core0") == core0_ptr);
+    assert(cpu->getChildByRelativePath("core0.rob") == rob_ptr);
+    assert(cpu->getChildByRelativePath("core0.lsu") == lsu_ptr);
 
     // Test root
     assert(rob_ptr->root() == cpu.get());
@@ -494,10 +474,6 @@ void test_complete_hierarchy() {
 
     std::cout << "  PASS" << std::endl;
 }
-
-// =======================
-// Main Test Runner
-// =======================
 
 int main() {
     std::cout << "\n=== TreeNode Tests ===" << std::endl;

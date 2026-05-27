@@ -50,7 +50,6 @@ struct TaggedMsg {
     static uint64_t getKey(const TaggedMsg& m) { return m.key; }
 };
 
-// -----------------------------------------------------------------------------
 // Test A: basic flush cancellation semantic
 //
 // Producer pushes keys 10, 20, 30 at cycles 0, 1, 2 (delay=1, so they arrive
@@ -61,7 +60,6 @@ struct TaggedMsg {
 //   key=10: enqueue_cycle=0 < 2 (flush) AND 10 <= 15 (max_keep) -> SURVIVES
 //   key=20: enqueue_cycle=1 < 2 AND 20 > 15                     -> CANCELLED
 //   key=30: enqueue_cycle=2 NOT < 2                             -> SURVIVES
-// -----------------------------------------------------------------------------
 void test_basic_flush_semantic() {
     std::cout << "Testing basic StageSelective flush semantic... ";
 
@@ -98,7 +96,6 @@ void test_basic_flush_semantic() {
     std::cout << "PASSED\n";
 }
 
-// -----------------------------------------------------------------------------
 // Test B: overlapping flush (#7 scenario)
 //
 // Two flushes installed at the same receiver cycle: max_keep=100 and
@@ -107,7 +104,6 @@ void test_basic_flush_semantic() {
 // A message with key=150 triggers ONLY the first (150 > 100, 150 <= 200)
 // -> still cancelled because ANY matching predicate cancels. A message with
 // key=50 matches NEITHER -> survives.
-// -----------------------------------------------------------------------------
 void test_overlapping_flush_predicates() {
     std::cout << "Testing overlapping flush predicates (#7)... ";
 
@@ -138,7 +134,6 @@ void test_overlapping_flush_predicates() {
     std::cout << "PASSED\n";
 }
 
-// -----------------------------------------------------------------------------
 // Test C: retirement boundary
 //
 // A predicate installed at receiver cycle 5 with max_keep=100 is live.
@@ -146,7 +141,6 @@ void test_overlapping_flush_predicates() {
 // is still cancelled (enqueue_cycle=4 < 5).
 // After the predicate retires pop-driven (fresh message has enqueue_cycle >= 5),
 // a fresh message survives.
-// -----------------------------------------------------------------------------
 void test_retirement_boundary() {
     std::cout << "Testing pop-driven predicate retirement... ";
 
@@ -187,14 +181,12 @@ void test_retirement_boundary() {
     std::cout << "PASSED\n";
 }
 
-// -----------------------------------------------------------------------------
 // Test D: sender-side filter removal does not block pushes
 //
 // Push N messages all of which would have been filtered by the OLD sender-side
 // receiver-canceled check. With StageSelective, pushes succeed regardless of
 // the cancel predicate; filtering happens at pop time. Verify all pushes
 // returned true (no early-reject) and that the queue actually holds them.
-// -----------------------------------------------------------------------------
 void test_sender_filter_removal() {
     std::cout << "Testing sender filter removal (no early-reject)... ";
 

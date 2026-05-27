@@ -42,16 +42,9 @@ public:
     CompressionBuffer(const CompressionBuffer&) = delete;
     CompressionBuffer& operator=(const CompressionBuffer&) = delete;
 
-    /**
-     * Check if compression is available.
-     *
-     * @return true if zstd is available and working
-     */
     [[nodiscard]] bool isAvailable() const noexcept { return available_; }
 
     /**
-     * Compress data.
-     *
      * @param input Input data to compress
      * @param input_size Size of input data
      * @return Compressed data (or copy of input if compression unavailable/ineffective)
@@ -59,8 +52,6 @@ public:
     std::vector<std::byte> compress(const std::byte* input, size_t input_size);
 
     /**
-     * Decompress data.
-     *
      * @param input Compressed data
      * @param input_size Size of compressed data
      * @param output_size Expected decompressed size
@@ -69,14 +60,7 @@ public:
     std::vector<std::byte> decompress(const std::byte* input, size_t input_size,
                                       size_t output_size);
 
-    /**
-     * Get compression level.
-     */
     [[nodiscard]] int level() const noexcept { return level_; }
-
-    /**
-     * Get last compression ratio (compressed/uncompressed).
-     */
     [[nodiscard]] double lastRatio() const noexcept { return last_ratio_; }
 
 private:

@@ -270,43 +270,6 @@ public:
     bool canAccept(size_t pending = 0) const { return pending < admissionCapacity(); }
 
     /**
-     * Producer-side canAccept: is there room for another push this cycle?
-     *
-     * Rate-based per-cycle admission: a producer may push up to
-     * `effectiveCapacity_()` items per simulated cycle. The bound is
-     * tracked by Connection::pushes_this_cycle_ (passed as `pending`)
-     * and reset at each cycle advance. This matches RTL pipeline-register
-     * semantics — each clock edge captures up to `capacity` parallel
-     * values regardless of whether the receiver has drained previous
-     * cycles' captures — and is intrinsically race-free: the value of
-     * `pending` is a per-producer-connection cycle-local counter, never
-     * read from the live queue that the consumer mutates on a parallel
-     * thread.
-     *
-     * This replaces the previous `queue_->size() < capacity` live-size
-     * check, which had two failure modes:
-     *   - In parallel mode (num_workers>=2), the consumer's mid-cycle
-     *     pops could let the producer "win the race" and push beyond the
-     *     intended bound — exposing cycle-count drift across num_workers.
-     *   - In sequential mode (num_workers=1), the producer ticks before
-     *     the consumer, so the live queue still holds last cycle's batch
-     *     (capacity items waiting for this cycle's pop). The producer
-     *     saw size == capacity and back-pressured itself every cycle,
-     *     inserting a spurious 1-cycle stall per pipeline stage.
-     *
-     * Total queue growth is still bounded: the consumer's per-cycle drain
-     * keeps the queue at steady-state occupancy. Pathological consumer
-     * stalls are caught by the underlying ring's physical capacity
-     * (USABLE_CAPACITY in LockFreeMessageQueue). For MPSC fan-in, the
-     * per-connection staging deque is bounded by the InPort's capacity,
-     * giving multi-producer back-pressure without a shared-queue race.
-     */
-    [[deprecated("Use canAccept(pending)")]]
-    bool canAcceptFromProducer(size_t pending) const {
-        return canAccept(pending);
-    }
-
-    /**
      * Check if a specific producer queue can accept data (MPSC mode).
      *
      * Falls back to port-level canAccept in non-MPSC mode.
@@ -325,23 +288,6 @@ public:
         return !multi_producer_queue_raw_->fullForThread(queue_id);
     }
 
-    [[deprecated("Use canAcceptOnThreadQueue(queue_id)")]]
-    bool canAcceptThreadQueue(size_t queue_id) const {
-        return canAcceptOnThreadQueue(queue_id);
-    }
-
-    [[deprecated("Use canAcceptOnThreadQueue(queue_id, pending)")]]
-    bool canAcceptThreadQueueFromProducer(size_t queue_id, size_t pending) const {
-        return canAcceptOnThreadQueue(queue_id, pending);
-    }
-
-    /// True if the zero-pending admission check would reject another push.
-    /// Prefer !canAccept() in new code.
-    [[deprecated("Use !canAccept()")]]
-    bool isFull() const {
-        return !canAccept();
-    }
-
     size_t capacity() const { return queue_->capacity(); }
     size_t available() const { return queue_->available(); }
 
@@ -357,11 +303,6 @@ public:
      * as canAccept() on the push path.
      */
     size_t admissionCapacity() const noexcept { return effectiveCapacity_(); }
-
-    [[deprecated("Use admissionCapacity()")]]
-    size_t effectiveCapacityPublic() const noexcept {
-        return admissionCapacity();
-    }
 
     /**
      * Register an MPSC-mode Connection with this InPort so that the
@@ -510,14 +451,6 @@ public:
 
     /// Drop all queued messages (including future arrivals).
     void flush() { queue_->clear(); }
-
-    /**
-     * Clear all pending messages (type-erased override).
-     *
-     * Enables iterating unit->ports() and clearing all InPort queues
-     * without knowing the template type. Used for post-profiling reset.
-     */
-    void clearPendingMessages() override { flush(); }
 
     /**
      * Selectively cancel in-flight messages where KeyFn(data) < watermark.

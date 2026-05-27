@@ -37,8 +37,8 @@ void TickSimulation::initialize() {
     reorderUnitsTopologically_();
     buildDependencyGraph();
 
-    // Remap pre-computed profiling costs to the new index order.
-    // setPrecomputedProfilingData() stores costs in creation order (by unit
+    // Remap pre-computed costs to the new index order.
+    // setPrecomputedUnitCosts() stores costs in creation order (by unit
     // id), so we permute the cost vector to match the reordered indices.
     if (has_precomputed_costs_ && precomputed_unit_costs_.size() == unit_ptrs_.size()) {
         std::vector<double> remapped(unit_ptrs_.size());
@@ -254,15 +254,10 @@ void TickSimulation::selectExecutionMode_() {
     }
 
     if (config_.enable_weighted_partitioning && units_.size() >= 4) {
-        // Unified cluster-aware + cost-aware partitioning. When there are
-        // no tight connections each unit becomes its own cluster — the
-        // runtime scheduler handles `cluster.size() == 1` uniformly.
-        if (config_.deterministic_partitioning) {
-            assignThreadsDeterministic_();
-        } else if (has_precomputed_costs_) {
+        if (has_precomputed_costs_) {
             assignThreadsFromPrecomputedCosts_();
         } else {
-            profileAndAssignThreadsClustered_();
+            assignThreadsDeterministic_();
         }
         parallel_beneficial_ = parallelBeneficialWeighted_();
     } else if (has_tight_connections_) {
