@@ -68,140 +68,24 @@ void TickSimulation::buildPartitionAdjacency_(
 }
 
 // ---------------------------------------------------------------------------
-// Cost profiling and thread assignment
+// Cost-aware thread assignment
 // ---------------------------------------------------------------------------
-
-void TickSimulation::profileAndAssignThreadsClustered_() {
-    size_t num_threads = normalizeThreadCount(config_.num_threads);
-    config_.num_threads = num_threads;
-
-    platform_metrics_ = PlatformBenchmark::measure();
-
-    if (observe_ctx_) {
-        observe::log_info<"Platform sync cost: {}ns (measured 10000 iterations)">(
-            observe_ctx_, static_cast<uint64_t>(platform_metrics_.atomic_roundtrip_ns));
-    }
-
-    // Consult the persistent cache before profiling — a cache hit makes
-    // the resulting partition a function of topology alone, not wall-clock
-    // variance.
-    const uint64_t topology_hash = CostProfileCache::hashTopology(unit_ptrs_, connections_);
-    const std::string& cache_path = config_.cost_profile_cache_path;
-    bool cache_hit = false;
-    std::vector<UnitTickProfile> profiles;
-
-    if (!cache_path.empty()) {
-        auto cached = CostProfileCache::load(cache_path, topology_hash);
-        if (cached && cached->size() == unit_ptrs_.size()) {
-            profiles = std::move(*cached);
-            cache_hit = true;
-            if (observe_ctx_) {
-                observe::log_info<"Cost profile cache HIT: {} profiles loaded from {}">(
-                    observe_ctx_, profiles.size(), cache_path.c_str());
-            }
-        } else if (observe_ctx_) {
-            observe::log_info<"Cost profile cache MISS: will profile and save to {}">(
-                observe_ctx_, cache_path.c_str());
-        }
-    }
-
-    if (!cache_hit) {
-        // Detach ObservationContexts during profiling so the per-tick
-        // observation overhead is not measured.
-        std::vector<observe::ObservationContext*> saved_contexts;
-        saved_contexts.reserve(unit_ptrs_.size());
-        for (auto* unit : unit_ptrs_) {
-            auto* obs_unit = dynamic_cast<observe::ObservableUnit*>(static_cast<Unit*>(unit));
-            if (obs_unit) {
-                saved_contexts.push_back(
-                    const_cast<observe::ObservationContext*>(obs_unit->observationContext()));
-                obs_unit->setObservationContext(nullptr);
-            } else {
-                saved_contexts.push_back(nullptr);
-            }
-        }
-
-        profiles = TickCostProfiler::profile(unit_ptrs_, platform_metrics_.rdtsc_to_ns,
-                                             config_.profiling_warmup_cycles,
-                                             config_.profiling_measurement_cycles);
-
-        for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-            auto* obs_unit =
-                dynamic_cast<observe::ObservableUnit*>(static_cast<Unit*>(unit_ptrs_[i]));
-            if (obs_unit) {
-                obs_unit->setObservationContext(saved_contexts[i]);
-            }
-        }
-
-        if (!cache_path.empty()) {
-            std::vector<std::string> names;
-            names.reserve(unit_ptrs_.size());
-            for (auto* unit : unit_ptrs_) {
-                names.push_back(unit->name());
-            }
-            const bool saved = CostProfileCache::save(cache_path, topology_hash, profiles, names);
-            if (observe_ctx_) {
-                if (saved) {
-                    observe::log_info<"Cost profile cache saved to {}">(observe_ctx_,
-                                                                        cache_path.c_str());
-                } else {
-                    observe::log_info<"Cost profile cache save FAILED for {}">(observe_ctx_,
-                                                                               cache_path.c_str());
-                }
-            }
-        }
-    }
-
-    profiled_unit_costs_.resize(unit_ptrs_.size());
-    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-        profiled_unit_costs_[i] = profiles[i].mean_ns;
-    }
-
-    if (observe_ctx_) {
-        observe::log_info<"Unit tick costs ({} units, source={}):">(
-            observe_ctx_, unit_ptrs_.size(), cache_hit ? "cache" : "profiled");
-        for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-            observe::log_info<"  {}: mean={}ns, median={}ns">(
-                observe_ctx_, unit_ptrs_[i]->name().c_str(),
-                static_cast<uint64_t>(profiles[i].mean_ns),
-                static_cast<uint64_t>(profiles[i].median_ns));
-        }
-    }
-
-    // Skip reset on cache hit — no ticks executed, port state is pristine.
-    if (!cache_hit) {
-        for (auto* conn : connections_) {
-            conn->cancelInFlight();
-        }
-        for (auto* unit : unit_ptrs_) {
-            for (auto* port : static_cast<Unit*>(unit)->ports()) {
-                port->clearPendingMessages();
-            }
-            unit->setLocalCycle(0);
-        }
-    }
-
-    applyClusteredThreadAssignment_(num_threads);
-}
 
 void TickSimulation::assignThreadsDeterministic_() {
     size_t num_threads = normalizeThreadCount(config_.num_threads);
     config_.num_threads = num_threads;
 
-    // 100ns is a realistic order-of-magnitude proxy for x86 atomic-roundtrip
-    // latency, used here to avoid calling the wall-clock benchmark.
+    // Zero sync cost + uniform unit costs makes the initial partition
+    // purely topology-driven and fully deterministic (no wall-clock
+    // measurement noise). Dynamic rebalance calibrates real platform
+    // metrics and unit costs from the first sample batch.
     platform_metrics_ = PlatformMetrics{};
-    platform_metrics_.atomic_roundtrip_ns = 100.0;
-    platform_metrics_.rdtsc_to_ns = 1.0;
 
-    // Any positive constant yields the same partition; 1.0 keeps the
-    // cluster_costs values readable in logs.
-    profiled_unit_costs_.assign(unit_ptrs_.size(), 1.0);
+    unit_costs_.assign(unit_ptrs_.size(), 1.0);
 
     if (observe_ctx_) {
-        observe::log_info<
-            "Deterministic partitioning: unit_cost=1.0ns, sync_cost=100ns ({} units)">(
-            observe_ctx_, profiled_unit_costs_.size());
+        observe::log_info<"Uniform-cost partitioning: unit_cost=1.0, sync_cost=0 ({} units)">(
+            observe_ctx_, unit_costs_.size());
     }
 
     applyClusteredThreadAssignment_(num_threads);
@@ -212,17 +96,16 @@ void TickSimulation::assignThreadsFromPrecomputedCosts_() {
     config_.num_threads = num_threads;
 
     platform_metrics_ = precomputed_platform_metrics_;
-    profiled_unit_costs_ = precomputed_unit_costs_;
+    unit_costs_ = precomputed_unit_costs_;
 
     if (observe_ctx_) {
-        observe::log_info<"Using pre-computed profiling data ({} units)">(
-            observe_ctx_, profiled_unit_costs_.size());
+        observe::log_info<"Using pre-computed profiling data ({} units)">(observe_ctx_,
+                                                                          unit_costs_.size());
         observe::log_info<"Platform sync cost: {}ns (pre-computed)">(
             observe_ctx_, static_cast<uint64_t>(platform_metrics_.atomic_roundtrip_ns));
         for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
             observe::log_info<"  {}: cost={}ns (pre-computed)">(
-                observe_ctx_, unit_ptrs_[i]->name().c_str(),
-                static_cast<uint64_t>(profiled_unit_costs_[i]));
+                observe_ctx_, unit_ptrs_[i]->name().c_str(), static_cast<uint64_t>(unit_costs_[i]));
         }
     }
 
@@ -249,7 +132,7 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads) {
 
     std::vector<double> cluster_costs(num_clusters, 0.0);
     for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-        cluster_costs[clusters_.cluster_id[i]] += profiled_unit_costs_[i];
+        cluster_costs[clusters_.cluster_id[i]] += unit_costs_[i];
     }
 
     std::unordered_map<Unit*, size_t> unit_ptr_to_idx;
@@ -340,7 +223,7 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads) {
             if (thread_units_[t].empty()) continue;
             double cost = 0.0;
             for (size_t u : thread_units_[t]) {
-                cost += profiled_unit_costs_[u];
+                cost += unit_costs_[u];
             }
             std::string names = buildUnitNameList_(thread_units_[t]);
             observe::log_info<"  Thread {}: cost={}ns [{}]">(
@@ -374,7 +257,7 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads) {
 }
 
 bool TickSimulation::parallelBeneficialWeighted_() const noexcept {
-    if (thread_units_.empty() || profiled_unit_costs_.empty()) {
+    if (thread_units_.empty() || unit_costs_.empty()) {
         return false;
     }
 
@@ -387,7 +270,7 @@ bool TickSimulation::parallelBeneficialWeighted_() const noexcept {
         active_threads++;
         double thread_cost = 0.0;
         for (size_t u : tu) {
-            thread_cost += profiled_unit_costs_[u];
+            thread_cost += unit_costs_[u];
         }
         max_cost = std::max(max_cost, thread_cost);
         total_cost += thread_cost;
@@ -458,6 +341,12 @@ bool TickSimulation::shouldRebalance_() const {
 }
 
 bool TickSimulation::performRebalance_() {
+    // Calibrate platform metrics on first rebalance if the initial partition
+    // used fixed proxy values (assignThreadsDeterministic_ path).
+    if (platform_metrics_.rdtsc_to_ns == 0.0) {
+        platform_metrics_ = PlatformBenchmark::measure();
+    }
+
     if (!thread_sampling_.empty()) {
         for (size_t t = 0; t < thread_units_.size(); ++t) {
             const auto& state = thread_sampling_[t];
@@ -478,8 +367,8 @@ bool TickSimulation::performRebalance_() {
                         count++;
                     }
                 }
-                if (count > 0 && u < profiled_unit_costs_.size()) {
-                    profiled_unit_costs_[u] =
+                if (count > 0 && u < unit_costs_.size()) {
+                    unit_costs_[u] =
                         sum / (static_cast<double>(count) * platform_metrics_.rdtsc_to_ns);
                 }
             }
@@ -496,7 +385,7 @@ bool TickSimulation::performRebalance_() {
     for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
         size_t cluster = unit_to_cluster_[i];
         if (cluster < cluster_costs.size()) {
-            cluster_costs[cluster] += profiled_unit_costs_[i];
+            cluster_costs[cluster] += unit_costs_[i];
         }
     }
 

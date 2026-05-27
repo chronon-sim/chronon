@@ -35,16 +35,9 @@ class ConnectionBase {
 public:
     virtual ~ConnectionBase() = default;
 
-    /// Delay in cycles between push and arrival.
     virtual uint32_t delay() const noexcept = 0;
-
-    /// Source unit (for dependency analysis).
     virtual Unit* source() const noexcept = 0;
-
-    /// Destination unit (for dependency analysis).
     virtual Unit* destination() const noexcept = 0;
-
-    /// Destination port pointer (type-erased) for port-level grouping.
     virtual void* destPortPtr() const noexcept = 0;
 
     /**

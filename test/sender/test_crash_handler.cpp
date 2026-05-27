@@ -9,14 +9,6 @@
 // test_crash_handler.cpp
 //
 // Tests for the crash handler and tick exception capture system.
-// Verifies that:
-//   1. Exceptions in tick() are caught and wrapped as TickException
-//   2. TickException carries correct unit name and cycle
-//   3. Sequential and parallel execution paths propagate exceptions
-//   4. Observer emergency flush works on exception
-//   5. Tick context is cleared on exception/unwind paths
-//   6. Fatal signal handler exits quickly in a subprocess
-//   7. Simulation destructs cleanly after exception
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -35,9 +27,9 @@
 #include <thread>
 
 #include "observe/ObservableUnit.hpp"
-#include "observe/ObservationApi.hpp"
 #include "observe/ObservationManager.hpp"
 #include "observe/ObservationYAMLConfig.hpp"
+#include "observe/ObserveApi.hpp"
 #include "observe/Types.hpp"
 #include "sender/core/CrashHandler.hpp"
 #include "sender/core/TickSimulation.hpp"
@@ -45,10 +37,6 @@
 
 using namespace chronon::sender;
 using namespace chronon::observe;
-
-// =============================================================================
-// Test Units
-// =============================================================================
 
 /**
  * A unit that throws a std::runtime_error after a specified number of ticks.
@@ -110,10 +98,6 @@ private:
     uint64_t throw_at_tick_;
 };
 
-// =============================================================================
-// Test: Sequential exception capture
-// =============================================================================
-
 void test_sequential_exception_capture() {
     std::cout << "Testing sequential exception capture... ";
 
@@ -138,10 +122,6 @@ void test_sequential_exception_capture() {
     std::cout << "PASSED\n";
 }
 
-// =============================================================================
-// Test: Sequential exception in runUntilTermination
-// =============================================================================
-
 void test_sequential_exception_run_until_termination() {
     std::cout << "Testing sequential exception in runUntilTermination... ";
 
@@ -165,10 +145,6 @@ void test_sequential_exception_run_until_termination() {
     (void)caught;
     std::cout << "PASSED\n";
 }
-
-// =============================================================================
-// Test: Multi-unit sequential exception identifies correct unit
-// =============================================================================
 
 void test_sequential_multi_unit_exception() {
     std::cout << "Testing multi-unit sequential exception identifies correct unit... ";
@@ -195,10 +171,6 @@ void test_sequential_multi_unit_exception() {
     (void)caught;
     std::cout << "PASSED\n";
 }
-
-// =============================================================================
-// Test: Parallel exception capture (stdexec bulk path)
-// =============================================================================
 
 void test_parallel_exception_capture() {
     std::cout << "Testing parallel exception capture... ";
@@ -236,10 +208,6 @@ void test_parallel_exception_capture() {
     std::cout << "PASSED\n";
 }
 
-// =============================================================================
-// Test: Context is cleared after exception unwind (sequential)
-// =============================================================================
-
 void test_context_cleared_after_sequential_exception() {
     std::cout << "Testing context is cleared after sequential exception... ";
 
@@ -262,10 +230,6 @@ void test_context_cleared_after_sequential_exception() {
     assert(detail::current_tick_context_.cycle == 0);
     std::cout << "PASSED\n";
 }
-
-// =============================================================================
-// Test: Context is cleared after exception unwind (parallel)
-// =============================================================================
 
 void test_context_cleared_after_parallel_exception() {
     std::cout << "Testing context is cleared after parallel exception... ";
@@ -296,10 +260,6 @@ void test_context_cleared_after_parallel_exception() {
     assert(detail::current_tick_context_.cycle == 0);
     std::cout << "PASSED\n";
 }
-
-// =============================================================================
-// Test: Simulation destructs cleanly after exception
-// =============================================================================
 
 void test_simulation_destructs_after_exception() {
     std::cout << "Testing simulation destructs cleanly after exception... ";
@@ -337,10 +297,6 @@ void test_simulation_destructs_after_exception() {
     std::cout << "PASSED\n";
 }
 
-// =============================================================================
-// Test: TickException fields are correct
-// =============================================================================
-
 void test_tick_exception_fields() {
     std::cout << "Testing TickException fields... ";
 
@@ -355,10 +311,6 @@ void test_tick_exception_fields() {
     std::cout << "PASSED\n";
 }
 
-// =============================================================================
-// Test: CrashHandler::install() is idempotent
-// =============================================================================
-
 void test_crash_handler_install_idempotent() {
     std::cout << "Testing CrashHandler::install() idempotent... ";
 
@@ -369,10 +321,6 @@ void test_crash_handler_install_idempotent() {
 
     std::cout << "PASSED\n";
 }
-
-// =============================================================================
-// Test: Thread-local context is set during tick
-// =============================================================================
 
 /**
  * A unit that checks the thread-local tick context is set correctly during tick.
@@ -422,10 +370,6 @@ void test_thread_local_context_set_during_tick() {
 
     std::cout << "PASSED\n";
 }
-
-// =============================================================================
-// Test: Fatal signal handler exits quickly and prints crash banner
-// =============================================================================
 
 void test_fatal_signal_handler_subprocess() {
     std::cout << "Testing fatal signal handler subprocess behavior... ";
@@ -494,10 +438,6 @@ void test_fatal_signal_handler_subprocess() {
 
     std::cout << "PASSED\n";
 }
-
-// =============================================================================
-// Test: Observer emergency flush on exception
-// =============================================================================
 
 void test_observer_emergency_flush_on_exception() {
     std::cout << "Testing observer emergency flush on exception... ";
@@ -595,10 +535,6 @@ void test_observer_emergency_flush_on_exception() {
     std::filesystem::remove_all(tmp_dir);
 }
 
-// =============================================================================
-// Test: Emergency flush is safe when no observer is running
-// =============================================================================
-
 void test_emergency_flush_no_observer() {
     std::cout << "Testing emergency flush with no observer running... ";
 
@@ -607,10 +543,6 @@ void test_emergency_flush_no_observer() {
 
     std::cout << "PASSED\n";
 }
-
-// =============================================================================
-// Main
-// =============================================================================
 
 int main() {
     std::cout << "=== Crash Handler Tests ===\n\n";

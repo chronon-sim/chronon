@@ -56,10 +56,6 @@ private:
     uint64_t work_;
 };
 
-// ========================================================================
-// Test: SA-partitioned simulation runs to completion
-// ========================================================================
-
 void test_sa_simulation_completes() {
     std::cout << "Testing SA-partitioned simulation completes... ";
 
@@ -70,8 +66,7 @@ void test_sa_simulation_completes() {
 
     config.enable_weighted_partitioning = true;
     config.epoch_size = 64;
-    config.profiling_warmup_cycles = 200;
-    config.profiling_measurement_cycles = 500;
+
     config.partition_solver = TickSimulationConfig::PartitionSolverType::SA;
 
     TickSimulation sim(config);
@@ -92,7 +87,7 @@ void test_sa_simulation_completes() {
     PlatformMetrics metrics{};
     metrics.atomic_roundtrip_ns = 1.0;
     metrics.rdtsc_to_ns = 1.0;
-    sim.setPrecomputedProfilingData({500, 300, 400, 200, 600, 100}, metrics);
+    sim.setPrecomputedUnitCosts({500, 300, 400, 200, 600, 100}, metrics);
     sim.initialize();
 
     REQUIRE(sim.isParallelBeneficial());
@@ -110,10 +105,6 @@ void test_sa_simulation_completes() {
     std::cout << "PASSED\n";
 }
 
-// ========================================================================
-// Test: SA with delay=0 edges in a simulation
-// ========================================================================
-
 void test_sa_simulation_delay_zero() {
     std::cout << "Testing SA simulation with delay=0 edges... ";
 
@@ -124,8 +115,7 @@ void test_sa_simulation_delay_zero() {
 
     config.enable_weighted_partitioning = true;
     config.epoch_size = 64;
-    config.profiling_warmup_cycles = 200;
-    config.profiling_measurement_cycles = 500;
+
     config.partition_solver = TickSimulationConfig::PartitionSolverType::SA;
 
     TickSimulation sim(config);
@@ -144,7 +134,7 @@ void test_sa_simulation_delay_zero() {
     PlatformMetrics metrics{};
     metrics.atomic_roundtrip_ns = 1.0;
     metrics.rdtsc_to_ns = 1.0;
-    sim.setPrecomputedProfilingData({300, 300, 300, 300}, metrics);
+    sim.setPrecomputedUnitCosts({300, 300, 300, 300}, metrics);
     sim.initialize();
 
     // delay=0 pairs must be co-located
@@ -156,10 +146,6 @@ void test_sa_simulation_delay_zero() {
     std::cout << "PASSED\n";
 }
 
-// ========================================================================
-// Test: SA with t=2 must not trigger sequential fallback
-// ========================================================================
-
 void test_sa_no_sequential_fallback_t2() {
     std::cout << "Testing SA no sequential fallback (t=2)... ";
 
@@ -170,8 +156,7 @@ void test_sa_no_sequential_fallback_t2() {
 
     config.enable_weighted_partitioning = true;
     config.epoch_size = 64;
-    config.profiling_warmup_cycles = 200;
-    config.profiling_measurement_cycles = 500;
+
     config.partition_solver = TickSimulationConfig::PartitionSolverType::SA;
 
     TickSimulation sim(config);
@@ -193,7 +178,7 @@ void test_sa_no_sequential_fallback_t2() {
     PlatformMetrics metrics{};
     metrics.atomic_roundtrip_ns = 1.0;
     metrics.rdtsc_to_ns = 1.0;
-    sim.setPrecomputedProfilingData({500, 300, 400, 200, 600, 100}, metrics);
+    sim.setPrecomputedUnitCosts({500, 300, 400, 200, 600, 100}, metrics);
     sim.initialize();
 
     // The critical assertion: parallelBeneficialWeighted_() must return true.
@@ -212,10 +197,6 @@ void test_sa_no_sequential_fallback_t2() {
     std::cout << "PASSED\n";
 }
 
-// ========================================================================
-// Test: SA with t=4 must not trigger sequential fallback
-// ========================================================================
-
 void test_sa_no_sequential_fallback_t4() {
     std::cout << "Testing SA no sequential fallback (t=4)... ";
 
@@ -226,8 +207,7 @@ void test_sa_no_sequential_fallback_t4() {
 
     config.enable_weighted_partitioning = true;
     config.epoch_size = 64;
-    config.profiling_warmup_cycles = 200;
-    config.profiling_measurement_cycles = 500;
+
     config.partition_solver = TickSimulationConfig::PartitionSolverType::SA;
 
     TickSimulation sim(config);
@@ -258,7 +238,7 @@ void test_sa_no_sequential_fallback_t4() {
     PlatformMetrics metrics{};
     metrics.atomic_roundtrip_ns = 1.0;
     metrics.rdtsc_to_ns = 1.0;
-    sim.setPrecomputedProfilingData({500, 300, 400, 200, 600, 100, 350, 150, 250, 80}, metrics);
+    sim.setPrecomputedUnitCosts({500, 300, 400, 200, 600, 100, 350, 150, 250, 80}, metrics);
     sim.initialize();
 
     REQUIRE(sim.isParallelBeneficial());
@@ -274,8 +254,6 @@ void test_sa_no_sequential_fallback_t4() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
 
 int main() {
     std::cout << "=== SA Integration Tests ===\n\n";

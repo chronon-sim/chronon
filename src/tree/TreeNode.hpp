@@ -16,10 +16,6 @@
 #include <unordered_map>
 #include <vector>
 
-namespace chronon {
-class Scheduler;
-}
-
 namespace chronon::tree {
 
 /**
@@ -71,14 +67,6 @@ public:
      * @brief Look up a descendant by relative dotted path (e.g. "core0.rob").
      * @return Pointer to the node, or nullptr if not found.
      */
-    TreeNode* getChild(const std::string& path);
-    const TreeNode* getChild(const std::string& path) const;
-
-    /**
-     * @brief Look up a descendant by relative dotted path (e.g. "core0.rob").
-     *
-     * Preferred semantic name for getChild().
-     */
     TreeNode* getChildByRelativePath(const std::string& path);
     const TreeNode* getChildByRelativePath(const std::string& path) const;
 
@@ -112,24 +100,10 @@ public:
      * @brief Find a node by absolute path from root (e.g. "cpu.core0.rob").
      * @return Pointer to node, or nullptr if not found.
      */
-    TreeNode* findByPath(const std::string& absolute_path);
-    const TreeNode* findByPath(const std::string& absolute_path) const;
-
-    /**
-     * @brief Find a node by absolute path from root (e.g. "cpu.core0.rob").
-     *
-     * Preferred semantic name for findByPath().
-     */
     TreeNode* findByAbsolutePath(const std::string& absolute_path);
     const TreeNode* findByAbsolutePath(const std::string& absolute_path) const;
 
     static std::string phaseToString(Phase p);
-
-    /// Set scheduler reference (typically on root during SimulationBuilder Phase 2).
-    void setScheduler(chronon::Scheduler* scheduler) { scheduler_ = scheduler; }
-
-    /// Get scheduler, traversing up to root.
-    chronon::Scheduler* getScheduler() const;
 
     /// Store a type-erased shared resource pointer.
     void setResource(std::shared_ptr<void> resource) { resource_ = std::move(resource); }
@@ -151,7 +125,6 @@ protected:
     TreeNode* parent_;
     std::unordered_map<std::string, std::unique_ptr<TreeNode>> children_;
     Phase phase_ = Phase::BUILDING;
-    chronon::Scheduler* scheduler_ = nullptr;  ///< Not owned; typically set on root only.
     std::shared_ptr<void> resource_;
 
 private:

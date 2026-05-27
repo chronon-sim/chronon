@@ -71,6 +71,17 @@ public:
         std::optional<OutputFormat> info_format;
         std::optional<OutputFormat> warn_format;
         std::optional<OutputFormat> error_format;
+
+        /// Check if any channel override matches the target format (or Both).
+        [[nodiscard]] bool hasFormat(OutputFormat target) const noexcept {
+            for (const auto* fmt :
+                 {&trace_format, &debug_format, &info_format, &warn_format, &error_format}) {
+                if (*fmt == target || *fmt == OutputFormat::Both) {
+                    return true;
+                }
+            }
+            return false;
+        }
     };
 
     struct Config {
@@ -102,81 +113,24 @@ public:
         std::string simulation_name;
 
         [[nodiscard]] bool needsTextOutput() const noexcept {
-            if (trace_format == OutputFormat::Text || trace_format == OutputFormat::Both) {
-                return true;
-            }
-            if (debug_format == OutputFormat::Text || debug_format == OutputFormat::Both) {
-                return true;
-            }
-            if (info_format == OutputFormat::Text || info_format == OutputFormat::Both) {
-                return true;
-            }
-            if (warn_format == OutputFormat::Text || warn_format == OutputFormat::Both) {
-                return true;
-            }
-            if (error_format == OutputFormat::Text || error_format == OutputFormat::Both) {
-                return true;
-            }
-            for (const auto& [mask, ovr] : category_format_overrides) {
-                if (ovr.trace_format == OutputFormat::Text ||
-                    ovr.trace_format == OutputFormat::Both) {
-                    return true;
-                }
-                if (ovr.debug_format == OutputFormat::Text ||
-                    ovr.debug_format == OutputFormat::Both) {
-                    return true;
-                }
-                if (ovr.info_format == OutputFormat::Text ||
-                    ovr.info_format == OutputFormat::Both) {
-                    return true;
-                }
-                if (ovr.warn_format == OutputFormat::Text ||
-                    ovr.warn_format == OutputFormat::Both) {
-                    return true;
-                }
-                if (ovr.error_format == OutputFormat::Text ||
-                    ovr.error_format == OutputFormat::Both) {
-                    return true;
-                }
-            }
-            return false;
+            return hasFormat_(OutputFormat::Text);
         }
 
         [[nodiscard]] bool needsBinaryOutput() const noexcept {
-            if (trace_format == OutputFormat::Binary || trace_format == OutputFormat::Both) {
-                return true;
-            }
-            if (debug_format == OutputFormat::Binary || debug_format == OutputFormat::Both) {
-                return true;
-            }
-            if (info_format == OutputFormat::Binary || info_format == OutputFormat::Both) {
-                return true;
-            }
-            if (warn_format == OutputFormat::Binary || warn_format == OutputFormat::Both) {
-                return true;
-            }
-            if (error_format == OutputFormat::Binary || error_format == OutputFormat::Both) {
-                return true;
+            return hasFormat_(OutputFormat::Binary);
+        }
+
+    private:
+        /// Check if any channel (direct or override) uses the target format (or Both).
+        [[nodiscard]] bool hasFormat_(OutputFormat target) const noexcept {
+            for (OutputFormat fmt :
+                 {trace_format, debug_format, info_format, warn_format, error_format}) {
+                if (fmt == target || fmt == OutputFormat::Both) {
+                    return true;
+                }
             }
             for (const auto& [mask, ovr] : category_format_overrides) {
-                if (ovr.trace_format == OutputFormat::Binary ||
-                    ovr.trace_format == OutputFormat::Both) {
-                    return true;
-                }
-                if (ovr.debug_format == OutputFormat::Binary ||
-                    ovr.debug_format == OutputFormat::Both) {
-                    return true;
-                }
-                if (ovr.info_format == OutputFormat::Binary ||
-                    ovr.info_format == OutputFormat::Both) {
-                    return true;
-                }
-                if (ovr.warn_format == OutputFormat::Binary ||
-                    ovr.warn_format == OutputFormat::Both) {
-                    return true;
-                }
-                if (ovr.error_format == OutputFormat::Binary ||
-                    ovr.error_format == OutputFormat::Both) {
+                if (ovr.hasFormat(target)) {
                     return true;
                 }
             }

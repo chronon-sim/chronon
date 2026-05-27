@@ -21,10 +21,6 @@
 
 using namespace chronon::params;
 
-// =======================
-// Test Parameter Set with YAML (new self-registering style)
-// =======================
-
 class YAMLTestParameterSet : public ParameterSet {
 public:
     Param<uint32_t> retire_width{this, "retire_width", 4, "Number of instructions to retire"};
@@ -46,10 +42,6 @@ public:
         out << YAML::EndMap;
     }
 };
-
-// =======================
-// Test Functions
-// =======================
 
 void test_yaml_basic_serialization() {
     std::cout << "Test: YAML basic serialization" << std::endl;
@@ -271,10 +263,6 @@ void test_get_set_param_string() {
 
     std::cout << "  PASS" << std::endl;
 }
-
-// =======================
-// Main Test Runner
-// =======================
 
 int main() {
     std::cout << "\n=== YAML Serialization Tests ===" << std::endl;

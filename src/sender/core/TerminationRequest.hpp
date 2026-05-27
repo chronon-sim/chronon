@@ -33,16 +33,12 @@ namespace chronon::sender {
 /// Why the simulation is being terminated.
 enum class TerminationReason : uint8_t {
     None = 0,
-    Completed = 1,        ///< Normal completion (e.g., retired N instructions)
-    ExitSyscall = 2,      ///< Exit syscall encountered
-    Error = 3,            ///< Error condition detected
-    UserInterrupted = 4,  ///< External stop (e.g., Ctrl+C, API call)
-    UserRequested [[deprecated("Use UserInterrupted")]] =
-        UserInterrupted,      ///< Backward-compatible alias.
+    Completed = 1,            ///< Normal completion (e.g., retired N instructions)
+    ExitSyscall = 2,          ///< Exit syscall encountered
+    Error = 3,                ///< Error condition detected
+    UserInterrupted = 4,      ///< External stop (e.g., Ctrl+C, API call)
     MaxCyclesReached = 5,     ///< Hit cycle limit
     CheckpointRequested = 6,  ///< Checkpoint reached (for save/restore)
-    Checkpoint [[deprecated("Use CheckpointRequested")]] =
-        CheckpointRequested,  ///< Backward-compatible alias.
 };
 
 /// Context for a termination request: reason, exit code, cycle, unit, message.

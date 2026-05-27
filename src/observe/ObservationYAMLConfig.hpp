@@ -192,96 +192,36 @@ struct UnifiedLoggingConfig {
     std::vector<TemporalFilter> temporal;
     std::vector<CategoryPattern> categories;
 
-    [[nodiscard]] bool needsTextOutput() const noexcept {
-        if (debug_channel.enabled && (debug_channel.format == OutputFormat::Text ||
-                                      debug_channel.format == OutputFormat::Both)) {
-            return true;
-        }
-        if (info_channel.enabled && (info_channel.format == OutputFormat::Text ||
-                                     info_channel.format == OutputFormat::Both)) {
-            return true;
-        }
-        if (warn_channel.enabled && (warn_channel.format == OutputFormat::Text ||
-                                     warn_channel.format == OutputFormat::Both)) {
-            return true;
-        }
-        if (error_channel.enabled && (error_channel.format == OutputFormat::Text ||
-                                      error_channel.format == OutputFormat::Both)) {
-            return true;
-        }
-        if (trace_channel.enabled && (trace_channel.format == OutputFormat::Text ||
-                                      trace_channel.format == OutputFormat::Both)) {
-            return true;
-        }
-        // A category may override a Binary channel to Text/Both.
-        for (const auto& cat : categories) {
-            if (cat.format == OutputFormat::Text || cat.format == OutputFormat::Both) {
-                return true;
-            }
-            if (cat.trace_format == OutputFormat::Text || cat.trace_format == OutputFormat::Both) {
-                return true;
-            }
-            if (cat.debug_format == OutputFormat::Text || cat.debug_format == OutputFormat::Both) {
-                return true;
-            }
-            if (cat.info_format == OutputFormat::Text || cat.info_format == OutputFormat::Both) {
-                return true;
-            }
-            if (cat.warn_format == OutputFormat::Text || cat.warn_format == OutputFormat::Both) {
-                return true;
-            }
-            if (cat.error_format == OutputFormat::Text || cat.error_format == OutputFormat::Both) {
-                return true;
-            }
-        }
-        return false;
-    }
+    [[nodiscard]] bool needsTextOutput() const noexcept { return hasFormat_(OutputFormat::Text); }
 
     /**
      * Check if any channel uses Binary or Both format.
      */
     [[nodiscard]] bool needsBinaryOutput() const noexcept {
-        if (debug_channel.enabled && (debug_channel.format == OutputFormat::Binary ||
-                                      debug_channel.format == OutputFormat::Both)) {
+        return hasFormat_(OutputFormat::Binary);
+    }
+
+private:
+    /// Helper: check if any enabled channel or category override uses the target format (or Both).
+    [[nodiscard]] bool hasFormat_(OutputFormat target) const noexcept {
+        // Check log channels
+        for (const auto* ch : {&debug_channel, &info_channel, &warn_channel, &error_channel}) {
+            if (ch->enabled && (ch->format == target || ch->format == OutputFormat::Both)) {
+                return true;
+            }
+        }
+        // Check trace channel
+        if (trace_channel.enabled &&
+            (trace_channel.format == target || trace_channel.format == OutputFormat::Both)) {
             return true;
         }
-        if (info_channel.enabled && (info_channel.format == OutputFormat::Binary ||
-                                     info_channel.format == OutputFormat::Both)) {
-            return true;
-        }
-        if (warn_channel.enabled && (warn_channel.format == OutputFormat::Binary ||
-                                     warn_channel.format == OutputFormat::Both)) {
-            return true;
-        }
-        if (error_channel.enabled && (error_channel.format == OutputFormat::Binary ||
-                                      error_channel.format == OutputFormat::Both)) {
-            return true;
-        }
-        if (trace_channel.enabled && (trace_channel.format == OutputFormat::Binary ||
-                                      trace_channel.format == OutputFormat::Both)) {
-            return true;
-        }
+        // A category may override a channel's default format.
         for (const auto& cat : categories) {
-            if (cat.format == OutputFormat::Binary || cat.format == OutputFormat::Both) {
-                return true;
-            }
-            if (cat.trace_format == OutputFormat::Binary ||
-                cat.trace_format == OutputFormat::Both) {
-                return true;
-            }
-            if (cat.debug_format == OutputFormat::Binary ||
-                cat.debug_format == OutputFormat::Both) {
-                return true;
-            }
-            if (cat.info_format == OutputFormat::Binary || cat.info_format == OutputFormat::Both) {
-                return true;
-            }
-            if (cat.warn_format == OutputFormat::Binary || cat.warn_format == OutputFormat::Both) {
-                return true;
-            }
-            if (cat.error_format == OutputFormat::Binary ||
-                cat.error_format == OutputFormat::Both) {
-                return true;
+            for (const auto* fmt : {&cat.format, &cat.trace_format, &cat.debug_format,
+                                    &cat.info_format, &cat.warn_format, &cat.error_format}) {
+                if (*fmt == target || *fmt == OutputFormat::Both) {
+                    return true;
+                }
             }
         }
         return false;

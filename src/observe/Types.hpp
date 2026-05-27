@@ -183,10 +183,6 @@ struct ObservationStats {
     }
 };
 
-using ObserveChannel [[deprecated("Use ObservationChannel")]] = ObservationChannel;
-using ObserveChannelStats [[deprecated("Use ObservationChannelStats")]] = ObservationChannelStats;
-using ObserveStats [[deprecated("Use ObservationStats")]] = ObservationStats;
-
 /**
  * @brief Producer behavior when SPSC queues are full.
  *

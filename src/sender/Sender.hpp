@@ -35,7 +35,6 @@
 #include "util/Graph.hpp"
 #include "util/PipelinePhase.hpp"
 #include "util/PriorityArbiter.hpp"
-#include "util/SingleStageReg.hpp"
 #include "util/StageForward.hpp"
 #include "util/StagePipeline.hpp"
 #include "util/StageReg.hpp"

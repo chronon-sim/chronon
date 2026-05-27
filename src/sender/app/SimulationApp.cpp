@@ -57,11 +57,6 @@ SimulationApp& SimulationApp::onPostBuild(PostBuildHook hook) {
     return *this;
 }
 
-SimulationApp& SimulationApp::onProfilingBuild(ProfilingBuildHook hook) {
-    profiling_build_hook_ = std::move(hook);
-    return *this;
-}
-
 SimulationApp& SimulationApp::onPostRun(PostRunHook hook) {
     post_run_hook_ = std::move(hook);
     return *this;
@@ -144,73 +139,6 @@ int SimulationApp::run(int argc, char* argv[]) {
             pre_build_hook_(yaml_node);
         }
 
-        // Optional profiling pass: build a throw-away simulation, extract tick costs, destroy
-        // it, then build the real simulation with pre-computed costs. Keeps profiling state
-        // out of the real simulation.
-        std::vector<double> precomputed_unit_costs;
-        sender::PlatformMetrics precomputed_platform_metrics{};
-        bool have_precomputed_costs = false;
-
-        bool profiling_likely_needed = false;
-        {
-            auto sim_node = yaml_node["simulation"];
-            if (sim_node) {
-                bool enable_parallel =
-                    sim_node["enable_parallel"] ? sim_node["enable_parallel"].as<bool>(true) : true;
-                bool enable_weighted = sim_node["enable_weighted_partitioning"]
-                                           ? sim_node["enable_weighted_partitioning"].as<bool>(true)
-                                           : true;
-                uint32_t num_workers =
-                    sim_node["num_workers"] ? sim_node["num_workers"].as<uint32_t>(1) : 1;
-                profiling_likely_needed = enable_parallel && enable_weighted && num_workers > 1;
-            }
-        }
-
-        if (profiling_likely_needed && profiling_build_hook_) {
-            if (opts.verbose) {
-                std::cout << "\nBuilding independent profiling simulation...\n";
-            }
-
-            // YAML-CPP's Clone() can share sub-nodes — modifying the clone corrupts the
-            // original. Round-trip through emit+parse for a fully independent copy.
-            YAML::Emitter emitter;
-            emitter << yaml_node;
-            YAML::Node profiling_yaml = YAML::Load(emitter.c_str());
-            if (!profiling_yaml["simulation"]["observation"]) {
-                profiling_yaml["simulation"]["observation"] = YAML::Node(YAML::NodeType::Map);
-            }
-            profiling_yaml["simulation"]["observation"]["enabled"] = false;
-
-            sender::config::SenderSimulationBuilder profiling_builder;
-            auto profiling_build = profiling_builder.buildFromYAMLNode(profiling_yaml, config_path);
-
-            Result profiling_result;
-            profiling_result.simulation = std::move(profiling_build.simulation);
-            profiling_result.root_node = std::move(profiling_build.root_node);
-            profiling_result.config = std::move(profiling_build.config);
-            profiling_result.units_created = profiling_build.units_created;
-            profiling_result.ports_registered = profiling_build.ports_registered;
-            profiling_result.connections_made = profiling_build.connections_made;
-            profiling_result.unit_map = std::move(profiling_build.unit_map);
-            profiling_result.observation_enabled = false;
-
-            profiling_build_hook_(profiling_result);
-
-            // initialize() runs the profile and assigns threads.
-            profiling_result.simulation->initialize();
-
-            precomputed_unit_costs = profiling_result.simulation->getProfiledUnitCosts();
-            precomputed_platform_metrics = profiling_result.simulation->getPlatformMetrics();
-            have_precomputed_costs = !precomputed_unit_costs.empty();
-
-            if (opts.verbose) {
-                std::cout << "Profiling complete: extracted costs for "
-                          << precomputed_unit_costs.size() << " units\n";
-            }
-
-            // profiling_result goes out of scope here, destroying the throw-away sim.
-        }
-
         sender::config::SenderSimulationBuilder builder;
         auto build_result = builder.buildFromYAMLNode(yaml_node, config_path);
 
@@ -239,13 +167,6 @@ int SimulationApp::run(int argc, char* argv[]) {
             post_build_hook_(result);
         }
 
-        if (have_precomputed_costs) {
-            result.simulation->setPrecomputedProfilingData(std::move(precomputed_unit_costs),
-                                                           precomputed_platform_metrics);
-        }
-
-        // initialize() also runs unit initialization (which registers Counters). When
-        // precomputed costs are set, this skips live profiling.
         result.simulation->initialize();
 
         // Force-commit SPSC observation queues so cycle-0 init events are visible to the

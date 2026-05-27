@@ -34,7 +34,6 @@ using namespace chronon::sender;
         }                                                                          \
     } while (0)
 
-// ========================================================================
 // Topology builder for the chain-vs-split scenario.
 //
 // 6 units on 2 threads:
@@ -58,7 +57,6 @@ using namespace chronon::sender;
 // sync cost low). Y has *worse* base makespan but shorter critical path.
 // With critical_path_weight=0, SA should prefer X. With a large weight,
 // SA should prefer Y.
-// ========================================================================
 
 PartitionInput makeChainInput(double critical_path_weight) {
     PartitionInput input;
@@ -84,10 +82,6 @@ PartitionInput makeChainInput(double critical_path_weight) {
 const std::vector<size_t> ASSIGNMENT_X = {1, 1, 0, 0, 0, 0};  // {A,B,C,D}=T0
 const std::vector<size_t> ASSIGNMENT_Y = {1, 1, 0, 0, 1, 1};  // {A,B}=T0
 
-// ========================================================================
-// Test: maxCriticalPathChain_ returns expected chain costs.
-// ========================================================================
-
 void test_chain_cost_matches_hand_computed() {
     std::cout << "Testing chain-cost computation on known topology... ";
 
@@ -106,10 +100,6 @@ void test_chain_cost_matches_hand_computed() {
     std::cout << "PASSED (CP_X=" << cp_x << ", CP_Y=" << cp_y << ")\n";
 }
 
-// ========================================================================
-// Test: Objective term is additive and zero when weight=0.
-// ========================================================================
-
 void test_objective_weight_zero_matches_baseline() {
     std::cout << "Testing weight=0 leaves objective unchanged... ";
 
@@ -124,10 +114,6 @@ void test_objective_weight_zero_matches_baseline() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: Objective ordering flips when weight is large.
-// ========================================================================
 
 void test_objective_ordering_flips_with_weight() {
     std::cout << "Testing objective ordering flips with large weight... ";
@@ -150,10 +136,6 @@ void test_objective_ordering_flips_with_weight() {
     std::cout << "PASSED (obj_X_w0=" << obj_x_w0 << ", obj_Y_w0=" << obj_y_w0
               << "; obj_X_big=" << obj_x_big << ", obj_Y_big=" << obj_y_big << ")\n";
 }
-
-// ========================================================================
-// Test: SA picks the shorter critical-path partition when weight is large.
-// ========================================================================
 
 void test_sa_prefers_shorter_chain_with_weight() {
     std::cout << "Testing SA prefers shorter CP when weight > 0...\n";
@@ -188,10 +170,6 @@ void test_sa_prefers_shorter_chain_with_weight() {
     std::cout << "  PASSED\n";
 }
 
-// ========================================================================
-// Test: Determinism — same input yields same chain cost across runs.
-// ========================================================================
-
 void test_chain_cost_deterministic() {
     std::cout << "Testing chain-cost determinism... ";
 
@@ -205,10 +183,8 @@ void test_chain_cost_deterministic() {
     std::cout << "PASSED\n";
 }
 
-// ========================================================================
 // Test: Cycle fallback — chain computation doesn't hang or return garbage
 // on an intra-thread cycle.
-// ========================================================================
 
 void test_cycle_fallback() {
     std::cout << "Testing intra-thread-cycle fallback... ";
@@ -239,10 +215,6 @@ void test_cycle_fallback() {
     std::cout << "PASSED (cycle fallback CP=" << cp << ")\n";
 }
 
-// ========================================================================
-// Test: No cross-thread edges → CP is 0 on all threads.
-// ========================================================================
-
 void test_no_cross_edges_zero_cp() {
     std::cout << "Testing no-cross-edges → CP=0... ";
 
@@ -262,10 +234,6 @@ void test_no_cross_edges_zero_cp() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Main
-// ========================================================================
 
 int main() {
     std::cout << "=== SA Critical-Path Objective Tests ===\n\n";

@@ -89,9 +89,7 @@ public:
      *         Multi-destination sends are preflighted before transfer so
      *         normal back-pressure failure is all-or-none.
      */
-    [[nodiscard(
-        "send() reports whether the message was accepted; "
-        "retain local state and retry on false")]]
+    [[nodiscard]]
     bool send(const T& data) {
         if (connections_.empty()) return true;
 
@@ -132,9 +130,7 @@ public:
      *         Multi-destination sends are preflighted before transfer so
      *         normal back-pressure failure is all-or-none.
      */
-    [[nodiscard(
-        "send() reports whether the message was accepted; "
-        "retain local state and retry on false")]]
+    [[nodiscard]]
     bool send(T&& data) {
         if (connections_.empty()) return true;
 
@@ -171,14 +167,12 @@ public:
         return result;
     }
 
-    [[nodiscard(
-        "sendImmediate() is a compatibility alias; use send() and handle false by retrying")]]
+    [[nodiscard]]
     bool sendImmediate(const T& data) {
         return send(data);
     }
 
-    [[nodiscard(
-        "sendImmediate() is a compatibility alias; use send() and handle false by retrying")]]
+    [[nodiscard]]
     bool sendImmediate(T&& data) {
         return send(std::move(data));
     }

@@ -34,7 +34,7 @@ add_library(chronon_observe
     BinaryTraceReader.cpp
     BinaryTraceWriter.cpp
     CompressionBuffer.cpp
-    Counter.cpp
+    CounterRegistry.cpp
     DerivedCounter.cpp
     LocalCounter.cpp
     ObservationBackend.cpp

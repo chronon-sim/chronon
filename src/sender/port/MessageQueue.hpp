@@ -504,13 +504,18 @@ public:
 };
 
 /**
- * MessageQueueAdapter - Adapts MessageQueue to IMessageQueue interface.
+ * QueueAdapterImpl - Generic adapter from a concrete queue to IMessageQueue.
+ *
+ * Works for any queue type that exposes: push(), tryPop(), popAll(),
+ * hasReady(), minArrivalCycle(), empty(), full(), size(), capacity(),
+ * available(), setCapacity(), clear().  Both MessageQueue and
+ * SingleThreadMessageQueue satisfy this contract.
  */
-template <typename T>
-class MessageQueueAdapter : public IMessageQueue<T> {
+template <typename T, typename QueueImpl>
+class QueueAdapterImpl : public IMessageQueue<T> {
 public:
-    explicit MessageQueueAdapter(size_t capacity = MessageQueue<T>::UNLIMITED_CAPACITY)
-        : queue_(capacity) {}
+    template <typename... Args>
+    explicit QueueAdapterImpl(Args&&... args) : queue_(std::forward<Args>(args)...) {}
 
     bool push(T data, uint64_t arrive_cycle) override {
         return queue_.push(std::move(data), arrive_cycle);
@@ -535,44 +540,16 @@ public:
     void clear() override { queue_.clear(); }
 
 private:
-    MessageQueue<T> queue_;
+    QueueImpl queue_;
 };
 
-/**
- * SingleThreadQueueAdapter - Adapts SingleThreadMessageQueue to IMessageQueue.
- */
+/** Adapts MessageQueue (mutex-protected) to IMessageQueue. */
 template <typename T>
-class SingleThreadQueueAdapter : public IMessageQueue<T> {
-public:
-    explicit SingleThreadQueueAdapter(
-        size_t capacity = SingleThreadMessageQueue<T>::UNLIMITED_CAPACITY)
-        : queue_(capacity) {}
+using MessageQueueAdapter = QueueAdapterImpl<T, MessageQueue<T>>;
 
-    bool push(T data, uint64_t arrive_cycle) override {
-        return queue_.push(std::move(data), arrive_cycle);
-    }
-
-    std::optional<T> tryPop(uint64_t current_cycle) override {
-        return queue_.tryPop(current_cycle);
-    }
-
-    std::vector<T> popAll(uint64_t current_cycle) override { return queue_.popAll(current_cycle); }
-
-    bool hasReady(uint64_t current_cycle) const override { return queue_.hasReady(current_cycle); }
-
-    std::optional<uint64_t> minArrivalCycle() const override { return queue_.minArrivalCycle(); }
-
-    bool empty() const override { return queue_.empty(); }
-    bool full() const override { return queue_.full(); }
-    size_t size() const override { return queue_.size(); }
-    size_t capacity() const noexcept override { return queue_.capacity(); }
-    size_t available() const override { return queue_.available(); }
-    void setCapacity(size_t capacity) override { queue_.setCapacity(capacity); }
-    void clear() override { queue_.clear(); }
-
-private:
-    SingleThreadMessageQueue<T> queue_;
-};
+/** Adapts SingleThreadMessageQueue (no synchronization) to IMessageQueue. */
+template <typename T>
+using SingleThreadQueueAdapter = QueueAdapterImpl<T, SingleThreadMessageQueue<T>>;
 
 /**
  * LockFreeQueueAdapter - Adapts LockFreeMessageQueue to IMessageQueue interface.

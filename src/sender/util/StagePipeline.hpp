@@ -14,7 +14,7 @@
 
 namespace chronon::sender {
 
-/** @brief Groups heterogeneous StageReg / SingleStageReg instances for batch lifecycle calls. */
+/** @brief Groups heterogeneous StageReg instances for batch lifecycle calls. */
 template <typename... Stages>
 class StagePipeline {
     std::tuple<Stages*...> stages_;

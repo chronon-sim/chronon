@@ -76,13 +76,6 @@ public:
 
     ~Counter() = default;
 
-    // =========================================================================
-    // Hot-Path Operations (~2-3ns)
-    // =========================================================================
-
-    /**
-     * Pre-increment operator.
-     */
     [[gnu::always_inline]] Counter& operator++() noexcept {
         if (registered_ && ctx_) {
             ctx_->count(id_, 1);
@@ -90,18 +83,6 @@ public:
         return *this;
     }
 
-    /**
-     * Post-increment operator.
-     */
-    Counter operator++(int) noexcept {
-        Counter tmp = std::move(*this);
-        ++(*this);
-        return tmp;
-    }
-
-    /**
-     * Add-assign operator.
-     */
     [[gnu::always_inline]] Counter& operator+=(uint64_t delta) noexcept {
         if (registered_ && ctx_) {
             ctx_->count(id_, delta);
@@ -109,9 +90,6 @@ public:
         return *this;
     }
 
-    /**
-     * Get current value.
-     */
     [[gnu::always_inline]] uint64_t get() const noexcept {
         if (registered_ && ctx_) {
             return ctx_->counters().getUnchecked(id_).get();
@@ -119,42 +97,16 @@ public:
         return 0;
     }
 
-    /**
-     * Reset value to zero.
-     */
     void reset() noexcept {
         if (registered_ && ctx_) {
             ctx_->counters().getUnchecked(id_).reset();
         }
     }
 
-    // =========================================================================
-    // Accessors
-    // =========================================================================
-
-    /**
-     * Get the counter name.
-     */
     const std::string& name() const noexcept { return name_; }
-
-    /**
-     * Get the counter description.
-     */
     const std::string& description() const noexcept { return description_; }
-
-    /**
-     * Get the counter unit.
-     */
     const std::string& unit() const noexcept { return unit_; }
-
-    /**
-     * Check if the counter is registered.
-     */
     bool isRegistered() const noexcept { return registered_; }
-
-    /**
-     * Get the counter ID (only valid if registered).
-     */
     CounterId id() const noexcept { return id_; }
 
 private:

@@ -66,7 +66,7 @@ bool convertForward(Src& src, Dst& dst, std::size_t pipe, Convert&& convert) {
     return true;
 }
 
-/// Single-entry overload (for SingleStageReg).
+/// Single-entry overload (for StageReg&lt;T, 1&gt;).
 template <ValidPhase P, typename Src, typename Dst>
 bool simpleForward(Src& src, Dst& dst) {
     if (!src.template valid<P>()) return false;

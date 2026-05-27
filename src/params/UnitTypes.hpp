@@ -21,7 +21,7 @@ namespace chronon::params {
 namespace detail {
 
 /**
- * @brief Split a unit-suffixed numeric string into value and unit (e.g. "3GHz" → {3.0, "GHz"}).
+ * @brief Split a unit-suffixed numeric string into value and unit (e.g. "3GHz" -> {3.0, "GHz"}).
  * @throws std::invalid_argument if the string is empty or has no numeric prefix.
  */
 inline std::pair<double, std::string> parseValueAndUnit(const std::string& s,
@@ -53,6 +53,97 @@ inline std::string toLower(std::string s) {
     return s;
 }
 
+/**
+ * @brief Scale entry mapping a unit suffix to a multiplier.
+ */
+struct ScaleEntry {
+    double multiplier;
+    const char* suffix;        ///< Display suffix (canonical casing).
+    const char* lower_suffix;  ///< Lowercased suffix for case-insensitive parse.
+    bool case_sensitive;       ///< If true, match exact suffix (e.g. "B" vs "b").
+};
+
+/**
+ * @brief CRTP base for scaled-unit types (Frequency, Latency, Bandwidth).
+ *
+ * Derived must provide:
+ *   - static constexpr const char* type_name();
+ *   - static const std::array<ScaleEntry, N>& scaleTable();
+ *     (ordered from largest to smallest multiplier for toString())
+ *   - static constexpr bool non_negative();
+ */
+template <typename Derived>
+class ScaledUnitBase {
+public:
+    ScaledUnitBase() : value_(0.0) {}
+
+    explicit ScaledUnitBase(double base_value) : value_(base_value) {
+        if constexpr (Derived::non_negative()) {
+            if (value_ < 0) {
+                throw std::invalid_argument(std::string(Derived::type_name()) +
+                                            " cannot be negative");
+            }
+        }
+    }
+
+    explicit ScaledUnitBase(const std::string& s) : value_(0.0) { parse(s); }
+
+    double baseValue() const { return value_; }
+
+    Derived operator*(double scalar) const { return Derived(value_ * scalar); }
+    Derived operator/(double scalar) const { return Derived(value_ / scalar); }
+    double operator/(const Derived& other) const { return value_ / other.baseValue(); }
+    Derived operator+(const Derived& other) const { return Derived(value_ + other.baseValue()); }
+    Derived operator-(const Derived& other) const { return Derived(value_ - other.baseValue()); }
+
+    bool operator==(const Derived& other) const {
+        return std::abs(value_ - other.baseValue()) < 1e-6;
+    }
+    bool operator!=(const Derived& other) const { return !(*this == other); }
+    bool operator<(const Derived& other) const { return value_ < other.baseValue(); }
+    bool operator>(const Derived& other) const { return value_ > other.baseValue(); }
+    bool operator<=(const Derived& other) const { return value_ <= other.baseValue(); }
+    bool operator>=(const Derived& other) const { return value_ >= other.baseValue(); }
+
+    std::string toString() const {
+        const auto& table = Derived::scaleTable();
+        for (const auto& entry : table) {
+            if (value_ >= entry.multiplier) {
+                return std::to_string(value_ / entry.multiplier) + entry.suffix;
+            }
+        }
+        // Fallback: use last entry (smallest unit)
+        const auto& last = table.back();
+        return std::to_string(value_ / last.multiplier) + last.suffix;
+    }
+
+protected:
+    double value_;
+
+    void parse(const std::string& s) {
+        auto [val, unit] = detail::parseValueAndUnit(s, Derived::type_name());
+        std::string lower_unit = detail::toLower(unit);
+
+        const auto& table = Derived::scaleTable();
+        for (const auto& entry : table) {
+            bool match =
+                entry.case_sensitive ? (unit == entry.suffix) : (lower_unit == entry.lower_suffix);
+            if (match) {
+                value_ = val * entry.multiplier;
+                if constexpr (Derived::non_negative()) {
+                    if (value_ < 0) {
+                        throw std::invalid_argument(std::string(Derived::type_name()) +
+                                                    " cannot be negative");
+                    }
+                }
+                return;
+            }
+        }
+        throw std::invalid_argument(std::string("Unknown ") + Derived::type_name() +
+                                    " unit: " + unit);
+    }
+};
+
 }  // namespace detail
 
 /**
@@ -63,68 +154,32 @@ inline std::string toLower(std::string s) {
  * double ghz = f.ghz();  // 3.0
  * @endcode
  */
-class Frequency {
+class Frequency : public detail::ScaledUnitBase<Frequency> {
+    using Base = detail::ScaledUnitBase<Frequency>;
+    friend Base;
+
+    static constexpr const char* type_name() { return "frequency"; }
+    static constexpr bool non_negative() { return true; }
+
+    static const auto& scaleTable() {
+        static const std::array<detail::ScaleEntry, 4> table = {{
+            {1e9, "GHz", "ghz", false},
+            {1e6, "MHz", "mhz", false},
+            {1e3, "kHz", "khz", false},
+            {1.0, "Hz", "hz", false},
+        }};
+        return table;
+    }
+
 public:
-    explicit Frequency(const std::string& s) : hz_(0.0) { parse(s); }
+    Frequency() : Base() {}
+    explicit Frequency(const std::string& s) : Base(s) {}
+    explicit Frequency(double hz) : Base(hz) {}
 
-    explicit Frequency(double hz) : hz_(hz) {
-        if (hz_ < 0) {
-            throw std::invalid_argument("Frequency cannot be negative");
-        }
-    }
-
-    Frequency() : hz_(0.0) {}
-
-    double hz() const { return hz_; }
-    double khz() const { return hz_ / 1e3; }
-    double mhz() const { return hz_ / 1e6; }
-    double ghz() const { return hz_ / 1e9; }
-
-    Frequency operator*(double scalar) const { return Frequency(hz_ * scalar); }
-    Frequency operator/(double scalar) const { return Frequency(hz_ / scalar); }
-    double operator/(const Frequency& other) const { return hz_ / other.hz_; }
-    Frequency operator+(const Frequency& other) const { return Frequency(hz_ + other.hz_); }
-    Frequency operator-(const Frequency& other) const { return Frequency(hz_ - other.hz_); }
-
-    bool operator==(const Frequency& other) const { return std::abs(hz_ - other.hz_) < 1e-6; }
-    bool operator!=(const Frequency& other) const { return !(*this == other); }
-    bool operator<(const Frequency& other) const { return hz_ < other.hz_; }
-    bool operator>(const Frequency& other) const { return hz_ > other.hz_; }
-
-    std::string toString() const {
-        if (hz_ >= 1e9) {
-            return std::to_string(ghz()) + "GHz";
-        } else if (hz_ >= 1e6) {
-            return std::to_string(mhz()) + "MHz";
-        } else if (hz_ >= 1e3) {
-            return std::to_string(khz()) + "kHz";
-        }
-        return std::to_string(hz_) + "Hz";
-    }
-
-private:
-    double hz_;
-
-    void parse(const std::string& s) {
-        auto [value, unit] = detail::parseValueAndUnit(s, "frequency");
-        std::string lower_unit = detail::toLower(unit);
-
-        if (lower_unit == "hz") {
-            hz_ = value;
-        } else if (lower_unit == "khz") {
-            hz_ = value * 1e3;
-        } else if (lower_unit == "mhz") {
-            hz_ = value * 1e6;
-        } else if (lower_unit == "ghz") {
-            hz_ = value * 1e9;
-        } else {
-            throw std::invalid_argument("Unknown frequency unit: " + unit);
-        }
-
-        if (hz_ < 0) {
-            throw std::invalid_argument("Frequency cannot be negative");
-        }
-    }
+    double hz() const { return value_; }
+    double khz() const { return value_ / 1e3; }
+    double mhz() const { return value_ / 1e6; }
+    double ghz() const { return value_ / 1e9; }
 };
 
 /**
@@ -135,68 +190,32 @@ private:
  * double us = lat.us();  // 0.01
  * @endcode
  */
-class Latency {
+class Latency : public detail::ScaledUnitBase<Latency> {
+    using Base = detail::ScaledUnitBase<Latency>;
+    friend Base;
+
+    static constexpr const char* type_name() { return "latency"; }
+    static constexpr bool non_negative() { return true; }
+
+    static const auto& scaleTable() {
+        static const std::array<detail::ScaleEntry, 4> table = {{
+            {1e9, "s", "s", false},
+            {1e6, "ms", "ms", false},
+            {1e3, "us", "us", false},
+            {1.0, "ns", "ns", false},
+        }};
+        return table;
+    }
+
 public:
-    explicit Latency(const std::string& s) : ns_(0.0) { parse(s); }
+    Latency() : Base() {}
+    explicit Latency(const std::string& s) : Base(s) {}
+    explicit Latency(double ns) : Base(ns) {}
 
-    explicit Latency(double ns) : ns_(ns) {
-        if (ns_ < 0) {
-            throw std::invalid_argument("Latency cannot be negative");
-        }
-    }
-
-    Latency() : ns_(0.0) {}
-
-    double ns() const { return ns_; }
-    double us() const { return ns_ / 1e3; }
-    double ms() const { return ns_ / 1e6; }
-    double s() const { return ns_ / 1e9; }
-
-    Latency operator*(double scalar) const { return Latency(ns_ * scalar); }
-    Latency operator/(double scalar) const { return Latency(ns_ / scalar); }
-    double operator/(const Latency& other) const { return ns_ / other.ns_; }
-    Latency operator+(const Latency& other) const { return Latency(ns_ + other.ns_); }
-    Latency operator-(const Latency& other) const { return Latency(ns_ - other.ns_); }
-
-    bool operator==(const Latency& other) const { return std::abs(ns_ - other.ns_) < 1e-6; }
-    bool operator!=(const Latency& other) const { return !(*this == other); }
-    bool operator<(const Latency& other) const { return ns_ < other.ns_; }
-    bool operator>(const Latency& other) const { return ns_ > other.ns_; }
-
-    std::string toString() const {
-        if (ns_ >= 1e9) {
-            return std::to_string(s()) + "s";
-        } else if (ns_ >= 1e6) {
-            return std::to_string(ms()) + "ms";
-        } else if (ns_ >= 1e3) {
-            return std::to_string(us()) + "us";
-        }
-        return std::to_string(ns_) + "ns";
-    }
-
-private:
-    double ns_;
-
-    void parse(const std::string& s) {
-        auto [value, unit] = detail::parseValueAndUnit(s, "latency");
-        std::string lower_unit = detail::toLower(unit);
-
-        if (lower_unit == "ns") {
-            ns_ = value;
-        } else if (lower_unit == "us") {
-            ns_ = value * 1e3;
-        } else if (lower_unit == "ms") {
-            ns_ = value * 1e6;
-        } else if (lower_unit == "s") {
-            ns_ = value * 1e9;
-        } else {
-            throw std::invalid_argument("Unknown latency unit: " + unit);
-        }
-
-        if (ns_ < 0) {
-            throw std::invalid_argument("Latency cannot be negative");
-        }
-    }
+    double ns() const { return value_; }
+    double us() const { return value_ / 1e3; }
+    double ms() const { return value_ / 1e6; }
+    double s() const { return value_ / 1e9; }
 };
 
 /**
@@ -248,27 +267,40 @@ public:
 private:
     uint64_t bytes_;
 
+    struct SizeScale {
+        double multiplier;
+        const char* suffix;
+        const char* lower_suffix;
+        bool case_sensitive;
+    };
+
+    static const auto& scaleTable() {
+        static const std::array<SizeScale, 7> table = {{
+            {1024.0 * 1024.0 * 1024.0, "GiB", "gib", false},
+            {1024.0 * 1024.0, "MiB", "mib", false},
+            {1024.0, "KiB", "kib", false},
+            {1000000000.0, "GB", "gb", false},
+            {1000000.0, "MB", "mb", false},
+            {1000.0, "KB", "kb", false},
+            {1.0, "B", "B", true},
+        }};
+        return table;
+    }
+
     void parse(const std::string& s) {
         auto [value, unit] = detail::parseValueAndUnit(s, "size");
         std::string lower_unit = detail::toLower(unit);
 
-        if (unit == "B") {
-            bytes_ = static_cast<uint64_t>(value);
-        } else if (lower_unit == "kib") {
-            bytes_ = static_cast<uint64_t>(value * 1024);
-        } else if (lower_unit == "mib") {
-            bytes_ = static_cast<uint64_t>(value * 1024 * 1024);
-        } else if (lower_unit == "gib") {
-            bytes_ = static_cast<uint64_t>(value * 1024 * 1024 * 1024);
-        } else if (lower_unit == "kb") {
-            bytes_ = static_cast<uint64_t>(value * 1000);
-        } else if (lower_unit == "mb") {
-            bytes_ = static_cast<uint64_t>(value * 1000000);
-        } else if (lower_unit == "gb") {
-            bytes_ = static_cast<uint64_t>(value * 1000000000);
-        } else {
-            throw std::invalid_argument("Unknown size unit: " + unit);
+        const auto& table = scaleTable();
+        for (const auto& entry : table) {
+            bool match =
+                entry.case_sensitive ? (unit == entry.suffix) : (lower_unit == entry.lower_suffix);
+            if (match) {
+                bytes_ = static_cast<uint64_t>(value * entry.multiplier);
+                return;
+            }
         }
+        throw std::invalid_argument("Unknown size unit: " + unit);
     }
 };
 
@@ -280,52 +312,29 @@ private:
  * double bps = bw.bytesPerSecond();
  * @endcode
  */
-class Bandwidth {
+class Bandwidth : public detail::ScaledUnitBase<Bandwidth> {
+    using Base = detail::ScaledUnitBase<Bandwidth>;
+    friend Base;
+
+    static constexpr const char* type_name() { return "bandwidth"; }
+    static constexpr bool non_negative() { return true; }
+
+    static const auto& scaleTable() {
+        static const std::array<detail::ScaleEntry, 4> table = {{
+            {1024.0 * 1024.0 * 1024.0, "GiB/s", "gib/s", false},
+            {1024.0 * 1024.0, "MiB/s", "mib/s", false},
+            {1024.0, "KiB/s", "kib/s", false},
+            {1.0, "B/s", "b/s", false},
+        }};
+        return table;
+    }
+
 public:
-    explicit Bandwidth(const std::string& s) : bytes_per_second_(0.0) { parse(s); }
+    Bandwidth() : Base() {}
 
-    explicit Bandwidth(double bytes_per_second) : bytes_per_second_(bytes_per_second) {
-        if (bytes_per_second_ < 0) {
-            throw std::invalid_argument("Bandwidth cannot be negative");
-        }
-    }
+    explicit Bandwidth(double bytes_per_second) : Base(bytes_per_second) {}
 
-    Bandwidth() : bytes_per_second_(0.0) {}
-
-    double bytesPerSecond() const { return bytes_per_second_; }
-    double kibPerSecond() const { return bytes_per_second_ / 1024.0; }
-    double mibPerSecond() const { return bytes_per_second_ / (1024.0 * 1024.0); }
-    double gibPerSecond() const { return bytes_per_second_ / (1024.0 * 1024.0 * 1024.0); }
-
-    Bandwidth operator*(double scalar) const { return Bandwidth(bytes_per_second_ * scalar); }
-    Bandwidth operator/(double scalar) const { return Bandwidth(bytes_per_second_ / scalar); }
-
-    bool operator==(const Bandwidth& other) const {
-        return std::abs(bytes_per_second_ - other.bytes_per_second_) < 1e-6;
-    }
-    bool operator!=(const Bandwidth& other) const { return !(*this == other); }
-    bool operator<(const Bandwidth& other) const {
-        return bytes_per_second_ < other.bytes_per_second_;
-    }
-    bool operator>(const Bandwidth& other) const {
-        return bytes_per_second_ > other.bytes_per_second_;
-    }
-
-    std::string toString() const {
-        if (bytes_per_second_ >= 1e9) {
-            return std::to_string(gibPerSecond()) + "GiB/s";
-        } else if (bytes_per_second_ >= 1e6) {
-            return std::to_string(mibPerSecond()) + "MiB/s";
-        } else if (bytes_per_second_ >= 1e3) {
-            return std::to_string(kibPerSecond()) + "KiB/s";
-        }
-        return std::to_string(bytes_per_second_) + "B/s";
-    }
-
-private:
-    double bytes_per_second_;
-
-    void parse(const std::string& s) {
+    explicit Bandwidth(const std::string& s) : Base() {
         if (s.empty()) {
             throw std::invalid_argument("Empty bandwidth string");
         }
@@ -337,8 +346,13 @@ private:
 
         std::string size_str = s.substr(0, slash_pos);
         Size size(size_str);
-        bytes_per_second_ = static_cast<double>(size.bytes());
+        value_ = static_cast<double>(size.bytes());
     }
+
+    double bytesPerSecond() const { return value_; }
+    double kibPerSecond() const { return value_ / 1024.0; }
+    double mibPerSecond() const { return value_ / (1024.0 * 1024.0); }
+    double gibPerSecond() const { return value_ / (1024.0 * 1024.0 * 1024.0); }
 };
 
 inline std::string toString(const Frequency& f) { return f.toString(); }
@@ -346,7 +360,7 @@ inline std::string toString(const Latency& l) { return l.toString(); }
 inline std::string toString(const Size& s) { return s.toString(); }
 inline std::string toString(const Bandwidth& b) { return b.toString(); }
 
-// Non-template overloads — chosen by ADL over the generic templates in Parameter.hpp.
+// Non-template overloads -- chosen by ADL over the generic templates in Parameter.hpp.
 inline Frequency fromString(const std::string& s, std::type_identity<Frequency>) {
     return Frequency(s);
 }

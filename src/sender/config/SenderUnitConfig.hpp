@@ -71,10 +71,6 @@ struct SimulationYAMLConfig {
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< Default 1 GHz.
 
     bool enable_weighted_partitioning = true;
-    uint64_t profiling_warmup_cycles = 512;
-    uint64_t profiling_measurement_cycles = 1024;
-    bool deterministic_partitioning = false;  ///< Skip live profile; use constant costs.
-    std::string cost_profile_cache_path;      ///< Empty = disabled.
     bool enable_dynamic_rebalance = true;
     double rebalance_imbalance_threshold = 1.3;
     uint64_t rebalance_check_interval_cycles = 8192;
@@ -109,32 +105,6 @@ struct SimulationYAMLConfig {
             names.push_back(name);
         }
         return names;
-    }
-
-    void clear() {
-        num_workers = 4;
-        enable_parallel = true;
-        enable_lookahead = true;
-        trace_execution = false;
-        max_lookahead_cycles = 100;
-        epoch_size = 64;
-        run_cycles = 0;
-        name = "simulation";
-        tick_frequency_hz = 1'000'000'000;
-        enable_weighted_partitioning = true;
-        profiling_warmup_cycles = 512;
-        profiling_measurement_cycles = 1024;
-        enable_dynamic_rebalance = true;
-        rebalance_imbalance_threshold = 1.3;
-        rebalance_check_interval_cycles = 8192;
-        rebalance_min_gain = 0.05;
-        rebalance_cooldown_cycles = 0;
-        partition_solver = "Weighted";
-        sa_critical_path_weight = 0.0;
-        timeline_trace = SchedulerTimelineTraceConfig{};
-        observation.reset();
-        units.clear();
-        connections.clear();
     }
 };
 

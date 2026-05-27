@@ -140,8 +140,8 @@ public:
     void setLookaheadMode(bool enabled) noexcept { lookahead_mode_ = enabled; }
     bool isLookaheadMode() const noexcept { return lookahead_mode_; }
 
-    /// Registers counter addresses with the manager for the pull-model snapshot.
-    void registerAllCounters(class ObservationManager* manager);
+    /// Registers counter addresses with the registry for the pull-model snapshot.
+    void registerAllCounters(class CounterRegistry* registry);
 
     /// Called by DerivedCounter::onContextAttached() during unit initialization.
     void addDerivedCounterDef(DerivedCounterDef def) {
@@ -481,11 +481,6 @@ private:
 
 public:
     const ObservationStats& observationStats() const noexcept { return stats_; }
-
-    [[deprecated("Use observationStats()")]]
-    const ObservationStats& observeStats() const noexcept {
-        return observationStats();
-    }
 };
 
 }  // namespace chronon::observe

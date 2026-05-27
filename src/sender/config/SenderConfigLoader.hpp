@@ -77,73 +77,30 @@ private:
 
         const YAML::Node& sim = root["simulation"];
 
-        if (sim["name"]) {
-            config.name = sim["name"].as<std::string>();
-        }
-        if (sim["num_workers"]) {
-            config.num_workers = sim["num_workers"].as<uint32_t>();
-        }
-        if (sim["enable_parallel"]) {
-            config.enable_parallel = sim["enable_parallel"].as<bool>();
-        }
-        if (sim["enable_lookahead"]) {
-            config.enable_lookahead = sim["enable_lookahead"].as<bool>();
-        }
-        if (sim["trace_execution"]) {
-            config.trace_execution = sim["trace_execution"].as<bool>();
-        }
-        if (sim["max_lookahead_cycles"]) {
-            config.max_lookahead_cycles = sim["max_lookahead_cycles"].as<uint32_t>();
-        }
-        if (sim["epoch_size"]) {
-            config.epoch_size = sim["epoch_size"].as<uint64_t>();
-        }
-        if (sim["run_cycles"]) {
-            config.run_cycles = sim["run_cycles"].as<uint64_t>();
-        }
-        if (sim["tick_frequency_hz"]) {
-            config.tick_frequency_hz = sim["tick_frequency_hz"].as<uint64_t>();
-        }
+// Loads a YAML field into a config struct member when the YAML key matches the field name.
+#define LOAD_IF_PRESENT(node, cfg, field)                   \
+    if (node[#field]) {                                     \
+        cfg.field = node[#field].as<decltype(cfg.field)>(); \
+    }
 
-        if (sim["enable_weighted_partitioning"]) {
-            config.enable_weighted_partitioning = sim["enable_weighted_partitioning"].as<bool>();
-        }
-        if (sim["profiling_warmup_cycles"]) {
-            config.profiling_warmup_cycles = sim["profiling_warmup_cycles"].as<uint64_t>();
-        }
-        if (sim["profiling_measurement_cycles"]) {
-            config.profiling_measurement_cycles =
-                sim["profiling_measurement_cycles"].as<uint64_t>();
-        }
-        if (sim["deterministic_partitioning"]) {
-            config.deterministic_partitioning = sim["deterministic_partitioning"].as<bool>();
-        }
-        if (sim["cost_profile_cache_path"]) {
-            config.cost_profile_cache_path = sim["cost_profile_cache_path"].as<std::string>();
-        }
-        if (sim["enable_dynamic_rebalance"]) {
-            config.enable_dynamic_rebalance = sim["enable_dynamic_rebalance"].as<bool>();
-        }
-        if (sim["rebalance_imbalance_threshold"]) {
-            config.rebalance_imbalance_threshold =
-                sim["rebalance_imbalance_threshold"].as<double>();
-        }
-        if (sim["rebalance_check_interval_cycles"]) {
-            config.rebalance_check_interval_cycles =
-                sim["rebalance_check_interval_cycles"].as<uint64_t>();
-        }
-        if (sim["rebalance_min_gain"]) {
-            config.rebalance_min_gain = sim["rebalance_min_gain"].as<double>();
-        }
-        if (sim["rebalance_cooldown_cycles"]) {
-            config.rebalance_cooldown_cycles = sim["rebalance_cooldown_cycles"].as<uint64_t>();
-        }
-        if (sim["partition_solver"]) {
-            config.partition_solver = sim["partition_solver"].as<std::string>();
-        }
-        if (sim["sa_critical_path_weight"]) {
-            config.sa_critical_path_weight = sim["sa_critical_path_weight"].as<double>();
-        }
+        LOAD_IF_PRESENT(sim, config, name);
+        LOAD_IF_PRESENT(sim, config, num_workers);
+        LOAD_IF_PRESENT(sim, config, enable_parallel);
+        LOAD_IF_PRESENT(sim, config, enable_lookahead);
+        LOAD_IF_PRESENT(sim, config, trace_execution);
+        LOAD_IF_PRESENT(sim, config, max_lookahead_cycles);
+        LOAD_IF_PRESENT(sim, config, epoch_size);
+        LOAD_IF_PRESENT(sim, config, run_cycles);
+        LOAD_IF_PRESENT(sim, config, tick_frequency_hz);
+        LOAD_IF_PRESENT(sim, config, enable_weighted_partitioning);
+        LOAD_IF_PRESENT(sim, config, enable_dynamic_rebalance);
+        LOAD_IF_PRESENT(sim, config, rebalance_imbalance_threshold);
+        LOAD_IF_PRESENT(sim, config, rebalance_check_interval_cycles);
+        LOAD_IF_PRESENT(sim, config, rebalance_min_gain);
+        LOAD_IF_PRESENT(sim, config, rebalance_cooldown_cycles);
+        LOAD_IF_PRESENT(sim, config, partition_solver);
+        LOAD_IF_PRESENT(sim, config, sa_critical_path_weight);
+
         if (sim["timeline_trace"]) {
             parseTimelineTrace(sim["timeline_trace"], config.timeline_trace);
         }
@@ -160,63 +117,51 @@ private:
             parseUnits(sim["unit"], config, source);
         }
 
+#undef LOAD_IF_PRESENT
         return config;
     }
 
     void parseTimelineTrace(const YAML::Node& trace_node,
                             SchedulerTimelineTraceConfig& trace_config) {
-        if (trace_node["enabled"]) {
-            trace_config.enabled = trace_node["enabled"].as<bool>();
-        }
-        if (trace_node["file"]) {
-            trace_config.file = trace_node["file"].as<std::string>();
-        }
-        if (trace_node["max_events"]) {
-            trace_config.max_events = trace_node["max_events"].as<uint64_t>();
-        }
-        if (trace_node["start_cycle"]) {
-            trace_config.start_cycle = trace_node["start_cycle"].as<uint64_t>();
-        }
-        if (trace_node["end_cycle"]) {
-            trace_config.end_cycle = trace_node["end_cycle"].as<uint64_t>();
-        }
-        if (trace_node["trace_units"]) {
-            trace_config.trace_units = trace_node["trace_units"].as<bool>();
-        }
-        if (trace_node["trace_waits"]) {
-            trace_config.trace_waits = trace_node["trace_waits"].as<bool>();
-        }
-        if (trace_node["trace_epochs"]) {
-            trace_config.trace_epochs = trace_node["trace_epochs"].as<bool>();
-        }
-        if (trace_node["trace_arbitration"]) {
-            trace_config.trace_arbitration = trace_node["trace_arbitration"].as<bool>();
-        }
-        if (trace_node["min_duration_ns"]) {
-            trace_config.min_duration_ns = trace_node["min_duration_ns"].as<uint64_t>();
-        }
+#define LOAD_IF_PRESENT(node, cfg, field)                   \
+    if (node[#field]) {                                     \
+        cfg.field = node[#field].as<decltype(cfg.field)>(); \
+    }
+
+        LOAD_IF_PRESENT(trace_node, trace_config, enabled);
+        LOAD_IF_PRESENT(trace_node, trace_config, file);
+        LOAD_IF_PRESENT(trace_node, trace_config, max_events);
+        LOAD_IF_PRESENT(trace_node, trace_config, start_cycle);
+        LOAD_IF_PRESENT(trace_node, trace_config, end_cycle);
+        LOAD_IF_PRESENT(trace_node, trace_config, trace_units);
+        LOAD_IF_PRESENT(trace_node, trace_config, trace_waits);
+        LOAD_IF_PRESENT(trace_node, trace_config, trace_epochs);
+        LOAD_IF_PRESENT(trace_node, trace_config, trace_arbitration);
+        LOAD_IF_PRESENT(trace_node, trace_config, min_duration_ns);
+
+#undef LOAD_IF_PRESENT
     }
 
     void parseObservation(const YAML::Node& obs_node, SimulationYAMLConfig& config,
                           const std::string& source) {
         observe::ObservationYAMLConfig obs_config;
 
-        if (obs_node["enabled"]) {
-            obs_config.enabled = obs_node["enabled"].as<bool>();
-        }
-        if (obs_node["output_dir"]) {
-            obs_config.output_dir = obs_node["output_dir"].as<std::string>();
-        }
-        if (obs_node["queue_capacity"]) {
-            obs_config.queue_capacity = obs_node["queue_capacity"].as<size_t>();
-        }
+#define LOAD_IF_PRESENT(node, cfg, field)                   \
+    if (node[#field]) {                                     \
+        cfg.field = node[#field].as<decltype(cfg.field)>(); \
+    }
 
+        LOAD_IF_PRESENT(obs_node, obs_config, enabled);
+        LOAD_IF_PRESENT(obs_node, obs_config, output_dir);
+        LOAD_IF_PRESENT(obs_node, obs_config, queue_capacity);
+        LOAD_IF_PRESENT(obs_node, obs_config, backpressure_max_spins);
+
+#undef LOAD_IF_PRESENT
+
+        // backpressure needs string-to-enum conversion, handled separately.
         if (obs_node["backpressure"]) {
             obs_config.backpressure =
                 parseBackpressurePolicy(obs_node["backpressure"].as<std::string>());
-        }
-        if (obs_node["backpressure_max_spins"]) {
-            obs_config.backpressure_max_spins = obs_node["backpressure_max_spins"].as<uint32_t>();
         }
 
         if (obs_node["counters"]) {
@@ -236,12 +181,19 @@ private:
 
     void parseCountersConfig(const YAML::Node& node, observe::CountersYAMLConfig& config,
                              const std::string& /*source*/) {
-        if (node["enabled"]) {
-            config.enabled = node["enabled"].as<bool>();
-        }
-        if (node["csv_output"]) {
-            config.csv_output = node["csv_output"].as<bool>();
-        }
+#define LOAD_IF_PRESENT(n, cfg, field)                   \
+    if (n[#field]) {                                     \
+        cfg.field = n[#field].as<decltype(cfg.field)>(); \
+    }
+
+        LOAD_IF_PRESENT(node, config, enabled);
+        LOAD_IF_PRESENT(node, config, csv_output);
+        LOAD_IF_PRESENT(node, config, periodic_dump_cycles);
+        LOAD_IF_PRESENT(node, config, dump_on_shutdown);
+
+#undef LOAD_IF_PRESENT
+
+        // csv_format needs string-to-enum conversion, handled separately.
         if (node["csv_format"]) {
             auto fmt_str = node["csv_format"].as<std::string>();
             if (fmt_str == "long") {
@@ -249,12 +201,6 @@ private:
             } else if (fmt_str == "pivoted" || fmt_str == "wide") {
                 config.csv_format = observe::CounterCsvFormat::Pivoted;
             }
-        }
-        if (node["periodic_dump_cycles"]) {
-            config.periodic_dump_cycles = node["periodic_dump_cycles"].as<uint64_t>();
-        }
-        if (node["dump_on_shutdown"]) {
-            config.dump_on_shutdown = node["dump_on_shutdown"].as<bool>();
         }
     }
 
@@ -310,18 +256,24 @@ private:
 
     void parseChannelConfig(const YAML::Node& node, observe::ChannelConfig& config,
                             const std::string& source) {
-        if (node["enabled"]) {
-            config.enabled = node["enabled"].as<bool>();
-        }
+#define LOAD_IF_PRESENT(n, cfg, field)                   \
+    if (n[#field]) {                                     \
+        cfg.field = n[#field].as<decltype(cfg.field)>(); \
+    }
+
+        LOAD_IF_PRESENT(node, config, enabled);
+        LOAD_IF_PRESENT(node, config, file);
+
+#undef LOAD_IF_PRESENT
+
+        // format and backpressure need string-to-enum conversion.
         if (node["format"]) {
             config.format = parseOutputFormat(node["format"].as<std::string>(), source);
-        }
-        if (node["file"]) {
-            config.file = node["file"].as<std::string>();
         }
         if (node["backpressure"]) {
             config.backpressure = parseBackpressurePolicy(node["backpressure"].as<std::string>());
         }
+        // backpressure_max_spins is std::optional<uint32_t>; yaml-cpp cannot convert directly.
         if (node["backpressure_max_spins"]) {
             config.backpressure_max_spins = node["backpressure_max_spins"].as<uint32_t>();
         }
@@ -329,41 +281,43 @@ private:
 
     void parseTraceChannelConfig(const YAML::Node& node, observe::TraceChannelConfig& config,
                                  const std::string& source) {
-        if (node["enabled"]) {
-            config.enabled = node["enabled"].as<bool>();
-        }
+#define LOAD_IF_PRESENT(n, cfg, field)                   \
+    if (n[#field]) {                                     \
+        cfg.field = n[#field].as<decltype(cfg.field)>(); \
+    }
+
+        LOAD_IF_PRESENT(node, config, enabled);
+        LOAD_IF_PRESENT(node, config, file);
+        LOAD_IF_PRESENT(node, config, embed_schema);
+        LOAD_IF_PRESENT(node, config, generate_index);
+
+#undef LOAD_IF_PRESENT
+
+        // format and backpressure need string-to-enum conversion.
         if (node["format"]) {
             config.format = parseOutputFormat(node["format"].as<std::string>(), source);
-        }
-        if (node["file"]) {
-            config.file = node["file"].as<std::string>();
-        }
-        if (node["compression"]) {
-            const auto& comp = node["compression"];
-            if (comp["enabled"]) {
-                config.compression.enabled = comp["enabled"].as<bool>();
-            }
-            if (comp["algorithm"]) {
-                config.compression.algorithm = comp["algorithm"].as<std::string>();
-            }
-            if (comp["level"]) {
-                config.compression.level = comp["level"].as<int>();
-            }
-            if (comp["block_size"]) {
-                config.compression.block_size = comp["block_size"].as<size_t>();
-            }
-        }
-        if (node["embed_schema"]) {
-            config.embed_schema = node["embed_schema"].as<bool>();
-        }
-        if (node["generate_index"]) {
-            config.generate_index = node["generate_index"].as<bool>();
         }
         if (node["backpressure"]) {
             config.backpressure = parseBackpressurePolicy(node["backpressure"].as<std::string>());
         }
+        // backpressure_max_spins is std::optional<uint32_t>; yaml-cpp cannot convert directly.
         if (node["backpressure_max_spins"]) {
             config.backpressure_max_spins = node["backpressure_max_spins"].as<uint32_t>();
+        }
+
+        if (node["compression"]) {
+            const auto& comp = node["compression"];
+#define LOAD_IF_PRESENT(n, cfg, field)                   \
+    if (n[#field]) {                                     \
+        cfg.field = n[#field].as<decltype(cfg.field)>(); \
+    }
+
+            LOAD_IF_PRESENT(comp, config.compression, enabled);
+            LOAD_IF_PRESENT(comp, config.compression, algorithm);
+            LOAD_IF_PRESENT(comp, config.compression, level);
+            LOAD_IF_PRESENT(comp, config.compression, block_size);
+
+#undef LOAD_IF_PRESENT
         }
     }
 

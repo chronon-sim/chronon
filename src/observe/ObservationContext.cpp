@@ -6,29 +6,24 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// ObservationContext.cpp
-//
-// Implementation of ObservationContext methods.
-
 #include "ObservationContext.hpp"
 
-#include "ObservationManager.hpp"
+#include "CounterRegistry.hpp"
 
 namespace chronon::observe {
 
-void ObservationContext::registerAllCounters(ObservationManager* manager) {
-    if (!manager) {
+void ObservationContext::registerAllCounters(CounterRegistry* registry) {
+    if (!registry) {
         return;
     }
 
     const std::string& unit_name = unit_name_;
     auto& counter_array = counters_.counters();
 
-    // Register each counter address along with its name
     for (size_t i = 0; i < counter_array.size(); ++i) {
         CounterId id = makeCounterId(static_cast<uint32_t>(i));
         const auto& info = counters_.info(id);
-        manager->registerCounter(unit_name, id, &counter_array[i], info.name);
+        registry->registerCounter(unit_name, id, &counter_array[i], info.name);
     }
 }
 

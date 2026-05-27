@@ -48,26 +48,6 @@ struct TickSimulationConfig {
     SchedulerTimelineTraceConfig timeline_trace;
 
     bool enable_weighted_partitioning = true;
-    uint64_t profiling_warmup_cycles = 512;
-    uint64_t profiling_measurement_cycles = 1024;
-
-    /**
-     * Skip live wall-clock profiling and partition units with constant
-     * unit_cost=1.0 + sync_cost=100ns. The partitioner's LPT becomes a
-     * pure round-robin and the resulting cluster_to_thread mapping is
-     * bit-exactly reproducible run-to-run (and often across num_workers
-     * for cost-insensitive topologies). Use for regression tests and A/B
-     * comparisons; leave off for production throughput.
-     */
-    bool deterministic_partitioning = false;
-
-    /**
-     * When non-empty, serialize the TickCostProfiler output here after the
-     * first profiling run and reuse it on subsequent runs whose topology
-     * hash matches. Cache hits skip the rdtsc profiler, removing
-     * measurement noise from run-to-run partitioning.
-     */
-    std::string cost_profile_cache_path;
 
     bool enable_dynamic_rebalance = true;
     double rebalance_imbalance_threshold = 1.3;

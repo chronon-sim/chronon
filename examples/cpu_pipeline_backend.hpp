@@ -88,7 +88,6 @@ public:
             skip_next_validation_ = true;
             expected_hash_hint_ = 0;
             pending_result_.reset();
-            (void)flush;
         }
 
         // 2. Process current pipeline stage
@@ -302,7 +301,6 @@ public:
                 skip_next_validation_[i] = true;
                 expected_hash_hint_[i] = 0;
             }
-            (void)flush;
         }
 
         InPort<Result>* ports[] = {&in_result_0, &in_result_1, &in_result_2, &in_result_3};

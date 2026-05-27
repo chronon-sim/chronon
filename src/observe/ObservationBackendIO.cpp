@@ -16,6 +16,7 @@
 #include <chrono>
 #include <iostream>
 
+#include "ArgFormat.hpp"
 #include "BinaryTraceWriter.hpp"
 #include "FormatRegistry.hpp"
 #include "ObservationBackend.hpp"
@@ -271,35 +272,7 @@ void ObservationBackend::formatArgToFast_(fmt::memory_buffer& out, const std::by
 }
 
 size_t ObservationBackend::argSize_(ArgType type, const std::byte* data, const std::byte* end) {
-    switch (type) {
-        case ArgType::Int8:
-        case ArgType::UInt8:
-        case ArgType::Bool:
-            return 1;
-        case ArgType::Int16:
-        case ArgType::UInt16:
-            return 2;
-        case ArgType::Int32:
-        case ArgType::UInt32:
-        case ArgType::Float:
-            return 4;
-        case ArgType::Int64:
-        case ArgType::UInt64:
-        case ArgType::Double:
-        case ArgType::Pointer:
-            return 8;
-        case ArgType::String: {
-            const char* str = reinterpret_cast<const char*>(data);
-            size_t len = 0;
-            while (data + len < end && str[len] != '\0') {
-                ++len;
-            }
-            return len + 1;  // Include null terminator
-        }
-        case ArgType::None:
-        default:
-            return 0;
-    }
+    return argSize(type, data, end);
 }
 
 // ---------------------------------------------------------------------------
@@ -576,23 +549,19 @@ void ObservationBackend::initializeOutputDir_() {
             return ptr;
         };
 
-        if (!config_.trace_file.empty()) {
-            channel_sink_[static_cast<size_t>(Channel::Trace)] =
-                getOrCreateSink(config_.trace_file);
-        }
-        if (!config_.debug_file.empty()) {
-            channel_sink_[static_cast<size_t>(Channel::Debug)] =
-                getOrCreateSink(config_.debug_file);
-        }
-        if (!config_.info_file.empty()) {
-            channel_sink_[static_cast<size_t>(Channel::Info)] = getOrCreateSink(config_.info_file);
-        }
-        if (!config_.warn_file.empty()) {
-            channel_sink_[static_cast<size_t>(Channel::Warn)] = getOrCreateSink(config_.warn_file);
-        }
-        if (!config_.error_file.empty()) {
-            channel_sink_[static_cast<size_t>(Channel::Error)] =
-                getOrCreateSink(config_.error_file);
+        struct ChannelFileEntry {
+            Channel channel;
+            const std::string& file;
+        };
+        const ChannelFileEntry channel_files[] = {
+            {Channel::Trace, config_.trace_file}, {Channel::Debug, config_.debug_file},
+            {Channel::Info, config_.info_file},   {Channel::Warn, config_.warn_file},
+            {Channel::Error, config_.error_file},
+        };
+        for (const auto& entry : channel_files) {
+            if (!entry.file.empty()) {
+                channel_sink_[static_cast<size_t>(entry.channel)] = getOrCreateSink(entry.file);
+            }
         }
     }
 }

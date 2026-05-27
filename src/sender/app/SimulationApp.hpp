@@ -96,17 +96,6 @@ public:
     using PostBuildHook = std::function<void(Result&)>;
     SimulationApp& onPostBuild(PostBuildHook hook);
 
-    /**
-     * @brief Hook to configure a separate, throw-away simulation used for profiling.
-     *
-     * When parallel + weighted partitioning are enabled, profiling builds a temporary
-     * simulation, configures it via this hook, profiles, and destroys it before the real
-     * simulation is built — this prevents profiling from contaminating real state.
-     * Configure with independent resources that can be safely destroyed.
-     */
-    using ProfilingBuildHook = std::function<void(Result&)>;
-    SimulationApp& onProfilingBuild(ProfilingBuildHook hook);
-
     /// Hook for post-processing after the run completes.
     using PostRunHook = std::function<void(Result&)>;
     SimulationApp& onPostRun(PostRunHook hook);
@@ -152,7 +141,6 @@ private:
     PreBuildHook pre_build_hook_;
     PostBuildHook post_build_hook_;
     PostRunHook post_run_hook_;
-    ProfilingBuildHook profiling_build_hook_;
 };
 
 }  // namespace chronon

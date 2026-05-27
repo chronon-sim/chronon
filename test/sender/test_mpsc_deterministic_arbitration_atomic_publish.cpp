@@ -135,6 +135,13 @@ RunResult runOnce(size_t num_workers, uint64_t producer_ticks, size_t user_cap) 
     cfg.enable_parallel = (num_workers > 1);
     cfg.enable_lookahead = true;
     cfg.epoch_size = 64;
+    // Disable weighted partitioning so thread assignment is pure round-robin.
+    // This test exercises MPSC arbitration determinism, not partitioning
+    // quality. The default uniform-cost partitioner may assign producers and
+    // consumer sub-optimally for some num_workers values, causing throughput
+    // backpressure that is correct but violates this test's "all 200 sent"
+    // expectation. Partitioning quality is covered separately.
+    cfg.enable_weighted_partitioning = false;
 
     TickSimulation sim(cfg);
 

@@ -39,10 +39,6 @@ void assertValidResult(const PartitionResult& result, [[maybe_unused]] size_t nu
     }
 }
 
-// ========================================================================
-// Test: Empty input
-// ========================================================================
-
 void test_empty_input() {
     std::cout << "Testing empty input... ";
 
@@ -57,10 +53,6 @@ void test_empty_input() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: Single unit
-// ========================================================================
 
 void test_single_unit() {
     std::cout << "Testing single unit... ";
@@ -78,10 +70,6 @@ void test_single_unit() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: More threads than units
-// ========================================================================
 
 void test_more_threads_than_units() {
     std::cout << "Testing more threads than units... ";
@@ -102,10 +90,6 @@ void test_more_threads_than_units() {
     std::cout << "PASSED\n";
 }
 
-// ========================================================================
-// Test: Uniform costs, no edges -> balanced assignment
-// ========================================================================
-
 void test_uniform_no_edges() {
     std::cout << "Testing uniform costs, no edges... ";
 
@@ -124,10 +108,6 @@ void test_uniform_no_edges() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: Heavy unit gets its own thread
-// ========================================================================
 
 void test_heavy_unit_isolation() {
     std::cout << "Testing heavy unit isolation... ";
@@ -151,10 +131,6 @@ void test_heavy_unit_isolation() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: delay=0 pairs forced to same thread
-// ========================================================================
 
 void test_delay_zero_colocation() {
     std::cout << "Testing delay=0 co-location... ";
@@ -183,10 +159,6 @@ void test_delay_zero_colocation() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: SA result not worse than 2x Weighted on varied inputs
-// ========================================================================
 
 void test_not_worse_than_2x_weighted() {
     std::cout << "Testing SA not worse than 2x Weighted... ";
@@ -247,10 +219,6 @@ void test_not_worse_than_2x_weighted() {
     std::cout << "PASSED\n";
 }
 
-// ========================================================================
-// Test: Matches PartitionSolver function pointer signature
-// ========================================================================
-
 void test_matches_partition_solver_signature() {
     std::cout << "Testing PartitionSolver signature... ";
 
@@ -273,10 +241,6 @@ void test_matches_partition_solver_signature() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: Deterministic output
-// ========================================================================
 
 void test_deterministic() {
     std::cout << "Testing determinism... ";
@@ -303,10 +267,6 @@ void test_deterministic() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: Mixed topology (pipeline-like graph)
-// ========================================================================
 
 void test_mixed_topology() {
     std::cout << "Testing mixed topology... ";
@@ -336,10 +296,6 @@ void test_mixed_topology() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
-// Test: Sync-heavy topology must NOT degenerate to unused-thread partition
-// ========================================================================
 
 void test_sync_heavy_no_thread_degeneration() {
     std::cout << "Testing sync-heavy no thread degeneration... ";
@@ -371,8 +327,6 @@ void test_sync_heavy_no_thread_degeneration() {
 
     std::cout << "PASSED\n";
 }
-
-// ========================================================================
 
 int main() {
     std::cout << "=== SimulatedAnnealingPartitioner Tests ===\n\n";

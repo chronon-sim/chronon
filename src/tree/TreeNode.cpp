@@ -47,12 +47,6 @@ void TreeNode::addChild(const std::string& name, std::unique_ptr<TreeNode> child
     children_[name] = std::move(child);
 }
 
-TreeNode* TreeNode::getChild(const std::string& path) { return getChildByRelativePath(path); }
-
-const TreeNode* TreeNode::getChild(const std::string& path) const {
-    return getChildByRelativePath(path);
-}
-
 TreeNode* TreeNode::getChildByRelativePath(const std::string& path) {
     if (path.empty()) {
         return this;
@@ -154,25 +148,6 @@ const TreeNode* TreeNode::root() const {
         current = current->parent_;
     }
     return current;
-}
-
-chronon::Scheduler* TreeNode::getScheduler() const {
-    const TreeNode* current = this;
-    while (current != nullptr) {
-        if (current->scheduler_ != nullptr) {
-            return current->scheduler_;
-        }
-        current = current->parent_;
-    }
-    return nullptr;
-}
-
-TreeNode* TreeNode::findByPath(const std::string& absolute_path) {
-    return findByAbsolutePath(absolute_path);
-}
-
-const TreeNode* TreeNode::findByPath(const std::string& absolute_path) const {
-    return findByAbsolutePath(absolute_path);
 }
 
 TreeNode* TreeNode::findByAbsolutePath(const std::string& absolute_path) {
