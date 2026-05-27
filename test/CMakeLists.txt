@@ -81,7 +81,7 @@ target_include_directories(test_yaml_serialization PRIVATE
 
 target_link_libraries(test_yaml_serialization
     chronon::core
-    yaml-cpp
+    yaml-cpp::yaml-cpp
     chronon_compile_options
 )
 

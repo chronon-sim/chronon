@@ -44,7 +44,7 @@ target_compile_features(chronon PUBLIC cxx_std_20)
 target_link_libraries(chronon PUBLIC STDEXEC::stdexec)
 
 # Link yaml-cpp for configuration support
-target_link_libraries(chronon PUBLIC yaml-cpp)
+target_link_libraries(chronon PUBLIC yaml-cpp::yaml-cpp)
 
 # Thread support
 find_package(Threads REQUIRED)

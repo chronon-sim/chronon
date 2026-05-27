@@ -25,7 +25,7 @@ target_link_libraries(cpu_pipeline_example PRIVATE
     chronon::core
     chronon::observe
     STDEXEC::stdexec
-    yaml-cpp
+    yaml-cpp::yaml-cpp
     chronon_compile_options
 )
 
@@ -47,7 +47,7 @@ target_link_libraries(cpu_pipeline_yaml_example PRIVATE
     chronon::core
     chronon::observe
     STDEXEC::stdexec
-    yaml-cpp
+    yaml-cpp::yaml-cpp
     chronon_compile_options
 )
 
