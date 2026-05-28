@@ -15,6 +15,7 @@
 #include <string_view>
 #include <thread>
 
+#include "../chronon/CpuPause.hpp"
 #include "Counter.hpp"
 #include "DerivedCounter.hpp"
 #include "FormatRegistry.hpp"
@@ -292,11 +293,7 @@ private:
                         std::this_thread::yield();
                         spins = (spins > max_spins) ? max_spins : spins;
                     } else {
-#if defined(__x86_64__) || defined(_M_X64)
-                        __builtin_ia32_pause();
-#elif defined(__aarch64__)
-                        asm volatile("yield" ::: "memory");
-#endif
+                        cpuPause();
                     }
                     ptr = ctx->queue().prepareWrite(aligned_size);
                     if (ptr) break;
@@ -418,11 +415,7 @@ private:
                         std::this_thread::yield();
                         spins = (spins > max_spins) ? max_spins : spins;
                     } else {
-#if defined(__x86_64__) || defined(_M_X64)
-                        __builtin_ia32_pause();
-#elif defined(__aarch64__)
-                        asm volatile("yield" ::: "memory");
-#endif
+                        cpuPause();
                     }
                     ptr = ctx->queue().prepareWrite(aligned_size);
                     if (ptr) break;

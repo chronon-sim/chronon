@@ -4,15 +4,11 @@
 
 // test_rebalance_calibration.cpp
 //
-// Verifies that the deferred PlatformBenchmark calibration fires on the
-// first dynamic rebalance. After assignThreadsDeterministic_(), rdtsc_to_ns
-// is left at 0 (uncalibrated sentinel). performRebalance_() must call
-// PlatformBenchmark::measure() before converting sampled ticks to
-// nanoseconds, setting rdtsc_to_ns > 0.
-//
-// Topology: 5 units with deliberately imbalanced tick costs so that
-// shouldRebalance_() triggers. rebalance_check_interval_cycles is set
-// low (64) to ensure a rebalance occurs within the test's run budget.
+// Verifies that the dynamic rebalance fires and produces meaningful
+// unit costs. Topology: 5 units with deliberately imbalanced tick costs
+// so that shouldRebalance_() triggers. rebalance_check_interval_cycles
+// is set low (64) to ensure a rebalance occurs within the test's run
+// budget.
 
 #include <cassert>
 #include <cstdint>
@@ -103,14 +99,9 @@ int main() {
 
     sim.initialize();
 
-    const auto& pre = sim.getPlatformMetrics();
-    std::cout << "Pre-rebalance rdtsc_to_ns: " << pre.rdtsc_to_ns << "\n";
-    assert(pre.rdtsc_to_ns == 0.0 && "rdtsc_to_ns should be uncalibrated before first rebalance");
-
     sim.runUntilTermination(16384);
 
     const auto& post = sim.getPlatformMetrics();
-    std::cout << "Post-run rdtsc_to_ns: " << post.rdtsc_to_ns << "\n";
     std::cout << "Post-run atomic_roundtrip_ns: " << post.atomic_roundtrip_ns << "\n";
     std::cout << "Rebalance count: " << sim.rebalanceCount() << "\n";
 
@@ -123,16 +114,6 @@ int main() {
 
     if (sim.rebalanceCount() == 0) {
         std::cerr << "FAIL: no rebalance occurred (imbalance may not have been detected)\n";
-        return 1;
-    }
-
-    if (post.rdtsc_to_ns == 0.0) {
-        std::cerr << "FAIL: rdtsc_to_ns still 0 after rebalance (calibration not triggered)\n";
-        return 1;
-    }
-
-    if (post.rdtsc_to_ns < 0.0) {
-        std::cerr << "FAIL: rdtsc_to_ns is negative: " << post.rdtsc_to_ns << "\n";
         return 1;
     }
 

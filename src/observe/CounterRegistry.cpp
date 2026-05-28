@@ -11,6 +11,7 @@
 #include <cstring>
 #include <thread>
 
+#include "../chronon/CpuPause.hpp"
 #include "ObservationContext.hpp"
 #include "ObservationQueue.hpp"
 #include "ThreadContextManager.hpp"
@@ -110,13 +111,7 @@ void CounterRegistry::dumpSnapshots(
             if (++spins > 64) {
                 std::this_thread::yield();
             } else {
-#if defined(__x86_64__) || defined(_M_X64)
-                __builtin_ia32_pause();
-#elif defined(__aarch64__)
-                asm volatile("yield" ::: "memory");
-#else
-                std::this_thread::yield();
-#endif
+                cpuPause();
             }
             if ((spins & 0xFFu) == 0u) {
                 (void)ThreadContextManager::instance().wakeBackend();
