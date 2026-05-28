@@ -145,6 +145,34 @@ public:
         return result;
     }
 
+    /// Required VersionedRegister depth for a single-writer / multi-reader
+    /// pattern.  The writer can advance at most distances[reader][writer]
+    /// cycles ahead of each reader; the buffer must retain that many versions
+    /// plus one baseline so the slowest reader always finds a correct value.
+    /// When no graph path exists from a reader back to the writer, the skew
+    /// is bounded only by @p max_lookahead_cycles.
+    uint32_t requiredVersionedRegisterDepth(Unit* writer, const std::vector<Unit*>& readers,
+                                            uint32_t max_lookahead_cycles) const {
+        auto w_it = unit_to_index_.find(writer);
+        if (w_it == unit_to_index_.end()) return max_lookahead_cycles + 1;
+        size_t w = w_it->second;
+
+        uint32_t max_skew = 0;
+        for (Unit* reader : readers) {
+            if (reader == writer) continue;
+            auto r_it = unit_to_index_.find(reader);
+            if (r_it == unit_to_index_.end()) {
+                max_skew = max_lookahead_cycles;
+                continue;
+            }
+            uint32_t d = distances_[r_it->second][w];
+            uint32_t skew =
+                std::min(d < DirectedGraph::INF ? d : max_lookahead_cycles, max_lookahead_cycles);
+            max_skew = std::max(max_skew, skew);
+        }
+        return std::max(max_skew + 1, uint32_t(2));
+    }
+
     const DirectedGraph* graph() const { return graph_.get(); }
     const std::vector<Unit*>& units() const { return units_; }
     size_t numUnits() const { return units_.size(); }

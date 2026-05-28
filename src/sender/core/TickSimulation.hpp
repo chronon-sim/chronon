@@ -244,6 +244,8 @@ public:
         return dynamic_cast<UnitT*>(getUnit(name));
     }
 
+    const DependencyGraph& dependencyGraph() const { return dep_graph_; }
+
     const std::vector<double>& getUnitCosts() const { return unit_costs_; }
     const PlatformMetrics& getPlatformMetrics() const { return platform_metrics_; }
 
