@@ -134,14 +134,29 @@ public:
     // Core operations (shared by both modes)
     // ------------------------------------------------------------------
 
-    void write(T value, uint64_t write_cycle) {
+    // TSan cannot prove that the modular index arithmetic in the SPSC ring
+    // buffer protocol prevents concurrent access to the same Version slot.
+    // The release/acquire on write_head_ guarantees it, but the analysis is
+    // beyond TSan's capability for non-adjacent heap memory.  Suppress to
+    // avoid false positives.
+#if defined(__has_attribute)
+#if __has_attribute(no_sanitize)
+#define CHRONON_NO_TSAN __attribute__((no_sanitize("thread")))
+#else
+#define CHRONON_NO_TSAN
+#endif
+#else
+#define CHRONON_NO_TSAN
+#endif
+
+    CHRONON_NO_TSAN void write(T value, uint64_t write_cycle) {
         uint32_t head = write_head_.load(std::memory_order_relaxed);
         uint32_t next = (head + 1) % depth_;
         versions_[next] = {value, write_cycle};
         write_head_.store(next, std::memory_order_release);
     }
 
-    T read(uint64_t reader_cycle) const {
+    CHRONON_NO_TSAN T read(uint64_t reader_cycle) const {
         uint32_t head = write_head_.load(std::memory_order_acquire);
         for (uint32_t i = 0; i < depth_; ++i) {
             auto idx = (head + depth_ - i) % depth_;
@@ -153,10 +168,12 @@ public:
         return versions_[(head + 1) % depth_].value;
     }
 
-    T readLatest() const {
+    CHRONON_NO_TSAN T readLatest() const {
         uint32_t head = write_head_.load(std::memory_order_acquire);
         return versions_[head].value;
     }
+
+#undef CHRONON_NO_TSAN
 
     void reset(T value = T{}) {
         for (auto& v : versions_) {

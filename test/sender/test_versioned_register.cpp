@@ -186,6 +186,7 @@ void test_depth_chain() {
     uint32_t depth = sim.dependencyGraph().requiredVersionedRegisterDepth(stages[0], readers,
                                                                           cfg.max_lookahead_cycles);
 
+    // dist[3][0] = INF (no back-edge), falls back to max_lookahead_cycles.
     assert(depth == cfg.max_lookahead_cycles + 1);
 
     std::cout << "PASSED\n";

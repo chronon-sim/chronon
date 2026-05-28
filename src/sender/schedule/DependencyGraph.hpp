@@ -149,8 +149,11 @@ public:
     /// pattern.  The writer can advance at most distances[reader][writer]
     /// cycles ahead of each reader; the buffer must retain that many versions
     /// plus one baseline so the slowest reader always finds a correct value.
-    /// When no graph path exists from a reader back to the writer, the skew
-    /// is bounded only by @p max_lookahead_cycles.
+    ///
+    /// When the graph has a finite path from reader to writer, the raw graph
+    /// distance is used (not capped).  When no such path exists, the writer's
+    /// advance is bounded only by @p max_lookahead_cycles — the global skew
+    /// limit that the scheduler must enforce.
     uint32_t requiredVersionedRegisterDepth(Unit* writer, const std::vector<Unit*>& readers,
                                             uint32_t max_lookahead_cycles) const {
         auto w_it = unit_to_index_.find(writer);
@@ -162,12 +165,11 @@ public:
             if (reader == writer) continue;
             auto r_it = unit_to_index_.find(reader);
             if (r_it == unit_to_index_.end()) {
-                max_skew = max_lookahead_cycles;
+                max_skew = std::max(max_skew, max_lookahead_cycles);
                 continue;
             }
             uint32_t d = distances_[r_it->second][w];
-            uint32_t skew =
-                std::min(d < DirectedGraph::INF ? d : max_lookahead_cycles, max_lookahead_cycles);
+            uint32_t skew = (d < DirectedGraph::INF) ? d : max_lookahead_cycles;
             max_skew = std::max(max_skew, skew);
         }
         return std::max(max_skew + 1, uint32_t(2));
