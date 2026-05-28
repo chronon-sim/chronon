@@ -498,6 +498,11 @@ private:
     ThreadProgress* thread_progress_array_ = nullptr;
     size_t thread_progress_count_ = 0;
     std::vector<std::vector<ResolvedDep>> thread_resolved_deps_;
+
+    /// Per-epoch floor for max_lookahead_cycles enforcement.  Set to
+    /// epoch_start before dispatch; each cluster's synthetic ResolvedDep
+    /// reads this to gate advancement at epoch_start + max_lookahead_cycles.
+    alignas(64) std::atomic<uint64_t> lookahead_floor_{0};
     std::vector<std::vector<TickableUnit*>> thread_unit_ptrs_;
     std::vector<std::vector<size_t>> thread_clusters_;
     std::vector<std::vector<TickableUnit*>> cluster_unit_ptrs_;

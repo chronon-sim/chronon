@@ -107,14 +107,18 @@ void TickSimulation::initProgressSync() {
     thread_resolved_deps_.resize(num_clusters);
     for (size_t c = 0; c < num_clusters; ++c) {
         thread_resolved_deps_[c].clear();
-        if (c >= thread_cross_deps_temp_.size()) continue;
-        for (const auto& dep : thread_cross_deps_temp_[c]) {
-            if (dep.pred_thread < thread_progress_count_) {
-                thread_resolved_deps_[c].push_back(
-                    {&thread_progress_array_[dep.pred_thread].completed_cycle, dep.min_delay,
-                     dep.pred_thread});
+        if (c < thread_cross_deps_temp_.size()) {
+            for (const auto& dep : thread_cross_deps_temp_[c]) {
+                if (dep.pred_thread < thread_progress_count_) {
+                    thread_resolved_deps_[c].push_back(
+                        {&thread_progress_array_[dep.pred_thread].completed_cycle, dep.min_delay,
+                         dep.pred_thread});
+                }
             }
         }
+        // Synthetic dep: cluster cannot advance past lookahead_floor_ + max_lookahead_cycles.
+        thread_resolved_deps_[c].push_back(
+            {&lookahead_floor_, config_.max_lookahead_cycles, /*pred_id=*/SIZE_MAX});
     }
 
     thread_unit_ptrs_.resize(num_threads);
@@ -186,6 +190,7 @@ void TickSimulation::executeEpochProgressBased(uint64_t epoch_cycles) {
     uint64_t start_cycle =
         thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
     uint64_t end_cycle = start_cycle + epoch_cycles;
+    lookahead_floor_.store(start_cycle, std::memory_order_relaxed);
     const bool trace_epoch = timeline_trace_.traceEpochs();
     SchedulerTimelineTrace::TimePoint epoch_begin{};
     if (trace_epoch) {
@@ -269,6 +274,27 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
 
             executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units);
             progress.store(cycle + 1, std::memory_order_release);
+            // Advance the global floor so other clusters' lookahead deps
+            // unblock.  Scan ALL clusters (not just this thread's) to get
+            // the true global minimum.  The scan is O(num_clusters) with
+            // relaxed loads from cache-line-aligned atomics — cheap on the
+            // hot path since num_clusters is typically < 20 and the lines
+            // are L1-hot from the dep checks that just ran.
+            uint64_t old_floor = lookahead_floor_.load(std::memory_order_relaxed);
+            if (cycle + 1 > old_floor) {
+                uint64_t global_min = UINT64_MAX;
+                for (size_t c2 = 0; c2 < thread_progress_count_; ++c2) {
+                    uint64_t cc =
+                        thread_progress_array_[c2].completed_cycle.load(std::memory_order_relaxed);
+                    global_min = std::min(global_min, cc);
+                }
+                while (global_min > old_floor) {
+                    if (lookahead_floor_.compare_exchange_weak(old_floor, global_min,
+                                                               std::memory_order_relaxed)) {
+                        break;
+                    }
+                }
+            }
             made_progress = true;
         }
 

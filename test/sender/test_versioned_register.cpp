@@ -119,13 +119,15 @@ void test_depth_ring_uniform() {
     uint32_t depth = graph.requiredVersionedRegisterDepth(setup.writer, asUnits(setup.readers),
                                                           cfg.max_lookahead_cycles);
 
-    // Ring of 8 with delay=1: max dist from reader 1 to writer 0 = 7. depth = 8.
     assert(depth == N);
+    (void)depth;
 
     // Subset: only nearby readers {6, 7}, distances 2 and 1.
     std::vector<Unit*> close = {setup.stages[6], setup.stages[7]};
-    depth = graph.requiredVersionedRegisterDepth(setup.writer, close, cfg.max_lookahead_cycles);
-    assert(depth == 3);
+    uint32_t depth2 =
+        graph.requiredVersionedRegisterDepth(setup.writer, close, cfg.max_lookahead_cycles);
+    assert(depth2 == 3);
+    (void)depth2;
 
     std::cout << "PASSED\n";
 }
@@ -146,13 +148,15 @@ void test_depth_ring_varying_delay() {
     uint32_t depth = graph.requiredVersionedRegisterDepth(setup.writer, asUnits(setup.readers),
                                                           cfg.max_lookahead_cycles);
 
-    // dist[1][0]=7, dist[2][0]=5, dist[3][0]=4.  max=7, depth=8.
     assert(depth == 8);
+    (void)depth;
 
     // Single reader: unit 3 only.  dist[3][0]=4, depth=5.
     std::vector<Unit*> one = {setup.stages[3]};
-    depth = graph.requiredVersionedRegisterDepth(setup.writer, one, cfg.max_lookahead_cycles);
-    assert(depth == 5);
+    uint32_t depth2 =
+        graph.requiredVersionedRegisterDepth(setup.writer, one, cfg.max_lookahead_cycles);
+    assert(depth2 == 5);
+    (void)depth2;
 
     std::cout << "PASSED\n";
 }
@@ -186,8 +190,8 @@ void test_depth_chain() {
     uint32_t depth = sim.dependencyGraph().requiredVersionedRegisterDepth(stages[0], readers,
                                                                           cfg.max_lookahead_cycles);
 
-    // dist[3][0] = INF (no back-edge), falls back to max_lookahead_cycles.
     assert(depth == cfg.max_lookahead_cycles + 1);
+    (void)depth;
 
     std::cout << "PASSED\n";
 }
@@ -222,6 +226,8 @@ void test_depth_random_ring() {
 
     assert(depth >= 2);
     assert(depth <= total_delay + 1);
+    (void)depth;
+    (void)total_delay;
 
     std::cout << "PASSED (depth=" << depth << ")\n";
 }
