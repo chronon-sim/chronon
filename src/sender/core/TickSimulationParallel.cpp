@@ -17,11 +17,8 @@
 #include <string>
 #include <unordered_map>
 
+#include "../../chronon/CpuPause.hpp"
 #include "TickSimulation.hpp"
-
-#if defined(__x86_64__) || defined(_M_X64)
-#include <x86intrin.h>
-#endif
 
 namespace chronon::sender {
 
@@ -296,11 +293,7 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
                 }
             }
             if (any_ready) break;
-#if defined(__x86_64__) || defined(_M_X64)
-            __builtin_ia32_pause();
-#elif defined(__aarch64__)
-            asm volatile("yield" ::: "memory");
-#endif
+            cpuPause();
         }
 
         if (trace_waits && !token.stop_requested()) {
@@ -363,25 +356,15 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
         points[0] = SchedulerTimelineTrace::Clock::now();
         for (size_t u = 0; u < num_units; ++u) {
             const bool sample_tick = config_.enable_dynamic_rebalance && (cycle & 1023u) == 0;
-#if defined(__x86_64__) || defined(_M_X64)
-            uint64_t t0 = sample_tick ? __rdtsc() : 0;
-#endif
             units[u]->executeTick();
-#if defined(__x86_64__) || defined(_M_X64)
-            uint64_t t1 = sample_tick ? __rdtsc() : 0;
-#endif
             points[u + 1] = SchedulerTimelineTrace::Clock::now();
 
             if (__builtin_expect(sample_tick, 0)) {
-#if defined(__x86_64__) || defined(_M_X64)
-                recordTickSample_(thread_idx, cluster_thread_unit_positions_[cluster][u], t1 - t0);
-#else
                 recordTickSample_(
                     thread_idx, cluster_thread_unit_positions_[cluster][u],
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                               points[u + 1] - points[u])
                                               .count()));
-#endif
             }
         }
         for (size_t u = 0; u < num_units; ++u) {
@@ -390,19 +373,12 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
         }
     } else if (__builtin_expect(config_.enable_dynamic_rebalance && (cycle & 1023u) == 0, 0)) {
         for (size_t u = 0; u < num_units; ++u) {
-#if defined(__x86_64__) || defined(_M_X64)
-            uint64_t t0 = __rdtsc();
-            units[u]->executeTick();
-            uint64_t t1 = __rdtsc();
-#else
             auto tp0 = std::chrono::steady_clock::now();
             units[u]->executeTick();
             auto tp1 = std::chrono::steady_clock::now();
-            uint64_t t0 = 0,
-                     t1 = static_cast<uint64_t>(
-                         std::chrono::duration_cast<std::chrono::nanoseconds>(tp1 - tp0).count());
-#endif
-            recordTickSample_(thread_idx, cluster_thread_unit_positions_[cluster][u], t1 - t0);
+            uint64_t elapsed_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(tp1 - tp0).count());
+            recordTickSample_(thread_idx, cluster_thread_unit_positions_[cluster][u], elapsed_ns);
         }
     } else {
         for (size_t u = 0; u < num_units; ++u) {

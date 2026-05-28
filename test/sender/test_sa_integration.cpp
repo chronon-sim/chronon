@@ -86,7 +86,6 @@ void test_sa_simulation_completes() {
 
     PlatformMetrics metrics{};
     metrics.atomic_roundtrip_ns = 1.0;
-    metrics.rdtsc_to_ns = 1.0;
     sim.setPrecomputedUnitCosts({500, 300, 400, 200, 600, 100}, metrics);
     sim.initialize();
 
@@ -133,7 +132,6 @@ void test_sa_simulation_delay_zero() {
 
     PlatformMetrics metrics{};
     metrics.atomic_roundtrip_ns = 1.0;
-    metrics.rdtsc_to_ns = 1.0;
     sim.setPrecomputedUnitCosts({300, 300, 300, 300}, metrics);
     sim.initialize();
 
@@ -177,7 +175,6 @@ void test_sa_no_sequential_fallback_t2() {
 
     PlatformMetrics metrics{};
     metrics.atomic_roundtrip_ns = 1.0;
-    metrics.rdtsc_to_ns = 1.0;
     sim.setPrecomputedUnitCosts({500, 300, 400, 200, 600, 100}, metrics);
     sim.initialize();
 
@@ -237,7 +234,6 @@ void test_sa_no_sequential_fallback_t4() {
 
     PlatformMetrics metrics{};
     metrics.atomic_roundtrip_ns = 1.0;
-    metrics.rdtsc_to_ns = 1.0;
     sim.setPrecomputedUnitCosts({500, 300, 400, 200, 600, 100, 350, 150, 250, 80}, metrics);
     sim.initialize();
 

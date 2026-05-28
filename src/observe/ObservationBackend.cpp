@@ -17,30 +17,12 @@
 #include <iostream>
 #include <thread>
 
+#include "../chronon/CpuPause.hpp"
 #include "BinaryTraceWriter.hpp"
 #include "FormatRegistry.hpp"
 #include "SIMDOps.hpp"
 
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#endif
-
 namespace chronon::observe {
-
-namespace {
-
-/// Portable CPU pause hint for spin-wait loops.
-inline void cpuPause() noexcept {
-#if defined(__x86_64__) || defined(_M_X64)
-    _mm_pause();
-#elif defined(__aarch64__)
-    asm volatile("yield" ::: "memory");
-#else
-    // No-op on other architectures
-#endif
-}
-
-}  // anonymous namespace
 
 ObservationBackend::ObservationBackend(ObservationQueue& queue) : queue_(queue), config_() {}
 

@@ -341,12 +341,6 @@ bool TickSimulation::shouldRebalance_() const {
 }
 
 bool TickSimulation::performRebalance_() {
-    // Calibrate platform metrics on first rebalance if the initial partition
-    // used fixed proxy values (assignThreadsDeterministic_ path).
-    if (platform_metrics_.rdtsc_to_ns == 0.0) {
-        platform_metrics_ = PlatformBenchmark::measure();
-    }
-
     if (!thread_sampling_.empty()) {
         for (size_t t = 0; t < thread_units_.size(); ++t) {
             const auto& state = thread_sampling_[t];
@@ -368,8 +362,7 @@ bool TickSimulation::performRebalance_() {
                     }
                 }
                 if (count > 0 && u < unit_costs_.size()) {
-                    unit_costs_[u] =
-                        sum / (static_cast<double>(count) * platform_metrics_.rdtsc_to_ns);
+                    unit_costs_[u] = sum / static_cast<double>(count);
                 }
             }
         }
