@@ -79,19 +79,23 @@ class SlowCounter : public TickableUnit {
 public:
     explicit SlowCounter(uint32_t id) : TickableUnit("slow_counter_" + std::to_string(id)) {}
     void tick() override {
-        // Busy work the optimizer cannot elide. ~tens of thousands of adds.
-        volatile uint64_t acc = sink_;
+        // Busy work to make this cluster lag in wall-clock time. A data-
+        // dependent LCG folded back into sink_ keeps it from being elided
+        // (sink_ escapes via sink()); avoids volatile, which is deprecated for
+        // compound assignment in C++20 (-Wvolatile).
+        uint64_t a = sink_;
         for (int i = 0; i < 20000; ++i) {
-            acc += i;
+            a = a * 6364136223846793005ULL + static_cast<uint64_t>(i) + 1;
         }
-        sink_ = acc;
+        sink_ = a;
         ++ticks_;
     }
     uint64_t ticks() const { return ticks_; }
+    uint64_t sink() const { return sink_; }
 
 private:
     uint64_t ticks_ = 0;
-    uint64_t sink_ = 0;
+    uint64_t sink_ = 1;
 };
 
 struct Msg {
