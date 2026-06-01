@@ -76,6 +76,26 @@ target_link_libraries(bench_parallel_scheduler PRIVATE
 target_compile_features(bench_parallel_scheduler PRIVATE cxx_std_20)
 
 # ==============================================================================
+# LockFreeMessageQueue 2-thread throughput benchmark
+# ==============================================================================
+
+add_executable(bench_message_queue
+    bench_message_queue.cpp
+)
+
+target_include_directories(bench_message_queue PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(bench_message_queue PRIVATE
+    chronon::core
+    chronon_compile_options
+    Threads::Threads
+)
+
+target_compile_features(bench_message_queue PRIVATE cxx_std_20)
+
+# ==============================================================================
 # Summary
 # ==============================================================================
 
