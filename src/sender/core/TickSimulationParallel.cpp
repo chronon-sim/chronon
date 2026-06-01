@@ -117,8 +117,11 @@ void TickSimulation::initProgressSync() {
             }
         }
         // Synthetic dep: cluster cannot advance past lookahead_floor_ + max_lookahead_cycles.
-        thread_resolved_deps_[c].push_back(
-            {&lookahead_floor_, config_.max_lookahead_cycles, /*pred_id=*/SIZE_MAX});
+        // Skip when max_lookahead_cycles == 0 (no limit — epoch boundary is the only cap).
+        if (config_.max_lookahead_cycles > 0) {
+            thread_resolved_deps_[c].push_back(
+                {&lookahead_floor_, config_.max_lookahead_cycles, /*pred_id=*/SIZE_MAX});
+        }
     }
 
     thread_unit_ptrs_.resize(num_threads);
