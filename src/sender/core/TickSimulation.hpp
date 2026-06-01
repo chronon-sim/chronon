@@ -427,6 +427,15 @@ private:
     void executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
                              stdexec::inplace_stop_token token);
 
+    /// Recompute the global-min completed cycle and monotonically raise
+    /// lookahead_floor_ to it.  Slow-path only (a stalled thread's spin-wait) —
+    /// never called per cycle advance.  See lookahead_floor_ for the contract.
+    void refreshLookaheadFloor_();
+
+    /// Test-only white-box access to exercise refreshLookaheadFloor_ over the
+    /// private progress array in isolation (test/sender/test_lookahead_floor_progress.cpp).
+    friend struct LookaheadFloorTestAccess;
+
     bool clusterCanAdvance_(size_t cluster, uint64_t cycle, BlockedClusterInfo& blocker) const;
     std::string formatBlockerDetail_(const BlockedClusterInfo& blocker) const;
     void executeClusterOneCycle_(size_t thread_idx, size_t cluster, uint64_t cycle,
@@ -502,6 +511,14 @@ private:
     /// Per-epoch floor for max_lookahead_cycles enforcement.  Set to
     /// epoch_start before dispatch; each cluster's synthetic ResolvedDep
     /// reads this to gate advancement at epoch_start + max_lookahead_cycles.
+    ///
+    /// Memory-order contract: written with a *relaxed* monotone CAS
+    /// (refreshLookaheadFloor_) and read with *acquire* in clusterCanAdvance_.
+    /// This is a gating HINT only — it never publishes data, so the asymmetric
+    /// ordering is intentional and a stale value is always safe (it merely
+    /// blocks a cluster marginally sooner).  Do not repurpose it to carry
+    /// state; real cross-thread data sync uses the per-edge ThreadProgress
+    /// completed_cycle release/acquire.
     alignas(64) std::atomic<uint64_t> lookahead_floor_{0};
     std::vector<std::vector<TickableUnit*>> thread_unit_ptrs_;
     std::vector<std::vector<size_t>> thread_clusters_;
