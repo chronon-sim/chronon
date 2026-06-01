@@ -19,13 +19,13 @@ Ports solve this with timestamped message queues (`arrive_cycle`), but shared re
 
 ## Solution
 
-`VersionedRegister<T, HistoryDepth>` maintains a ring buffer of `(value, cycle)` pairs. Writes are timestamped; reads are temporally filtered.
+`VersionedRegister<T>` maintains a ring buffer of `(value, cycle)` pairs. The depth (number of retained versions) is set at construction — use `DependencyGraph::requiredVersionedRegisterDepth()` after `initialize()` to compute it from the topology. Writes are timestamped; reads are temporally filtered.
 
 ```cpp
 #include "chronon/Chronon.hpp"
 using namespace chronon;
 
-VersionedRegister<uint64_t, 16> mip{0};
+VersionedRegister<uint64_t> mip{0, /*depth=*/100};
 
 // Writer (CLINT at cycle 1000):
 mip.write(0x80, 1000);       // MTIP set at cycle 1000
@@ -40,8 +40,13 @@ uint64_t val = mip.read(1000); // returns 0x80
 ## API
 
 ```cpp
-template <typename T, size_t HistoryDepth = 16>
+template <typename T>
 class VersionedRegister {
+    // Default-construct (value = T{}, depth = 16).
+    VersionedRegister();
+    // Construct with initial value and depth (from requiredVersionedRegisterDepth).
+    VersionedRegister(T initial_value, uint32_t depth = 16);
+
     // Write a new value at the given simulation cycle.
     void write(T value, uint64_t write_cycle);
 
@@ -53,6 +58,9 @@ class VersionedRegister {
 
     // Reset all versions to the given value at cycle 0.
     void reset(T value = T{});
+
+    // Number of retained versions.
+    uint32_t depth() const;
 };
 ```
 
@@ -60,17 +68,11 @@ class VersionedRegister {
 
 A single atomic `write_head_` with acquire/release ordering allows one writer and multiple readers on different threads without locks. For multiple concurrent writers, ensure monotonically increasing `write_cycle` values (naturally satisfied when each writer uses its own `localCycle()`).
 
-### History Depth
+### Depth
 
-The `HistoryDepth` template parameter controls how many versions are retained. If a reader's cycle is older than all retained versions (skew exceeds buffer depth), the oldest version is returned as a best-effort fallback.
+The constructor `depth` parameter controls how many versions are retained. If a reader's cycle is older than all retained versions (skew exceeds depth), the oldest version is returned as a best-effort fallback.
 
-Choose `HistoryDepth` based on the maximum expected lookahead skew between writers and readers:
-
-| Use Case | Typical Depth | Rationale |
-|----------|---------------|-----------|
-| Physical register file | 16 | Execution units are close in cycle to retirement |
-| Cycle/instret counters | 32 | Island nodes (MMIO devices) can race ahead by `epoch_size` |
-| Interrupt pending (MIP) | 16 | Written by CLINT/PLIC, read by ROB |
+Use `DependencyGraph::requiredVersionedRegisterDepth(writer, readers, max_lookahead)` to compute the correct depth after `initialize()`. The result is `max_skew + 1` — the extra slot retains the baseline version that the slowest reader may still need. Do not use `max_lookahead_cycles` directly as the depth; that is off by one.
 
 ## Usage Pattern
 
@@ -78,7 +80,10 @@ The typical pattern for shared state accessed by multiple Chronon units:
 
 ```cpp
 // In a shared data structure (e.g., CSRFile):
-VersionedRegister<uint64_t, 32> cycle_counter_{0};
+VersionedRegister<uint64_t> cycle_counter_;
+
+// Construct with depth from requiredVersionedRegisterDepth():
+CSRFile(uint32_t depth) : cycle_counter_(uint64_t{0}, depth) {}
 
 void incrementCycle(uint64_t at_cycle) {
     uint64_t cur = cycle_counter_.readLatest();
