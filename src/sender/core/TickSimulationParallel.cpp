@@ -22,6 +22,12 @@
 
 namespace chronon::sender {
 
+namespace {
+/// Throttle for the slow-path floor refresh: scan once per 256 spins (refresh
+/// fires when (spin & mask) == 0) to keep the cross-core scan off the hot path.
+constexpr uint64_t kFloorRefreshSpinMask = 0xFF;
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // MPSC producer progress wiring
 // ---------------------------------------------------------------------------
@@ -277,39 +283,37 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
 
             executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units);
             progress.store(cycle + 1, std::memory_order_release);
-            // Advance the global floor so other clusters' lookahead deps
-            // unblock.  Scan ALL clusters (not just this thread's) to get
-            // the true global minimum.  The scan is O(num_clusters) with
-            // relaxed loads from cache-line-aligned atomics — cheap on the
-            // hot path since num_clusters is typically < 20 and the lines
-            // are L1-hot from the dep checks that just ran.
-            uint64_t old_floor = lookahead_floor_.load(std::memory_order_relaxed);
-            if (cycle + 1 > old_floor) {
-                uint64_t global_min = UINT64_MAX;
-                for (size_t c2 = 0; c2 < thread_progress_count_; ++c2) {
-                    uint64_t cc =
-                        thread_progress_array_[c2].completed_cycle.load(std::memory_order_relaxed);
-                    global_min = std::min(global_min, cc);
-                }
-                while (global_min > old_floor) {
-                    if (lookahead_floor_.compare_exchange_weak(old_floor, global_min,
-                                                               std::memory_order_relaxed)) {
-                        break;
-                    }
-                }
-            }
+            // Floor not recomputed per advance (that was an O(num_clusters)
+            // cross-core scan on the hot path). It is refreshed lazily, only
+            // when a cluster is actually blocked — see below and the spin-wait.
             made_progress = true;
         }
 
         if (all_done || token.stop_requested()) return;
-        if (made_progress) continue;
+        if (made_progress) {
+            // A worker advancing one cluster while another is stuck at the
+            // ceiling never reaches the spin-wait; refresh here so the blocked
+            // cluster isn't pinned to the epoch-start ceiling all epoch.
+            // blocker.cluster is set iff some cluster failed clusterCanAdvance_;
+            // this fires at most once per executed cycle, so it needs no throttle.
+            if (blocker.cluster != SIZE_MAX) {
+                refreshLookaheadFloor_();
+            }
+            continue;
+        }
 
         SchedulerTimelineTrace::TimePoint wait_begin{};
         if (trace_waits) {
             wait_begin = SchedulerTimelineTrace::Clock::now();
         }
 
+        // Refresh the floor as peers advance to lift the ceiling; throttled
+        // (kFloorRefreshSpinMask) so the tight spin doesn't hammer the scan.
+        uint64_t spin = 0;
         while (!token.stop_requested()) {
+            if ((spin++ & kFloorRefreshSpinMask) == 0) {
+                refreshLookaheadFloor_();
+            }
             bool any_ready = false;
             for (size_t cluster : clusters) {
                 uint64_t cycle =
@@ -341,6 +345,23 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
 // ---------------------------------------------------------------------------
 // Cluster advancement and execution
 // ---------------------------------------------------------------------------
+
+void TickSimulation::refreshLookaheadFloor_() {
+    // Monotonically raise lookahead_floor_ to the global-min completed cycle.
+    // Relaxed throughout — see the memory-order contract on its declaration.
+    uint64_t old_floor = lookahead_floor_.load(std::memory_order_relaxed);
+    uint64_t global_min = UINT64_MAX;
+    for (size_t c = 0; c < thread_progress_count_; ++c) {
+        global_min = std::min(
+            global_min, thread_progress_array_[c].completed_cycle.load(std::memory_order_relaxed));
+    }
+    while (global_min > old_floor) {
+        if (lookahead_floor_.compare_exchange_weak(old_floor, global_min,
+                                                   std::memory_order_relaxed)) {
+            break;
+        }
+    }
+}
 
 bool TickSimulation::clusterCanAdvance_(size_t cluster, uint64_t cycle,
                                         BlockedClusterInfo& blocker) const {

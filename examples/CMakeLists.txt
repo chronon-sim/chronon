@@ -54,6 +54,48 @@ target_link_libraries(cpu_pipeline_yaml_example PRIVATE
 target_compile_features(cpu_pipeline_yaml_example PRIVATE cxx_std_20)
 
 # ==============================================================================
+# Parallel Scheduler Benchmark (issue #24 hot-path micro-benchmark)
+# ==============================================================================
+
+add_executable(bench_parallel_scheduler
+    bench_parallel_scheduler.cpp
+)
+
+target_include_directories(bench_parallel_scheduler PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(bench_parallel_scheduler PRIVATE
+    chronon::core
+    chronon::observe
+    STDEXEC::stdexec
+    yaml-cpp::yaml-cpp
+    chronon_compile_options
+)
+
+target_compile_features(bench_parallel_scheduler PRIVATE cxx_std_20)
+
+# ==============================================================================
+# LockFreeMessageQueue 2-thread throughput benchmark
+# ==============================================================================
+
+add_executable(bench_message_queue
+    bench_message_queue.cpp
+)
+
+target_include_directories(bench_message_queue PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(bench_message_queue PRIVATE
+    chronon::core
+    chronon_compile_options
+    Threads::Threads
+)
+
+target_compile_features(bench_message_queue PRIVATE cxx_std_20)
+
+# ==============================================================================
 # Summary
 # ==============================================================================
 
