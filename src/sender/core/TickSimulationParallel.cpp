@@ -23,11 +23,8 @@
 namespace chronon::sender {
 
 namespace {
-/// Spin iterations between lazy lookahead-floor refreshes in the slow-path
-/// spin-wait (bitmask; refresh fires when (spin & mask) == 0).  256 keeps the
-/// O(num_clusters) cross-core scan off the hot interconnect path while still
-/// lifting the max_lookahead ceiling far sooner than the slowest cluster could
-/// stall on it.
+/// Throttle for the slow-path floor refresh: scan once per 256 spins (refresh
+/// fires when (spin & mask) == 0) to keep the cross-core scan off the hot path.
 constexpr uint64_t kFloorRefreshSpinMask = 0xFF;
 }  // namespace
 
@@ -286,30 +283,19 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
 
             executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units);
             progress.store(cycle + 1, std::memory_order_release);
-            // The global lookahead floor is NOT recomputed per advance here.
-            // It only gates the synthetic max_lookahead ceiling dep, and a
-            // stale floor merely blocks a cluster marginally sooner (never a
-            // correctness issue — real data sync rides on the per-edge
-            // completed_cycle release/acquire above).  Refreshing it on every
-            // advance would be an O(num_clusters) all-to-all scan of atomics
-            // written by other cores on the hot path.  It is instead refreshed
-            // only when some cluster is actually blocked (below and in the
-            // spin-wait), which is the only time a stale floor delays progress.
+            // Floor not recomputed per advance (that was an O(num_clusters)
+            // cross-core scan on the hot path). It is refreshed lazily, only
+            // when a cluster is actually blocked — see below and the spin-wait.
             made_progress = true;
         }
 
         if (all_done || token.stop_requested()) return;
         if (made_progress) {
-            // A worker can own a cluster blocked only by the synthetic
-            // lookahead ceiling alongside another cluster that still advances.
-            // The advancing cluster sets made_progress, so this worker never
-            // reaches the spin-wait that refreshes the floor; without a refresh
-            // here the blocked cluster would stay pinned to the epoch-start
-            // ceiling for the whole epoch, serializing it instead of keeping
-            // the configured max_lookahead lead.  blocker.cluster is set iff
-            // some cluster failed clusterCanAdvance_ this pass.  This runs at
-            // most once per executed cycle (the loop is gated by real work, not
-            // a tight spin), so unlike the spin-wait it needs no throttle.
+            // A worker advancing one cluster while another is stuck at the
+            // ceiling never reaches the spin-wait; refresh here so the blocked
+            // cluster isn't pinned to the epoch-start ceiling all epoch.
+            // blocker.cluster is set iff some cluster failed clusterCanAdvance_;
+            // this fires at most once per executed cycle, so it needs no throttle.
             if (blocker.cluster != SIZE_MAX) {
                 refreshLookaheadFloor_();
             }
@@ -321,13 +307,8 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
             wait_begin = SchedulerTimelineTrace::Clock::now();
         }
 
-        // Refresh the global lookahead floor every kFloorRefreshSpinMask+1 spin
-        // iterations (and on the first, so a stale ceiling lifts promptly).  The
-        // O(num_clusters) cross-core scan is throttled here rather than run on
-        // every cpuPause so it does not re-introduce the coherence traffic it
-        // replaces — the mask is large enough to keep that traffic low, yet far
-        // smaller than the cycles the slowest cluster takes to advance, so the
-        // ceiling lifts well before it would actually stall forward progress.
+        // Refresh the floor as peers advance to lift the ceiling; throttled
+        // (kFloorRefreshSpinMask) so the tight spin doesn't hammer the scan.
         uint64_t spin = 0;
         while (!token.stop_requested()) {
             if ((spin++ & kFloorRefreshSpinMask) == 0) {
@@ -366,11 +347,8 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
 // ---------------------------------------------------------------------------
 
 void TickSimulation::refreshLookaheadFloor_() {
-    // Recompute the global minimum completed cycle (GVT) and monotonically
-    // raise lookahead_floor_ to it.  Called only on the slow path (a stalled
-    // thread's spin-wait), never per cycle advance.  Loads are relaxed — the
-    // floor is a monotone gating hint that carries no data; see the
-    // memory-order contract on its declaration in TickSimulation.hpp.
+    // Monotonically raise lookahead_floor_ to the global-min completed cycle.
+    // Relaxed throughout — see the memory-order contract on its declaration.
     uint64_t old_floor = lookahead_floor_.load(std::memory_order_relaxed);
     uint64_t global_min = UINT64_MAX;
     for (size_t c = 0; c < thread_progress_count_; ++c) {

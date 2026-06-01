@@ -4,28 +4,12 @@
 
 // test_lookahead_floor_progress.cpp
 //
-// Regression test for issue #24: the lookahead floor (lookahead_floor_) is now
-// refreshed lazily on the slow-path spin-wait instead of on every cycle
-// advance. This test exercises a deliberately *imbalanced* cluster layout with
-// a *small* max_lookahead_cycles so the fast clusters repeatedly race ahead,
-// jam against the synthetic max_lookahead ceiling, and must rely on the lazily
-// refreshed floor to unblock.
-//
-// The invariants checked:
-//   1. No deadlock — every configuration completes (the CTest 60s timeout
-//      would catch a hang where the floor stops rising).
-//   2. Every unit advances exactly TARGET cycles (a lagged floor only delays;
-//      it never drops or duplicates cycles).
-//   3. Message accounting on a connected producer->consumer pair is exact
-//      (no loss, no duplicates) even while the floor is stale.
-//
-// Topology (all independent clusters except the one connected pair, so the
-// fast clusters are gated *only* by the floor ceiling, not by data deps):
-//   - 1 slow standalone counter (busy work per tick -> drags the global min)
-//   - 6 fast standalone counters (race ahead, hit the ceiling)
-//   - 1 producer -> 1 consumer pair, delay=1 (exercises a real data dep too)
-//
-// Sweep: num_workers in {1, 2, 4, 8} x max_lookahead in {4, 16} x 2 repeats.
+// Regression test for issue #24 (lazy lookahead-floor refresh). Two parts:
+//  - white-box unit tests of refreshLookaheadFloor_ semantics;
+//  - an end-to-end imbalanced layout (1 slow + 6 fast clusters + a producer->
+//    consumer pair) with small max_lookahead, swept over num_workers {1,2,4,8}
+//    x max_lookahead {4,16}, asserting no deadlock, exact cycle counts, and
+//    exact message accounting under a lagged floor.
 
 #include <cstdint>
 #include <iostream>
@@ -39,9 +23,8 @@
 
 using namespace chronon::sender;
 
-// White-box accessor (befriended by TickSimulation) used by the direct unit
-// tests of refreshLookaheadFloor_ below. It drives the private progress array
-// and floor on the main thread, so those checks are fully deterministic.
+// White-box accessor (befriended by TickSimulation) for the direct unit tests
+// of refreshLookaheadFloor_ below, driven deterministically on the main thread.
 namespace chronon::sender {
 struct LookaheadFloorTestAccess {
     static size_t count(const TickSimulation& s) { return s.thread_progress_count_; }
@@ -79,10 +62,7 @@ class SlowCounter : public TickableUnit {
 public:
     explicit SlowCounter(uint32_t id) : TickableUnit("slow_counter_" + std::to_string(id)) {}
     void tick() override {
-        // Busy work to make this cluster lag in wall-clock time. A data-
-        // dependent LCG folded back into sink_ keeps it from being elided
-        // (sink_ escapes via sink()); avoids volatile, which is deprecated for
-        // compound assignment in C++20 (-Wvolatile).
+        // Busy work so this cluster lags; LCG folded into sink_ resists elision.
         uint64_t a = sink_;
         for (int i = 0; i < 20000; ++i) {
             a = a * 6364136223846793005ULL + static_cast<uint64_t>(i) + 1;
@@ -104,11 +84,8 @@ struct Msg {
 
 class Producer : public TickableUnit {
 public:
-    // Stop sending one delay-cycle before the run ends so every message has a
-    // cycle in which to be delivered (a message sent at cycle c with delay=1 is
-    // received at c+1). This keeps the message accounting exact rather than
-    // leaving one in-flight tail message — the point under test is the floor,
-    // not the pipeline tail.
+    // Stop sending one delay-cycle before the end so the last message is
+    // delivered within the run (keeps message accounting exact; delay=1).
     explicit Producer(uint64_t last_send_cycle)
         : TickableUnit("producer"), last_send_cycle_(last_send_cycle) {}
     OutPort<Msg> out{this, "out"};
@@ -209,14 +186,8 @@ int run_trial(size_t nw, uint32_t max_lookahead, int rep) {
     return failures;
 }
 
-// --------------------------------------------------------------------------
-// White-box unit tests of refreshLookaheadFloor_ itself.
-//
-// Drives the private progress array directly on the main thread (via the
-// befriended LookaheadFloorTestAccess) so each case is deterministic. Verifies
-// the function's full contract: it raises lookahead_floor_ to the global
-// minimum completed cycle, never lowers it (monotone), and is idempotent.
-// --------------------------------------------------------------------------
+// White-box unit tests of refreshLookaheadFloor_: raises the floor to the
+// global-min completed cycle, never lowers it (monotone), and is idempotent.
 int test_refresh_semantics() {
     using TA = chronon::sender::LookaheadFloorTestAccess;
     int failures = 0;

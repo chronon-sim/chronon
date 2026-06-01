@@ -4,18 +4,13 @@
 
 // bench_message_queue.cpp
 //
-// Real two-thread throughput benchmark for LockFreeMessageQueue — the SPSC ring
-// the parallel scheduler uses to hand messages between worker threads. Unlike
-// the single-thread SPSC micro-benchmark (which the optimizer can elide and
-// which says nothing about cross-core cost), this spawns a dedicated producer
-// and consumer on separate cores, so every item crosses a cache line under real
-// coherence traffic and cannot be optimized away (the consumer folds each value
-// into a checksum that is printed).
+// Real two-thread (dedicated producer + consumer) throughput benchmark for
+// LockFreeMessageQueue, the SPSC ring the scheduler uses for cross-thread
+// messaging. The consumer folds each value into a printed, in-order-asserted
+// checksum, so the loop can't be elided like the single-thread SPSC micro-bench.
+// Reports ns/item and M items/sec (one item = one push+pop handoff), best of N.
 //
-// Reports ns per item and million items/sec (one item = one push + one pop
-// handoff). Best of N repeats.
-//
-// Usage: bench_message_queue [num_items] [repeats] [payload_bytes: 8|64]
+// Usage: bench_message_queue [num_items] [repeats]
 
 #include <atomic>
 #include <chrono>

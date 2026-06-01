@@ -4,15 +4,10 @@
 
 // bench_parallel_scheduler.cpp
 //
-// Micro-benchmark for the progress-based parallel scheduler hot path. Designed
-// to be sensitive to issue #24: many lightweight INDEPENDENT clusters with a
-// small amount of per-tick work, so the per-cycle global-min lookahead-floor
-// scan (O(num_clusters) cross-core loads, formerly run on every cycle advance)
-// dominates relative to useful work.
-//
-// Reports wall-clock and throughput (million cluster-cycles / second) across a
-// worker-count sweep. Run the same binary against the pre- and post-change
-// scheduler to compare.
+// Throughput benchmark for the progress-based parallel scheduler. Many light
+// independent clusters make the per-cycle lookahead-floor scan (issue #24)
+// dominate, so the before/after gap is visible. Reports cluster-Mcyc/s across a
+// worker-count sweep.
 //
 // Usage: bench_parallel_scheduler [num_units] [cycles] [per_tick_work]
 
