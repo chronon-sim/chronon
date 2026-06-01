@@ -231,7 +231,8 @@ public:
     static constexpr size_t CAPACITY = 4096;
     static constexpr size_t USABLE_CAPACITY = CAPACITY - 1;
 
-    LockFreeMessageQueue() : buffer_(CAPACITY), head_(0), tail_(0) {}
+    LockFreeMessageQueue()
+        : buffer_(CAPACITY), head_(0), cached_tail_(0), tail_(0), cached_head_(0) {}
 
     /**
      * Push a message (producer only).
@@ -247,8 +248,13 @@ public:
         size_t tail = tail_.load(std::memory_order_relaxed);
         size_t next = (tail + 1) % CAPACITY;
 
-        if (next == head_.load(std::memory_order_acquire)) {
-            return false;  // Full
+        // Re-read the consumer's head_ (a cross-core load) only when the cached
+        // copy says full; a stale cached_head_ is conservative (looks more full).
+        if (next == cached_head_) {
+            cached_head_ = head_.load(std::memory_order_acquire);
+            if (next == cached_head_) {
+                return false;
+            }
         }
 
         buffer_[tail] = {std::move(data), arrive_cycle, sender_id};
@@ -265,8 +271,13 @@ public:
     std::optional<T> tryPop(uint64_t current_cycle) {
         size_t head = head_.load(std::memory_order_relaxed);
 
-        if (head == tail_.load(std::memory_order_acquire)) {
-            return std::nullopt;  // Empty
+        // Symmetric to tryPush: re-read the producer's tail_ only when the
+        // cached copy says empty.
+        if (head == cached_tail_) {
+            cached_tail_ = tail_.load(std::memory_order_acquire);
+            if (head == cached_tail_) {
+                return std::nullopt;
+            }
         }
 
         // Check if head message is ready
@@ -328,6 +339,9 @@ public:
     void clear() noexcept {
         auto tail = tail_.load(std::memory_order_acquire);
         head_.store(tail, std::memory_order_release);
+        // Refresh the consumer cache, else the next tryPop sees
+        // head != cached_tail_ and reads the unwritten tail slot.
+        cached_tail_ = tail;
     }
 
 private:
@@ -338,8 +352,12 @@ private:
     };
 
     std::vector<Entry> buffer_;
-    alignas(64) std::atomic<size_t> head_;
-    alignas(64) std::atomic<size_t> tail_;
+    // Each side's atomic and its private cache of the opposite index sit on one
+    // cache line, kept apart from the other side's to avoid false sharing.
+    alignas(64) std::atomic<size_t> head_;  // written by consumer
+    size_t cached_tail_;                    // consumer-private
+    alignas(64) std::atomic<size_t> tail_;  // written by producer
+    size_t cached_head_;                    // producer-private
 };
 
 /**

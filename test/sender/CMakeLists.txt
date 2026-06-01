@@ -6,6 +6,7 @@
 
 # Test executables (prefixed with sender_ to avoid conflicts)
 add_executable(sender_test_message_queue test_message_queue.cpp)
+add_executable(sender_test_lockfree_message_queue test_lockfree_message_queue.cpp)
 add_executable(sender_test_dependency_graph test_dependency_graph.cpp)
 add_executable(sender_test_termination test_termination.cpp)
 add_executable(sender_test_port_flush_cancel test_port_flush_cancel.cpp)
@@ -29,6 +30,7 @@ add_executable(sender_test_versioned_register test_versioned_register.cpp)
 
 # Link against chronon library
 target_link_libraries(sender_test_message_queue PRIVATE chronon::core)
+target_link_libraries(sender_test_lockfree_message_queue PRIVATE chronon::core Threads::Threads)
 target_link_libraries(sender_test_dependency_graph PRIVATE chronon::core)
 target_link_libraries(sender_test_termination PRIVATE chronon::core)
 target_link_libraries(sender_test_port_flush_cancel PRIVATE chronon::core)
@@ -52,6 +54,7 @@ target_link_libraries(sender_test_versioned_register PRIVATE chronon::core Threa
 
 # Include paths
 target_include_directories(sender_test_message_queue PRIVATE ${chronon_SOURCE_DIR}/src)
+target_include_directories(sender_test_lockfree_message_queue PRIVATE ${chronon_SOURCE_DIR}/src)
 target_include_directories(sender_test_dependency_graph PRIVATE ${chronon_SOURCE_DIR}/src)
 target_include_directories(sender_test_termination PRIVATE ${chronon_SOURCE_DIR}/src)
 target_include_directories(sender_test_port_flush_cancel PRIVATE ${chronon_SOURCE_DIR}/src)
@@ -75,6 +78,7 @@ target_include_directories(sender_test_versioned_register PRIVATE ${chronon_SOUR
 
 # C++20 required
 target_compile_features(sender_test_message_queue PRIVATE cxx_std_20)
+target_compile_features(sender_test_lockfree_message_queue PRIVATE cxx_std_20)
 target_compile_features(sender_test_dependency_graph PRIVATE cxx_std_20)
 target_compile_features(sender_test_termination PRIVATE cxx_std_20)
 target_compile_features(sender_test_port_flush_cancel PRIVATE cxx_std_20)
@@ -97,7 +101,7 @@ target_compile_features(sender_test_rebalance_calibration PRIVATE cxx_std_20)
 target_compile_features(sender_test_versioned_register PRIVATE cxx_std_20)
 
 # Compiler flags (centralized via chronon_compile_options)
-foreach(target sender_test_message_queue sender_test_dependency_graph sender_test_termination sender_test_port_flush_cancel sender_test_cpu_pipeline_flush_validation sender_test_thread_queue_hardening sender_test_config_loader_tuning sender_test_crash_handler sender_test_weighted_partitioner sender_test_priority_arbiter sender_test_outport_per_cycle_capacity sender_test_mpsc_kway_merge sender_test_mpsc_deterministic_arbitration_atomic_publish sender_test_stage_selective_port sender_test_sa_partitioner sender_test_sa_integration sender_test_sa_critical_path sender_test_mpsc_weighted_no_message_loss sender_test_rebalance_calibration sender_test_versioned_register)
+foreach(target sender_test_message_queue sender_test_lockfree_message_queue sender_test_dependency_graph sender_test_termination sender_test_port_flush_cancel sender_test_cpu_pipeline_flush_validation sender_test_thread_queue_hardening sender_test_config_loader_tuning sender_test_crash_handler sender_test_weighted_partitioner sender_test_priority_arbiter sender_test_outport_per_cycle_capacity sender_test_mpsc_kway_merge sender_test_mpsc_deterministic_arbitration_atomic_publish sender_test_stage_selective_port sender_test_sa_partitioner sender_test_sa_integration sender_test_sa_critical_path sender_test_mpsc_weighted_no_message_loss sender_test_rebalance_calibration sender_test_versioned_register)
     target_link_libraries(${target} PRIVATE chronon_compile_options)
 endforeach()
 
@@ -108,6 +112,7 @@ target_link_libraries(sender_test_termination PRIVATE Threads::Threads)
 
 # Register tests with CTest
 add_test(NAME sender_message_queue COMMAND sender_test_message_queue)
+add_test(NAME sender_lockfree_message_queue COMMAND sender_test_lockfree_message_queue)
 add_test(NAME sender_dependency_graph COMMAND sender_test_dependency_graph)
 add_test(NAME sender_termination COMMAND sender_test_termination)
 add_test(NAME sender_port_flush_cancel COMMAND sender_test_port_flush_cancel)
@@ -133,5 +138,13 @@ add_test(NAME sender_versioned_register COMMAND sender_test_versioned_register)
 set_tests_properties(sender_message_queue sender_dependency_graph sender_termination sender_port_flush_cancel sender_cpu_pipeline_flush_validation sender_thread_queue_hardening sender_config_loader_tuning sender_crash_handler sender_weighted_partitioner sender_priority_arbiter sender_outport_per_cycle_capacity sender_mpsc_kway_merge sender_mpsc_deterministic_arbitration_atomic_publish sender_stage_selective_port sender_sa_partitioner sender_sa_integration sender_sa_critical_path sender_mpsc_weighted_no_message_loss sender_rebalance_calibration sender_versioned_register
     PROPERTIES
     TIMEOUT 60
+    LABELS "sender"
+)
+
+# The lock-free queue stress test runs a multi-million-item SPSC race loop,
+# which is slower under TSan/ASan; give it a larger timeout.
+set_tests_properties(sender_lockfree_message_queue
+    PROPERTIES
+    TIMEOUT 120
     LABELS "sender"
 )
