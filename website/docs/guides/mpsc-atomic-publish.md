@@ -36,7 +36,25 @@ Without a global sync point, arbitration rides on the consumer's own execution.
 Arbitration shifts from "main thread at global sync" to "consumer thread at the
 start of every tick that owns the InPort". The lookahead scheduler already
 gates the consumer's tick on predecessor progress atomics, so the arbiter can
-safely drain everything up to the slowest predecessor's published cycle.
+safely drain each connection up to its own producer's published cycle.
+
+:::note Per-connection drain bound (heterogeneous-delay correctness)
+The arbiter drains **each connection up to its OWN producer cluster's
+`completed_cycle`**, not a single `S = min` over all producers. Each MPSC
+connection has its own per-connection ring (keyed on `conn_id`, so it carries a
+single fixed delay and stays monotonic in `arrive_cycle`), and the consumer pops
+by `(arrive_cycle, conn_id)`. A single `min`-over-producers bound is only correct
+when every edge into the InPort shares one delay: with mixed delays it drags the
+bound down to the slowest (highest-delay) producer, so a **low-delay** producer's
+entry needed at the consumer's current cycle is left un-arbitrated and arrives a
+cycle late — diverging from barrier/sequential and breaking num_workers
+invariance. Draining per connection (bound = that producer's `completed_cycle`)
+admits exactly the entries whose producer cycle is finished; the lookahead gate
+(`completed >= K+1-delay` for each edge) guarantees every `arrive_cycle <= K`
+entry is admitted before the consumer reads cycle `K`. See
+`InPort::arbitrateMPSCConsumerDriven` and the
+`test_mpsc_mixed_delay_determinism` regression test.
+:::
 
 ### Sequencing
 
@@ -70,14 +88,10 @@ Pseudocode equivalent:
 
 ```
 At start of U's tick for cycle K (before user tick() runs):
-  S := min over p in producer_clusters(P) of
-          thread_progress_array_[p].completed_cycle.load(acquire)
-
-  if S > last_arbitrated_cycle_:
-      for c in (last_arbitrated_cycle_ + 1 .. S):
-          for conn in P.mpsc_connections_ sorted by conn_id:
-              drain staging entries with enqueue_cycle == c
-      last_arbitrated_cycle_ = S
+  for conn in P.mpsc_connections_ sorted by conn_id:
+      p := producer_completed_cycle(conn)      // conn's OWN producer cluster
+      d := conn.delay
+      drain conn's staging entries with enqueue_cycle <= min(p - 1, K - d)
 
   user tick() runs → tryReceive pops via k-way merge on (arrive_cycle, conn_id)
 ```
@@ -86,10 +100,24 @@ Hook: `TickableUnit::executeTick` calls `arbitrateOwnedMPSCPorts_()` before the
 user's `tick()`. The helper walks the owner's ports and calls
 `arbitrateMPSCConsumerDriven` on each.
 
-The `min` over producer clusters is the critical invariant. Even if one producer
-is 20 cycles ahead and another is 3 cycles behind, the arbiter only consumes
-up to the slower producer's progress, so both producers' cycle-`c` entries are
-arbitrated in a topologically deterministic `(send_cycle, conn_id)` order.
+Each connection is drained up to a **per-connection** bound, `min(p - 1, K - d)`:
+
+- `p - 1` (its own producer's `completed_cycle`): a single `min` over producers
+  would be too conservative under heterogeneous edge delays — it caps every
+  connection at the slowest producer, so a low-delay producer's entry due at the
+  consumer's current cycle is left un-arbitrated and arrives late.
+- `K - d` (consumer's current cycle minus this edge's delay): admit only entries
+  whose `arrive_cycle = enqueue_cycle + d` is `<= K`, i.e. visible to the
+  receiver *this* cycle. A producer running ahead under lookahead must not have
+  its future-cycle entries admitted early — under `LegacyFastPath` selective
+  cancellation an early-admitted entry can be stamped and then wrongly canceled
+  by a later `cancelYoungerThan` flush, which sequential/barrier (never admitting
+  early) would not do.
+
+Because each connection has its own `conn_id`-keyed ring (one fixed delay ⇒
+monotonic `arrive_cycle`), per-connection draining is safe, and the lookahead
+gate (`producer.completed >= K+1-delay` for each edge) guarantees all
+`arrive_cycle <= K` entries are admitted before the consumer reads cycle `K`.
 
 Under Sequential or Barrier execution the per-InPort producer-progress pointer
 set is empty, so `arbitrateMPSCConsumerDriven` degrades to the legacy unbounded

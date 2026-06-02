@@ -23,6 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -252,6 +253,19 @@ public:
      * if empty or if the port has no MPSC connections.
      */
     virtual void setArbitrationProgressPointers(std::vector<const std::atomic<uint64_t>*> ptrs) = 0;
+
+    /**
+     * Install PER-CONNECTION producer completed_cycle atomics for
+     * consumer-tick-driven arbitration. `src_progress` maps each producer
+     * Unit* to its cluster's completed_cycle atomic. The InPort resolves one
+     * atomic per MPSC connection (by connection source), enabling each
+     * connection to be drained up to its OWN producer's progress rather than
+     * the min across producers — required for correctness under heterogeneous
+     * edge delays (a low-delay producer's message must not be held back by a
+     * lagging high-delay producer on the same InPort). Default: no-op.
+     */
+    virtual void setArbitrationConnProgress(
+        const std::unordered_map<Unit*, const std::atomic<uint64_t>*>& /*src_progress*/) {}
 };
 
 /**
