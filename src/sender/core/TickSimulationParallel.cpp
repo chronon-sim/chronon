@@ -57,6 +57,18 @@ void TickSimulation::installMPSCProducerProgress_() {
         }
     }
 
+    // Per-connection producer progress: each producer Unit -> its cluster's
+    // completed_cycle atomic. The InPort uses this to drain each MPSC
+    // connection up to its OWN producer's progress (heterogeneous-delay
+    // correctness), rather than the min across producers.
+    std::unordered_map<Unit*, const std::atomic<uint64_t>*> src_to_progress;
+    src_to_progress.reserve(unit_to_cluster.size());
+    for (const auto& [unit, cluster] : unit_to_cluster) {
+        if (cluster < thread_progress_count_) {
+            src_to_progress[unit] = &thread_progress_array_[cluster].completed_cycle;
+        }
+    }
+
     for (IArbitratablePort* arb : mpsc_inports_) {
         void* key = arb->arbitratablePortKey();
         auto it = port_to_src_clusters.find(key);
@@ -69,6 +81,7 @@ void TickSimulation::installMPSCProducerProgress_() {
             }
         }
         arb->setArbitrationProgressPointers(std::move(ptrs));
+        arb->setArbitrationConnProgress(src_to_progress);
     }
 }
 
