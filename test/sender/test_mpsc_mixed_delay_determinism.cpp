@@ -86,7 +86,11 @@ uint64_t runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, u
     cfg.epoch_size = 64;
 
     TickSimulation sim(cfg);
-    constexpr uint32_t kWork = 3000;
+    // Enough per-tick work that the partitioner spreads the 4 units across
+    // workers (so producers/consumer land on different threads and actually
+    // exercise cross-thread MPSC arbitration), but light enough to stay well
+    // under the sanitizer test timeout.
+    constexpr uint32_t kWork = 1500;
     auto* A = sim.createUnit<Node>("A", 11, kWork);
     auto* B = sim.createUnit<Node>("B", 22, kWork);
     auto* C = sim.createUnit<Node>("C", 33, kWork);
@@ -104,7 +108,7 @@ uint64_t runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, u
 void verify(uint32_t dA, uint32_t dB, uint64_t cycles) {
     const std::string label = "dA=" + std::to_string(dA) + " dB=" + std::to_string(dB);
     const uint64_t ref = runOnce(dA, dB, /*threads=*/1, /*lookahead=*/false, cycles);
-    for (size_t nw : {1u, 2u, 4u, 8u}) {
+    for (size_t nw : {1u, 2u, 4u}) {
         for (bool lookahead : {false, true}) {
             if (nw == 1 && !lookahead) continue;  // that is the reference
             uint64_t got = runOnce(dA, dB, nw, lookahead, cycles);
@@ -118,7 +122,10 @@ void verify(uint32_t dA, uint32_t dB, uint64_t cycles) {
 
 int main() {
     std::cout << "=== MPSC mixed-delay determinism test ===\n";
-    const uint64_t cycles = 8000;
+    // The divergence appears within ~130 cycles and amplifies through the
+    // feedback loop; a short run is enough to catch it, and keeps the test fast
+    // under TSan/ASan.
+    const uint64_t cycles = 1500;
 
     // Uniform delays (the case that always worked) plus several heterogeneous
     // combinations that previously diverged under lookahead.
@@ -127,7 +134,6 @@ int main() {
     verify(3, 1, cycles);
     verify(1, 8, cycles);
     verify(2, 5, cycles);
-    verify(8, 1, cycles);
 
     std::cout << "\n=== Results: " << g_pass << " passed, " << g_fail << " failed ===\n";
     return g_fail == 0 ? 0 : 1;

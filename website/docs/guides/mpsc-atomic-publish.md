@@ -90,7 +90,8 @@ Pseudocode equivalent:
 At start of U's tick for cycle K (before user tick() runs):
   for conn in P.mpsc_connections_ sorted by conn_id:
       p := producer_completed_cycle(conn)      // conn's OWN producer cluster
-      drain conn's staging entries with enqueue_cycle <= p - 1
+      d := conn.delay
+      drain conn's staging entries with enqueue_cycle <= min(p - 1, K - d)
 
   user tick() runs → tryReceive pops via k-way merge on (arrive_cycle, conn_id)
 ```
@@ -99,13 +100,23 @@ Hook: `TickableUnit::executeTick` calls `arbitrateOwnedMPSCPorts_()` before the
 user's `tick()`. The helper walks the owner's ports and calls
 `arbitrateMPSCConsumerDriven` on each.
 
-Each connection is drained up to its **own** producer's `completed_cycle`. A
-single `min` over producers would be too conservative under heterogeneous edge
-delays: it caps every connection at the slowest producer, so a low-delay
-producer's entry due at the consumer's current cycle is left un-arbitrated and
-arrives late. Because each connection has its own `conn_id`-keyed ring (one fixed
-delay ⇒ monotonic `arrive_cycle`), per-connection draining is safe, and the
-lookahead gate (`producer.completed >= K+1-delay` for each edge) guarantees all
+Each connection is drained up to a **per-connection** bound, `min(p - 1, K - d)`:
+
+- `p - 1` (its own producer's `completed_cycle`): a single `min` over producers
+  would be too conservative under heterogeneous edge delays — it caps every
+  connection at the slowest producer, so a low-delay producer's entry due at the
+  consumer's current cycle is left un-arbitrated and arrives late.
+- `K - d` (consumer's current cycle minus this edge's delay): admit only entries
+  whose `arrive_cycle = enqueue_cycle + d` is `<= K`, i.e. visible to the
+  receiver *this* cycle. A producer running ahead under lookahead must not have
+  its future-cycle entries admitted early — under `LegacyFastPath` selective
+  cancellation an early-admitted entry can be stamped and then wrongly canceled
+  by a later `cancelYoungerThan` flush, which sequential/barrier (never admitting
+  early) would not do.
+
+Because each connection has its own `conn_id`-keyed ring (one fixed delay ⇒
+monotonic `arrive_cycle`), per-connection draining is safe, and the lookahead
+gate (`producer.completed >= K+1-delay` for each edge) guarantees all
 `arrive_cycle <= K` entries are admitted before the consumer reads cycle `K`.
 
 Under Sequential or Barrier execution the per-InPort producer-progress pointer

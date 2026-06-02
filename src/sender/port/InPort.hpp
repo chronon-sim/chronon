@@ -361,27 +361,40 @@ public:
         if (mpsc_connections_.empty()) return;
 
         // Preferred path: per-connection progress. Drain EACH connection up to
-        // its OWN producer's completed cycle. This is required for correctness
+        // a PER-CONNECTION send-cycle bound. This is required for correctness
         // under heterogeneous edge delays: with a single min-over-producers
         // bound (the legacy path below), a low-delay connection's entry needed
         // at the consumer's current cycle can be held back because a lagging
         // high-delay producer on the same InPort drags the min down — the
         // message then arrives a cycle late, diverging from barrier/sequential.
-        // Each connection's staging is monotonic in send_cycle, so draining it
-        // up to (producer_completed - 1) admits exactly the entries whose
-        // producer cycle is finished; the shared k-way merge still pops in
-        // (arrive_cycle, conn_id) order. The lookahead gate guarantees that
-        // when the consumer runs cycle K, every producer p feeding it via an
-        // edge of delay d has completed >= K+1-d, so all entries with
-        // arrive_cycle <= K are admitted before the consumer reads them.
+        //
+        // The bound is min(producer_completed - 1, K - delay):
+        //   - producer_completed - 1: only admit entries the producer has finished.
+        //   - K - delay (K = this consumer's current cycle): only admit entries
+        //     whose arrive_cycle (= send_cycle + delay) is <= K, i.e. visible to
+        //     the receiver THIS cycle. A producer running ahead under lookahead
+        //     must not have its future-cycle entries admitted early — with
+        //     LegacyFastPath selective cancellation, an entry admitted before the
+        //     receiver reaches its cycle can be stamped and then wrongly canceled
+        //     by a later cancelYoungerThan flush, which sequential/barrier (that
+        //     never admit early) would not do.
+        // Each connection's staging is monotonic in send_cycle and has its own
+        // conn_id-keyed ring (one fixed delay), so the shared k-way merge still
+        // pops in (arrive_cycle, conn_id) order. The lookahead gate guarantees
+        // producer_completed >= K+1-delay, so all arrive_cycle <= K entries are
+        // admitted before the consumer reads them.
         if (!mpsc_conn_progress_.empty()) {
             constexpr size_t kUnlimitedBudget = std::numeric_limits<size_t>::max();
+            const uint64_t k = getCurrentCycle();
             for (size_t i = 0; i < mpsc_connections_.size(); ++i) {
                 const std::atomic<uint64_t>* p = mpsc_conn_progress_[i];
                 if (!p) continue;  // unresolved producer (covered by epoch-end flush)
                 const uint64_t pc = p->load(std::memory_order_acquire);
                 if (pc == 0) continue;  // producer hasn't finished cycle 0 yet
-                (void)mpsc_connections_[i]->arbitrateAdmitBoundedErased(kUnlimitedBudget, pc - 1);
+                const uint64_t delay = mpsc_connections_[i]->delay();
+                if (k < delay) continue;  // nothing has arrived for this edge yet
+                const uint64_t bound = std::min<uint64_t>(pc - 1, k - delay);
+                (void)mpsc_connections_[i]->arbitrateAdmitBoundedErased(kUnlimitedBudget, bound);
             }
             return;
         }
