@@ -72,9 +72,16 @@ public:
         const size_t stream_count = thread_units.empty() ? 1 : thread_units.size();
         streams_.clear();
         streams_.resize(stream_count + 1);  // Last stream is the scheduler lane.
+        stream_arenas_.clear();
+        stream_arenas_.resize(stream_count + 1);
         const size_t reserve_per = config_.max_events / streams_.size();
         for (auto& s : streams_) {
             s.reserve(reserve_per);
+        }
+        // Pre-size each string arena to its share of events (~16 B/event heuristic)
+        // so the common case appends without reallocating.
+        for (auto& a : stream_arenas_) {
+            a.reserve(reserve_per * 16);
         }
         stream_names_.clear();
         stream_names_.reserve(stream_count + 1);
@@ -96,8 +103,9 @@ public:
      * map 1:1 to stdexec bulk indices; the scheduler stream is only written from the main
      * thread after sync_wait returns.
      */
-    void recordDuration(size_t stream, const char* category, std::string_view name, uint64_t cycle,
-                        TimePoint begin, TimePoint end, std::string detail = {}) {
+    void recordDuration(size_t stream, std::string_view category, std::string_view name,
+                        uint64_t cycle, TimePoint begin, TimePoint end,
+                        std::string_view detail = {}) {
         if (!started_ || stream >= streams_.size()) return;
         if (cycle < config_.start_cycle || cycle >= config_.end_cycle) return;
         if (end < begin) return;
@@ -112,13 +120,22 @@ public:
             return;
         }
 
-        // Lightweight record: store non-owning references for category/name (both
-        // point at stable storage — string literals or the unit's name_, which all
-        // outlive write()) instead of constructing two std::strings per event. This
-        // keeps the per-unit recording cost off the scheduler's hot path; the only
-        // owned allocation is `detail`, which is set only on rare scheduler/wait events.
-        streams_[stream].push_back(
-            {category, name, cycle, relNs(begin), duration_ns, std::move(detail)});
+        // Copy the strings into this stream's byte arena and store [offset,len)
+        // slices. No per-event std::string is constructed (the arena's capacity is
+        // reused across events), and because the bytes are copied here the trace
+        // owns them — caller-supplied temporaries are safe. Per the contract above,
+        // a given stream's arena is written by exactly one thread at a time.
+        std::string& arena = stream_arenas_[stream];
+        const auto intern = [&arena](std::string_view s) -> std::pair<uint32_t, uint32_t> {
+            const uint32_t off = static_cast<uint32_t>(arena.size());
+            arena.append(s.data(), s.size());
+            return {off, static_cast<uint32_t>(s.size())};
+        };
+        const auto [cat_off, cat_len] = intern(category);
+        const auto [name_off, name_len] = intern(name);
+        const auto [detail_off, detail_len] = intern(detail);
+        streams_[stream].push_back({cat_off, cat_len, name_off, name_len, detail_off, detail_len,
+                                    cycle, relNs(begin), duration_ns});
     }
 
     size_t schedulerStream() const noexcept { return scheduler_stream_; }
@@ -151,19 +168,25 @@ public:
         }
 
         for (size_t sid = 0; sid < streams_.size(); ++sid) {
+            const std::string& arena = stream_arenas_[sid];
+            const auto slice = [&arena](uint32_t off, uint32_t len) {
+                return std::string_view(arena.data() + off, len);
+            };
             for (const auto& event : streams_[sid]) {
+                const std::string_view cat = slice(event.cat_off, event.cat_len);
+                const std::string_view name = slice(event.name_off, event.name_len);
+                const std::string_view detail = slice(event.detail_off, event.detail_len);
                 if (!first) out << ",\n";
                 first = false;
-                out << "{\"name\":\"" << escape(event.name) << "\",\"cat\":\""
-                    << escape(event.category) << "\",\"cname\":\""
-                    << colorFor(event.category, event.name)
+                out << "{\"name\":\"" << escape(name) << "\",\"cat\":\"" << escape(cat)
+                    << "\",\"cname\":\"" << colorFor(cat, name)
                     << "\",\"ph\":\"X\",\"pid\":1,\"tid\":" << traceTid(sid) << ",\"ts\":";
                 writeMicros(out, event.ts_ns);
                 out << ",\"dur\":";
                 writeMicros(out, event.dur_ns);
                 out << ",\"args\":{\"cycle\":" << event.cycle << ",\"stream\":" << sid;
-                if (!event.detail.empty()) {
-                    out << ",\"detail\":\"" << escape(event.detail) << "\"";
+                if (!detail.empty()) {
+                    out << ",\"detail\":\"" << escape(detail) << "\"";
                 }
                 out << "}}";
             }
@@ -182,13 +205,19 @@ public:
     }
 
 private:
+    // POD event: category/name/detail are stored as [offset,len) slices into the
+    // owning per-stream `stream_arenas_` byte arena (copied at record time), so the
+    // record path constructs no std::string and the event is trivially copyable,
+    // yet the trace owns every string and is safe for any caller-supplied input
+    // (temporaries included). Offsets are indices, so arena growth never
+    // invalidates them.
     struct Event {
-        const char* category = "";  // stable string literal (never owned)
-        std::string_view name;      // points at stable storage (literal or unit name_)
+        uint32_t cat_off = 0, cat_len = 0;
+        uint32_t name_off = 0, name_len = 0;
+        uint32_t detail_off = 0, detail_len = 0;
         uint64_t cycle = 0;
         uint64_t ts_ns = 0;
         uint64_t dur_ns = 0;
-        std::string detail;  // owned; set only on rare scheduler/wait events
     };
 
     uint64_t relNs(TimePoint tp) const {
@@ -296,6 +325,8 @@ private:
     TimePoint base_time_{};
     size_t scheduler_stream_ = 0;
     std::vector<std::vector<Event>> streams_;
+    std::vector<std::string>
+        stream_arenas_;  ///< Per-stream byte arena backing Event string slices.
     std::vector<std::string> stream_names_;
     std::atomic<uint64_t> event_count_{0};
     std::atomic<uint64_t> dropped_events_{0};
