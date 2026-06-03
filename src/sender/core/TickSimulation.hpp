@@ -422,6 +422,19 @@ private:
      */
     void executeEpochProgressBased(uint64_t epoch_cycles);
 
+    /**
+     * Persistent-worker variant of executeEpochProgressBased: launches the
+     * parallel region ONCE for the whole run and crosses epoch boundaries with a
+     * reusable std::barrier, so there is no per-epoch bulk operation-state
+     * allocation (the stdexec static_thread_pool otherwise heap-allocates one
+     * operation per sync_wait). The barrier's noexcept completion runs the exact
+     * same serial epoch-tail work (MPSC flush + progress publish) as the
+     * per-epoch path. Used by runParallel() when lookahead is active, dynamic
+     * rebalance is off, and tracing is disabled; otherwise the per-epoch path is
+     * retained. Returns cycles actually executed.
+     */
+    uint64_t executeRunProgressBased(uint64_t total_cycles);
+
     /// Per-thread epoch body. Spin-waits on cross-thread progress atomics
     /// and exits via stop_token on termination or exception.
     void executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,

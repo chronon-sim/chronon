@@ -128,7 +128,7 @@ public:
     void tick() override {
         // (1) Consume all ready inputs. MPSC staging was drained in conn_id
         //     order by executeTick() before tick(); XOR is order-independent.
-        for (uint64_t v : in.receiveAll(localCycle())) {
+        for (uint64_t v : in.receiveAllBuffered(localCycle())) {
             acc_ ^= v;
         }
 

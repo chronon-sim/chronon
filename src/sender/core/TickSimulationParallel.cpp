@@ -11,8 +11,10 @@
 /// cross-thread dependency spin-waits, MPSC arbitration helpers,
 /// and progress-sync initialization.
 
+#include <barrier>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <new>
 #include <string>
 #include <unordered_map>
@@ -263,6 +265,88 @@ void TickSimulation::executeEpochProgressBased(uint64_t epoch_cycles) {
                                        "progress epoch", start_cycle, epoch_begin, epoch_end,
                                        "cycles=" + std::to_string(epoch_cycles));
     }
+}
+
+uint64_t TickSimulation::executeRunProgressBased(uint64_t total_cycles) {
+    const size_t nthreads = thread_units_.size();
+    if (nthreads == 0 || total_cycles == 0) return 0;
+
+    auto token = stop_source_->get_token();
+    auto sched = pool_.get_scheduler();
+
+    const uint64_t run_start =
+        thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
+    const uint64_t run_target = run_start + total_cycles;
+
+    // Epoch state shared with the barrier completion. `epoch_end` and `run_done`
+    // are written only inside the completion (one thread, all workers parked) or
+    // before launch, and read by workers only after a barrier release — the
+    // barrier (and the initial task dispatch) supply the happens-before, so no
+    // atomics are needed.
+    uint64_t epoch_end = run_start + std::min<uint64_t>(config_.epoch_size, total_cycles);
+    bool run_done = false;
+    std::exception_ptr captured;
+    std::atomic_flag captured_set = ATOMIC_FLAG_INIT;
+
+    lookahead_floor_.store(run_start, std::memory_order_relaxed);
+
+    // Runs once per epoch when every worker has arrived (all clusters driven to
+    // `epoch_end`). Does the serial epoch tail — MPSC staging flush (its
+    // happens-before comes from the lock-free queue atomics, not the barrier) —
+    // plus epoch bookkeeping on completion-local state. Must be nothrow
+    // (std::barrier completion contract). It deliberately does NOT read any
+    // unit's plain localCycle: that is published per-worker below, so the
+    // completion never touches peer-thread-written non-atomic state.
+    auto on_epoch_complete = [&]() noexcept {
+        arbitrateAllMPSCPorts_();
+        if (epoch_end >= run_target || token.stop_requested()) {
+            run_done = true;
+            return;
+        }
+        const uint64_t next_cycles = std::min<uint64_t>(config_.epoch_size, run_target - epoch_end);
+        lookahead_floor_.store(epoch_end, std::memory_order_relaxed);
+        epoch_end += next_cycles;
+    };
+
+    std::barrier sync_point(static_cast<std::ptrdiff_t>(nthreads), on_epoch_complete);
+
+    auto work =
+        stdexec::bulk(stdexec::just(), stdexec::par, nthreads, [&, token](std::size_t thread_idx) {
+            const std::vector<size_t>& my_units = thread_units_[thread_idx];
+            for (;;) {
+                const uint64_t end = epoch_end;  // published by init / prior barrier
+                try {
+                    executeThreadEpoch_(thread_idx, end, token);
+                } catch (...) {
+                    // Capture the first exception, request stop so peers leave
+                    // their dependency spin-waits, then still arrive at the
+                    // barrier so no worker deadlocks waiting on this one.
+                    if (!captured_set.test_and_set(std::memory_order_relaxed)) {
+                        captured = std::current_exception();
+                    }
+                    stop_source_->request_stop();
+                }
+                // Publish this thread's OWN units' progress (release) before the
+                // barrier. Each unit's localCycle is read only by the thread that
+                // wrote it, so there is no cross-thread plain-memory access; the
+                // release store is the synchronization point for any later
+                // acquire-load reader.
+                for (size_t unit_idx : my_units) {
+                    unit_progress_[unit_idx].store(unit_ptrs_[unit_idx]->localCycle(),
+                                                   std::memory_order_release);
+                }
+                sync_point.arrive_and_wait();  // -> on_epoch_complete (once)
+                if (run_done) break;
+            }
+        });
+
+    stdexec::sync_wait(stdexec::starts_on(sched, std::move(work)));
+
+    if (captured) std::rethrow_exception(captured);
+
+    const uint64_t reached =
+        thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
+    return reached - run_start;
 }
 
 // ---------------------------------------------------------------------------

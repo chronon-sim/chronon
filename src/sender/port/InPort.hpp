@@ -74,6 +74,7 @@ public:
           capacity_(capacity),
           policy_(policy),
           queue_(std::make_unique<MessageQueueAdapter<StoredMessage>>(capacity)) {
+        reserveScratch_();
         installAutoRegistration_();
     }
 
@@ -83,6 +84,7 @@ public:
           capacity_(UNLIMITED_CAPACITY),
           policy_(policy),
           queue_(std::make_unique<MessageQueueAdapter<StoredMessage>>(UNLIMITED_CAPACITY)) {
+        reserveScratch_();
         installAutoRegistration_();
     }
 
@@ -90,6 +92,17 @@ public:
     PortPolicy policy() const noexcept { return policy_; }
 
 private:
+    /// Pre-size the receiveAllBuffered() scratch buffers to the port's known
+    /// capacity so even the first drain doesn't allocate. Bounded capacities
+    /// only — an unlimited port lets the buffers grow once to their high-water
+    /// mark and then stay (still O(1) allocations over the whole run).
+    void reserveScratch_() {
+        if (capacity_ != UNLIMITED_CAPACITY && capacity_ > 0 && capacity_ <= (1u << 16)) {
+            drain_scratch_.reserve(capacity_);
+            recv_scratch_.reserve(capacity_);
+        }
+    }
+
     void installAutoRegistration_() {
         if (owner_) {
             addPortRegistrationToUnit(owner_, [this](const std::string& prefix) {
@@ -493,6 +506,28 @@ public:
     /// Receive all messages ready at the owning Unit's current local cycle.
     std::vector<T> receiveAll() { return receiveAll(getCurrentCycle()); }
 
+    /**
+     * Allocation-free variant of receiveAll(): drains and filters into internal
+     * buffers that are reused across cycles, and returns a reference to the
+     * filtered payloads. Identical ordering and cancellation semantics to
+     * receiveAll(); the only difference is no per-cycle heap allocation.
+     *
+     * The returned reference is valid until the next receive call on this port.
+     * Single-consumer (only the owning unit drains its own port), so the buffers
+     * need no synchronization.
+     */
+    const std::vector<T>& receiveAllBuffered(uint64_t current_cycle) {
+        queue_->popAllInto(drain_scratch_, current_cycle);
+        recv_scratch_.clear();
+        for (auto& msg : drain_scratch_) {
+            if (!detail::isCanceled(msg) && !isReceiverCanceled_(msg)) {
+                recv_scratch_.push_back(std::move(msg.data));
+            }
+        }
+        return recv_scratch_;
+    }
+    const std::vector<T>& receiveAllBuffered() { return receiveAllBuffered(getCurrentCycle()); }
+
     bool hasData(uint64_t current_cycle) const { return queue_->hasReady(current_cycle); }
 
     /// True if messages are ready at the owning Unit's current local cycle.
@@ -762,6 +797,11 @@ private:
     std::unique_ptr<IMessageQueue<StoredMessage>> queue_;
     MultiProducerQueueAdapter<StoredMessage>* multi_producer_queue_raw_ =
         nullptr;  ///< Non-owning ptr for MPSC access
+    // Scratch buffers reused by receiveAllBuffered() to avoid per-cycle heap
+    // allocation. Single-consumer (the owning unit drains its own port), so they
+    // need no synchronization. Sized once to capacity_ when the queue is built.
+    std::vector<StoredMessage> drain_scratch_;
+    std::vector<T> recv_scratch_;
     mutable std::mutex receiver_cancel_mutex_;
     std::atomic<uint64_t> receiver_min_keep_key_{0};
     std::atomic<uint64_t> receiver_max_keep_key_{std::numeric_limits<uint64_t>::max()};

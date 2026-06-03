@@ -112,8 +112,13 @@ public:
             return;
         }
 
+        // Lightweight record: store non-owning references for category/name (both
+        // point at stable storage — string literals or the unit's name_, which all
+        // outlive write()) instead of constructing two std::strings per event. This
+        // keeps the per-unit recording cost off the scheduler's hot path; the only
+        // owned allocation is `detail`, which is set only on rare scheduler/wait events.
         streams_[stream].push_back(
-            {category, std::string(name), cycle, relNs(begin), duration_ns, std::move(detail)});
+            {category, name, cycle, relNs(begin), duration_ns, std::move(detail)});
     }
 
     size_t schedulerStream() const noexcept { return scheduler_stream_; }
@@ -178,12 +183,12 @@ public:
 
 private:
     struct Event {
-        std::string category;
-        std::string name;
+        const char* category = "";  // stable string literal (never owned)
+        std::string_view name;      // points at stable storage (literal or unit name_)
         uint64_t cycle = 0;
         uint64_t ts_ns = 0;
         uint64_t dur_ns = 0;
-        std::string detail;
+        std::string detail;  // owned; set only on rare scheduler/wait events
     };
 
     uint64_t relNs(TimePoint tp) const {
@@ -223,7 +228,7 @@ private:
     /// Chrome/Perfetto viewer renders distinct, stable colors. Stalls are red so
     /// they stand out; scheduler bookkeeping is grey; each unit gets its own color
     /// hashed from its name (consistent across runs and across all its slices).
-    static const char* colorFor(const std::string& category, const std::string& name) {
+    static const char* colorFor(std::string_view category, std::string_view name) {
         if (category == "wait") return "terrible";   // red: cross-cluster stalls pop out
         if (category == "scheduler") return "grey";  // neutral: epoch / arbitration
         if (category == "summary") return "white";
