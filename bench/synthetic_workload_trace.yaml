@@ -1,0 +1,85 @@
+# Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
+# Author: Haomeng Wang <chang_yun@outlook.com>
+# SPDX-License-Identifier: MPL-2.0
+#
+# Timeline-trace preset for the synthetic workload. Same topology as
+# synthetic_workload.yaml, but with the scheduler timeline trace enabled and
+# heavier per-unit work baked in so per-tick slices are legible (microseconds,
+# not noise) in the Chrome/Perfetto viewer.
+#
+# Topology (delay=1 throughout):
+#   src -> a -> b -> c \
+#     \-> d -> e -------> sink
+#
+# Run (from build dir):
+#   cd build_bench
+#   ./bench/synthetic_workload_yaml_example synthetic_workload_trace.yaml
+# Each run writes chronon_timeline.json -> open at ui.perfetto.dev or chrome://tracing.
+# Override the output file per run:  -p simulation.timeline_trace.file=run1.json
+
+simulation:
+    name: synthetic_workload_trace
+    num_workers: 4
+    enable_parallel: true
+    enable_lookahead: true
+    max_lookahead_cycles: 100
+    epoch_size: 256
+    run_cycles: 800
+
+    observation:
+        enabled: false
+
+    # Scheduler timeline trace (Chrome Trace / Perfetto JSON).
+    timeline_trace:
+        enabled: true
+        file: chronon_timeline.json
+        trace_units: true          # per-unit tick() slices (colored per unit)
+        trace_waits: true          # cross-cluster stalls (red)
+        trace_epochs: true         # epoch boundaries (grey)
+        trace_arbitration: true    # epoch-end MPSC arbitration (grey)
+        # min_duration_ns: 200     # uncomment to drop sub-200ns noise slices
+
+    unit:
+        src:
+            type: SyntheticUnit
+            params: { seed: 1, arith_ops: 3000, accesses_per_tick: 32, footprint_bytes: 8192 }
+            port:
+                out:
+                    - to: a.in
+                      delay: 1
+                    - to: d.in
+                      delay: 1
+
+        a:
+            type: SyntheticUnit
+            params: { seed: 2, arith_ops: 6000, accesses_per_tick: 64, footprint_bytes: 16384 }
+            port:
+                out: { to: b.in, delay: 1 }
+
+        b:
+            type: SyntheticUnit
+            params: { seed: 3, arith_ops: 6000, accesses_per_tick: 64, footprint_bytes: 16384 }
+            port:
+                out: { to: c.in, delay: 1 }
+
+        c:
+            type: SyntheticUnit
+            params: { seed: 4, arith_ops: 2000, accesses_per_tick: 16, footprint_bytes: 4096 }
+            port:
+                out: { to: sink.in, delay: 1 }
+
+        d:
+            type: SyntheticUnit
+            params: { seed: 5, arith_ops: 9000, fp_ops: 16, accesses_per_tick: 48, footprint_bytes: 8192 }
+            port:
+                out: { to: e.in, delay: 1 }
+
+        e:
+            type: SyntheticUnit
+            params: { seed: 6, arith_ops: 9000, fp_ops: 16, accesses_per_tick: 48, footprint_bytes: 8192 }
+            port:
+                out: { to: sink.in, delay: 1 }
+
+        sink:
+            type: SyntheticUnit
+            params: { seed: 7, arith_ops: 1000, accesses_per_tick: 0, footprint_bytes: 4096 }

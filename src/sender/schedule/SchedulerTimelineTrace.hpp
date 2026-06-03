@@ -150,7 +150,8 @@ public:
                 if (!first) out << ",\n";
                 first = false;
                 out << "{\"name\":\"" << escape(event.name) << "\",\"cat\":\""
-                    << escape(event.category)
+                    << escape(event.category) << "\",\"cname\":\""
+                    << colorFor(event.category, event.name)
                     << "\",\"ph\":\"X\",\"pid\":1,\"tid\":" << traceTid(sid) << ",\"ts\":";
                 writeMicros(out, event.ts_ns);
                 out << ",\"dur\":";
@@ -216,6 +217,41 @@ private:
             }
         }
         return out;
+    }
+
+    /// Map an event to a catapult reserved color name (the "cname" field) so the
+    /// Chrome/Perfetto viewer renders distinct, stable colors. Stalls are red so
+    /// they stand out; scheduler bookkeeping is grey; each unit gets its own color
+    /// hashed from its name (consistent across runs and across all its slices).
+    static const char* colorFor(const std::string& category, const std::string& name) {
+        if (category == "wait") return "terrible";   // red: cross-cluster stalls pop out
+        if (category == "scheduler") return "grey";  // neutral: epoch / arbitration
+        if (category == "summary") return "white";
+        // Curated palette of visually-distinct reserved colors (reds/greys excluded
+        // so units never look like stalls or scheduler events).
+        static constexpr const char* kPalette[] = {
+            "thread_state_running",
+            "rail_response",
+            "rail_animation",
+            "rail_load",
+            "rail_idle",
+            "good",
+            "yellow",
+            "olive",
+            "startup",
+            "generic_work",
+            "vsync_highlighted",
+            "cq_build_running",
+            "cq_build_passed",
+            "thread_state_iowait",
+            "thread_state_runnable",
+        };
+        uint64_t h = 1469598103934665603ULL;  // FNV-1a over the name
+        for (unsigned char c : name) {
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+        return kPalette[h % (sizeof(kPalette) / sizeof(kPalette[0]))];
     }
 
     static void writeMicros(std::ostream& out, uint64_t ns) {

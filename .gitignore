@@ -34,3 +34,6 @@ CLAUDE.md
 .DS_Store
 Thumbs.db
 .serena
+
+# CTest run artifacts
+Testing/

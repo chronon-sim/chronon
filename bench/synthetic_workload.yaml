@@ -1,0 +1,75 @@
+# Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
+# Author: Haomeng Wang <chang_yun@outlook.com>
+# SPDX-License-Identifier: MPL-2.0
+#
+# Hand-authored synthetic-workload topology, demonstrating that SyntheticUnit
+# (from synthetic_workload.hpp) is YAML/factory-instantiable. Each unit has one
+# `in` and one `out` port; `out` fans out to every connected `in`.
+#
+# Topology (delay=1 throughout):
+#   src -> a -> b -> c \
+#     \-> d -> e -------> sink
+#
+# For large/parametric sweeps use the bench_synthetic_framework CLI instead;
+# YAML is for small, explicitly-wired topologies.
+
+simulation:
+    name: synthetic_workload
+    num_workers: 4
+    enable_parallel: true
+    enable_lookahead: true
+    max_lookahead_cycles: 100
+    epoch_size: 256
+    run_cycles: 200000
+
+    observation:
+        enabled: false
+
+    unit:
+        src:
+            type: SyntheticUnit
+            params:
+                seed: 1
+                arith_ops: 16
+                accesses_per_tick: 2
+                footprint_bytes: 8192
+            port:
+                out:
+                    - to: a.in
+                      delay: 1
+                    - to: d.in
+                      delay: 1
+
+        a:
+            type: SyntheticUnit
+            params: { seed: 2, arith_ops: 32, accesses_per_tick: 4, footprint_bytes: 16384 }
+            port:
+                out: { to: b.in, delay: 1 }
+
+        b:
+            type: SyntheticUnit
+            params: { seed: 3, arith_ops: 32, accesses_per_tick: 4, footprint_bytes: 16384 }
+            port:
+                out: { to: c.in, delay: 1 }
+
+        c:
+            type: SyntheticUnit
+            params: { seed: 4, arith_ops: 8, accesses_per_tick: 1, footprint_bytes: 4096 }
+            port:
+                out: { to: sink.in, delay: 1 }
+
+        d:
+            type: SyntheticUnit
+            params: { seed: 5, arith_ops: 64, fp_ops: 16, accesses_per_tick: 2, footprint_bytes: 8192 }
+            port:
+                out: { to: e.in, delay: 1 }
+
+        e:
+            type: SyntheticUnit
+            params: { seed: 6, arith_ops: 64, fp_ops: 16, accesses_per_tick: 2, footprint_bytes: 8192 }
+            port:
+                out: { to: sink.in, delay: 1 }
+
+        sink:
+            type: SyntheticUnit
+            params: { seed: 7, arith_ops: 8, accesses_per_tick: 0, footprint_bytes: 4096 }
