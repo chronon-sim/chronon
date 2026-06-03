@@ -78,7 +78,8 @@ public:
         for (auto& s : streams_) {
             s.reserve(reserve_per);
         }
-        // Pre-size arenas (~16 B/event) so the common case appends without realloc.
+        // Pre-size each string arena to its share of events (~16 B/event heuristic)
+        // so the common case appends without reallocating.
         for (auto& a : stream_arenas_) {
             a.reserve(reserve_per * 16);
         }
@@ -119,8 +120,11 @@ public:
             return;
         }
 
-        // Copy into the stream's arena (single-writer, per the contract above) and
-        // store slices; the reused capacity means no per-event allocation.
+        // Copy the strings into this stream's byte arena and store [offset,len)
+        // slices. No per-event std::string is constructed (the arena's capacity is
+        // reused across events), and because the bytes are copied here the trace
+        // owns them — caller-supplied temporaries are safe. Per the contract above,
+        // a given stream's arena is written by exactly one thread at a time.
         std::string& arena = stream_arenas_[stream];
         const auto intern = [&arena](std::string_view s) -> std::pair<uint32_t, uint32_t> {
             const uint32_t off = static_cast<uint32_t>(arena.size());
@@ -201,9 +205,12 @@ public:
     }
 
 private:
-    // Strings are [offset,len) slices into the per-stream byte arena, copied at
-    // record time: no per-event std::string, the trace owns every string (so
-    // caller temporaries are safe), and offsets survive arena growth.
+    // POD event: category/name/detail are stored as [offset,len) slices into the
+    // owning per-stream `stream_arenas_` byte arena (copied at record time), so the
+    // record path constructs no std::string and the event is trivially copyable,
+    // yet the trace owns every string and is safe for any caller-supplied input
+    // (temporaries included). Offsets are indices, so arena growth never
+    // invalidates them.
     struct Event {
         uint32_t cat_off = 0, cat_len = 0;
         uint32_t name_off = 0, name_len = 0;
