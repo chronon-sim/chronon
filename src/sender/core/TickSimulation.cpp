@@ -340,6 +340,17 @@ uint64_t TickSimulation::runParallelEpoch(uint64_t epoch_cycles, uint64_t /*exec
 }
 
 uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
+    // Persistent-worker fast path (see executeRunProgressBased): only safe with a
+    // fixed thread layout and no tracing; runUntilTermination keeps the per-epoch
+    // path for its dump/termination boundaries.
+    const bool use_lookahead = config_.enable_lookahead && !has_tight_inter_cluster_;
+    const bool can_persist = use_lookahead && thread_progress_count_ > 0 &&
+                             !config_.enable_dynamic_rebalance && !timeline_trace_.enabled() &&
+                             thread_units_.size() <= pool_.available_parallelism();
+    if (can_persist) {
+        return executeRunProgressBased(num_cycles);
+    }
+
     uint64_t executed = 0;
     while (executed < num_cycles) {
         uint64_t epoch_cycles = std::min(config_.epoch_size, num_cycles - executed);
