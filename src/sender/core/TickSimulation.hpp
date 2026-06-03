@@ -375,7 +375,7 @@ private:
 
     void assignThreadsDeterministic_();
     void assignThreadsFromPrecomputedCosts_();
-    void applyClusteredThreadAssignment_(size_t num_threads);
+    void applyClusteredThreadAssignment_(size_t num_threads, double partition_sync_cost_ns);
 
     /// Parallel is beneficial when the bottleneck thread cost (with 10%
     /// sync margin) is less than total sequential cost.

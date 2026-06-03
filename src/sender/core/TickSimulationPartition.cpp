@@ -80,20 +80,24 @@ void TickSimulation::assignThreadsDeterministic_() {
     // locality: the non-zero sync term drives the solver to minimize the
     // cross-thread edge cut, co-locating connected units (e.g. a core's pipeline)
     // on one thread so their intra-component edges resolve intra-thread for free.
-    // A zero cost (config opt-out) reverts to pure load balance. Dynamic rebalance
-    // later calibrates real platform metrics and unit costs from sampled batches.
+    // A zero cost (config opt-out) reverts to pure load balance.
+    //
+    // The locality weight is scoped to THIS initial partition: it is passed
+    // straight to the solver and deliberately NOT stored in platform_metrics_,
+    // so dynamic rebalance keeps deciding migrations on its own inputs (measured
+    // unit costs + platform_metrics_, which stays zero in the deterministic flow)
+    // rather than on this fixed heuristic.
     platform_metrics_ = PlatformMetrics{};
-    platform_metrics_.atomic_roundtrip_ns = config_.initial_partition_sync_cost_ns;
 
     unit_costs_.assign(unit_ptrs_.size(), 1.0);
 
     if (observe_ctx_) {
         observe::log_info<"Locality-aware partitioning: unit_cost=1.0, sync_cost={}ns ({} units)">(
-            observe_ctx_, static_cast<uint64_t>(platform_metrics_.atomic_roundtrip_ns),
+            observe_ctx_, static_cast<uint64_t>(config_.initial_partition_sync_cost_ns),
             unit_costs_.size());
     }
 
-    applyClusteredThreadAssignment_(num_threads);
+    applyClusteredThreadAssignment_(num_threads, config_.initial_partition_sync_cost_ns);
 }
 
 void TickSimulation::assignThreadsFromPrecomputedCosts_() {
@@ -114,14 +118,17 @@ void TickSimulation::assignThreadsFromPrecomputedCosts_() {
         }
     }
 
-    applyClusteredThreadAssignment_(num_threads);
+    // Precomputed flow carries a real measured platform sync cost; rebalance
+    // uses the same value (platform_metrics_) for consistency.
+    applyClusteredThreadAssignment_(num_threads, platform_metrics_.atomic_roundtrip_ns);
 }
 
 // ---------------------------------------------------------------------------
 // Clustered thread assignment
 // ---------------------------------------------------------------------------
 
-void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads) {
+void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
+                                                     double partition_sync_cost_ns) {
     if (dep_graph_.graph()) {
         clusters_ = findTightCouplingClusters(*dep_graph_.graph());
     } else {
@@ -169,7 +176,7 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads) {
     cluster_input.num_units = num_clusters;
     cluster_input.num_threads = num_threads;
     cluster_input.unit_cost_ns = cluster_costs;
-    cluster_input.sync_cost_ns = platform_metrics_.atomic_roundtrip_ns;
+    cluster_input.sync_cost_ns = partition_sync_cost_ns;
     cluster_input.critical_path_weight = config_.sa_critical_path_weight;
     cluster_input.adjacency.resize(num_clusters);
 
