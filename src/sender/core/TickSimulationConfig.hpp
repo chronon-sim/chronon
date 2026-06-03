@@ -57,11 +57,22 @@ struct TickSimulationConfig {
         0;  ///< Minimum cycles between rebalances (0 disables cooldown).
 
     enum class PartitionSolverType { Weighted, SA };
-    PartitionSolverType partition_solver = PartitionSolverType::Weighted;
+    PartitionSolverType partition_solver = PartitionSolverType::SA;
 
     /// SA objective critical-path term weight applied to max per-thread
     /// chain cost (ns). 0 disables the term (default).
     double sa_critical_path_weight = 0.0;
+
+    /// Fixed, wall-clock-free sync cost (ns) fed to the *initial* deterministic
+    /// partition so the solver minimizes cross-thread edge cut, co-locating
+    /// topologically-connected units (e.g. a CPU core's pipeline) on one thread.
+    /// Scaled to dominate the uniform unit cost (1.0) — empirically ~8x is the
+    /// sweet spot: large enough to pull connected components together, small
+    /// enough that the compute-balance signal still steers the SA solver (much
+    /// higher swamps it and convergence degrades). 0 restores the old
+    /// pure-load-balance behavior. Dynamic rebalance ignores this and uses the
+    /// measured platform sync cost instead.
+    double initial_partition_sync_cost_ns = 8.0;
 };
 
 /**

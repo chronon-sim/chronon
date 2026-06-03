@@ -75,17 +75,22 @@ void TickSimulation::assignThreadsDeterministic_() {
     size_t num_threads = normalizeThreadCount(config_.num_threads);
     config_.num_threads = num_threads;
 
-    // Zero sync cost + uniform unit costs makes the initial partition
-    // purely topology-driven and fully deterministic (no wall-clock
-    // measurement noise). Dynamic rebalance calibrates real platform
-    // metrics and unit costs from the first sample batch.
+    // Uniform unit costs + a fixed, wall-clock-free sync cost make the initial
+    // partition fully deterministic (no measurement noise) while still rewarding
+    // locality: the non-zero sync term drives the solver to minimize the
+    // cross-thread edge cut, co-locating connected units (e.g. a core's pipeline)
+    // on one thread so their intra-component edges resolve intra-thread for free.
+    // A zero cost (config opt-out) reverts to pure load balance. Dynamic rebalance
+    // later calibrates real platform metrics and unit costs from sampled batches.
     platform_metrics_ = PlatformMetrics{};
+    platform_metrics_.atomic_roundtrip_ns = config_.initial_partition_sync_cost_ns;
 
     unit_costs_.assign(unit_ptrs_.size(), 1.0);
 
     if (observe_ctx_) {
-        observe::log_info<"Uniform-cost partitioning: unit_cost=1.0, sync_cost=0 ({} units)">(
-            observe_ctx_, unit_costs_.size());
+        observe::log_info<"Locality-aware partitioning: unit_cost=1.0, sync_cost={}ns ({} units)">(
+            observe_ctx_, static_cast<uint64_t>(platform_metrics_.atomic_roundtrip_ns),
+            unit_costs_.size());
     }
 
     applyClusteredThreadAssignment_(num_threads);

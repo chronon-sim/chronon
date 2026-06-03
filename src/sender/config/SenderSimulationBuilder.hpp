@@ -123,6 +123,7 @@ private:
         sim_config.rebalance_cooldown_cycles = result.config.rebalance_cooldown_cycles;
         sim_config.partition_solver = parsePartitionSolverType_(result.config.partition_solver);
         sim_config.sa_critical_path_weight = result.config.sa_critical_path_weight;
+        sim_config.initial_partition_sync_cost_ns = result.config.initial_partition_sync_cost_ns;
         sim_config.tick_frequency_hz = result.config.tick_frequency_hz;
         sim_config.timeline_trace = result.config.timeline_trace;
 
