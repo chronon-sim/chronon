@@ -72,9 +72,15 @@ public:
         const size_t stream_count = thread_units.empty() ? 1 : thread_units.size();
         streams_.clear();
         streams_.resize(stream_count + 1);  // Last stream is the scheduler lane.
+        stream_arenas_.clear();
+        stream_arenas_.resize(stream_count + 1);
         const size_t reserve_per = config_.max_events / streams_.size();
         for (auto& s : streams_) {
             s.reserve(reserve_per);
+        }
+        // Pre-size arenas (~16 B/event) so the common case appends without realloc.
+        for (auto& a : stream_arenas_) {
+            a.reserve(reserve_per * 16);
         }
         stream_names_.clear();
         stream_names_.reserve(stream_count + 1);
@@ -96,8 +102,9 @@ public:
      * map 1:1 to stdexec bulk indices; the scheduler stream is only written from the main
      * thread after sync_wait returns.
      */
-    void recordDuration(size_t stream, const char* category, std::string_view name, uint64_t cycle,
-                        TimePoint begin, TimePoint end, std::string detail = {}) {
+    void recordDuration(size_t stream, std::string_view category, std::string_view name,
+                        uint64_t cycle, TimePoint begin, TimePoint end,
+                        std::string_view detail = {}) {
         if (!started_ || stream >= streams_.size()) return;
         if (cycle < config_.start_cycle || cycle >= config_.end_cycle) return;
         if (end < begin) return;
@@ -112,8 +119,19 @@ public:
             return;
         }
 
-        streams_[stream].push_back(
-            {category, std::string(name), cycle, relNs(begin), duration_ns, std::move(detail)});
+        // Copy into the stream's arena (single-writer, per the contract above) and
+        // store slices; the reused capacity means no per-event allocation.
+        std::string& arena = stream_arenas_[stream];
+        const auto intern = [&arena](std::string_view s) -> std::pair<uint32_t, uint32_t> {
+            const uint32_t off = static_cast<uint32_t>(arena.size());
+            arena.append(s.data(), s.size());
+            return {off, static_cast<uint32_t>(s.size())};
+        };
+        const auto [cat_off, cat_len] = intern(category);
+        const auto [name_off, name_len] = intern(name);
+        const auto [detail_off, detail_len] = intern(detail);
+        streams_[stream].push_back({cat_off, cat_len, name_off, name_len, detail_off, detail_len,
+                                    cycle, relNs(begin), duration_ns});
     }
 
     size_t schedulerStream() const noexcept { return scheduler_stream_; }
@@ -146,18 +164,25 @@ public:
         }
 
         for (size_t sid = 0; sid < streams_.size(); ++sid) {
+            const std::string& arena = stream_arenas_[sid];
+            const auto slice = [&arena](uint32_t off, uint32_t len) {
+                return std::string_view(arena.data() + off, len);
+            };
             for (const auto& event : streams_[sid]) {
+                const std::string_view cat = slice(event.cat_off, event.cat_len);
+                const std::string_view name = slice(event.name_off, event.name_len);
+                const std::string_view detail = slice(event.detail_off, event.detail_len);
                 if (!first) out << ",\n";
                 first = false;
-                out << "{\"name\":\"" << escape(event.name) << "\",\"cat\":\""
-                    << escape(event.category)
+                out << "{\"name\":\"" << escape(name) << "\",\"cat\":\"" << escape(cat)
+                    << "\",\"cname\":\"" << colorFor(cat, name)
                     << "\",\"ph\":\"X\",\"pid\":1,\"tid\":" << traceTid(sid) << ",\"ts\":";
                 writeMicros(out, event.ts_ns);
                 out << ",\"dur\":";
                 writeMicros(out, event.dur_ns);
                 out << ",\"args\":{\"cycle\":" << event.cycle << ",\"stream\":" << sid;
-                if (!event.detail.empty()) {
-                    out << ",\"detail\":\"" << escape(event.detail) << "\"";
+                if (!detail.empty()) {
+                    out << ",\"detail\":\"" << escape(detail) << "\"";
                 }
                 out << "}}";
             }
@@ -176,13 +201,16 @@ public:
     }
 
 private:
+    // Strings are [offset,len) slices into the per-stream byte arena, copied at
+    // record time: no per-event std::string, the trace owns every string (so
+    // caller temporaries are safe), and offsets survive arena growth.
     struct Event {
-        std::string category;
-        std::string name;
+        uint32_t cat_off = 0, cat_len = 0;
+        uint32_t name_off = 0, name_len = 0;
+        uint32_t detail_off = 0, detail_len = 0;
         uint64_t cycle = 0;
         uint64_t ts_ns = 0;
         uint64_t dur_ns = 0;
-        std::string detail;
     };
 
     uint64_t relNs(TimePoint tp) const {
@@ -216,6 +244,41 @@ private:
             }
         }
         return out;
+    }
+
+    /// Map an event to a catapult reserved color name (the "cname" field) so the
+    /// Chrome/Perfetto viewer renders distinct, stable colors. Stalls are red so
+    /// they stand out; scheduler bookkeeping is grey; each unit gets its own color
+    /// hashed from its name (consistent across runs and across all its slices).
+    static const char* colorFor(std::string_view category, std::string_view name) {
+        if (category == "wait") return "terrible";   // red: cross-cluster stalls pop out
+        if (category == "scheduler") return "grey";  // neutral: epoch / arbitration
+        if (category == "summary") return "white";
+        // Curated palette of visually-distinct reserved colors (reds/greys excluded
+        // so units never look like stalls or scheduler events).
+        static constexpr const char* kPalette[] = {
+            "thread_state_running",
+            "rail_response",
+            "rail_animation",
+            "rail_load",
+            "rail_idle",
+            "good",
+            "yellow",
+            "olive",
+            "startup",
+            "generic_work",
+            "vsync_highlighted",
+            "cq_build_running",
+            "cq_build_passed",
+            "thread_state_iowait",
+            "thread_state_runnable",
+        };
+        uint64_t h = 1469598103934665603ULL;  // FNV-1a over the name
+        for (unsigned char c : name) {
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+        return kPalette[h % (sizeof(kPalette) / sizeof(kPalette[0]))];
     }
 
     static void writeMicros(std::ostream& out, uint64_t ns) {
@@ -255,6 +318,8 @@ private:
     TimePoint base_time_{};
     size_t scheduler_stream_ = 0;
     std::vector<std::vector<Event>> streams_;
+    std::vector<std::string>
+        stream_arenas_;  ///< Per-stream byte arena backing Event string slices.
     std::vector<std::string> stream_names_;
     std::atomic<uint64_t> event_count_{0};
     std::atomic<uint64_t> dropped_events_{0};

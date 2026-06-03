@@ -110,16 +110,19 @@ public:
      * @return Vector of all ready messages in order
      */
     std::vector<T> popAll(uint64_t current_cycle) {
-        std::lock_guard<std::mutex> lock(mutex_);
         std::vector<T> result;
+        popAllInto(result, current_cycle);
+        return result;
+    }
 
+    void popAllInto(std::vector<T>& out, uint64_t current_cycle) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        out.clear();
         while (!messages_.empty() && messages_.top().arrive_cycle <= current_cycle) {
-            result.push_back(std::move(const_cast<InternalMessage&>(messages_.top()).data));
+            out.push_back(std::move(const_cast<InternalMessage&>(messages_.top()).data));
             messages_.pop();
         }
-
         size_.store(messages_.size(), std::memory_order_release);
-        return result;
     }
 
     /**
@@ -434,11 +437,16 @@ public:
 
     std::vector<T> popAll(uint64_t current_cycle) {
         std::vector<T> result;
+        popAllInto(result, current_cycle);
+        return result;
+    }
+
+    void popAllInto(std::vector<T>& out, uint64_t current_cycle) {
+        out.clear();
         while (!messages_.empty() && messages_.top().arrive_cycle <= current_cycle) {
-            result.push_back(std::move(const_cast<InternalMessage&>(messages_.top()).data));
+            out.push_back(std::move(const_cast<InternalMessage&>(messages_.top()).data));
             messages_.pop();
         }
-        return result;
     }
 
     bool hasReady(uint64_t current_cycle) const {
@@ -510,6 +518,8 @@ public:
     virtual bool push(T data, uint64_t arrive_cycle) = 0;
     virtual std::optional<T> tryPop(uint64_t current_cycle) = 0;
     virtual std::vector<T> popAll(uint64_t current_cycle) = 0;
+    /// Reusable-buffer drain: avoids the fresh-vector allocation popAll() makes per call.
+    virtual void popAllInto(std::vector<T>& out, uint64_t current_cycle) = 0;
     virtual bool hasReady(uint64_t current_cycle) const = 0;
     virtual std::optional<uint64_t> minArrivalCycle() const = 0;
     virtual bool empty() const = 0;
@@ -544,6 +554,10 @@ public:
     }
 
     std::vector<T> popAll(uint64_t current_cycle) override { return queue_.popAll(current_cycle); }
+
+    void popAllInto(std::vector<T>& out, uint64_t current_cycle) override {
+        queue_.popAllInto(out, current_cycle);
+    }
 
     bool hasReady(uint64_t current_cycle) const override { return queue_.hasReady(current_cycle); }
 
@@ -600,10 +614,15 @@ public:
 
     std::vector<T> popAll(uint64_t current_cycle) override {
         std::vector<T> result;
-        while (auto v = queue_.tryPop(current_cycle)) {
-            result.push_back(std::move(*v));
-        }
+        popAllInto(result, current_cycle);
         return result;
+    }
+
+    void popAllInto(std::vector<T>& out, uint64_t current_cycle) override {
+        out.clear();
+        while (auto v = queue_.tryPop(current_cycle)) {
+            out.push_back(std::move(*v));
+        }
     }
 
     bool hasReady(uint64_t current_cycle) const override {
@@ -776,10 +795,15 @@ public:
 
     std::vector<T> popAll(uint64_t current_cycle) override {
         std::vector<T> result;
-        while (auto v = tryPop(current_cycle)) {
-            result.push_back(std::move(*v));
-        }
+        popAllInto(result, current_cycle);
         return result;
+    }
+
+    void popAllInto(std::vector<T>& out, uint64_t current_cycle) override {
+        out.clear();
+        while (auto v = tryPop(current_cycle)) {
+            out.push_back(std::move(*v));
+        }
     }
 
     bool hasReady(uint64_t current_cycle) const override {

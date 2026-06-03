@@ -422,6 +422,15 @@ private:
      */
     void executeEpochProgressBased(uint64_t epoch_cycles);
 
+    /**
+     * Persistent-worker variant of executeEpochProgressBased: one bulk launch for
+     * the whole run, epoch boundaries crossed via a reusable std::barrier, so the
+     * stdexec thread pool no longer heap-allocates a bulk op-state per epoch. Used
+     * by runParallel() only when lookahead is on, rebalance is off, and tracing is
+     * disabled (the per-epoch path handles the rest). Returns cycles executed.
+     */
+    uint64_t executeRunProgressBased(uint64_t total_cycles);
+
     /// Per-thread epoch body. Spin-waits on cross-thread progress atomics
     /// and exits via stop_token on termination or exception.
     void executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
