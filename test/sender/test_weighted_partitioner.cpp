@@ -121,6 +121,32 @@ void test_evaluate_delay_scaling() {
     std::cout << "PASSED\n";
 }
 
+void test_directed_sync_cost_charged_to_consumer() {
+    std::cout << "Testing directed sync cost is charged to consumer... ";
+
+    PartitionInput input;
+    input.num_units = 4;
+    input.num_threads = 2;
+    input.unit_cost_ns = {10, 10, 10, 10};
+    input.sync_cost_ns = 100.0;
+    input.adjacency.resize(4);
+
+    // Fan-in: producers 0,1,2 feed consumer 3 across threads.
+    input.adjacency[0].push_back({3, 1, 1});
+    input.adjacency[1].push_back({3, 1, 1});
+    input.adjacency[2].push_back({3, 1, 1});
+
+    std::vector<size_t> assignment = {0, 0, 0, 1};
+    auto per_thread = WeightedPartitioner::evaluatePerThread(input, assignment);
+
+    assert(per_thread.size() == 2);
+    assert(per_thread[0] == 30.0);
+    assert(per_thread[1] == 310.0);
+    assert(WeightedPartitioner::evaluatePartition(input, assignment) == 310.0);
+
+    std::cout << "PASSED\n";
+}
+
 void test_heavy_unit_isolation() {
     std::cout << "Testing heavy unit isolation... ";
 
@@ -471,6 +497,7 @@ int main() {
     test_uniform_no_edges();
     test_delay_aware_sync();
     test_evaluate_delay_scaling();
+    test_directed_sync_cost_charged_to_consumer();
     test_heavy_unit_isolation();
     test_parallel_beneficial();
     test_cluster_partition();

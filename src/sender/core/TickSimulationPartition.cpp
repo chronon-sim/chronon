@@ -67,6 +67,24 @@ void TickSimulation::buildPartitionAdjacency_(
     }
 }
 
+PartitionInput TickSimulation::buildUnitPartitionInput_(double sync_cost_ns) const {
+    PartitionInput input;
+    input.num_units = unit_ptrs_.size();
+    input.num_threads = thread_units_.size();
+    input.unit_cost_ns = unit_costs_;
+    input.sync_cost_ns = sync_cost_ns;
+    input.critical_path_weight = config_.sa_critical_path_weight;
+    input.adjacency.resize(unit_ptrs_.size());
+
+    std::unordered_map<Unit*, size_t> unit_ptr_to_idx;
+    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
+        unit_ptr_to_idx[static_cast<Unit*>(unit_ptrs_[i])] = i;
+    }
+    buildPartitionAdjacency_(unit_ptr_to_idx, input);
+
+    return input;
+}
+
 // ---------------------------------------------------------------------------
 // Cost-aware thread assignment
 // ---------------------------------------------------------------------------
@@ -75,20 +93,29 @@ void TickSimulation::assignThreadsDeterministic_() {
     size_t num_threads = normalizeThreadCount(config_.num_threads);
     config_.num_threads = num_threads;
 
-    // Zero sync cost + uniform unit costs makes the initial partition
-    // purely topology-driven and fully deterministic (no wall-clock
-    // measurement noise). Dynamic rebalance calibrates real platform
-    // metrics and unit costs from the first sample batch.
+    // Uniform unit costs + a fixed, wall-clock-free sync cost make the initial
+    // partition fully deterministic (no measurement noise) while still rewarding
+    // locality: the non-zero sync term drives the solver to minimize the
+    // cross-thread edge cut, co-locating connected units (e.g. a core's pipeline)
+    // on one thread so their intra-component edges resolve intra-thread for free.
+    // A zero cost (config opt-out) reverts to pure load balance.
+    //
+    // The locality weight is scoped to THIS initial partition: it is passed
+    // straight to the solver and deliberately NOT stored in platform_metrics_,
+    // so dynamic rebalance keeps deciding migrations on its own inputs (measured
+    // unit costs + platform_metrics_, which stays zero in the deterministic flow)
+    // rather than on this fixed heuristic.
     platform_metrics_ = PlatformMetrics{};
 
     unit_costs_.assign(unit_ptrs_.size(), 1.0);
 
     if (observe_ctx_) {
-        observe::log_info<"Uniform-cost partitioning: unit_cost=1.0, sync_cost=0 ({} units)">(
-            observe_ctx_, unit_costs_.size());
+        observe::log_info<"Locality-aware partitioning: unit_cost=1.0, sync_cost={}ns ({} units)">(
+            observe_ctx_, static_cast<uint64_t>(config_.initial_partition_sync_cost_ns),
+            unit_costs_.size());
     }
 
-    applyClusteredThreadAssignment_(num_threads);
+    applyClusteredThreadAssignment_(num_threads, config_.initial_partition_sync_cost_ns);
 }
 
 void TickSimulation::assignThreadsFromPrecomputedCosts_() {
@@ -109,14 +136,17 @@ void TickSimulation::assignThreadsFromPrecomputedCosts_() {
         }
     }
 
-    applyClusteredThreadAssignment_(num_threads);
+    // Precomputed flow carries a real measured platform sync cost; rebalance
+    // uses the same value (platform_metrics_) for consistency.
+    applyClusteredThreadAssignment_(num_threads, platform_metrics_.atomic_roundtrip_ns);
 }
 
 // ---------------------------------------------------------------------------
 // Clustered thread assignment
 // ---------------------------------------------------------------------------
 
-void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads) {
+void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
+                                                     double partition_sync_cost_ns) {
     if (dep_graph_.graph()) {
         clusters_ = findTightCouplingClusters(*dep_graph_.graph());
     } else {
@@ -164,7 +194,7 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads) {
     cluster_input.num_units = num_clusters;
     cluster_input.num_threads = num_threads;
     cluster_input.unit_cost_ns = cluster_costs;
-    cluster_input.sync_cost_ns = platform_metrics_.atomic_roundtrip_ns;
+    cluster_input.sync_cost_ns = partition_sync_cost_ns;
     cluster_input.critical_path_weight = config_.sa_critical_path_weight;
     cluster_input.adjacency.resize(num_clusters);
 
@@ -256,7 +286,7 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads) {
     }
 }
 
-bool TickSimulation::parallelBeneficialWeighted_() const noexcept {
+bool TickSimulation::parallelBeneficialWeighted_() const {
     if (thread_units_.empty() || unit_costs_.empty()) {
         return false;
     }
@@ -264,23 +294,37 @@ bool TickSimulation::parallelBeneficialWeighted_() const noexcept {
     double max_cost = 0.0;
     double total_cost = 0.0;
     size_t active_threads = 0;
+    std::vector<size_t> assignment(unit_ptrs_.size(), 0);
 
-    for (const auto& tu : thread_units_) {
+    for (size_t t = 0; t < thread_units_.size(); ++t) {
+        const auto& tu = thread_units_[t];
         if (tu.empty()) continue;
         active_threads++;
-        double thread_cost = 0.0;
         for (size_t u : tu) {
-            thread_cost += unit_costs_[u];
+            if (u < assignment.size()) assignment[u] = t;
         }
-        max_cost = std::max(max_cost, thread_cost);
-        total_cost += thread_cost;
     }
 
     if (active_threads < 2) return false;
 
-    // 10% sync-overhead margin against total sequential cost. The earlier
-    // (max < 1.5 * avg) heuristic rejected parallel runs that delivered
-    // >3x speedup at moderate imbalance.
+    for (double cost : unit_costs_) {
+        total_cost += cost;
+    }
+
+    // In the deterministic path unit_costs_ are uniform placeholders and
+    // initial_partition_sync_cost_ns is a placement-only locality weight. Only
+    // precomputed profiling carries a measured sync cost suitable for deciding
+    // whether parallel execution is beneficial.
+    double sync_cost_ns = has_precomputed_costs_ ? platform_metrics_.atomic_roundtrip_ns : 0.0;
+    auto input = buildUnitPartitionInput_(sync_cost_ns);
+    auto thread_times = WeightedPartitioner::evaluatePerThread(input, assignment);
+    thread_times.resize(thread_units_.size(), 0.0);
+    for (double thread_time : thread_times) {
+        max_cost = std::max(max_cost, thread_time);
+    }
+
+    // 10% margin against total sequential compute cost. max_cost uses the
+    // same partition cost model as the solver, including cross-thread waits.
     double parallel_overhead_factor = 1.10;
     return max_cost * parallel_overhead_factor < total_cost;
 }

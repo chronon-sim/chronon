@@ -76,8 +76,10 @@ struct SimulationYAMLConfig {
     uint64_t rebalance_check_interval_cycles = 8192;
     double rebalance_min_gain = 0.05;
     uint64_t rebalance_cooldown_cycles = 0;
-    std::string partition_solver = "Weighted";
+    std::string partition_solver = "SA";
     double sa_critical_path_weight = 0.0;  ///< 0 disables the SA critical-path term.
+    double initial_partition_sync_cost_ns =
+        8.0;  ///< Locality weight for the initial partition; 0 = pure load balance.
     SchedulerTimelineTraceConfig timeline_trace;
 
     /// Builder auto-creates observation contexts when present and enabled.

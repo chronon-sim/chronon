@@ -100,6 +100,7 @@ private:
         LOAD_IF_PRESENT(sim, config, rebalance_cooldown_cycles);
         LOAD_IF_PRESENT(sim, config, partition_solver);
         LOAD_IF_PRESENT(sim, config, sa_critical_path_weight);
+        LOAD_IF_PRESENT(sim, config, initial_partition_sync_cost_ns);
 
         if (sim["timeline_trace"]) {
             parseTimelineTrace(sim["timeline_trace"], config.timeline_trace);

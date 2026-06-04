@@ -134,28 +134,17 @@ private:
                                    const std::vector<size_t>& assignment,
                                    const std::vector<double>& thread_times, size_t unit_idx,
                                    size_t from_thread, size_t to_thread) {
-        double old_max = std::max(thread_times[from_thread], thread_times[to_thread]);
+        (void)from_thread;
 
-        double from_new = thread_times[from_thread] - input.unit_cost_ns[unit_idx];
-        double to_new = thread_times[to_thread] + input.unit_cost_ns[unit_idx];
+        double old_max = *std::max_element(thread_times.begin(), thread_times.end());
 
-        for (const auto& edge : input.adjacency[unit_idx]) {
-            size_t neighbor_thread = assignment[edge.neighbor];
-            double delay_factor = partition_utils::delayFactor(edge.min_delay);
-            double sync =
-                input.sync_cost_ns * static_cast<double>(edge.num_connections) * delay_factor;
+        std::vector<size_t> new_assignment = assignment;
+        new_assignment[unit_idx] = to_thread;
 
-            if (neighbor_thread == from_thread) {
-                // Edge becomes cross-thread on the destination side.
-                to_new += sync;
-            } else if (neighbor_thread == to_thread) {
-                // Edge becomes same-thread; both sides drop the sync cost.
-                from_new -= sync;
-                to_new -= sync;
-            }
-        }
+        std::vector<double> new_times(thread_times.size(), 0.0);
+        partition_utils::computeThreadTimes(input, new_assignment, new_times);
+        double new_max = *std::max_element(new_times.begin(), new_times.end());
 
-        double new_max = std::max(from_new, to_new);
         return old_max - new_max;
     }
 

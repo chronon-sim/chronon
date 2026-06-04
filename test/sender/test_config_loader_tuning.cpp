@@ -32,6 +32,7 @@ simulation:
   rebalance_min_gain: 0.05
   rebalance_cooldown_cycles: 2048
   partition_solver: SA
+  initial_partition_sync_cost_ns: 12.5
 )yaml");
 
     assert(config.name == "tuning_parse");
@@ -45,6 +46,7 @@ simulation:
     assert(config.rebalance_min_gain == 0.05);
     assert(config.rebalance_cooldown_cycles == 2048);
     assert(config.partition_solver == "SA");
+    assert(config.initial_partition_sync_cost_ns == 12.5);
 
     std::cout << "PASSED\n";
 }
@@ -65,7 +67,8 @@ simulation:
     assert(config.rebalance_check_interval_cycles == 8192);
     assert(config.rebalance_min_gain == 0.05);
     assert(config.rebalance_cooldown_cycles == 0);
-    assert(config.partition_solver == "Weighted");
+    assert(config.partition_solver == "SA");
+    assert(config.initial_partition_sync_cost_ns == 8.0);
 
     std::cout << "PASSED\n";
 }
