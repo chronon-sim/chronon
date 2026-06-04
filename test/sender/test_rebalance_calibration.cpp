@@ -79,6 +79,9 @@ int main() {
     cfg.rebalance_imbalance_threshold = 1.05;
     cfg.rebalance_min_gain = 0.0;
     cfg.rebalance_cooldown_cycles = 0;
+    // This test isolates runtime sampling and migration. Disable the initial
+    // locality heuristic so the fan-in topology still starts in parallel mode.
+    cfg.initial_partition_sync_cost_ns = 0.0;
 
     TickSimulation sim(cfg);
 
