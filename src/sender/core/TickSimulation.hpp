@@ -372,6 +372,7 @@ private:
      */
     void buildPartitionAdjacency_(const std::unordered_map<Unit*, size_t>& unit_ptr_to_idx,
                                   PartitionInput& input) const;
+    PartitionInput buildUnitPartitionInput_(double sync_cost_ns) const;
 
     void assignThreadsDeterministic_();
     void assignThreadsFromPrecomputedCosts_();
@@ -379,7 +380,7 @@ private:
 
     /// Parallel is beneficial when the bottleneck thread cost (with 10%
     /// sync margin) is less than total sequential cost.
-    bool parallelBeneficialWeighted_() const noexcept;
+    bool parallelBeneficialWeighted_() const;
 
     bool shouldRebalance_() const;
     bool performRebalance_();

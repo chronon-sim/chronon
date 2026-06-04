@@ -67,6 +67,24 @@ void TickSimulation::buildPartitionAdjacency_(
     }
 }
 
+PartitionInput TickSimulation::buildUnitPartitionInput_(double sync_cost_ns) const {
+    PartitionInput input;
+    input.num_units = unit_ptrs_.size();
+    input.num_threads = thread_units_.size();
+    input.unit_cost_ns = unit_costs_;
+    input.sync_cost_ns = sync_cost_ns;
+    input.critical_path_weight = config_.sa_critical_path_weight;
+    input.adjacency.resize(unit_ptrs_.size());
+
+    std::unordered_map<Unit*, size_t> unit_ptr_to_idx;
+    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
+        unit_ptr_to_idx[static_cast<Unit*>(unit_ptrs_[i])] = i;
+    }
+    buildPartitionAdjacency_(unit_ptr_to_idx, input);
+
+    return input;
+}
+
 // ---------------------------------------------------------------------------
 // Cost-aware thread assignment
 // ---------------------------------------------------------------------------
@@ -268,7 +286,7 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
     }
 }
 
-bool TickSimulation::parallelBeneficialWeighted_() const noexcept {
+bool TickSimulation::parallelBeneficialWeighted_() const {
     if (thread_units_.empty() || unit_costs_.empty()) {
         return false;
     }
@@ -276,23 +294,34 @@ bool TickSimulation::parallelBeneficialWeighted_() const noexcept {
     double max_cost = 0.0;
     double total_cost = 0.0;
     size_t active_threads = 0;
+    std::vector<size_t> assignment(unit_ptrs_.size(), 0);
 
-    for (const auto& tu : thread_units_) {
+    for (size_t t = 0; t < thread_units_.size(); ++t) {
+        const auto& tu = thread_units_[t];
         if (tu.empty()) continue;
         active_threads++;
-        double thread_cost = 0.0;
         for (size_t u : tu) {
-            thread_cost += unit_costs_[u];
+            if (u < assignment.size()) assignment[u] = t;
         }
-        max_cost = std::max(max_cost, thread_cost);
-        total_cost += thread_cost;
     }
 
     if (active_threads < 2) return false;
 
-    // 10% sync-overhead margin against total sequential cost. The earlier
-    // (max < 1.5 * avg) heuristic rejected parallel runs that delivered
-    // >3x speedup at moderate imbalance.
+    for (double cost : unit_costs_) {
+        total_cost += cost;
+    }
+
+    double sync_cost_ns = has_precomputed_costs_ ? platform_metrics_.atomic_roundtrip_ns
+                                                 : config_.initial_partition_sync_cost_ns;
+    auto input = buildUnitPartitionInput_(sync_cost_ns);
+    auto thread_times = WeightedPartitioner::evaluatePerThread(input, assignment);
+    thread_times.resize(thread_units_.size(), 0.0);
+    for (double thread_time : thread_times) {
+        max_cost = std::max(max_cost, thread_time);
+    }
+
+    // 10% margin against total sequential compute cost. max_cost uses the
+    // same partition cost model as the solver, including cross-thread waits.
     double parallel_overhead_factor = 1.10;
     return max_cost * parallel_overhead_factor < total_cost;
 }

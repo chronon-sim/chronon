@@ -76,11 +76,12 @@ inline void computeThreadTimes(const PartitionInput& input, const std::vector<si
     }
 
     // Sync cost scales by 1/delay: delay=1 edges cause tight spin-waiting while
-    // higher-delay edges rarely stall the consumer.
+    // higher-delay edges rarely stall the consumer. Adjacency is directed
+    // source -> consumer, so charge cross-thread waits to the consumer thread.
     for (size_t u = 0; u < input.num_units; ++u) {
-        size_t dst_thread = assignment[u];
+        size_t src_thread = assignment[u];
         for (const auto& edge : input.adjacency[u]) {
-            size_t src_thread = assignment[edge.neighbor];
+            size_t dst_thread = assignment[edge.neighbor];
             if (src_thread != dst_thread) {
                 double df = delayFactor(edge.min_delay);
                 thread_times[dst_thread] +=
@@ -90,7 +91,7 @@ inline void computeThreadTimes(const PartitionInput& input, const std::vector<si
     }
 }
 
-/// Count distinct cross-thread connections (bidirectional adjacency is halved).
+/// Count directed cross-thread connections.
 inline size_t countCrossThreadConnections(const PartitionInput& input,
                                           const std::vector<size_t>& assignment) {
     size_t count = 0;
@@ -101,7 +102,7 @@ inline size_t countCrossThreadConnections(const PartitionInput& input,
             }
         }
     }
-    return count / 2;  // Bidirectional adjacency double-counts each connection.
+    return count;
 }
 
 /// LPT (Longest Processing Time) initial placement — classic 4/3-OPT makespan heuristic.

@@ -242,6 +242,25 @@ void test_partition_repeatable() {
     check(assignmentOf() == assignmentOf(), "partition is identical across runs");
 }
 
+void test_parallel_benefit_includes_sync_cost() {
+    std::cout << "Testing parallel-benefit decision includes sync cost...\n";
+
+    TickSimulation sim(baseConfig(/*num_threads=*/2, /*sync_cost=*/2.8));
+    Topology topo = buildCores(sim, /*cores=*/1, /*depth=*/4, /*work=*/0, /*with_shared=*/false);
+    sim.initialize();
+
+    size_t cross_edges = countCrossThreadEdges(sim, topo);
+    std::set<size_t> used_threads;
+    for (Node* n : topo.cores[0]) {
+        used_threads.insert(sim.assignedThread(n));
+    }
+
+    check(used_threads.size() == 2, "partition keeps the cheap split across two threads");
+    check(cross_edges > 0, "partition still has a cross-thread delay-1 edge");
+    check(!sim.isParallelBeneficial(), "sync-dominated split falls back to sequential");
+    check(!sim.useParallelExecution(), "automatic execution mode rejects the parallel path");
+}
+
 }  // namespace
 
 int main() {
@@ -250,6 +269,7 @@ int main() {
     test_locality_colocation();
     test_locality_determinism_sweep();
     test_partition_repeatable();
+    test_parallel_benefit_includes_sync_cost();
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed\n";
     return g_fail == 0 ? 0 : 1;
