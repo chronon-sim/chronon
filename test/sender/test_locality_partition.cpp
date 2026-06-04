@@ -242,11 +242,29 @@ void test_partition_repeatable() {
     check(assignmentOf() == assignmentOf(), "partition is identical across runs");
 }
 
-void test_parallel_benefit_includes_sync_cost() {
-    std::cout << "Testing parallel-benefit decision includes sync cost...\n";
+void test_deterministic_parallel_benefit_ignores_locality_weight() {
+    std::cout << "Testing deterministic parallel-benefit ignores locality weight...\n";
 
-    TickSimulation sim(baseConfig(/*num_threads=*/2, /*sync_cost=*/2.8));
+    TickSimulation sim(baseConfig(/*num_threads=*/4, /*sync_cost=*/8.0));
+    Topology topo = buildCores(sim, /*cores=*/4, /*depth=*/4, /*work=*/0, /*with_shared=*/true);
+    sim.initialize();
+
+    check(countCrossThreadEdges(sim, topo) > 0, "topology has unavoidable cross-thread fan-in");
+    check(sim.isParallelBeneficial(), "placement-only locality weight does not force sequential");
+    check(sim.useParallelExecution(), "automatic execution mode keeps the parallel path");
+}
+
+void test_precomputed_parallel_benefit_includes_sync_cost() {
+    std::cout << "Testing precomputed parallel-benefit includes sync cost...\n";
+
+    TickSimulationConfig cfg = baseConfig(/*num_threads=*/2, /*sync_cost=*/0.0);
+    cfg.partition_solver = TickSimulationConfig::PartitionSolverType::Weighted;
+    TickSimulation sim(cfg);
     Topology topo = buildCores(sim, /*cores=*/1, /*depth=*/4, /*work=*/0, /*with_shared=*/false);
+
+    PlatformMetrics metrics{};
+    metrics.atomic_roundtrip_ns = 2.8;
+    sim.setPrecomputedUnitCosts({1.0, 1.0, 1.0, 1.0}, metrics);
     sim.initialize();
 
     size_t cross_edges = countCrossThreadEdges(sim, topo);
@@ -257,7 +275,7 @@ void test_parallel_benefit_includes_sync_cost() {
 
     check(used_threads.size() == 2, "partition keeps the cheap split across two threads");
     check(cross_edges > 0, "partition still has a cross-thread delay-1 edge");
-    check(!sim.isParallelBeneficial(), "sync-dominated split falls back to sequential");
+    check(!sim.isParallelBeneficial(), "measured sync-dominated split falls back to sequential");
     check(!sim.useParallelExecution(), "automatic execution mode rejects the parallel path");
 }
 
@@ -269,7 +287,8 @@ int main() {
     test_locality_colocation();
     test_locality_determinism_sweep();
     test_partition_repeatable();
-    test_parallel_benefit_includes_sync_cost();
+    test_deterministic_parallel_benefit_ignores_locality_weight();
+    test_precomputed_parallel_benefit_includes_sync_cost();
 
     std::cout << "\n" << g_pass << " passed, " << g_fail << " failed\n";
     return g_fail == 0 ? 0 : 1;

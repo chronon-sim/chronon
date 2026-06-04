@@ -311,8 +311,11 @@ bool TickSimulation::parallelBeneficialWeighted_() const {
         total_cost += cost;
     }
 
-    double sync_cost_ns = has_precomputed_costs_ ? platform_metrics_.atomic_roundtrip_ns
-                                                 : config_.initial_partition_sync_cost_ns;
+    // In the deterministic path unit_costs_ are uniform placeholders and
+    // initial_partition_sync_cost_ns is a placement-only locality weight. Only
+    // precomputed profiling carries a measured sync cost suitable for deciding
+    // whether parallel execution is beneficial.
+    double sync_cost_ns = has_precomputed_costs_ ? platform_metrics_.atomic_roundtrip_ns : 0.0;
     auto input = buildUnitPartitionInput_(sync_cost_ns);
     auto thread_times = WeightedPartitioner::evaluatePerThread(input, assignment);
     thread_times.resize(thread_units_.size(), 0.0);
