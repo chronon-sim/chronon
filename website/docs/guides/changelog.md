@@ -4,6 +4,30 @@ sidebar_label: "Changelog"
 
 # Changelog
 
+## 2026-06-11 - Epoch-Free Lookahead
+
+### New Feature
+
+`TickSimulationConfig::enable_epoch_free_lookahead` (default off) collapses the
+per-epoch `std::barrier` of the persistent-worker lookahead path into a single
+run-spanning window. Run-ahead is then bounded only by `lookahead_floor_ +
+max_lookahead_cycles` and per-connection MPSC arbitration, with one MPSC flush at
+the end of the run instead of one per epoch. Results stay bit-identical across all
+scheduling modes; only wall-clock changes.
+
+It is an opt-in A/B knob: it wins on imbalanced, high-worker-count topologies
+where the per-epoch barrier's straggler wait dominates, and is neutral or slightly
+negative on balanced or dependency-bound chains.
+
+### Safety
+
+The dispatch gate keeps the per-epoch barrier path (no result change) unless every
+MPSC connection can absorb the configured run-ahead without overflowing its staging
+ring or back-pressuring where the barrier flush would not. The supported run-ahead
+per connection is `min(InPort capacity, ring slots) / per_cycle_send_rate -
+edge_delay`; an uncapped source rate forces a fallback. See the
+[Scheduling guide](scheduling.md) for details.
+
 ## 2026-05-07 - Scheduler Timeline Trace
 
 ### New Feature
