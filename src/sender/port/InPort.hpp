@@ -462,6 +462,24 @@ public:
         }
     }
 
+    bool mpscConnProgressFullyResolved() const noexcept override {
+        // No fan-in connections => nothing is drained late; safe by vacuity.
+        if (mpsc_connections_.empty()) return true;
+        // Every connection must have a non-null per-connection progress atomic.
+        // A null entry is an unresolved producer that arbitrateMPSCConsumerDriven
+        // skips (relying on the epoch-end central flush), which epoch-free
+        // execution does not provide mid-run.
+        if (mpsc_conn_progress_.size() != mpsc_connections_.size()) return false;
+        for (const auto* p : mpsc_conn_progress_) {
+            if (!p) return false;
+        }
+        return true;
+    }
+
+    uint64_t stagingOverflowEvents() const noexcept override {
+        return multi_producer_queue_raw_ ? multi_producer_queue_raw_->stagingOverflowEvents() : 0;
+    }
+
     void* arbitratablePortKey() noexcept override { return static_cast<void*>(this); }
 
     /**

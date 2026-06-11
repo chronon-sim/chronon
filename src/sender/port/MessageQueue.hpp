@@ -751,7 +751,23 @@ public:
         if (queue_id >= thread_queues_.size()) {
             return false;
         }
-        return thread_queues_[queue_id]->tryPush(std::move(data), arrive_cycle, sender_id);
+        const bool ok = thread_queues_[queue_id]->tryPush(std::move(data), arrive_cycle, sender_id);
+        if (!ok) {
+            // Physical SPSC ring full: the entry is dropped, which corrupts the
+            // run. Under epoch-free lookahead a producer can run up to
+            // max_lookahead_cycles ahead of a lagging consumer, so this counter
+            // is the staging-overflow watchdog (each producer thread writes its
+            // own queue_id, hence atomic). Relaxed: rare path, read after join.
+            staging_overflow_events_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return ok;
+    }
+
+    /// Count of dropped pushes due to a full physical staging ring. Nonzero
+    /// means the lookahead window outran the ring capacity (USABLE_CAPACITY) —
+    /// a correctness failure, surfaced for the epoch-free A/B watchdog.
+    uint64_t stagingOverflowEvents() const noexcept {
+        return staging_overflow_events_.load(std::memory_order_relaxed);
     }
 
     // IMessageQueue interface - consumer polls all thread queues
@@ -883,6 +899,7 @@ private:
     std::vector<std::unique_ptr<LockFreeMessageQueue<T>>> thread_queues_;
     std::unordered_map<size_t, size_t> thread_to_queue_id_;  // thread_id -> queue_id
     size_t user_capacity_;  // Soft aggregate cap consulted by arbiter/full().
+    std::atomic<uint64_t> staging_overflow_events_{0};  // full-ring drops (watchdog)
 };
 
 }  // namespace chronon::sender

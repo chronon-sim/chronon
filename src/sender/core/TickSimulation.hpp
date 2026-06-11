@@ -222,6 +222,20 @@ public:
     const std::string& timelineTraceFile() const noexcept { return timeline_trace_.file(); }
     void writeTimelineTrace() { timeline_trace_.write(); }
 
+    /// Number of runParallel() invocations that took the epoch-free path.
+    /// Test/bench introspection for the enable_epoch_free_lookahead A/B knob.
+    uint64_t epochFreeRunCount() const noexcept { return epoch_free_run_count_; }
+
+    /// Total dropped staged pushes across all MPSC InPorts (full physical ring).
+    /// Nonzero means the lookahead window outran the staging capacity — a
+    /// correctness failure. The epoch-free A/B watchdog (see
+    /// enable_epoch_free_lookahead). Always 0 for the barrier/sequential paths.
+    uint64_t totalStagingOverflowEvents() const noexcept {
+        uint64_t total = 0;
+        for (const IArbitratablePort* p : mpsc_inports_) total += p->stagingOverflowEvents();
+        return total;
+    }
+
     /// Used by observation async I/O.
     exec::static_thread_pool& pool() noexcept { return pool_; }
     bool hasTightConnectionsInGraph() const noexcept { return has_tight_connections_; }
@@ -432,6 +446,23 @@ private:
      */
     uint64_t executeRunProgressBased(uint64_t total_cycles);
 
+    /**
+     * Epoch-free variant of executeRunProgressBased: one bulk launch, one
+     * run-spanning window, NO per-epoch barrier. Each worker drives its
+     * clusters straight to run_target; run-ahead is bounded only by the
+     * lookahead_floor_ + max_lookahead_cycles synthetic dep (refreshed lazily
+     * on the slow path), and MPSC delivery is the per-connection consumer-driven
+     * drain plus a single arbitrateAllMPSCPorts_() flush after the workers join.
+     * Selected by runParallel() only when allMPSCPortsHaveConnProgress_() and
+     * max_lookahead_cycles > 0. Returns cycles actually executed.
+     */
+    uint64_t executeRunEpochFree_(uint64_t total_cycles);
+
+    /// True iff every MPSC InPort has fully resolved per-connection producer
+    /// progress, so the consumer-driven drain needs no per-epoch central flush.
+    /// Precondition for executeRunEpochFree_ (see enable_epoch_free_lookahead).
+    bool allMPSCPortsHaveConnProgress_() const noexcept;
+
     /// Per-thread epoch body. Spin-waits on cross-thread progress atomics
     /// and exits via stop_token on termination or exception.
     void executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
@@ -482,6 +513,10 @@ private:
     bool has_tight_connections_ = false;
     bool has_tight_inter_cluster_ = false;
     bool parallel_beneficial_ = false;
+
+    /// Count of runParallel() invocations dispatched to executeRunEpochFree_.
+    /// Introspection only (see epochFreeRunCount()).
+    uint64_t epoch_free_run_count_ = 0;
 
     TerminationController termination_ctrl_;
 

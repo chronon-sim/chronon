@@ -341,6 +341,71 @@ uint64_t TickSimulation::executeRunProgressBased(uint64_t total_cycles) {
     return reached - run_start;
 }
 
+bool TickSimulation::allMPSCPortsHaveConnProgress_() const noexcept {
+    for (const IArbitratablePort* p : mpsc_inports_) {
+        if (!p->mpscConnProgressFullyResolved()) return false;
+    }
+    return true;
+}
+
+uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
+    const size_t nthreads = thread_units_.size();
+    if (nthreads == 0 || total_cycles == 0) return 0;
+
+    auto token = stop_source_->get_token();
+    auto sched = pool_.get_scheduler();
+
+    const uint64_t run_start =
+        thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
+    const uint64_t run_target = run_start + total_cycles;
+
+    // Single run-spanning window: no per-epoch barrier. Run-ahead is bounded
+    // solely by the lookahead_floor_ + max_lookahead_cycles synthetic dep
+    // (installed in initProgressSync), seeded here at run_start and raised
+    // monotonically by refreshLookaheadFloor_ on the slow path as the
+    // global-min cluster advances. The caller guarantees max_lookahead_cycles>0
+    // (so the floor, not an epoch boundary, is the cap) and full per-connection
+    // MPSC progress (so no port needs a per-epoch central flush).
+    lookahead_floor_.store(run_start, std::memory_order_relaxed);
+
+    std::exception_ptr captured;
+    std::atomic_flag captured_set = ATOMIC_FLAG_INIT;
+
+    auto work =
+        stdexec::bulk(stdexec::just(), stdexec::par, nthreads, [&, token](std::size_t thread_idx) {
+            // Drive this worker's clusters straight to run_target. The try-catch
+            // captures the first exception and requests stop so peers leave their
+            // dependency spin-waits; sync_wait below is the sole join.
+            try {
+                executeThreadEpoch_(thread_idx, run_target, token);
+            } catch (...) {
+                if (!captured_set.test_and_set(std::memory_order_relaxed)) {
+                    captured = std::current_exception();
+                }
+                stop_source_->request_stop();
+            }
+        });
+
+    stdexec::sync_wait(stdexec::starts_on(sched, std::move(work)));
+
+    if (captured) std::rethrow_exception(captured);
+
+    // Single final MPSC flush. Every worker has published its final progress and
+    // exited, so the consumer-driven drains (which admit up to
+    // producer_completed-1) may leave the run's last staged entries
+    // unarbitrated; commit them once here. Mirrors the epoch-end flush in
+    // executeEpochProgressBased, but runs once per run instead of per epoch.
+    arbitrateAllMPSCPorts_();
+
+    for (size_t i = 0; i < units_.size(); ++i) {
+        unit_progress_[i].store(unit_ptrs_[i]->localCycle(), std::memory_order_release);
+    }
+
+    const uint64_t reached =
+        thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
+    return reached - run_start;
+}
+
 // ---------------------------------------------------------------------------
 // Per-thread epoch driver
 // ---------------------------------------------------------------------------
@@ -420,8 +485,14 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
 
         if (trace_waits && !token.stop_requested()) {
             auto wait_end = SchedulerTimelineTrace::Clock::now();
+            // Tag the stall by cause so the timeline distinguishes recoverable
+            // lookahead-floor stalls (widen the window) from genuine cross-cluster
+            // dependency stalls (critical path, not tunable).
+            const char* stall_name = blocker.cluster == SIZE_MAX        ? "stall: no-ready-cluster"
+                                     : blocker.pred_cluster == SIZE_MAX ? "stall: lookahead-floor"
+                                                                        : "stall: cluster-dep";
             timeline_trace_.recordDuration(
-                thread_idx, "wait", "cluster dependency",
+                thread_idx, "wait", stall_name,
                 blocker.cluster == SIZE_MAX
                     ? current_cycle_
                     : thread_progress_array_[blocker.cluster].completed_cycle.load(

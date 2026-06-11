@@ -90,6 +90,7 @@ private:
         LOAD_IF_PRESENT(sim, config, trace_execution);
         LOAD_IF_PRESENT(sim, config, max_lookahead_cycles);
         LOAD_IF_PRESENT(sim, config, epoch_size);
+        LOAD_IF_PRESENT(sim, config, enable_epoch_free_lookahead);
         LOAD_IF_PRESENT(sim, config, run_cycles);
         LOAD_IF_PRESENT(sim, config, tick_frequency_hz);
         LOAD_IF_PRESENT(sim, config, enable_weighted_partitioning);
