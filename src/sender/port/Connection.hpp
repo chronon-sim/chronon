@@ -112,6 +112,20 @@ public:
     virtual void cancelInFlight() noexcept = 0;
 
     /**
+     * Max producer run-ahead (in cycles) this connection's cross-thread buffer
+     * (MPSC staging ring or SPSC lock-free ring) can absorb while the epoch-free
+     * path keeps results identical to the reference: roughly
+     * `threshold / rate - delay`, where `threshold` is the entry count at which
+     * transfer() stops accepting (the ring, or the InPort capacity if smaller),
+     * `rate` is the source's per-cycle send cap, and `delay` accounts for
+     * not-yet-due entries the consumer cannot drain. Returns SIZE_MAX for
+     * connections with no bounded cross-thread ring (same-thread / unbounded) and
+     * 0 when no finite run-ahead is provably safe (uncapped source rate). Used to
+     * gate the epoch-free lookahead path, which removes the per-epoch drain.
+     */
+    virtual size_t crossThreadHeadroom() const noexcept { return SIZE_MAX; }
+
+    /**
      * Type-erased MPSC admission helper. Called by the destination InPort's
      * arbiter at cycle boundary. Pops up to `budget` entries from the
      * per-connection staging ring and forwards them into the shared queue
@@ -347,6 +361,37 @@ public:
     void setThreadQueueId(size_t queue_id) override { thread_queue_id_ = queue_id; }
 
     bool hasThreadQueueId() const noexcept override { return thread_queue_id_ != SIZE_MAX; }
+
+    size_t crossThreadHeadroom() const noexcept override {
+        // Identify the bounded cross-thread buffer this connection fills:
+        //   MPSC (thread_queue_id_ set) -> the per-connection staging ring,
+        //   SPSC (lock-free ring)       -> the InPort's lock-free queue (finite
+        //                                  even for an unlimited-capacity port),
+        //   same-thread / unbounded     -> no ring to overflow (SIZE_MAX).
+        size_t ring_usable;
+        if (thread_queue_id_ != SIZE_MAX) {
+            ring_usable = staging_mask_;
+        } else if (to_->usesLockFreeQueue()) {
+            ring_usable = to_->capacity();
+        } else {
+            return SIZE_MAX;  // single-thread queue drains synchronously each tick
+        }
+        const size_t rate = from_->perCycleCapacity();
+        // An uncapped per-cycle send rate can stage unboundedly per cycle, so no
+        // finite run-ahead is provably safe.
+        if (rate == OutPort<T>::UNLIMITED_CAPACITY) return 0;
+        // transfer() stops accepting once buffered entries reach this many: a
+        // bounded port back-pressures at to_->capacity(); an unlimited port fills
+        // the ring. Past it the epoch-free path either drops (unlimited: overflow)
+        // or back-pressures where the per-epoch barrier flush would not (bounded),
+        // so results would diverge from the reference.
+        const size_t threshold = std::min(to_->capacity(), ring_usable);
+        const size_t cycles = threshold / rate;
+        // The consumer drains only *due* entries (arrive_cycle <= k, i.e.
+        // send_cycle <= k - delay_), so delay_ cycles of not-yet-due entries always
+        // sit buffered. The supportable producer run-ahead is cycles - delay_.
+        return (cycles > delay_) ? (cycles - delay_) : 0;
+    }
 
     void setConnId(uint32_t conn_id) noexcept override { conn_id_ = conn_id; }
     uint32_t connId() const noexcept override { return conn_id_; }

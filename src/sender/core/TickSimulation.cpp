@@ -348,6 +348,26 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
                              !config_.enable_dynamic_rebalance && !timeline_trace_.enabled() &&
                              thread_units_.size() <= pool_.available_parallelism();
     if (can_persist) {
+        // Epoch-free (A/B): drop the per-epoch barrier when the lookahead floor
+        // can be the sole run-ahead cap (max_lookahead_cycles > 0) and every
+        // MPSC port is fully covered by per-connection progress (so no port
+        // needs the per-epoch central flush). Otherwise keep the barrier path.
+        const bool epoch_free = config_.enable_epoch_free_lookahead &&
+                                config_.max_lookahead_cycles > 0 &&
+                                allMPSCPortsHaveConnProgress_() &&
+                                crossThreadHeadroomFits_(config_.max_lookahead_cycles);
+        if (config_.enable_epoch_free_lookahead && !epoch_free && observe_ctx_) {
+            observe::log_info<
+                "epoch-free lookahead requested but vetoed (max_lookahead={}, "
+                "mpsc_progress_full={}, headroom_fits={}); "
+                "using barrier path">(observe_ctx_, config_.max_lookahead_cycles,
+                                      allMPSCPortsHaveConnProgress_(),
+                                      crossThreadHeadroomFits_(config_.max_lookahead_cycles));
+        }
+        if (epoch_free) {
+            ++epoch_free_run_count_;
+            return executeRunEpochFree_(num_cycles);
+        }
         return executeRunProgressBased(num_cycles);
     }
 

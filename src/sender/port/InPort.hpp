@@ -122,8 +122,14 @@ public:
      */
     void useSingleThreadQueue() {
         multi_producer_queue_raw_ = nullptr;
+        lock_free_queue_ = false;
         queue_ = std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity_);
     }
+
+    /// True when this port drains a bounded lock-free SPSC ring (cross-thread,
+    /// single producer). The ring is finite even for an unlimited-capacity port,
+    /// so the epoch-free gate must bound producer run-ahead against capacity().
+    bool usesLockFreeQueue() const noexcept { return lock_free_queue_; }
 
     /**
      * Switch to lock-free SPSC queue.
@@ -134,6 +140,7 @@ public:
      */
     void useLockFreeQueue() {
         multi_producer_queue_raw_ = nullptr;
+        lock_free_queue_ = true;
         queue_ = std::make_unique<LockFreeQueueAdapter<StoredMessage>>(capacity_);
     }
 
@@ -148,6 +155,7 @@ public:
         if (multi_producer_queue_raw_) {
             return;
         }
+        lock_free_queue_ = false;
         auto mpq = std::make_unique<MultiProducerQueueAdapter<StoredMessage>>(capacity_);
         multi_producer_queue_raw_ = mpq.get();
         queue_ = std::move(mpq);
@@ -460,6 +468,24 @@ public:
             auto it = src_progress.find(conn->source());
             mpsc_conn_progress_.push_back(it == src_progress.end() ? nullptr : it->second);
         }
+    }
+
+    bool mpscConnProgressFullyResolved() const noexcept override {
+        // No fan-in connections => nothing is drained late; safe by vacuity.
+        if (mpsc_connections_.empty()) return true;
+        // Every connection must have a non-null per-connection progress atomic.
+        // A null entry is an unresolved producer that arbitrateMPSCConsumerDriven
+        // skips (relying on the epoch-end central flush), which epoch-free
+        // execution does not provide mid-run.
+        if (mpsc_conn_progress_.size() != mpsc_connections_.size()) return false;
+        for (const auto* p : mpsc_conn_progress_) {
+            if (!p) return false;
+        }
+        return true;
+    }
+
+    uint64_t stagingOverflowEvents() const noexcept override {
+        return multi_producer_queue_raw_ ? multi_producer_queue_raw_->stagingOverflowEvents() : 0;
     }
 
     void* arbitratablePortKey() noexcept override { return static_cast<void*>(this); }
@@ -790,7 +816,8 @@ private:
     PortPolicy policy_ = PortPolicy::LegacyFastPath;
     std::unique_ptr<IMessageQueue<StoredMessage>> queue_;
     MultiProducerQueueAdapter<StoredMessage>* multi_producer_queue_raw_ =
-        nullptr;  ///< Non-owning ptr for MPSC access
+        nullptr;                    ///< Non-owning ptr for MPSC access
+    bool lock_free_queue_ = false;  ///< True iff queue_ is the lock-free SPSC ring
     // Reused by receiveAllBuffered() to avoid per-cycle allocation; single-consumer,
     // so no synchronization is needed.
     std::vector<StoredMessage> drain_scratch_;

@@ -203,6 +203,59 @@ TickSimulation selects execution mode based on topology:
 | Lookahead | No tight connections | Units run ahead within safe boundaries |
 | Cluster-aware | Tight intra-cluster only | Groups on same thread, lookahead between |
 
+### Epoch-Free Lookahead
+
+By default the persistent-worker lookahead path synchronizes all worker threads
+at a `std::barrier` every `epoch_size` cycles. Within an epoch, clusters advance
+out of order on their own predecessor dependencies, but the per-epoch barrier
+still makes every thread wait for the slowest one at each boundary — a straggler
+tax that hurts most when load is imbalanced.
+
+`enable_epoch_free_lookahead` (default **off**) removes that barrier: the whole
+run becomes a single window in which run-ahead is bounded solely by
+`lookahead_floor_ + max_lookahead_cycles` (refreshed lazily as the global-minimum
+cluster advances) and per-connection MPSC arbitration, with one MPSC flush at the
+end of the run instead of one per epoch. Results stay bit-identical to every other
+mode; only wall-clock changes.
+
+It is an opt-in A/B knob, not a universal default — it wins on imbalanced,
+high-worker-count topologies (where the straggler tax is real) and is neutral or
+slightly negative on balanced or dependency-bound chains (where the lazy floor
+refresh costs more than the barrier it removes). Measure on your own model.
+
+**When it engages.** The dispatch gate keeps the per-epoch barrier path unless
+*all* of the following hold; otherwise it transparently falls back (no result
+change):
+
+- `enable_epoch_free_lookahead` is set and `max_lookahead_cycles > 0`;
+- the run uses the persistent path — reached via `TickSimulation::run()`;
+  `runUntilTermination()` (periodic dumps / termination polling) deliberately
+  keeps the per-epoch path for its boundaries, so epoch-free is a no-op there;
+- every MPSC input port has fully-resolved per-connection producer progress;
+- **cross-thread buffer headroom suffices for every connection** (see below).
+
+**Cross-thread buffer headroom.** Without the per-epoch drain, a producer can run
+ahead of a consumer and leave entries buffered in the connection's cross-thread
+ring — the per-connection MPSC staging ring for a multi-producer port, or the
+SPSC lock-free ring for a single-producer cross-thread edge. Both rings are
+bounded (typically ~4095 slots) even for an unlimited-capacity `InPort`, which
+never back-pressures, so the ring could silently overflow; a bounded port would
+back-pressure where the barrier flush would not. The gate therefore vetoes
+epoch-free unless each connection can absorb the configured run-ahead. The
+headroom (in cycles) a connection supports is roughly:
+
+```
+headroom = min(InPort capacity, ring slots) / per_cycle_send_rate - edge_delay
+```
+
+where `per_cycle_send_rate` is the source `OutPort`'s per-cycle send cap (an
+uncapped source forces a veto) and `edge_delay` accounts for not-yet-due entries
+the consumer cannot drain. Same-thread connections drain synchronously and impose
+no bound. If any cross-thread connection's headroom is `<= max_lookahead_cycles`,
+the run falls back to the barrier path. To use epoch-free with unlimited-capacity
+cross-thread edges, give the producing `OutPort` a per-cycle send cap and keep
+`max_lookahead_cycles + edge_delay` within the ring.
+
 ## Scheduler Timeline Diagnostics
 
 In progress-based lookahead mode, each tight-coupling cluster publishes its
@@ -263,6 +316,7 @@ struct TickSimulationConfig {
     // Lookahead configuration
     uint32_t max_lookahead_cycles = 100;    // Max cycles a unit can run ahead
     uint64_t epoch_size = 64;               // Cycles per epoch before sync
+    bool enable_epoch_free_lookahead = false; // Drop the per-epoch barrier (see below)
 
     // Debug options
     bool trace_execution = false;           // Log execution mode selection

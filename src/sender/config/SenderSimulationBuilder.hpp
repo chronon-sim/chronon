@@ -115,6 +115,7 @@ private:
         sim_config.trace_execution = result.config.trace_execution;
         sim_config.max_lookahead_cycles = result.config.max_lookahead_cycles;
         sim_config.epoch_size = result.config.epoch_size;
+        sim_config.enable_epoch_free_lookahead = result.config.enable_epoch_free_lookahead;
         sim_config.enable_weighted_partitioning = result.config.enable_weighted_partitioning;
         sim_config.enable_dynamic_rebalance = result.config.enable_dynamic_rebalance;
         sim_config.rebalance_imbalance_threshold = result.config.rebalance_imbalance_threshold;

@@ -266,6 +266,26 @@ public:
      */
     virtual void setArbitrationConnProgress(
         const std::unordered_map<Unit*, const std::atomic<uint64_t>*>& /*src_progress*/) {}
+
+    /**
+     * True iff every MPSC connection on this port has a resolved per-connection
+     * producer progress atomic, i.e. the heterogeneous-delay-correct
+     * consumer-driven drain in arbitrateMPSCConsumerDriven() fully covers this
+     * port. When false, at least one connection relies on the central per-epoch
+     * arbitrateMPSC() flush to deliver its tail (an unresolved producer is
+     * skipped by the consumer-driven path), so the epoch-free scheduler — which
+     * has no per-epoch flush — must NOT be used. Conservative default: false, so
+     * unknown port types veto epoch-free execution. InPort overrides.
+     */
+    virtual bool mpscConnProgressFullyResolved() const noexcept { return false; }
+
+    /**
+     * Number of staged pushes dropped because the physical MPSC ring was full.
+     * Nonzero indicates the lookahead window outran the ring capacity — a
+     * correctness failure. Surfaced for the epoch-free A/B watchdog. Default 0
+     * for ports with no multi-producer staging.
+     */
+    virtual uint64_t stagingOverflowEvents() const noexcept { return 0; }
 };
 
 /**
