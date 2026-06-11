@@ -11,9 +11,13 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 // Detect sanitizers (GCC vs Clang)
 #if defined(__SANITIZE_THREAD__)
@@ -404,6 +408,133 @@ void test_spin_wait_exits_when_wakeup_is_removed() {
     std::cout << "PASSED\n";
 }
 
+// ---------------------------------------------------------------------------
+// Timeline track re-declaration across backend restart
+// ---------------------------------------------------------------------------
+
+/// Minimal protobuf wire-format walk over a .pftrace: collects track UUIDs
+/// declared by TrackDescriptors and referenced by TrackEvents.
+struct TimelineTrackScan {
+    std::set<uint64_t> declared;
+    std::set<uint64_t> referenced;
+    size_t events = 0;
+};
+
+uint64_t scanVarint(const std::vector<unsigned char>& buf, size_t& p) {
+    uint64_t value = 0;
+    int shift = 0;
+    while (p < buf.size()) {
+        unsigned char byte = buf[p++];
+        value |= static_cast<uint64_t>(byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0) break;
+        shift += 7;
+    }
+    return value;
+}
+
+TimelineTrackScan scanTimelineTracks(const std::filesystem::path& path) {
+    TimelineTrackScan scan;
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        return scan;
+    }
+    std::vector<unsigned char> buf{std::istreambuf_iterator<char>(in),
+                                   std::istreambuf_iterator<char>()};
+
+    // Trace.packet = 1; TracePacket.track_event = 11, .track_descriptor = 60;
+    // TrackDescriptor.uuid = 1; TrackEvent.track_uuid = 11.
+    size_t pos = 0;
+    while (pos < buf.size()) {
+        uint64_t tag = scanVarint(buf, pos);
+        if (tag >> 3 != 1 || (tag & 0x7) != 2) break;  // Corrupt file: stop.
+        uint64_t pkt_len = scanVarint(buf, pos);
+        size_t pkt_end = pos + pkt_len;
+        while (pos < pkt_end) {
+            uint64_t ftag = scanVarint(buf, pos);
+            uint64_t field = ftag >> 3;
+            if ((ftag & 0x7) == 0) {
+                scanVarint(buf, pos);
+                continue;
+            }
+            uint64_t len = scanVarint(buf, pos);
+            size_t body_end = pos + len;
+            if (field == 60 || field == 11) {
+                const uint64_t want_field = (field == 60) ? 1 : 11;
+                auto& dest = (field == 60) ? scan.declared : scan.referenced;
+                if (field == 11) scan.events++;
+                while (pos < body_end) {
+                    uint64_t stag = scanVarint(buf, pos);
+                    if ((stag & 0x7) == 0) {
+                        uint64_t value = scanVarint(buf, pos);
+                        if (stag >> 3 == want_field) dest.insert(value);
+                    } else {
+                        uint64_t sub_len = scanVarint(buf, pos);
+                        pos += sub_len;
+                    }
+                }
+            }
+            pos = body_end;
+        }
+        pos = pkt_end;
+    }
+    return scan;
+}
+
+/// Regression (PR #41 review): a restarted backend opens a fresh
+/// timeline.pftrace, so it must re-declare its process/unit/counter tracks
+/// instead of referencing cached UUIDs that only exist in the previous file.
+void test_timeline_restart_redeclares_tracks() {
+    std::cout << "Testing timeline track re-declaration across backend restart... ";
+
+    const std::string out_dir = "/tmp/chronon_obs_timeline_restart";
+    std::filesystem::remove_all(out_dir);
+
+    ObservationQueue queue(64 * 1024);
+
+    ObservationBackend::Config cfg;
+    cfg.output_dir = out_dir;
+    cfg.enable_counter_csv = false;
+    cfg.enable_reordering = false;
+    cfg.timeline_enabled = true;
+
+    ObservationBackend backend(queue, cfg);
+
+    const FormatId fmt_id = FormatRegistry::instance().registerFormat(
+        "restart round {}", __FILE__, __LINE__, {ArgType::UInt64}, false, LogLevel::Info);
+
+    uint64_t cycle = 1;
+    std::filesystem::path last_timeline;
+    for (uint64_t round = 0; round < 2; ++round) {
+        backend.start();
+
+        ObservationContext ctx(&queue, [&cycle]() { return cycle; }, 0, "restart_unit", 1);
+        ctx.enableCategory(category::TRACE);
+        ctx.trace(category::TRACE, fmt_id, round);
+        ThreadContextManager::instance().flushAll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        last_timeline = backend.outputDir() / "timeline.pftrace";
+        backend.stop();
+    }
+
+    TimelineTrackScan scan = scanTimelineTracks(last_timeline);
+    bool ok = scan.events > 0 && !scan.referenced.empty();
+    for (uint64_t uuid : scan.referenced) {
+        if (scan.declared.count(uuid) == 0) {
+            ok = false;
+        }
+    }
+    if (!ok) {
+        std::cerr << "FAILED: second-run timeline at " << last_timeline << " has " << scan.events
+                  << " events, " << scan.declared.size() << " declared tracks, "
+                  << scan.referenced.size()
+                  << " referenced tracks; every referenced track must be declared\n";
+        std::abort();
+    }
+
+    std::cout << "PASSED\n";
+}
+
 }  // namespace
 
 int main() {
@@ -416,6 +547,7 @@ int main() {
     test_no_drops_under_pressure_debug();
     test_pressure_without_backend_drops_instead_of_hanging();
     test_spin_wait_exits_when_wakeup_is_removed();
+    test_timeline_restart_redeclares_tracks();
 
     std::cout << "\n=== Observation hardening tests PASSED ===\n";
     return 0;

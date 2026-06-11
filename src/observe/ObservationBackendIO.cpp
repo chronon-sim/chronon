@@ -556,6 +556,11 @@ void ObservationBackend::initializeOutputDir_() {
 
     if (config_.timeline_enabled) {
         perfetto_writer_ = std::make_unique<PerfettoTraceWriter>();
+        // Track caches index into the writer's per-file UUID space; reset them
+        // so a restarted backend re-declares its tracks in the new file.
+        source_track_uuids_.clear();
+        counter_track_uuids_.clear();
+        sim_process_uuid_ = 0;
         const std::string timeline_file =
             config_.timeline_file.empty() ? std::string("timeline.pftrace") : config_.timeline_file;
         if (perfetto_writer_->open(output_dir_ / timeline_file)) {
