@@ -111,8 +111,16 @@ inline std::vector<size_t> initialLPT(const PartitionInput& input, size_t num_th
 
     std::vector<size_t> order(input.num_units);
     std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(),
-              [&](size_t a, size_t b) { return input.unit_cost_ns[a] > input.unit_cost_ns[b]; });
+    // Total order: heaviest first, ties broken by unit index. The index tie-break
+    // makes the result independent of the standard library's std::sort (which is
+    // unstable) — without it, uniform-cost inputs sort equal elements in an
+    // implementation-defined order and the partition diverges across stdlibs.
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        if (input.unit_cost_ns[a] != input.unit_cost_ns[b]) {
+            return input.unit_cost_ns[a] > input.unit_cost_ns[b];
+        }
+        return a < b;
+    });
 
     std::vector<double> thread_load(num_threads, 0.0);
 
