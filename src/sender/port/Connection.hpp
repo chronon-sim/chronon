@@ -112,18 +112,18 @@ public:
     virtual void cancelInFlight() noexcept = 0;
 
     /**
-     * Max producer run-ahead (in cycles) this connection's MPSC staging can
-     * absorb while the epoch-free path keeps results identical to the reference:
-     * roughly `threshold / rate - delay`, where `threshold` is the staged-entry
-     * count at which transfer() stops accepting (the ring for an unlimited port,
-     * the InPort capacity for a bounded one), `rate` is the source's per-cycle
-     * send cap, and `delay` accounts for not-yet-due entries the consumer cannot
-     * drain. Returns SIZE_MAX for connections that need no bound (non-MPSC) and 0
-     * when no finite run-ahead is provably safe (uncapped source rate). Used to
-     * gate the epoch-free lookahead path, which removes the per-epoch staging
-     * drain.
+     * Max producer run-ahead (in cycles) this connection's cross-thread buffer
+     * (MPSC staging ring or SPSC lock-free ring) can absorb while the epoch-free
+     * path keeps results identical to the reference: roughly
+     * `threshold / rate - delay`, where `threshold` is the entry count at which
+     * transfer() stops accepting (the ring, or the InPort capacity if smaller),
+     * `rate` is the source's per-cycle send cap, and `delay` accounts for
+     * not-yet-due entries the consumer cannot drain. Returns SIZE_MAX for
+     * connections with no bounded cross-thread ring (same-thread / unbounded) and
+     * 0 when no finite run-ahead is provably safe (uncapped source rate). Used to
+     * gate the epoch-free lookahead path, which removes the per-epoch drain.
      */
-    virtual size_t mpscStagingHeadroom() const noexcept { return SIZE_MAX; }
+    virtual size_t crossThreadHeadroom() const noexcept { return SIZE_MAX; }
 
     /**
      * Type-erased MPSC admission helper. Called by the destination InPort's
@@ -362,23 +362,34 @@ public:
 
     bool hasThreadQueueId() const noexcept override { return thread_queue_id_ != SIZE_MAX; }
 
-    size_t mpscStagingHeadroom() const noexcept override {
-        if (thread_queue_id_ == SIZE_MAX) return SIZE_MAX;  // not in MPSC mode
+    size_t crossThreadHeadroom() const noexcept override {
+        // Identify the bounded cross-thread buffer this connection fills:
+        //   MPSC (thread_queue_id_ set) -> the per-connection staging ring,
+        //   SPSC (lock-free ring)       -> the InPort's lock-free queue (finite
+        //                                  even for an unlimited-capacity port),
+        //   same-thread / unbounded     -> no ring to overflow (SIZE_MAX).
+        size_t ring_usable;
+        if (thread_queue_id_ != SIZE_MAX) {
+            ring_usable = staging_mask_;
+        } else if (to_->usesLockFreeQueue()) {
+            ring_usable = to_->capacity();
+        } else {
+            return SIZE_MAX;  // single-thread queue drains synchronously each tick
+        }
         const size_t rate = from_->perCycleCapacity();
         // An uncapped per-cycle send rate can stage unboundedly per cycle, so no
         // finite run-ahead is provably safe.
         if (rate == OutPort<T>::UNLIMITED_CAPACITY) return 0;
-        // transfer() stops accepting once staged entries reach this many: a
-        // bounded port back-pressures at to_->capacity(); an unlimited port pushes
-        // until the ring physically fills (staging_mask_ usable slots). Past it the
-        // epoch-free path either drops (unlimited: overflow) or back-pressures
-        // where the per-epoch barrier flush would not (bounded), so results would
-        // diverge from the reference.
-        const size_t threshold = std::min(to_->capacity(), staging_mask_);
+        // transfer() stops accepting once buffered entries reach this many: a
+        // bounded port back-pressures at to_->capacity(); an unlimited port fills
+        // the ring. Past it the epoch-free path either drops (unlimited: overflow)
+        // or back-pressures where the per-epoch barrier flush would not (bounded),
+        // so results would diverge from the reference.
+        const size_t threshold = std::min(to_->capacity(), ring_usable);
         const size_t cycles = threshold / rate;
-        // The consumer-driven drain only admits *due* entries (arrive_cycle <= k,
-        // i.e. send_cycle <= k - delay_), so delay_ cycles of not-yet-due entries
-        // always sit staged. The supportable producer run-ahead is cycles - delay_.
+        // The consumer drains only *due* entries (arrive_cycle <= k, i.e.
+        // send_cycle <= k - delay_), so delay_ cycles of not-yet-due entries always
+        // sit buffered. The supportable producer run-ahead is cycles - delay_.
         return (cycles > delay_) ? (cycles - delay_) : 0;
     }
 

@@ -348,15 +348,16 @@ bool TickSimulation::allMPSCPortsHaveConnProgress_() const noexcept {
     return true;
 }
 
-bool TickSimulation::mpscStagingFitsLookahead_(uint64_t max_lookahead) const noexcept {
-    // mpscStagingHeadroom() already folds in the source's per-cycle send rate and
-    // the edge delay, so it is the max producer run-ahead (in cycles) a connection
-    // can absorb without overflow (unlimited port) or back-pressure divergence
-    // (bounded port). The producer can lead the consumer by up to max_lookahead
-    // cycles, so every connection's headroom must exceed it. Connections that need
-    // no bound report SIZE_MAX; an uncapped source reports 0 and always vetoes.
+bool TickSimulation::crossThreadHeadroomFits_(uint64_t max_lookahead) const noexcept {
+    // crossThreadHeadroom() folds in the source's per-cycle send rate and the edge
+    // delay, so it is the max producer run-ahead (in cycles) a connection's
+    // cross-thread buffer (MPSC staging ring or SPSC lock-free ring) can absorb
+    // without overflow (unlimited port) or back-pressure divergence (bounded port).
+    // The producer can lead the consumer by up to max_lookahead cycles, so every
+    // connection's headroom must exceed it. Connections with no bounded cross-thread
+    // ring report SIZE_MAX; an uncapped source reports 0 and always vetoes.
     for (const ConnectionBase* c : connections_) {
-        if (c->mpscStagingHeadroom() <= max_lookahead) return false;
+        if (c->crossThreadHeadroom() <= max_lookahead) return false;
     }
     return true;
 }

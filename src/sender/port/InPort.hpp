@@ -122,8 +122,14 @@ public:
      */
     void useSingleThreadQueue() {
         multi_producer_queue_raw_ = nullptr;
+        lock_free_queue_ = false;
         queue_ = std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity_);
     }
+
+    /// True when this port drains a bounded lock-free SPSC ring (cross-thread,
+    /// single producer). The ring is finite even for an unlimited-capacity port,
+    /// so the epoch-free gate must bound producer run-ahead against capacity().
+    bool usesLockFreeQueue() const noexcept { return lock_free_queue_; }
 
     /**
      * Switch to lock-free SPSC queue.
@@ -134,6 +140,7 @@ public:
      */
     void useLockFreeQueue() {
         multi_producer_queue_raw_ = nullptr;
+        lock_free_queue_ = true;
         queue_ = std::make_unique<LockFreeQueueAdapter<StoredMessage>>(capacity_);
     }
 
@@ -148,6 +155,7 @@ public:
         if (multi_producer_queue_raw_) {
             return;
         }
+        lock_free_queue_ = false;
         auto mpq = std::make_unique<MultiProducerQueueAdapter<StoredMessage>>(capacity_);
         multi_producer_queue_raw_ = mpq.get();
         queue_ = std::move(mpq);
@@ -808,7 +816,8 @@ private:
     PortPolicy policy_ = PortPolicy::LegacyFastPath;
     std::unique_ptr<IMessageQueue<StoredMessage>> queue_;
     MultiProducerQueueAdapter<StoredMessage>* multi_producer_queue_raw_ =
-        nullptr;  ///< Non-owning ptr for MPSC access
+        nullptr;                    ///< Non-owning ptr for MPSC access
+    bool lock_free_queue_ = false;  ///< True iff queue_ is the lock-free SPSC ring
     // Reused by receiveAllBuffered() to avoid per-cycle allocation; single-consumer,
     // so no synchronization is needed.
     std::vector<StoredMessage> drain_scratch_;

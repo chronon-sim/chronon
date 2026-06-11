@@ -179,6 +179,52 @@ void verify_staging_veto(uint64_t cycles, unsigned hw) {
     check(long_delay.epoch_free_runs == 0, "staging-veto vetoes epoch-free for long edge delay");
 }
 
+// Pure single-producer cycle A->B->C->D->A (delay 1). Every InPort has exactly
+// one producer, so each cross-thread edge is optimized as an SPSC lock-free ring
+// (no MPSC fan-in) — this exercises the SPSC branch of the headroom gate.
+RunResult runCycle(size_t num_threads, bool epoch_free, uint32_t max_lookahead, uint64_t cycles) {
+    TickSimulationConfig cfg;
+    cfg.num_threads = num_threads;
+    cfg.enable_parallel = (num_threads > 1);
+    cfg.enable_lookahead = true;
+    cfg.enable_dynamic_rebalance = false;
+    cfg.enable_epoch_free_lookahead = epoch_free;
+    cfg.max_lookahead_cycles = max_lookahead;
+    cfg.epoch_size = 64;
+
+    TickSimulation sim(cfg);
+    constexpr uint32_t kWork = 1500;
+    auto* A = sim.createUnit<Node>("A", 11, kWork);
+    auto* B = sim.createUnit<Node>("B", 22, kWork);
+    auto* C = sim.createUnit<Node>("C", 33, kWork);
+    auto* D = sim.createUnit<Node>("D", 44, kWork);
+    sim.connect(A->out, B->in, 1);
+    sim.connect(B->out, C->in, 1);
+    sim.connect(C->out, D->in, 1);
+    sim.connect(D->out, A->in, 1);  // close the cycle; one producer per port -> SPSC
+    sim.initialize();
+    sim.run(cycles);
+    return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount()};
+}
+
+// The SPSC lock-free ring (USABLE_CAPACITY, ~4095) is bounded even for unlimited
+// ports, so the gate must cover SPSC edges too — not just MPSC staging.
+void verify_spsc_gate(uint64_t cycles, unsigned hw) {
+    if (hw < 4) return;
+    const uint64_t ref =
+        runCycle(/*threads=*/1, /*epoch_free=*/false, /*max_lookahead=*/100, cycles).checksum;
+
+    // Small lookahead fits the SPSC ring -> engages, matches the reference.
+    RunResult ok = runCycle(/*threads=*/4, /*epoch_free=*/true, /*max_lookahead=*/64, cycles);
+    check(ok.checksum == ref, "spsc-gate epoch-free == ref (engaged)");
+    check(ok.epoch_free_runs > 0, "spsc-gate epoch-free engages within SPSC ring");
+
+    // Lookahead beyond the SPSC ring -> veto, fall back to barrier, still matches.
+    RunResult veto = runCycle(/*threads=*/4, /*epoch_free=*/true, /*max_lookahead=*/5000, cycles);
+    check(veto.checksum == ref, "spsc-gate epoch-free == ref (veto fallback)");
+    check(veto.epoch_free_runs == 0, "spsc-gate vetoes epoch-free past SPSC ring");
+}
+
 }  // namespace
 
 int main() {
@@ -195,6 +241,7 @@ int main() {
     verify(2, 5, cycles, hw);
 
     verify_staging_veto(cycles, hw);
+    verify_spsc_gate(cycles, hw);
 
     std::cout << "\n=== Results: " << g_pass << " passed, " << g_fail << " failed ===\n";
     return g_fail == 0 ? 0 : 1;
