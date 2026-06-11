@@ -110,6 +110,20 @@ if(perfetto_ADDED)
     target_compile_features(perfetto_sdk PUBLIC cxx_std_17)
     # Third-party code: keep it out of our warning/-Werror surface.
     target_compile_options(perfetto_sdk PRIVATE -w)
+    # Sanitizer instrumentation must match the rest of the build: protozero's
+    # arena poisoning is split between header-inlined code (compiled into
+    # chronon TUs) and perfetto.cc — mixing instrumented and uninstrumented
+    # TUs trips false use-after-poison reports under clang ASan.
+    if(CHRONON_ENABLE_ASAN)
+        target_compile_options(perfetto_sdk PRIVATE
+            -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(perfetto_sdk PUBLIC -fsanitize=address,undefined)
+    endif()
+    if(CHRONON_ENABLE_TSAN)
+        target_compile_options(perfetto_sdk PRIVATE
+            -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(perfetto_sdk PUBLIC -fsanitize=thread)
+    endif()
     find_package(Threads REQUIRED)
     target_link_libraries(perfetto_sdk PUBLIC Threads::Threads)
 endif()
