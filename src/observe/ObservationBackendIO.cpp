@@ -7,8 +7,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 /// @file ObservationBackendIO.cpp
-/// @brief File I/O, text/binary output formatting, counter CSV writing,
-///        and output directory initialization for ObservationBackend.
+/// @brief File I/O, text output formatting, Perfetto timeline output, counter
+///        CSV writing, and output directory initialization for ObservationBackend.
 
 #include <fmt/chrono.h>
 #include <fmt/format.h>
@@ -17,7 +17,6 @@
 #include <iostream>
 
 #include "ArgFormat.hpp"
-#include "BinaryTraceWriter.hpp"
 #include "FormatRegistry.hpp"
 #include "ObservationBackend.hpp"
 
@@ -59,32 +58,79 @@ void ObservationBackend::writeEventAsText_(const StructuredRecord* rec, const st
 }
 
 // ---------------------------------------------------------------------------
-// Per-channel format resolution
+// Perfetto timeline output
 // ---------------------------------------------------------------------------
 
-OutputFormat ObservationBackend::resolveTraceFormat_(CategoryMask event_category) const {
-    CategoryMask user_cat = event_category & category::USER_CATEGORY_MASK;
-    if (user_cat != 0) {
-        auto it = config_.category_format_overrides.find(user_cat);
-        if (it != config_.category_format_overrides.end() && it->second.trace_format.has_value()) {
-            return *it->second.trace_format;
-        }
+uint64_t ObservationBackend::timelineTrackForSource_(uint16_t source_id) {
+    if (source_id >= source_track_uuids_.size()) {
+        source_track_uuids_.resize(static_cast<size_t>(source_id) + 1, 0);
     }
-
-    return config_.trace_format;
+    uint64_t& uuid = source_track_uuids_[source_id];
+    if (uuid == 0) {
+        std::string_view name = "unknown";
+        if (source_id > 0 && source_id < source_name_cache_.size()) {
+            name = source_name_cache_[source_id];
+        }
+        uuid = perfetto_writer_->addTrack(name, sim_process_uuid_);
+    }
+    return uuid;
 }
 
-OutputFormat ObservationBackend::resolveLogFormat_(CategoryMask log_category) const {
-    if (log_category & static_cast<uint64_t>(category::LOG_DEBUG)) {
-        return config_.debug_format;
+void ObservationBackend::writeTraceToTimeline_(const StructuredRecord* rec,
+                                               const std::byte* args_data, size_t args_size) {
+    const FormatInfo& fmt_info = FormatRegistry::instance().getFormat(rec->format_id);
+    if (fmt_info.format_string.empty()) {
+        return;  // Invalid format ID
     }
-    if (log_category & static_cast<uint64_t>(category::LOG_WARN)) {
-        return config_.warn_format;
+
+    timeline_msg_buffer_.clear();
+    reconstructMessageTo_(timeline_msg_buffer_, fmt_info, rec, args_data, args_size);
+
+    // 1 cycle is rendered as 1 ns on the timeline axis.
+    perfetto_writer_->instant(
+        timelineTrackForSource_(rec->source_id), "trace",
+        std::string_view(timeline_msg_buffer_.data(), timeline_msg_buffer_.size()), rec->cycle);
+
+    local_bytes_written_ += timeline_msg_buffer_.size() + 24;
+}
+
+void ObservationBackend::writeCounterToTimeline_(uint64_t cycle, std::string_view unit_name,
+                                                 std::string_view counter_name, uint64_t value) {
+    std::string key;
+    key.reserve(unit_name.size() + 1 + counter_name.size());
+    key.append(unit_name);
+    key.push_back('.');
+    key.append(counter_name);
+
+    auto [it, inserted] = counter_track_uuids_.try_emplace(key, 0);
+    if (inserted) {
+        it->second = perfetto_writer_->addCounterTrack(key, /*unit_name=*/{}, sim_process_uuid_);
     }
-    if (log_category & static_cast<uint64_t>(category::LOG_ERROR)) {
-        return config_.error_format;
+
+    perfetto_writer_->counterValue(it->second, cycle, static_cast<int64_t>(value));
+    local_bytes_written_ += 24;
+}
+
+/// Appends timeline streams submitted via submitTimeline() (e.g. the scheduler
+/// execution timeline) and closes the Perfetto writer. Runs on the worker
+/// thread during shutdown, after the final event drain.
+void ObservationBackend::finalizeTimeline_() {
+    if (!perfetto_writer_) {
+        return;
     }
-    return config_.info_format;
+
+    std::vector<TimelineStreamData> pending;
+    {
+        std::lock_guard<std::mutex> lock(timeline_submit_mutex_);
+        pending.swap(submitted_timelines_);
+    }
+
+    for (const auto& data : pending) {
+        writeTimeline(*perfetto_writer_, data);
+    }
+
+    perfetto_writer_->flush();
+    perfetto_writer_->close();
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +356,7 @@ void ObservationBackend::flush_() {
         for (auto& [name, sink] : custom_sinks_) {
             sink->osFlush();
         }
-        if (binary_trace_writer_) binary_trace_writer_->flush();
+        if (perfetto_writer_) perfetto_writer_->flush();
         last_os_flush_time_ = now;
     }
 
@@ -484,8 +530,8 @@ void ObservationBackend::emitLongDerivedValues_(uint64_t cycle) {
 // Output directory initialization
 // ---------------------------------------------------------------------------
 
-/// Sets up the timestamped output directory, opens counter CSV, binary trace
-/// writer, and text log sinks based on per-channel format configuration.
+/// Sets up the timestamped output directory, opens counter CSV, the Perfetto
+/// timeline writer, and text log sinks.
 void ObservationBackend::initializeOutputDir_() {
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
@@ -507,27 +553,22 @@ void ObservationBackend::initializeOutputDir_() {
         counter_file_ << "cycle,unit,counter_name,value\n";
     }
 
-    if (config_.needsBinaryOutput()) {
-        const auto& trace_cfg = config_.trace_config;
-        BinaryTraceConfig binary_cfg;
-        binary_cfg.compression_enabled = trace_cfg.compression.enabled;
-        binary_cfg.compression_level = trace_cfg.compression.level;
-        binary_cfg.block_size = trace_cfg.compression.block_size;
-        binary_cfg.embed_schema = trace_cfg.embed_schema;
-        binary_cfg.generate_index = trace_cfg.generate_index;
-
-        binary_trace_writer_ = std::make_unique<BinaryTraceWriter>(binary_cfg);
-        binary_trace_writer_->setSimulationName(config_.simulation_name);
-        if (source_name_lookup_) {
-            binary_trace_writer_->setSourceNameLookup(source_name_lookup_);
+    if (config_.timeline_enabled) {
+        perfetto_writer_ = std::make_unique<PerfettoTraceWriter>();
+        const std::string& timeline_file =
+            config_.timeline_file.empty() ? std::string("timeline.pftrace") : config_.timeline_file;
+        if (perfetto_writer_->open(output_dir_ / timeline_file)) {
+            std::string process_name = config_.simulation_name.empty() ? std::string("Simulation")
+                                                                       : config_.simulation_name;
+            sim_process_uuid_ = perfetto_writer_->addProcessTrack(process_name, /*pid=*/1);
+        } else {
+            std::cerr << "[observe] failed to open timeline file " << timeline_file
+                      << " (timeline output disabled)\n";
+            perfetto_writer_.reset();
         }
-        if (unit_type_lookup_) {
-            binary_trace_writer_->setUnitTypeLookup(unit_type_lookup_);
-        }
-        binary_trace_writer_->open(output_dir_ / "events.ctrace");
     }
 
-    if (config_.needsTextOutput()) {
+    {
         default_sink_ = std::make_unique<LogFileSink>();
         default_sink_->file.open(output_dir_ / "events.log");
         default_sink_->buffer.reserve(TEXT_BUFFER_FLUSH_SIZE * 2);

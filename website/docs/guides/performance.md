@@ -175,42 +175,43 @@ Counter ops_{this, "ops", "Operations"};
 
 ### Inspect Scheduler Parallelism
 
-Chronon can emit a Chrome Trace / Perfetto scheduler timeline without adding
-unit-level instrumentation. The trace is disabled by default because detailed
-unit slices intentionally measure the hot path.
+Chronon can emit a Perfetto scheduler timeline without adding unit-level
+instrumentation. The trace is disabled by default because detailed unit slices
+intentionally measure the hot path.
 
 ```yaml
 simulation:
-  timeline_trace:
-    enabled: true
-    file: out/chronon_timeline.json
-    start_cycle: 0
-    end_cycle: 2000
-    max_events: 1000000
-    trace_units: true
-    trace_waits: true
-    trace_epochs: true
-    trace_arbitration: true
+  observation:
+    timeline:
+      scheduler:
+        enabled: true
+        start_cycle: 0
+        end_cycle: 2000
+        max_events: 1000000
+        trace_units: true
+        trace_waits: true
+        trace_epochs: true
+        trace_arbitration: true
 ```
 
 CLI override example:
 
 ```bash
 ./build_release/nucleus test.elf -n 200000 --no-observe \
-  -p simulation.timeline_trace.enabled=true \
-  -p simulation.timeline_trace.file=out/chronon_timeline.json \
-  -p simulation.timeline_trace.end_cycle=2000
+  -p simulation.observation.timeline.scheduler.enabled=true \
+  -p simulation.observation.timeline.scheduler.end_cycle=2000
 ```
 
-Open the resulting JSON in `ui.perfetto.dev` or `chrome://tracing`. Lanes named
+With the observation backend running, the scheduler slices appear in the run's
+`timeline.pftrace` under a "Chronon Scheduler" process group; with
+`--no-observe`, a standalone Perfetto file (default `chronon_timeline.pftrace`)
+is written instead. Open the `.pftrace` file in `ui.perfetto.dev`. Lanes named
 `stream N (logical worker)` are Chronon logical execution streams. Unit events
 on a lane show which unit executed there at that time; after dynamic rebalance,
-the same unit may appear on a different stream. Perfetto may show numeric
-thread ids; those ids are 1-based in the JSON, while `args.stream` retains the
-zero-based Chronon stream id. The separate `scheduler` lane records scheduler
-work, not a simulation worker. Long `cluster dependency` slices indicate
-spin-wait time on predecessor cluster progress atomics; sparse or
-non-overlapping `unit` slices indicate poor stream packing or insufficient
+the same unit may appear on a different stream. The separate `scheduler` lane
+records scheduler work, not a simulation worker. Long `cluster dependency`
+slices indicate spin-wait time on predecessor cluster progress atomics; sparse
+or non-overlapping `unit` slices indicate poor stream packing or insufficient
 lookahead.
 
 ### Tune Epoch Size

@@ -4,8 +4,8 @@ sidebar_label: "Scheduler Timeline Trace"
 
 # Scheduler Timeline Trace
 
-Chronon can emit a scheduler timeline in Chrome Trace / Perfetto JSON format.
-This is intended for diagnosing whether Chronon logical streams are tightly
+Chronon can emit a scheduler timeline in Perfetto protobuf format. This is
+intended for diagnosing whether Chronon logical streams are tightly
 overlapped, whether a partition leaves streams under-filled, and where workers
 spend wall time spinning on predecessor cluster progress atomics.
 
@@ -14,15 +14,19 @@ per-cycle timestamps for the timeline path.
 
 ## What Changed
 
-The scheduler timeline support is implemented entirely in the Chronon scheduler
-layer:
+The scheduler timeline recording is implemented entirely in the Chronon
+scheduler layer; output goes through the observation backend's unified
+Perfetto timeline:
 
 - `SchedulerTimelineTraceConfig` stores YAML/C++ configuration.
-- `SchedulerTimelineTrace` buffers per-stream events and writes Chrome Trace
-  JSON.
+- `SchedulerTimelineTrace` buffers per-stream events.
 - `TickSimulation` records events in the existing progress-based and barrier
   scheduler paths.
-- `SimulationApp` flushes the timeline after `runUntilTermination()` completes.
+- When the observation backend is running with a timeline sink, the recorded
+  scheduler slices merge into the unified `timeline.pftrace` (written during
+  backend shutdown), alongside simulation trace events and counter tracks.
+  When observation is disabled (e.g. `--no-observe`), `SimulationApp` writes a
+  standalone Perfetto `.pftrace` file after `runUntilTermination()` completes.
 
 No simulation unit code needs to be modified. The feature observes Chronon
 execution streams (`thread_units_[N]`), not model-specific pipeline state.
@@ -33,26 +37,30 @@ YAML:
 
 ```yaml
 simulation:
-  timeline_trace:
-    enabled: true
-    file: out/chronon_timeline.json
-    max_events: 1000000
-    start_cycle: 0
-    end_cycle: 2000
-    trace_units: true
-    trace_waits: true
-    trace_epochs: true
-    trace_arbitration: true
-    min_duration_ns: 0
+  observation:
+    timeline:
+      scheduler:
+        enabled: true
+        max_events: 1000000
+        start_cycle: 0
+        end_cycle: 2000
+        trace_units: true
+        trace_waits: true
+        trace_epochs: true
+        trace_arbitration: true
+        min_duration_ns: 0
 ```
+
+The old top-level `simulation.timeline_trace:` key is deprecated; it is still
+parsed but prints a warning. Use `simulation.observation.timeline.scheduler:`
+instead.
 
 Equivalent CLI overrides with `SimulationApp`:
 
 ```bash
 ./my_sim config.yaml --no-observe \
-  -p simulation.timeline_trace.enabled=true \
-  -p simulation.timeline_trace.file=out/chronon_timeline.json \
-  -p simulation.timeline_trace.end_cycle=2000
+  -p simulation.observation.timeline.scheduler.enabled=true \
+  -p simulation.observation.timeline.scheduler.end_cycle=2000
 ```
 
 ## Fields
@@ -60,7 +68,7 @@ Equivalent CLI overrides with `SimulationApp`:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Enables scheduler timeline collection. |
-| `file` | `chronon_timeline.json` | Output path. Parent directories are created if possible. |
+| `file` | `chronon_timeline.pftrace` | Standalone output path, used only when observation is disabled. Parent directories are created if possible. With the observation backend running, slices merge into `timeline.pftrace` instead. |
 | `max_events` | `1000000` | Global event cap. Further events are counted as dropped. |
 | `start_cycle` | `0` | First simulation cycle to record. |
 | `end_cycle` | `UINT64_MAX` | Stop recording at this cycle, exclusive. |
@@ -72,7 +80,9 @@ Equivalent CLI overrides with `SimulationApp`:
 
 ## Output Lanes
 
-The trace uses one process named `Chronon Scheduler`.
+The scheduler timeline appears as a process group named `Chronon Scheduler` in
+the Perfetto UI (separate from the `Simulation` process group that holds trace
+events and counter tracks).
 
 | Lane | Meaning |
 |------|---------|
@@ -84,13 +94,9 @@ IDs. The current `stdexec::static_thread_pool` may execute bulk work on worker
 threads chosen by the runtime, but the logical lane identity remains the
 Chronon stream assignment.
 
-Chrome Trace `tid` values are intentionally 1-based to avoid Perfetto treating
-`tid=0` as a special main-thread-like lane. The user-visible lane name remains
-zero-based: `stream 0 (logical worker)` is written with `tid=1`, `stream 1` with
-`tid=2`, and so on. The final `scheduler` lane uses the next `tid` after the
-worker streams and is expected to appear as its own row. It is not an extra
-simulation worker; it contains scheduler-side spans such as epoch and MPSC
-arbitration work.
+The `scheduler` lane appears as its own row after the worker streams. It is
+not an extra simulation worker; it contains scheduler-side spans such as epoch
+and MPSC arbitration work. Perfetto assigns slice colors automatically.
 
 ## Event Types
 
@@ -103,15 +109,15 @@ arbitration work.
 | `scheduler` | `epoch-end mpsc arbitration` | End-of-epoch MPSC flush in progress-based mode. |
 | `summary` | `dropped events` | Instant event emitted when `max_events` is exceeded. |
 
-Every duration event includes a `cycle` argument and a `stream` argument. The
-`stream` value is the original zero-based Chronon logical stream id, which is
-useful when a viewer displays the 1-based Chrome Trace `tid` instead of the lane
-name. Wait events include details such as `cluster`, `pred_cluster`, `needed`,
-`observed`, and `delay`.
+Every duration slice carries `cycle` and `detail` debug annotations (visible in
+the Perfetto slice details panel). For wait events, `detail` names the blocking
+predecessor cluster and includes fields such as `cluster`, `pred_cluster`,
+`needed`, `observed`, and `delay`.
 
 ## Reading The Trace
 
-Open the JSON in `ui.perfetto.dev` or `chrome://tracing`.
+Open `timeline.pftrace` (or the standalone `.pftrace` file when observation is
+disabled) in `ui.perfetto.dev`, or query it with Perfetto's `trace_processor`.
 
 Useful patterns:
 
@@ -129,18 +135,18 @@ Useful patterns:
 For performance investigations, keep the window small first:
 
 ```bash
--p simulation.timeline_trace.start_cycle=0 \
--p simulation.timeline_trace.end_cycle=2000 \
--p simulation.timeline_trace.max_events=1000000
+-p simulation.observation.timeline.scheduler.start_cycle=0 \
+-p simulation.observation.timeline.scheduler.end_cycle=2000 \
+-p simulation.observation.timeline.scheduler.max_events=1000000
 ```
 
 If the trace is too large or unit-level timing perturbs the run too much, start
 with waits only:
 
 ```bash
--p simulation.timeline_trace.trace_units=false \
--p simulation.timeline_trace.trace_waits=true \
--p simulation.timeline_trace.trace_epochs=true
+-p simulation.observation.timeline.scheduler.trace_units=false \
+-p simulation.observation.timeline.scheduler.trace_waits=true \
+-p simulation.observation.timeline.scheduler.trace_epochs=true
 ```
 
 ## Overhead

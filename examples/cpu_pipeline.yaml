@@ -34,28 +34,42 @@ simulation:
             periodic_dump_cycles: 10000 # Dump every 10K cycles (0 = disabled)
             dump_on_shutdown: true # Emit final snapshot on shutdown
 
-        # Unified logging configuration
+        # Unified Perfetto timeline (timeline.pftrace — open in ui.perfetto.dev).
+        # Carries trace events, counter tracks, and the scheduler execution
+        # timeline when its recorder is enabled below.
+        timeline:
+            enabled: true
+            file: timeline.pftrace
+            trace_events: true # Simulation trace channel → instant events
+            counters: true # Counter snapshots → counter tracks
+            # Scheduler execution timeline (wall-clock unit/wait/epoch slices)
+            scheduler:
+                enabled: false
+                # trace_units: true
+                # trace_waits: true
+                # trace_epochs: true
+                # trace_arbitration: true
+                # min_duration_ns: 0
+
+        # Unified logging configuration (text output; trace events go to the
+        # Perfetto timeline above, with an optional text mirror)
         logging:
             enabled: true
             debug:
                 enabled: true
-                format: text
                 file: debug.log
                 backpressure: bounded_wait
                 backpressure_max_spins: 32
             info:
                 enabled: true
-                format: text
                 file: info.log
             warn:
                 enabled: true
-                format: text
             error:
                 enabled: true
-                format: text
             trace:
                 enabled: true
-                format: binary
+                # text: true  # Also mirror trace events to the text log
                 # backpressure: spin_wait  # Optional per-channel override
             temporal:
                 - range: [0, 100000] # Observe first 100K cycles

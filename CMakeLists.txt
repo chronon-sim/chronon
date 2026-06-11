@@ -97,31 +97,6 @@ if(TARGET stdexec)
     set_target_properties(stdexec PROPERTIES SYSTEM TRUE)
 endif()
 
-# Add FlatBuffers (header-only, for binary trace format)
-CPMAddPackage(
-    NAME flatbuffers
-    GITHUB_REPOSITORY google/flatbuffers
-    GIT_TAG v25.12.19
-    GIT_SHALLOW ON
-    OPTIONS
-        "FLATBUFFERS_BUILD_TESTS OFF"
-        "FLATBUFFERS_BUILD_FLATC ON"
-        "FLATBUFFERS_BUILD_FLATHASH OFF"
-)
-
-# Mark flatbuffers includes as SYSTEM and suppress -Werror (third-party code)
-if(TARGET flatbuffers)
-    get_target_property(FB_INC flatbuffers INTERFACE_INCLUDE_DIRECTORIES)
-    set_target_properties(flatbuffers PROPERTIES
-        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${FB_INC}"
-    )
-    target_compile_options(flatbuffers PRIVATE -Wno-error)
-endif()
-
-if(TARGET flatc)
-    target_compile_options(flatc PRIVATE -Wno-error)
-endif()
-
 # Add the main framework library
 add_subdirectory(src)
 

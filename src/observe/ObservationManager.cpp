@@ -66,11 +66,7 @@ void ObservationManager::initialize(const ObservationYAMLConfig& config) {
     backend_config.enable_counter_csv = config.counters.csv_output;
     backend_config.counter_csv_format = config.counters.csv_format;
 
-    backend_config.trace_format = ul.trace_channel.format;
-    backend_config.debug_format = ul.debug_channel.format;
-    backend_config.info_format = ul.info_channel.format;
-    backend_config.warn_format = ul.warn_channel.format;
-    backend_config.error_format = ul.error_channel.format;
+    backend_config.trace_text = ul.trace_channel.text;
 
     backend_config.trace_file = ul.trace_channel.file;
     backend_config.debug_file = ul.debug_channel.file;
@@ -78,33 +74,10 @@ void ObservationManager::initialize(const ObservationYAMLConfig& config) {
     backend_config.warn_file = ul.warn_channel.file;
     backend_config.error_file = ul.error_channel.file;
 
-    backend_config.trace_config = ul.trace_channel;
-
-    for (const auto& cat : ul.categories) {
-        if (!cat.enabled) {
-            continue;
-        }
-
-        CategoryMask mask = resolvePattern(cat.pattern);
-        if (mask == 0) {
-            continue;
-        }
-
-        bool has_override = cat.format.has_value() || cat.trace_format.has_value() ||
-                            cat.debug_format.has_value() || cat.info_format.has_value() ||
-                            cat.warn_format.has_value() || cat.error_format.has_value();
-
-        if (has_override) {
-            ObservationBackend::CategoryFormatOverride ovr;
-            ovr.trace_format = cat.trace_format.has_value() ? cat.trace_format : cat.format;
-            ovr.debug_format = cat.debug_format.has_value() ? cat.debug_format : cat.format;
-            ovr.info_format = cat.info_format.has_value() ? cat.info_format : cat.format;
-            ovr.warn_format = cat.warn_format.has_value() ? cat.warn_format : cat.format;
-            ovr.error_format = cat.error_format.has_value() ? cat.error_format : cat.format;
-
-            backend_config.category_format_overrides[mask] = ovr;
-        }
-    }
+    backend_config.timeline_enabled = config.timeline.enabled;
+    backend_config.timeline_file = config.timeline.file;
+    backend_config.timeline_trace_events = config.timeline.trace_events;
+    backend_config.timeline_counters = config.timeline.counters;
 
     backend_ = std::make_unique<ObservationBackend>(*shared_queue_, backend_config);
 
@@ -249,6 +222,20 @@ bool ObservationManager::isBackendRunning() const noexcept {
     return backend_ && backend_->isRunning();
 }
 
+bool ObservationManager::timelineEnabled() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return backend_ && backend_->timelineEnabled();
+}
+
+bool ObservationManager::submitTimeline(TimelineStreamData&& data) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!backend_ || !backend_->isRunning() || !backend_->timelineEnabled()) {
+        return false;
+    }
+    backend_->submitTimeline(std::move(data));
+    return true;
+}
+
 void ObservationManager::shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
     shutdownLocked_();
@@ -335,29 +322,21 @@ void ObservationManager::printReport(std::ostream& out) const {
     out << "\nUnified Logging:\n";
     out << "  Enabled: " << (ul.enabled ? "yes" : "no") << "\n";
 
-    auto formatName = [](OutputFormat f) -> const char* {
-        switch (f) {
-            case OutputFormat::Text:
-                return "text";
-            case OutputFormat::Binary:
-                return "binary";
-            case OutputFormat::Both:
-                return "both";
-        }
-        return "unknown";
-    };
-
     out << "  Channels:\n";
-    out << "    debug:  " << (ul.debug_channel.enabled ? "on" : "off") << " ("
-        << formatName(ul.debug_channel.format) << ")\n";
-    out << "    info:   " << (ul.info_channel.enabled ? "on" : "off") << " ("
-        << formatName(ul.info_channel.format) << ")\n";
-    out << "    warn:   " << (ul.warn_channel.enabled ? "on" : "off") << " ("
-        << formatName(ul.warn_channel.format) << ")\n";
-    out << "    error:  " << (ul.error_channel.enabled ? "on" : "off") << " ("
-        << formatName(ul.error_channel.format) << ")\n";
-    out << "    trace:  " << (ul.trace_channel.enabled ? "on" : "off") << " ("
-        << formatName(ul.trace_channel.format) << ")\n";
+    out << "    debug:  " << (ul.debug_channel.enabled ? "on" : "off") << "\n";
+    out << "    info:   " << (ul.info_channel.enabled ? "on" : "off") << "\n";
+    out << "    warn:   " << (ul.warn_channel.enabled ? "on" : "off") << "\n";
+    out << "    error:  " << (ul.error_channel.enabled ? "on" : "off") << "\n";
+    out << "    trace:  " << (ul.trace_channel.enabled ? "on" : "off")
+        << (ul.trace_channel.enabled && ul.trace_channel.text ? " (+text)" : "") << "\n";
+
+    out << "\nTimeline (Perfetto):\n";
+    out << "  Enabled: " << (config_.timeline.enabled ? "yes" : "no") << "\n";
+    if (config_.timeline.enabled) {
+        out << "  File: " << config_.timeline.file << "\n";
+        out << "  Trace events: " << (config_.timeline.trace_events ? "yes" : "no") << "\n";
+        out << "  Counter tracks: " << (config_.timeline.counters ? "yes" : "no") << "\n";
+    }
 
     if (!ul.temporal.empty()) {
         out << "  Shared temporal filters: " << ul.temporal.size() << "\n";
@@ -366,9 +345,6 @@ void ObservationManager::printReport(std::ostream& out) const {
     out << "  Category patterns: " << ul.categories.size() << "\n";
     for (const auto& pattern : ul.categories) {
         out << "    - " << pattern.pattern;
-        if (pattern.format.has_value()) {
-            out << " (format: " << formatName(*pattern.format) << ")";
-        }
         if (!pattern.temporal.empty()) {
             out << " (with " << pattern.temporal.size() << " temporal filter(s))";
         }

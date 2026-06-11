@@ -11,6 +11,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -103,7 +104,10 @@ private:
         LOAD_IF_PRESENT(sim, config, sa_critical_path_weight);
         LOAD_IF_PRESENT(sim, config, initial_partition_sync_cost_ns);
 
+        // Deprecated alias for observation.timeline.scheduler (kept for migration).
         if (sim["timeline_trace"]) {
+            std::cerr << "[config] 'simulation.timeline_trace' is deprecated; move it to "
+                         "'simulation.observation.timeline.scheduler'\n";
             parseTimelineTrace(sim["timeline_trace"], config.timeline_trace);
         }
 
@@ -174,11 +178,51 @@ private:
             parseUnifiedLogging(obs_node["logging"], obs_config.unified_logging, source);
         }
 
+        if (obs_node["timeline"]) {
+            parseTimeline(obs_node["timeline"], obs_config.timeline, config);
+        }
+
         if (obs_node["unit_overrides"]) {
             parseUnitOverrides(obs_node["unit_overrides"], obs_config.unit_overrides, source);
         }
 
         config.observation = std::move(obs_config);
+    }
+
+    /**
+     * @brief Parse the unified Perfetto timeline section.
+     *
+     * @code{.yaml}
+     * timeline:
+     *   enabled: true
+     *   file: timeline.pftrace
+     *   trace_events: true
+     *   counters: true
+     *   scheduler: { enabled: true, trace_units: true, ... }   # execution timeline
+     * @endcode
+     *
+     * The scheduler sub-section configures the wall-clock scheduler execution
+     * timeline; it lands in SimulationYAMLConfig::timeline_trace because the
+     * recorder lives in the scheduler, but its output merges into the same
+     * timeline.pftrace.
+     */
+    void parseTimeline(const YAML::Node& node, observe::TimelineYAMLConfig& config,
+                       SimulationYAMLConfig& sim_config) {
+#define LOAD_IF_PRESENT(n, cfg, field)                   \
+    if (n[#field]) {                                     \
+        cfg.field = n[#field].as<decltype(cfg.field)>(); \
+    }
+
+        LOAD_IF_PRESENT(node, config, enabled);
+        LOAD_IF_PRESENT(node, config, file);
+        LOAD_IF_PRESENT(node, config, trace_events);
+        LOAD_IF_PRESENT(node, config, counters);
+
+#undef LOAD_IF_PRESENT
+
+        if (node["scheduler"]) {
+            parseTimelineTrace(node["scheduler"], sim_config.timeline_trace);
+        }
     }
 
     void parseCountersConfig(const YAML::Node& node, observe::CountersYAMLConfig& config,
@@ -213,12 +257,11 @@ private:
      * @code{.yaml}
      * logging:
      *   enabled: true
-     *   debug:  { enabled: true, format: text }
-     *   trace:  { enabled: true, format: binary, compression: {...}, embed_schema: true,
-     *             generate_index: true }
-     *   info:   { enabled: true, format: text }
-     *   warn:   { enabled: true, format: text }
-     *   error:  { enabled: true, format: text }
+     *   debug:  { enabled: true }
+     *   trace:  { enabled: true, text: false }   # trace events go to timeline.pftrace
+     *   info:   { enabled: true }
+     *   warn:   { enabled: true }
+     *   error:  { enabled: true }
      *   temporal:   [ { range: [0, 100000] } ]
      *   categories: [ { pattern: "verif" } ]
      * @endcode
@@ -268,10 +311,7 @@ private:
 
 #undef LOAD_IF_PRESENT
 
-        // format and backpressure need string-to-enum conversion.
-        if (node["format"]) {
-            config.format = parseOutputFormat(node["format"].as<std::string>(), source);
-        }
+        warnDeprecatedFormatKey(node, source);
         if (node["backpressure"]) {
             config.backpressure = parseBackpressurePolicy(node["backpressure"].as<std::string>());
         }
@@ -289,15 +329,18 @@ private:
     }
 
         LOAD_IF_PRESENT(node, config, enabled);
+        LOAD_IF_PRESENT(node, config, text);
         LOAD_IF_PRESENT(node, config, file);
-        LOAD_IF_PRESENT(node, config, embed_schema);
-        LOAD_IF_PRESENT(node, config, generate_index);
 
 #undef LOAD_IF_PRESENT
 
-        // format and backpressure need string-to-enum conversion.
-        if (node["format"]) {
-            config.format = parseOutputFormat(node["format"].as<std::string>(), source);
+        warnDeprecatedFormatKey(node, source);
+        for (const char* key : {"compression", "embed_schema", "generate_index"}) {
+            if (node[key]) {
+                std::cerr << "[config] " << source << ": 'logging.trace." << key
+                          << "' is deprecated (binary .ctrace output was replaced by "
+                             "Perfetto timeline.pftrace) and is ignored\n";
+            }
         }
         if (node["backpressure"]) {
             config.backpressure = parseBackpressurePolicy(node["backpressure"].as<std::string>());
@@ -306,30 +349,16 @@ private:
         if (node["backpressure_max_spins"]) {
             config.backpressure_max_spins = node["backpressure_max_spins"].as<uint32_t>();
         }
-
-        if (node["compression"]) {
-            const auto& comp = node["compression"];
-#define LOAD_IF_PRESENT(n, cfg, field)                   \
-    if (n[#field]) {                                     \
-        cfg.field = n[#field].as<decltype(cfg.field)>(); \
     }
 
-            LOAD_IF_PRESENT(comp, config.compression, enabled);
-            LOAD_IF_PRESENT(comp, config.compression, algorithm);
-            LOAD_IF_PRESENT(comp, config.compression, level);
-            LOAD_IF_PRESENT(comp, config.compression, block_size);
-
-#undef LOAD_IF_PRESENT
+    /// Channel output is text-only since the Perfetto migration; trace events go
+    /// to timeline.pftrace. Old `format:` keys are accepted but ignored.
+    static void warnDeprecatedFormatKey(const YAML::Node& node, const std::string& source) {
+        if (node["format"]) {
+            std::cerr << "[config] " << source
+                      << ": per-channel 'format' is deprecated and ignored (logs are text; "
+                         "trace events go to timeline.pftrace — see observation.timeline)\n";
         }
-    }
-
-    observe::OutputFormat parseOutputFormat(const std::string& format_str,
-                                            const std::string& source) {
-        if (format_str == "text") return observe::OutputFormat::Text;
-        if (format_str == "binary") return observe::OutputFormat::Binary;
-        if (format_str == "both") return observe::OutputFormat::Both;
-        throw ConfigLoadError(
-            source, "Invalid output format '" + format_str + "' (use: text, binary, both)");
     }
 
     static observe::BackpressurePolicy parseBackpressurePolicy(const std::string& bp) {
@@ -391,29 +420,13 @@ private:
                 pattern.enabled = pattern_node["enabled"].as<bool>();
             }
 
-            if (pattern_node["format"]) {
-                pattern.format =
-                    parseOutputFormat(pattern_node["format"].as<std::string>(), source);
-            }
-            if (pattern_node["trace_format"]) {
-                pattern.trace_format =
-                    parseOutputFormat(pattern_node["trace_format"].as<std::string>(), source);
-            }
-            if (pattern_node["debug_format"]) {
-                pattern.debug_format =
-                    parseOutputFormat(pattern_node["debug_format"].as<std::string>(), source);
-            }
-            if (pattern_node["info_format"]) {
-                pattern.info_format =
-                    parseOutputFormat(pattern_node["info_format"].as<std::string>(), source);
-            }
-            if (pattern_node["warn_format"]) {
-                pattern.warn_format =
-                    parseOutputFormat(pattern_node["warn_format"].as<std::string>(), source);
-            }
-            if (pattern_node["error_format"]) {
-                pattern.error_format =
-                    parseOutputFormat(pattern_node["error_format"].as<std::string>(), source);
+            for (const char* key : {"format", "trace_format", "debug_format", "info_format",
+                                    "warn_format", "error_format"}) {
+                if (pattern_node[key]) {
+                    std::cerr << "[config] " << source << ": category '" << key
+                              << "' is deprecated and ignored (output formats are no longer "
+                                 "configured per category)\n";
+                }
             }
 
             if (pattern_node["temporal"]) {

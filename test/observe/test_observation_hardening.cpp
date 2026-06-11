@@ -233,11 +233,8 @@ void test_no_drops_under_pressure_debug() {
     backend_cfg.output_dir = "/tmp/chronon_obs_pressure";
     backend_cfg.enable_counter_csv = false;
     backend_cfg.enable_reordering = false;
-    backend_cfg.trace_format = OutputFormat::Text;
-    backend_cfg.debug_format = OutputFormat::Text;
-    backend_cfg.info_format = OutputFormat::Text;
-    backend_cfg.warn_format = OutputFormat::Text;
-    backend_cfg.error_format = OutputFormat::Text;
+    backend_cfg.trace_text = true;
+    backend_cfg.timeline_enabled = false;
 
     ObservationBackend backend(queue, backend_cfg);
 

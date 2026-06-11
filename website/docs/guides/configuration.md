@@ -119,8 +119,8 @@ int main(int argc, char* argv[]) {
 ./my_sim --threads=4 --run-cycles=1000000
 ./my_sim -p simulation.num_workers=4
 ./my_sim -p simulation.observation.logging.debug.enabled=false
-./my_sim -p simulation.timeline_trace.enabled=true \
-         -p simulation.timeline_trace.file=out/chronon_timeline.json
+./my_sim -p simulation.observation.timeline.scheduler.enabled=true \
+         -p simulation.observation.timeline.scheduler.end_cycle=2000
 ```
 
 ## YAML Configuration
@@ -154,7 +154,7 @@ simulation:
 
 ### Observation Configuration
 
-Chronon uses a unified logging model where each event type (debug, info, warn, error, trace) is an independent "channel" with its own enable/format settings. Categories and temporal filters are shared across all channels.
+Chronon uses a unified logging model where each event type (debug, info, warn, error, trace) is an independent "channel" with its own enable settings. Categories and temporal filters are shared across all channels. Log channels are text-only (`events.log`); trace events go to the unified Perfetto timeline (`timeline.pftrace`).
 
 ```yaml
 simulation:
@@ -166,7 +166,16 @@ simulation:
     counters:
       enabled: true
       csv_output: true
+      periodic_dump_cycles: 10000
       dump_on_shutdown: true
+
+    timeline:                  # Unified Perfetto timeline (timeline.pftrace)
+      enabled: true            # Default true
+      file: timeline.pftrace
+      trace_events: true       # Simulation trace channel -> instant events
+      counters: true           # Counter snapshots -> counter tracks
+      scheduler:               # Scheduler execution timeline (see below)
+        enabled: false
 
     logging:
       enabled: true
@@ -174,26 +183,16 @@ simulation:
       # Per-channel configuration
       debug:
         enabled: true
-        format: text           # text | binary | both
+        file: debug.log        # Optional; empty = default events.log
       info:
         enabled: true
-        format: text
       warn:
         enabled: true
-        format: text
       error:
         enabled: true
-        format: text
       trace:
         enabled: true
-        format: binary         # Binary output for traces
-        compression:
-          enabled: true
-          algorithm: "zstd"
-          level: 3
-          block_size: 65536
-        embed_schema: true
-        generate_index: true
+        text: false            # true mirrors trace events into events.log
 
       # Shared temporal filters (apply to all channels)
       temporal:
@@ -205,7 +204,6 @@ simulation:
           temporal:
             - range: [0, 50000]
         - pattern: "branch_pred"
-          format: text         # Override: route this category to text for all channels
           temporal:
             - periodic:
                 window: 1000
@@ -213,63 +211,53 @@ simulation:
         - pattern: "flush"
 ```
 
-### Output Format
+### Output Files
 
-Each channel (debug, info, warn, error, trace) can independently route its events to text, binary, or both outputs:
+| File | Contents |
+|------|----------|
+| `events.log` | Text logs (debug/info/warn/error); trace events mirrored when `trace.text: true` |
+| `timeline.pftrace` | Perfetto protobuf timeline: trace instant events, counter tracks, scheduler slices |
+| `counters.csv` | Counter snapshots |
 
-| Format | Output File | Description |
-|--------|-------------|-------------|
-| `text` | `events.log` | Human-readable text output |
-| `binary` | `events.ctrace` | Compact binary format (FlatBuffers + zstd) |
-| `both` | Both files | Write to both text and binary outputs |
+Per-channel `format:` keys (and the removed binary trace output they used to
+select) are deprecated; they are parsed but ignored with a warning. Logs are
+always text, and trace events always go to the Perfetto timeline.
 
-Files are only created if at least one channel uses that format.
+### Category Format Overrides (Removed)
 
-### Per-Category Format Overrides
-
-Categories can override the output format for specific channels:
-
-```yaml
-categories:
-  - pattern: "verif"
-    format: text              # Shorthand: override all channels to text
-    trace_format: binary      # Override: trace channel stays binary
-  - pattern: "branch_pred"
-    debug_format: both        # Override: debug events for this category go to both
-```
-
-Priority: channel-specific (`trace_format`) > shorthand (`format`) > channel default.
+Category patterns no longer accept per-category format overrides (`format`,
+`trace_format`, `debug_format`, ...). These keys are deprecated and ignored
+with a warning. Categories still control enable/disable and temporal filters.
 
 ### Scheduler Timeline Trace
 
-The scheduler timeline is separate from observation logging and counters. It
-records Chronon scheduler streams, unit tick slices, cross-thread spin waits,
-epoch spans, and MPSC arbitration slices into Chrome Trace / Perfetto JSON.
-Worker lane names are zero-based (`stream 0`, `stream 1`, ...), while the JSON
-`tid` values are 1-based to avoid Perfetto's special handling of `tid=0`. Each
-duration event also carries `args.stream`, the original zero-based logical
-stream id. The `scheduler` lane is a separate non-worker row for epoch,
-rebalance, and MPSC arbitration spans.
+The scheduler timeline records Chronon scheduler streams, unit tick slices,
+cross-thread spin waits, epoch spans, and MPSC arbitration slices. It is part
+of the unified Perfetto timeline: when the observation backend runs with a
+timeline sink, the scheduler slices merge into `timeline.pftrace` under a
+"Chronon Scheduler" process group, with one lane per worker stream (`stream 0`,
+`stream 1`, ...) plus a `scheduler` lane for epoch, rebalance, and MPSC
+arbitration spans. Slices carry `cycle` and `detail` debug annotations.
 
 ```yaml
 simulation:
-  timeline_trace:
-    enabled: false
-    file: chronon_timeline.json
-    max_events: 1000000
-    start_cycle: 0
-    end_cycle: 2000
-    trace_units: true
-    trace_waits: true
-    trace_epochs: true
-    trace_arbitration: true
-    min_duration_ns: 0
+  observation:
+    timeline:
+      scheduler:
+        enabled: false
+        max_events: 1000000
+        start_cycle: 0
+        end_cycle: 2000
+        trace_units: true
+        trace_waits: true
+        trace_epochs: true
+        trace_arbitration: true
+        min_duration_ns: 0
 ```
 
 | Field | Description |
 |-------|-------------|
 | `enabled` | Enable timeline collection. Disabled by default. |
-| `file` | Output JSON path. |
 | `max_events` | Event cap; additional events are reported as dropped. |
 | `start_cycle`, `end_cycle` | Inclusive start and exclusive end cycle capture window. |
 | `trace_units` | Record each unit tick as a duration slice. |
@@ -277,6 +265,11 @@ simulation:
 | `trace_epochs` | Record progress-epoch spans on the scheduler lane. |
 | `trace_arbitration` | Record MPSC arbitration spans on the scheduler lane. |
 | `min_duration_ns` | Drop events below this duration. |
+
+The old top-level `simulation.timeline_trace:` key is deprecated; it is still
+parsed but prints a warning. When observation is disabled (e.g. `--no-observe`),
+the scheduler timeline falls back to a standalone Perfetto protobuf file at the
+configured path (default `chronon_timeline.pftrace`).
 
 See [Scheduler Timeline Trace](scheduler-timeline.md) for event semantics and
 Perfetto usage.

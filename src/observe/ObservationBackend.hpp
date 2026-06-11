@@ -32,13 +32,14 @@
 #include <stdexec/stop_token.hpp>
 #pragma GCC diagnostic pop
 
-#include "BinaryTraceWriter.hpp"
 #include "DerivedCounter.hpp"
 #include "FormatRegistry.hpp"
 #include "ObservationQueue.hpp"
 #include "ObservationYAMLConfig.hpp"
+#include "PerfettoTraceWriter.hpp"
 #include "ReorderBuffer.hpp"
 #include "ThreadContextManager.hpp"
+#include "TimelineData.hpp"
 #include "Types.hpp"
 
 namespace chronon::observe {
@@ -47,42 +48,19 @@ namespace chronon::observe {
  * @brief Background worker that drains observability queues and writes output files.
  *
  * Drains per-thread SPSC queues (traces/logs) and the shared queue (counter
- * snapshots, lookahead commits), then routes each event to text and/or binary
- * sinks based on per-channel format configuration.
+ * snapshots, lookahead commits), then routes each event to the text and/or
+ * Perfetto timeline sinks.
  *
  * Output files:
- * - events.log    — text output (channels with format=Text or Both).
- * - events.ctrace — binary output (channels with format=Binary or Both).
- * - counters.csv  — performance counter snapshots.
+ * - events.log       — text output (debug/info/warn/error, optional trace mirror).
+ * - timeline.pftrace — Perfetto timeline (trace events, counter tracks, and the
+ *                      scheduler execution timeline submitted at shutdown).
+ * - counters.csv     — performance counter snapshots.
  */
 class ObservationBackend {
 public:
     using EventHandler =
         std::function<void(ObservationQueue::EventType type, const std::byte* data, size_t size)>;
-
-    /**
-     * @brief Per-category, per-channel format overrides.
-     *
-     * When set, the channel-specific override takes priority over the per-channel default.
-     */
-    struct CategoryFormatOverride {
-        std::optional<OutputFormat> trace_format;
-        std::optional<OutputFormat> debug_format;
-        std::optional<OutputFormat> info_format;
-        std::optional<OutputFormat> warn_format;
-        std::optional<OutputFormat> error_format;
-
-        /// Check if any channel override matches the target format (or Both).
-        [[nodiscard]] bool hasFormat(OutputFormat target) const noexcept {
-            for (const auto* fmt :
-                 {&trace_format, &debug_format, &info_format, &warn_format, &error_format}) {
-                if (*fmt == target || *fmt == OutputFormat::Both) {
-                    return true;
-                }
-            }
-            return false;
-        }
-    };
 
     struct Config {
         std::string output_dir = "out";
@@ -90,11 +68,8 @@ public:
         bool enable_counter_csv = true;
         CounterCsvFormat counter_csv_format = CounterCsvFormat::Pivoted;
 
-        OutputFormat trace_format = OutputFormat::Binary;
-        OutputFormat debug_format = OutputFormat::Text;
-        OutputFormat info_format = OutputFormat::Text;
-        OutputFormat warn_format = OutputFormat::Text;
-        OutputFormat error_format = OutputFormat::Text;
+        /// Mirror structured trace events to the text log (timeline is the primary sink).
+        bool trace_text = false;
 
         std::string trace_file;
         std::string debug_file;
@@ -102,40 +77,16 @@ public:
         std::string warn_file;
         std::string error_file;
 
-        std::unordered_map<CategoryMask, CategoryFormatOverride> category_format_overrides;
-
-        TraceChannelConfig trace_config;
+        bool timeline_enabled = true;
+        std::string timeline_file = "timeline.pftrace";
+        bool timeline_trace_events = true;
+        bool timeline_counters = true;
 
         bool enable_reordering = true;
         uint64_t reorder_watermark_cycles = 1000;
         size_t reorder_max_events = 100000;
 
         std::string simulation_name;
-
-        [[nodiscard]] bool needsTextOutput() const noexcept {
-            return hasFormat_(OutputFormat::Text);
-        }
-
-        [[nodiscard]] bool needsBinaryOutput() const noexcept {
-            return hasFormat_(OutputFormat::Binary);
-        }
-
-    private:
-        /// Check if any channel (direct or override) uses the target format (or Both).
-        [[nodiscard]] bool hasFormat_(OutputFormat target) const noexcept {
-            for (OutputFormat fmt :
-                 {trace_format, debug_format, info_format, warn_format, error_format}) {
-                if (fmt == target || fmt == OutputFormat::Both) {
-                    return true;
-                }
-            }
-            for (const auto& [mask, ovr] : category_format_overrides) {
-                if (ovr.hasFormat(target)) {
-                    return true;
-                }
-            }
-            return false;
-        }
     };
 
     explicit ObservationBackend(ObservationQueue& queue);
@@ -166,6 +117,18 @@ public:
 
     const std::filesystem::path& outputDir() const noexcept { return output_dir_; }
 
+    /// True when this backend writes a Perfetto timeline file.
+    bool timelineEnabled() const noexcept { return config_.timeline_enabled; }
+
+    /**
+     * @brief Submit recorded timeline streams for inclusion in timeline.pftrace.
+     *
+     * Thread-safe; intended for end-of-run handoff (e.g. the scheduler execution
+     * timeline). The data is written by the worker thread during stop(), after
+     * the final event drain, so callers must submit before stopping the backend.
+     */
+    void submitTimeline(TimelineStreamData&& data);
+
     void setTraceHandler(EventHandler handler) { trace_handler_ = std::move(handler); }
     void setLogHandler(EventHandler handler) { log_handler_ = std::move(handler); }
 
@@ -185,16 +148,6 @@ public:
                 break;
             }
             source_name_cache_.emplace_back(name);
-        }
-        if (binary_trace_writer_) {
-            binary_trace_writer_->setSourceNameLookup(source_name_lookup_);
-        }
-    }
-
-    void setUnitTypeLookup(std::function<std::string_view(uint16_t)> lookup) noexcept {
-        unit_type_lookup_ = std::move(lookup);
-        if (binary_trace_writer_) {
-            binary_trace_writer_->setUnitTypeLookup(lookup);
         }
     }
 
@@ -261,11 +214,21 @@ private:
     void computeDerived_();
     void emitLongDerivedValues_(uint64_t cycle);
     void initializeOutputDir_();
+    void finalizeTimeline_();
 
     void writeEventAsText_(const StructuredRecord* rec, const std::byte* args_data,
                            size_t args_size, const char* level_str, LogFileSink& sink);
-    OutputFormat resolveTraceFormat_(CategoryMask event_category) const;
-    OutputFormat resolveLogFormat_(CategoryMask log_category) const;
+
+    /// Emit a structured trace event as a Perfetto instant on its unit's track.
+    void writeTraceToTimeline_(const StructuredRecord* rec, const std::byte* args_data,
+                               size_t args_size);
+
+    /// Emit a counter snapshot sample on its (lazily created) counter track.
+    void writeCounterToTimeline_(uint64_t cycle, std::string_view unit_name,
+                                 std::string_view counter_name, uint64_t value);
+
+    /// Track for @p source_id under the simulation process group (lazily created).
+    uint64_t timelineTrackForSource_(uint16_t source_id);
 
     ObservationQueue& queue_;
     Config config_;
@@ -318,9 +281,17 @@ private:
     /// avoids std::function dispatch per event.
     std::vector<std::string> source_name_cache_;
 
-    std::function<std::string_view(uint16_t)> unit_type_lookup_;
+    std::unique_ptr<PerfettoTraceWriter> perfetto_writer_;
+    uint64_t sim_process_uuid_ = 0;
+    /// source_id → timeline track uuid (0 = not yet created).
+    std::vector<uint64_t> source_track_uuids_;
+    /// "unit.counter" → counter track uuid.
+    std::unordered_map<std::string, uint64_t> counter_track_uuids_;
+    fmt::memory_buffer timeline_msg_buffer_;
 
-    std::unique_ptr<BinaryTraceWriter> binary_trace_writer_;
+    /// Timeline streams handed over via submitTimeline(); written at shutdown.
+    std::mutex timeline_submit_mutex_;
+    std::vector<TimelineStreamData> submitted_timelines_;
 
     std::vector<BufferedRecord> ready_buffer_;
 

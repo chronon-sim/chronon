@@ -177,3 +177,32 @@ add_test(
     COMMAND test_observation_hardening
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
+
+# ==============================================================================
+# Perfetto Trace Writer Test
+# ==============================================================================
+
+add_executable(test_perfetto_trace_writer
+    test_perfetto_trace_writer.cpp
+)
+
+target_include_directories(test_perfetto_trace_writer PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_link_libraries(test_perfetto_trace_writer
+    chronon_observe
+    chronon_compile_options
+)
+
+target_compile_features(test_perfetto_trace_writer PRIVATE cxx_std_20)
+
+# Add to regress target
+add_dependencies(regress test_perfetto_trace_writer)
+
+# Add test
+add_test(
+    NAME perfetto_trace_writer_test
+    COMMAND test_perfetto_trace_writer
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)

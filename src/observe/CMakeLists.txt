@@ -7,33 +7,10 @@
 # Unified observation system for performance counting, tracing, and logging.
 
 # =============================================================================
-# FlatBuffers Schema Generation
-# =============================================================================
-
-if(TARGET flatc)
-    set(FLATBUFFERS_SCHEMA ${CMAKE_CURRENT_SOURCE_DIR}/TraceSchema.fbs)
-    set(FLATBUFFERS_GENERATED ${CMAKE_CURRENT_BINARY_DIR}/TraceSchema_generated.h)
-
-    add_custom_command(
-        OUTPUT ${FLATBUFFERS_GENERATED}
-        COMMAND $<TARGET_FILE:flatc> --cpp -o ${CMAKE_CURRENT_BINARY_DIR} ${FLATBUFFERS_SCHEMA}
-        DEPENDS ${FLATBUFFERS_SCHEMA} flatc
-        COMMENT "Generating FlatBuffers header from TraceSchema.fbs"
-    )
-
-    add_custom_target(generate_trace_schema DEPENDS ${FLATBUFFERS_GENERATED})
-else()
-    message(WARNING "flatc target not found - binary trace format will not be available")
-endif()
-
-# =============================================================================
 # Library Definition
 # =============================================================================
 
 add_library(chronon_observe
-    BinaryTraceReader.cpp
-    BinaryTraceWriter.cpp
-    CompressionBuffer.cpp
     CounterRegistry.cpp
     DerivedCounter.cpp
     LocalCounter.cpp
@@ -41,19 +18,14 @@ add_library(chronon_observe
     ObservationBackendIO.cpp
     ObservationContext.cpp
     ObservationManager.cpp
+    PerfettoTraceWriter.cpp
     ReorderBuffer.cpp
 )
-
-# Add dependency on generated FlatBuffers header
-if(TARGET generate_trace_schema)
-    add_dependencies(chronon_observe generate_trace_schema)
-endif()
 
 target_include_directories(chronon_observe
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../..>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
         $<INSTALL_INTERFACE:include>
 )
 
@@ -68,39 +40,6 @@ if(fmt_FOUND)
 else()
     # Fallback to system fmt library
     target_link_libraries(chronon_observe PUBLIC fmt)
-endif()
-
-# FlatBuffers (header-only) - provided by CPM or system
-if(TARGET flatbuffers)
-    target_link_libraries(chronon_observe PUBLIC flatbuffers)
-else()
-    find_package(Flatbuffers QUIET)
-    if(Flatbuffers_FOUND)
-        target_link_libraries(chronon_observe PUBLIC flatbuffers::flatbuffers)
-    else()
-        find_path(FLATBUFFERS_INCLUDE_DIR flatbuffers/flatbuffers.h)
-        if(FLATBUFFERS_INCLUDE_DIR)
-            target_include_directories(chronon_observe PUBLIC ${FLATBUFFERS_INCLUDE_DIR})
-        endif()
-    endif()
-endif()
-
-# zstd compression (optional)
-find_package(zstd QUIET)
-if(zstd_FOUND)
-    target_link_libraries(chronon_observe PUBLIC zstd::libzstd_shared)
-    target_compile_definitions(chronon_observe PRIVATE CHRONON_HAS_ZSTD=1)
-else()
-    # Try pkg-config
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(ZSTD QUIET libzstd)
-        if(ZSTD_FOUND)
-            target_include_directories(chronon_observe PRIVATE ${ZSTD_INCLUDE_DIRS})
-            target_link_libraries(chronon_observe PUBLIC ${ZSTD_LIBRARIES})
-            target_compile_definitions(chronon_observe PRIVATE CHRONON_HAS_ZSTD=1)
-        endif()
-    endif()
 endif()
 
 # stdexec (header-only, for inplace_stop_token in ObservationBackend)
