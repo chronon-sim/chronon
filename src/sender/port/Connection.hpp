@@ -113,10 +113,12 @@ public:
 
     /**
      * Producer run-ahead (in cycles) this connection can absorb before its MPSC
-     * staging ring would overflow and silently drop, or SIZE_MAX when the
+     * staging ring would overflow and silently drop — the ring's usable slots
+     * divided by the source's per-cycle send cap. Returns SIZE_MAX when the
      * connection cannot silently drop (non-MPSC, or a bounded-capacity port that
-     * back-pressures before the ring fills). Used to gate the epoch-free
-     * lookahead path, which removes the per-epoch staging drain.
+     * back-pressures before the ring fills) and 0 when the source has no
+     * per-cycle cap (so no finite run-ahead is provably safe). Used to gate the
+     * epoch-free lookahead path, which removes the per-epoch staging drain.
      */
     virtual size_t mpscStagingHeadroom() const noexcept { return SIZE_MAX; }
 
@@ -366,7 +368,14 @@ public:
         // (e.g. UNLIMITED_CAPACITY) keeps pushing until the ring physically
         // fills — that is the case the epoch-free gate must bound.
         const size_t usable = staging_mask_;
-        return (to_->capacity() <= usable) ? SIZE_MAX : usable;
+        if (to_->capacity() <= usable) return SIZE_MAX;  // bounded port back-pressures
+        // Headroom in *cycles* of producer run-ahead: each cycle the source can
+        // stage up to its per-cycle send cap, so the ring absorbs usable/rate
+        // cycles. An uncapped source can stage unboundedly per cycle, so no
+        // finite run-ahead is safe (headroom 0 -> the gate always vetoes).
+        const size_t rate = from_->perCycleCapacity();
+        if (rate == OutPort<T>::UNLIMITED_CAPACITY) return 0;
+        return usable / rate;
     }
 
     void setConnId(uint32_t conn_id) noexcept override { conn_id_ = conn_id; }

@@ -349,9 +349,11 @@ bool TickSimulation::allMPSCPortsHaveConnProgress_() const noexcept {
 }
 
 bool TickSimulation::mpscStagingFitsLookahead_(uint64_t max_lookahead) const noexcept {
-    // Strict: the producer can lead the consumer by up to max_lookahead cycles
-    // and stage one entry per cycle, so headroom must exceed (not just equal)
-    // max_lookahead. Connections that cannot silently drop report SIZE_MAX.
+    // mpscStagingHeadroom() already folds in the source's per-cycle send rate, so
+    // it is the run-ahead (in cycles) a connection can absorb. The producer can
+    // lead the consumer by up to max_lookahead cycles, so every connection's
+    // headroom must exceed it. Connections that cannot silently drop report
+    // SIZE_MAX; an uncapped source reports 0 and always vetoes.
     for (const ConnectionBase* c : connections_) {
         if (c->mpscStagingHeadroom() <= max_lookahead) return false;
     }

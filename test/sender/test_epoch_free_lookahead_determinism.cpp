@@ -54,11 +54,14 @@ void check(bool cond, const std::string& msg) {
 // simulated cycle each message arrives at.
 class Node : public TickableUnit {
 public:
-    OutPort<uint64_t> out{this, "out"};
+    OutPort<uint64_t> out;
     InPort<uint64_t> in{this, "in"};
 
-    Node(std::string name, uint64_t seed, uint32_t work)
-        : TickableUnit(std::move(name)), acc_(seed), work_(work) {}
+    // out_rate is the OutPort's per-cycle send cap. The node sends once per tick,
+    // so a cap of 1 doesn't change behavior but lets the epoch-free staging gate
+    // bound run-ahead; UNLIMITED leaves the source uncapped (gate must veto).
+    Node(std::string name, uint64_t seed, uint32_t work, size_t out_rate = 1)
+        : TickableUnit(std::move(name)), out(this, "out", out_rate), acc_(seed), work_(work) {}
 
     void tick() override {
         for (uint64_t v : in.receiveAll(localCycle())) {
@@ -86,7 +89,7 @@ struct RunResult {
 // A and B fan in to C with delays (dA, dB); C -> D -> {A, B} closes a feedback
 // loop so producer rates are coupled.
 RunResult runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, bool epoch_free,
-                  uint32_t max_lookahead, uint64_t cycles) {
+                  uint32_t max_lookahead, uint64_t cycles, size_t out_rate = 1) {
     TickSimulationConfig cfg;
     cfg.num_threads = num_threads;
     cfg.enable_parallel = (num_threads > 1);
@@ -98,10 +101,10 @@ RunResult runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, 
 
     TickSimulation sim(cfg);
     constexpr uint32_t kWork = 1500;  // spread the 4 units across workers
-    auto* A = sim.createUnit<Node>("A", 11, kWork);
-    auto* B = sim.createUnit<Node>("B", 22, kWork);
-    auto* C = sim.createUnit<Node>("C", 33, kWork);
-    auto* D = sim.createUnit<Node>("D", 44, kWork);
+    auto* A = sim.createUnit<Node>("A", 11, kWork, out_rate);
+    auto* B = sim.createUnit<Node>("B", 22, kWork, out_rate);
+    auto* C = sim.createUnit<Node>("C", 33, kWork, out_rate);
+    auto* D = sim.createUnit<Node>("D", 44, kWork, out_rate);
     sim.connect(A->out, C->in, dA);  // mixed-delay MPSC fan-in into C
     sim.connect(B->out, C->in, dB);
     sim.connect(C->out, D->in, 1);
@@ -147,11 +150,21 @@ void verify_staging_veto(uint64_t cycles, unsigned hw) {
     const uint64_t ref = runOnce(2, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
                                  /*max_lookahead=*/100, cycles)
                              .checksum;
-    // 5000 > 4095 usable staging slots on the unlimited fan-in ports -> veto.
-    RunResult ef = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
-                           /*max_lookahead=*/5000, cycles);
-    check(ef.checksum == ref, "staging-veto epoch-free == ref (barrier fallback)");
-    check(ef.epoch_free_runs == 0, "staging-veto vetoes epoch-free past ring capacity");
+
+    // (1) Rate-1 source, but max_lookahead (5000) exceeds the 4095-slot ring ->
+    //     headroom 4095 < 5000 -> veto, fall back to the barrier path.
+    RunResult far = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                            /*max_lookahead=*/5000, cycles, /*out_rate=*/1);
+    check(far.checksum == ref, "staging-veto(lookahead) epoch-free == ref (barrier fallback)");
+    check(far.epoch_free_runs == 0, "staging-veto vetoes epoch-free past ring capacity");
+
+    // (2) Uncapped source (out_rate unlimited): the per-cycle send rate is
+    //     unbounded, so even a small max_lookahead could overflow -> veto.
+    const size_t kUnlimited = OutPort<uint64_t>::UNLIMITED_CAPACITY;
+    RunResult uncapped = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                                 /*max_lookahead=*/64, cycles, /*out_rate=*/kUnlimited);
+    check(uncapped.checksum == ref, "staging-veto(rate) epoch-free == ref (barrier fallback)");
+    check(uncapped.epoch_free_runs == 0, "staging-veto vetoes epoch-free for uncapped source rate");
 }
 
 }  // namespace
