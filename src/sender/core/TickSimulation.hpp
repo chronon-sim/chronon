@@ -463,6 +463,16 @@ private:
     /// Precondition for executeRunEpochFree_ (see enable_epoch_free_lookahead).
     bool allMPSCPortsHaveConnProgress_() const noexcept;
 
+    /// True iff every MPSC connection can absorb @p max_lookahead cycles of
+    /// producer run-ahead without overflowing its staging ring. Without the
+    /// per-epoch barrier the producer can lead the consumer by up to
+    /// max_lookahead_cycles, staging up to one entry per cycle; back-pressured
+    /// (bounded-capacity) ports are safe, but an unlimited-capacity port never
+    /// back-pressures and would silently drop once its ring fills. Vetoing the
+    /// epoch-free path here (fall back to the per-epoch barrier, which drains
+    /// every epoch) keeps long-delay / large-lookahead topologies lossless.
+    bool mpscStagingFitsLookahead_(uint64_t max_lookahead) const noexcept;
+
     /// Per-thread epoch body. Spin-waits on cross-thread progress atomics
     /// and exits via stop_token on termination or exception.
     void executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,

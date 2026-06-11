@@ -353,13 +353,16 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
         // MPSC port is fully covered by per-connection progress (so no port
         // needs the per-epoch central flush). Otherwise keep the barrier path.
         const bool epoch_free = config_.enable_epoch_free_lookahead &&
-                                config_.max_lookahead_cycles > 0 && allMPSCPortsHaveConnProgress_();
+                                config_.max_lookahead_cycles > 0 &&
+                                allMPSCPortsHaveConnProgress_() &&
+                                mpscStagingFitsLookahead_(config_.max_lookahead_cycles);
         if (config_.enable_epoch_free_lookahead && !epoch_free && observe_ctx_) {
             observe::log_info<
                 "epoch-free lookahead requested but vetoed (max_lookahead={}, "
-                "mpsc_progress_full={}); "
+                "mpsc_progress_full={}, staging_fits={}); "
                 "using barrier path">(observe_ctx_, config_.max_lookahead_cycles,
-                                      allMPSCPortsHaveConnProgress_());
+                                      allMPSCPortsHaveConnProgress_(),
+                                      mpscStagingFitsLookahead_(config_.max_lookahead_cycles));
         }
         if (epoch_free) {
             ++epoch_free_run_count_;

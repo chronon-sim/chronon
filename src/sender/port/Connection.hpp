@@ -112,6 +112,15 @@ public:
     virtual void cancelInFlight() noexcept = 0;
 
     /**
+     * Producer run-ahead (in cycles) this connection can absorb before its MPSC
+     * staging ring would overflow and silently drop, or SIZE_MAX when the
+     * connection cannot silently drop (non-MPSC, or a bounded-capacity port that
+     * back-pressures before the ring fills). Used to gate the epoch-free
+     * lookahead path, which removes the per-epoch staging drain.
+     */
+    virtual size_t mpscStagingHeadroom() const noexcept { return SIZE_MAX; }
+
+    /**
      * Type-erased MPSC admission helper. Called by the destination InPort's
      * arbiter at cycle boundary. Pops up to `budget` entries from the
      * per-connection staging ring and forwards them into the shared queue
@@ -347,6 +356,18 @@ public:
     void setThreadQueueId(size_t queue_id) override { thread_queue_id_ = queue_id; }
 
     bool hasThreadQueueId() const noexcept override { return thread_queue_id_ != SIZE_MAX; }
+
+    size_t mpscStagingHeadroom() const noexcept override {
+        if (thread_queue_id_ == SIZE_MAX) return SIZE_MAX;  // not in MPSC mode
+        // staging_mask_ is the most entries the ring can hold (phys size - 1).
+        // A bounded port back-pressures (transfer() returns false) once
+        // stagingSize_() reaches to_->capacity(), which is <= the ring, so it
+        // never silently drops. Only a port whose capacity exceeds the ring
+        // (e.g. UNLIMITED_CAPACITY) keeps pushing until the ring physically
+        // fills — that is the case the epoch-free gate must bound.
+        const size_t usable = staging_mask_;
+        return (to_->capacity() <= usable) ? SIZE_MAX : usable;
+    }
 
     void setConnId(uint32_t conn_id) noexcept override { conn_id_ = conn_id; }
     uint32_t connId() const noexcept override { return conn_id_; }

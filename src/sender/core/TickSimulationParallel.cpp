@@ -348,6 +348,16 @@ bool TickSimulation::allMPSCPortsHaveConnProgress_() const noexcept {
     return true;
 }
 
+bool TickSimulation::mpscStagingFitsLookahead_(uint64_t max_lookahead) const noexcept {
+    // Strict: the producer can lead the consumer by up to max_lookahead cycles
+    // and stage one entry per cycle, so headroom must exceed (not just equal)
+    // max_lookahead. Connections that cannot silently drop report SIZE_MAX.
+    for (const ConnectionBase* c : connections_) {
+        if (c->mpscStagingHeadroom() <= max_lookahead) return false;
+    }
+    return true;
+}
+
 uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
     const size_t nthreads = thread_units_.size();
     if (nthreads == 0 || total_cycles == 0) return 0;

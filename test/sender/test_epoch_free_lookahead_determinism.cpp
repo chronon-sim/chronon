@@ -137,6 +137,23 @@ void verify(uint32_t dA, uint32_t dB, uint64_t cycles, unsigned hw) {
     }
 }
 
+// The fan-in ports into C have unlimited capacity, so their MPSC staging rings
+// (4096) never back-pressure. If max_lookahead_cycles could exceed that ring,
+// the epoch-free path (no per-epoch drain) might silently drop staged sends, so
+// the gate must veto and fall back to the barrier path. Verify it does, and that
+// the result still matches the single-thread reference.
+void verify_staging_veto(uint64_t cycles, unsigned hw) {
+    if (hw < 2) return;
+    const uint64_t ref = runOnce(2, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
+                                 /*max_lookahead=*/100, cycles)
+                             .checksum;
+    // 5000 > 4095 usable staging slots on the unlimited fan-in ports -> veto.
+    RunResult ef = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                           /*max_lookahead=*/5000, cycles);
+    check(ef.checksum == ref, "staging-veto epoch-free == ref (barrier fallback)");
+    check(ef.epoch_free_runs == 0, "staging-veto vetoes epoch-free past ring capacity");
+}
+
 }  // namespace
 
 int main() {
@@ -151,6 +168,8 @@ int main() {
     verify(3, 1, cycles, hw);
     verify(1, 8, cycles, hw);
     verify(2, 5, cycles, hw);
+
+    verify_staging_veto(cycles, hw);
 
     std::cout << "\n=== Results: " << g_pass << " passed, " << g_fail << " failed ===\n";
     return g_fail == 0 ? 0 : 1;
