@@ -112,13 +112,16 @@ public:
     virtual void cancelInFlight() noexcept = 0;
 
     /**
-     * Producer run-ahead (in cycles) this connection can absorb before its MPSC
-     * staging ring would overflow and silently drop — the ring's usable slots
-     * divided by the source's per-cycle send cap. Returns SIZE_MAX when the
-     * connection cannot silently drop (non-MPSC, or a bounded-capacity port that
-     * back-pressures before the ring fills) and 0 when the source has no
-     * per-cycle cap (so no finite run-ahead is provably safe). Used to gate the
-     * epoch-free lookahead path, which removes the per-epoch staging drain.
+     * Max producer run-ahead (in cycles) this connection's MPSC staging can
+     * absorb while the epoch-free path keeps results identical to the reference:
+     * roughly `threshold / rate - delay`, where `threshold` is the staged-entry
+     * count at which transfer() stops accepting (the ring for an unlimited port,
+     * the InPort capacity for a bounded one), `rate` is the source's per-cycle
+     * send cap, and `delay` accounts for not-yet-due entries the consumer cannot
+     * drain. Returns SIZE_MAX for connections that need no bound (non-MPSC) and 0
+     * when no finite run-ahead is provably safe (uncapped source rate). Used to
+     * gate the epoch-free lookahead path, which removes the per-epoch staging
+     * drain.
      */
     virtual size_t mpscStagingHeadroom() const noexcept { return SIZE_MAX; }
 
@@ -361,21 +364,22 @@ public:
 
     size_t mpscStagingHeadroom() const noexcept override {
         if (thread_queue_id_ == SIZE_MAX) return SIZE_MAX;  // not in MPSC mode
-        // staging_mask_ is the most entries the ring can hold (phys size - 1).
-        // A bounded port back-pressures (transfer() returns false) once
-        // stagingSize_() reaches to_->capacity(), which is <= the ring, so it
-        // never silently drops. Only a port whose capacity exceeds the ring
-        // (e.g. UNLIMITED_CAPACITY) keeps pushing until the ring physically
-        // fills — that is the case the epoch-free gate must bound.
-        const size_t usable = staging_mask_;
-        if (to_->capacity() <= usable) return SIZE_MAX;  // bounded port back-pressures
-        // Headroom in *cycles* of producer run-ahead: each cycle the source can
-        // stage up to its per-cycle send cap, so the ring absorbs usable/rate
-        // cycles. An uncapped source can stage unboundedly per cycle, so no
-        // finite run-ahead is safe (headroom 0 -> the gate always vetoes).
         const size_t rate = from_->perCycleCapacity();
+        // An uncapped per-cycle send rate can stage unboundedly per cycle, so no
+        // finite run-ahead is provably safe.
         if (rate == OutPort<T>::UNLIMITED_CAPACITY) return 0;
-        return usable / rate;
+        // transfer() stops accepting once staged entries reach this many: a
+        // bounded port back-pressures at to_->capacity(); an unlimited port pushes
+        // until the ring physically fills (staging_mask_ usable slots). Past it the
+        // epoch-free path either drops (unlimited: overflow) or back-pressures
+        // where the per-epoch barrier flush would not (bounded), so results would
+        // diverge from the reference.
+        const size_t threshold = std::min(to_->capacity(), staging_mask_);
+        const size_t cycles = threshold / rate;
+        // The consumer-driven drain only admits *due* entries (arrive_cycle <= k,
+        // i.e. send_cycle <= k - delay_), so delay_ cycles of not-yet-due entries
+        // always sit staged. The supportable producer run-ahead is cycles - delay_.
+        return (cycles > delay_) ? (cycles - delay_) : 0;
     }
 
     void setConnId(uint32_t conn_id) noexcept override { conn_id_ = conn_id; }

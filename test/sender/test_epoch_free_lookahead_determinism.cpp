@@ -165,6 +165,18 @@ void verify_staging_veto(uint64_t cycles, unsigned hw) {
                                  /*max_lookahead=*/64, cycles, /*out_rate=*/kUnlimited);
     check(uncapped.checksum == ref, "staging-veto(rate) epoch-free == ref (barrier fallback)");
     check(uncapped.epoch_free_runs == 0, "staging-veto vetoes epoch-free for uncapped source rate");
+
+    // (3) Long edge delay: the consumer can't drain not-yet-due entries, so even a
+    //     small max_lookahead exceeds headroom (cycles - delay). delay 5000 on the
+    //     A->C edge -> headroom 0 -> veto. Reference uses the same delay.
+    const uint64_t ref_d =
+        runOnce(5000, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
+                /*max_lookahead=*/100, cycles)
+            .checksum;
+    RunResult long_delay = runOnce(5000, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                                   /*max_lookahead=*/64, cycles);
+    check(long_delay.checksum == ref_d, "staging-veto(delay) epoch-free == ref (barrier fallback)");
+    check(long_delay.epoch_free_runs == 0, "staging-veto vetoes epoch-free for long edge delay");
 }
 
 }  // namespace
