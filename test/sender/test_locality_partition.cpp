@@ -119,6 +119,31 @@ Topology buildCores(TickSimulation& sim, size_t cores, size_t depth, uint32_t wo
     return topo;
 }
 
+// Independent pipelines of *uneven* depth (no shared node). Uneven sizes are what
+// give the baseline comparison teeth: pure load balancing must split the deep core
+// across threads to equalize load (cutting its delay-1 internal edges), while a
+// locality-aware partition keeps each pipeline whole on one thread.
+Topology buildUnevenCores(TickSimulation& sim, const std::vector<size_t>& depths, uint32_t work) {
+    Topology topo;
+    topo.cores.resize(depths.size());
+    for (size_t c = 0; c < depths.size(); ++c) {
+        for (size_t s = 0; s < depths[c]; ++s) {
+            std::string name = "c";
+            name += std::to_string(c);
+            name += "_s";
+            name += std::to_string(s);
+            topo.cores[c].push_back(sim.createUnit<Node>(name, (c + 1) * 100 + s + 1, work));
+        }
+    }
+    for (size_t c = 0; c < depths.size(); ++c) {
+        for (size_t s = 0; s + 1 < depths[c]; ++s) {
+            sim.connect(topo.cores[c][s]->out, topo.cores[c][s + 1]->in, 1);
+            topo.edges.push_back({topo.cores[c][s], topo.cores[c][s + 1]});
+        }
+    }
+    return topo;
+}
+
 size_t countCrossThreadEdges(const TickSimulation& sim, const Topology& topo) {
     size_t cross = 0;
     for (const auto& e : topo.edges) {
@@ -150,27 +175,35 @@ size_t countColocatedCores(const TickSimulation& sim, const Topology& topo) {
     return colocated;
 }
 
-// With `cores` disjoint pipelines and `cores` threads, the locality-aware
-// partition must place each pipeline entirely on its own thread (zero
-// cross-thread edges) — whereas the old load-balance-only pass (sync_cost = 0)
-// round-robins connected units across threads and cuts many edges.
+// Locality vs. pure load balance on *uneven* disjoint pipelines.
+//
+// With equal-size cores both modes co-locate (perfect round-robin already keeps
+// each pipeline whole), so the comparison is vacuous — and which arbitrary balanced
+// layout the solver lands on is otherwise unstable. Uneven depths put balance and
+// locality in genuine conflict: equalizing load forces the deep core to be split
+// across threads (cutting its internal edges), so only a locality-aware partition
+// keeps every pipeline whole.
 void test_locality_colocation() {
-    std::cout << "Testing locality-aware co-location (disjoint cores)...\n";
+    std::cout << "Testing locality-aware co-location (uneven disjoint cores)...\n";
 
-    constexpr size_t kCores = 4;
-    constexpr size_t kDepth = 5;
+    // One deep pipeline + three shallow ones: 10 units across 4 threads (avg 2.5,
+    // so makespan-optimal max is 3). The depth-4 core exceeds that, so load
+    // balancing must split it; locality keeps it whole and tolerates the imbalance.
+    const std::vector<size_t> kDepths = {4, 2, 2, 2};
+    const size_t kCores = kDepths.size();
+    constexpr size_t kThreads = 4;
     constexpr uint32_t kWork = 0;  // uniform unit cost; only topology matters
 
     // Locality on (new default sync cost).
-    TickSimulation sim(baseConfig(kCores, /*sync_cost=*/8.0));
-    Topology topo = buildCores(sim, kCores, kDepth, kWork, /*with_shared=*/false);
+    TickSimulation sim(baseConfig(kThreads, /*sync_cost=*/8.0));
+    Topology topo = buildUnevenCores(sim, kDepths, kWork);
     sim.initialize();
     size_t cross_locality = countCrossThreadEdges(sim, topo);
     size_t colocated = countColocatedCores(sim, topo);
 
-    // Baseline: pure load balance (sync cost = 0) scatters connected units.
-    TickSimulation sim0(baseConfig(kCores, /*sync_cost=*/0.0));
-    Topology topo0 = buildCores(sim0, kCores, kDepth, kWork, /*with_shared=*/false);
+    // Baseline: pure load balance (sync cost = 0) splits the deep core to equalize.
+    TickSimulation sim0(baseConfig(kThreads, /*sync_cost=*/0.0));
+    Topology topo0 = buildUnevenCores(sim0, kDepths, kWork);
     sim0.initialize();
     size_t cross_baseline = countCrossThreadEdges(sim0, topo0);
 

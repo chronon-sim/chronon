@@ -217,8 +217,12 @@ private:
             for (size_t t = 0; t < num_threads; ++t) {
                 if (t != heaviest) targets.push_back(t);
             }
-            std::sort(targets.begin(), targets.end(),
-                      [&](size_t a, size_t b) { return thread_times[a] < thread_times[b]; });
+            // Lightest target first; ties broken by thread index so the choice is
+            // independent of std::sort's (unstable) ordering of equal-load threads.
+            std::sort(targets.begin(), targets.end(), [&](size_t a, size_t b) {
+                if (thread_times[a] != thread_times[b]) return thread_times[a] < thread_times[b];
+                return a < b;
+            });
             size_t num_targets = std::min(targets.size(), size_t(2));
 
             double best_gain = 0.01;

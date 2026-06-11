@@ -12,7 +12,6 @@
 /// analysis, and dynamic rebalancing.
 
 #include <algorithm>
-#include <cstdio>
 #include <set>
 #include <sstream>
 #include <string>
@@ -62,7 +61,18 @@ void TickSimulation::buildPartitionAdjacency_(
         fwd.second = (fwd.second == 0) ? conn->delay() : std::min(fwd.second, conn->delay());
     }
 
-    for (auto& [key, info] : pair_info) {
+    // Drain the hash map in a deterministic (u, v) order: unordered_map iteration
+    // order is implementation-defined, and the resulting adjacency ordering feeds
+    // floating-point sync-cost sums in the solver, so leaving it stdlib-dependent
+    // would make the partition diverge across standard libraries.
+    std::vector<PairKey> keys;
+    keys.reserve(pair_info.size());
+    for (const auto& [key, info] : pair_info) keys.push_back(key);
+    std::sort(keys.begin(), keys.end(), [](const PairKey& a, const PairKey& b) {
+        return a.u != b.u ? a.u < b.u : a.v < b.v;
+    });
+    for (const PairKey& key : keys) {
+        const auto& info = pair_info[key];
         input.adjacency[key.u].push_back({key.v, info.first, info.second});
     }
 }
@@ -198,7 +208,16 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
     cluster_input.critical_path_weight = config_.sa_critical_path_weight;
     cluster_input.adjacency.resize(num_clusters);
 
-    for (auto& [key, info] : cluster_pair_info) {
+    // Deterministic (u, v) drain order — see buildPartitionAdjacency_ for why the
+    // unordered_map's iteration order must not leak into the adjacency layout.
+    std::vector<PairKey> cluster_keys;
+    cluster_keys.reserve(cluster_pair_info.size());
+    for (const auto& [key, info] : cluster_pair_info) cluster_keys.push_back(key);
+    std::sort(cluster_keys.begin(), cluster_keys.end(), [](const PairKey& a, const PairKey& b) {
+        return a.u != b.u ? a.u < b.u : a.v < b.v;
+    });
+    for (const PairKey& key : cluster_keys) {
+        const auto& info = cluster_pair_info[key];
         cluster_input.adjacency[key.u].push_back({key.v, info.first, info.second});
     }
 
@@ -603,8 +622,12 @@ void TickSimulation::buildClusterAffinity() {
     for (size_t i = 0; i < clusters_.numClusters(); ++i) {
         cluster_sizes.emplace_back(i, clusters_.clusters[i].size());
     }
-    std::sort(cluster_sizes.begin(), cluster_sizes.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+    // Largest first; ties broken by cluster index so equal-size clusters order
+    // identically across standard libraries (std::sort is unstable).
+    std::sort(cluster_sizes.begin(), cluster_sizes.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second) return a.second > b.second;
+        return a.first < b.first;
+    });
 
     std::vector<size_t> thread_load(num_threads, 0);
 

@@ -293,6 +293,20 @@ class SimulatedAnnealingPartitioner {
         return h;
     }
 
+    // Portable random draws. std::mt19937_64 produces an identical stream across
+    // standard libraries, but std::uniform_int/real_distribution do NOT — the
+    // standard leaves their engine-output → value mapping unspecified, so libc++
+    // and libstdc++ pick different SA moves from the same seed and the partition
+    // diverges across platforms. These reductions are defined purely in terms of
+    // the engine's raw output, so SA's result is reproducible everywhere. The
+    // modulo bias is negligible for a stochastic partitioning heuristic.
+    static double canonicalReal_(std::mt19937_64& rng) {
+        return static_cast<double>(rng() >> 11) * 0x1.0p-53;  // 53-bit value in [0, 1)
+    }
+    static size_t boundedInt_(std::mt19937_64& rng, size_t bound) {
+        return static_cast<size_t>(rng() % bound);
+    }
+
     static std::vector<size_t> saSearch_(const PartitionInput& input,
                                          std::vector<size_t> assignment, size_t num_threads) {
         if (input.num_units <= 1 || num_threads <= 1) {
@@ -323,24 +337,25 @@ class SimulatedAnnealingPartitioner {
         // ceil(N/T) * 2 leaves room while preventing degeneration onto one thread.
         const size_t max_per_thread = std::max(size_t(2), ((N + T - 1) / T) * 2);
 
-        std::uniform_real_distribution<double> unif(0.0, 1.0);
-        std::uniform_int_distribution<size_t> unit_dist(0, N - 1);
-        std::uniform_int_distribution<size_t> thread_dist(0, num_threads - 1);
+        // Portable, stdlib-independent draws (see canonicalReal_/boundedInt_).
+        const auto unif = [&rng]() { return canonicalReal_(rng); };
+        const auto unit_dist = [&rng, N]() { return boundedInt_(rng, N); };
+        const auto thread_dist = [&rng, num_threads]() { return boundedInt_(rng, num_threads); };
 
         size_t total_iters = 0;
 
         while (temp > temp_final && total_iters < max_total_iters) {
             for (size_t iter = 0; iter < iters_per_temp && total_iters < max_total_iters;
                  ++iter, ++total_iters) {
-                bool do_swap = (unif(rng) < 0.30);
+                bool do_swap = (unif() < 0.30);
 
                 if (do_swap && N >= 2) {
                     // Swaps preserve per-thread counts — no balance check needed.
-                    size_t u = unit_dist(rng);
-                    size_t v = unit_dist(rng);
+                    size_t u = unit_dist();
+                    size_t v = unit_dist();
                     size_t attempts = 0;
                     while ((v == u || assignment[v] == assignment[u]) && attempts < N) {
-                        v = unit_dist(rng);
+                        v = unit_dist();
                         attempts++;
                     }
                     if (v == u || assignment[v] == assignment[u]) continue;
@@ -350,7 +365,7 @@ class SimulatedAnnealingPartitioner {
                     double new_cost = objective_(input, assignment, num_threads);
                     double delta = new_cost - current_cost;
 
-                    if (delta < 0.0 || unif(rng) < std::exp(-delta / temp)) {
+                    if (delta < 0.0 || unif() < std::exp(-delta / temp)) {
                         current_cost = new_cost;
                         if (new_cost < best_cost) {
                             best_cost = new_cost;
@@ -360,9 +375,9 @@ class SimulatedAnnealingPartitioner {
                         std::swap(assignment[u], assignment[v]);
                     }
                 } else {
-                    size_t u = unit_dist(rng);
+                    size_t u = unit_dist();
                     size_t old_thread = assignment[u];
-                    size_t new_thread = thread_dist(rng);
+                    size_t new_thread = thread_dist();
                     if (new_thread == old_thread) continue;
 
                     // Don't empty source or overflow destination.
@@ -376,7 +391,7 @@ class SimulatedAnnealingPartitioner {
                     double new_cost = objective_(input, assignment, num_threads);
                     double delta = new_cost - current_cost;
 
-                    if (delta < 0.0 || unif(rng) < std::exp(-delta / temp)) {
+                    if (delta < 0.0 || unif() < std::exp(-delta / temp)) {
                         current_cost = new_cost;
                         if (new_cost < best_cost) {
                             best_cost = new_cost;
