@@ -175,8 +175,9 @@ The timeline contains:
   carry `cycle` and `detail` debug annotations. See
   [Scheduler Timeline Trace](scheduler-timeline.md).
 
-The file is produced by a minimal hand-rolled protobuf writer
-(`src/observe/PerfettoTraceWriter`); Chronon has no Perfetto SDK dependency.
+The file is produced by `src/observe/PerfettoTraceWriter`, a thin wrapper over
+the Perfetto SDK's protozero message writers (no tracing session or category
+registration — packets are written straight to the file).
 
 ## Pre-Registered Format Strings
 

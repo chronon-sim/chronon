@@ -10,20 +10,20 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
-#include <string>
+#include <memory>
 #include <string_view>
-#include <vector>
 
 namespace chronon::observe {
 
 /**
- * @brief Minimal Perfetto protobuf trace writer (no Perfetto SDK dependency).
+ * @brief Perfetto trace writer for the small TracePacket subset chronon needs.
  *
- * Hand-encodes the protobuf wire format for the small TracePacket subset chronon
- * needs: TrackDescriptor (process / plain / counter tracks) and TrackEvent
- * (complete slices, instants, counter samples). Output opens directly in
- * ui.perfetto.dev and `trace_processor`.
+ * Thin wrapper over the Perfetto SDK's protozero message writers: TrackDescriptor
+ * (process / plain / counter tracks) and TrackEvent (complete slices, instants,
+ * counter samples). Output opens directly in ui.perfetto.dev and `trace_processor`.
+ * The SDK is an implementation detail (pimpl) and does not leak into chronon
+ * headers; no tracing session or category registration is involved — packets are
+ * written straight to the file.
  *
  * Timestamps are nanoseconds on the default trace clock. Simulation-domain
  * events use timestamp = cycle (1 cycle rendered as 1 ns); wall-clock-domain
@@ -36,7 +36,7 @@ namespace chronon::observe {
  */
 class PerfettoTraceWriter {
 public:
-    PerfettoTraceWriter() = default;
+    PerfettoTraceWriter();
     ~PerfettoTraceWriter();
 
     PerfettoTraceWriter(const PerfettoTraceWriter&) = delete;
@@ -45,7 +45,7 @@ public:
     /// Opens @p path for writing; emits the sequence-start packet.
     bool open(const std::filesystem::path& path);
 
-    [[nodiscard]] bool isOpen() const noexcept { return file_.is_open(); }
+    [[nodiscard]] bool isOpen() const noexcept;
 
     /// Writes buffered packets to the OS; does not close the file.
     void flush();
@@ -82,37 +82,12 @@ public:
     [[nodiscard]] uint64_t bytesWritten() const noexcept { return bytes_written_; }
 
 private:
-    // --- protobuf wire-format helpers (wire type 0 = varint, 2 = length-delimited) ---
-    static void appendVarint(std::string& buf, uint64_t value);
-    static void appendTag(std::string& buf, uint32_t field, uint32_t wire_type);
-    static void appendVarintField(std::string& buf, uint32_t field, uint64_t value);
-    static void appendStringField(std::string& buf, uint32_t field, std::string_view value);
-    /// Appends @p sub as a length-delimited sub-message field.
-    static void appendMessageField(std::string& buf, uint32_t field, const std::string& sub);
-
-    /// Wraps @p packet as `Trace.packet` (field 1) into the output buffer.
-    void commitPacket_();
-
-    /// Starts a fresh packet in pkt_ with sequence id (+ sequence-start flags once).
-    void beginPacket_();
-
-    void emitTrackDescriptor_(const std::string& descriptor);
-
-    void maybeFlush_();
-
-    std::ofstream file_;
-    std::string out_buf_;  ///< Encoded packets pending fwrite.
-    std::string pkt_;      ///< Scratch: current TracePacket body.
-    std::string msg_;      ///< Scratch: nested message (TrackEvent / TrackDescriptor).
-    std::string sub_;      ///< Scratch: doubly-nested message (descriptors, annotations).
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 
     uint64_t next_uuid_ = 1;
-    bool first_packet_ = true;
     uint64_t events_written_ = 0;
     uint64_t bytes_written_ = 0;
-
-    static constexpr uint32_t SEQUENCE_ID = 1;
-    static constexpr size_t FLUSH_THRESHOLD = size_t{256} * 1024;
 };
 
 }  // namespace chronon::observe

@@ -292,7 +292,12 @@ void ObservationManager::dumpCounterSnapshots(uint64_t cycle) {
         return;
     }
 
-    if (!config_.counters.enabled || !config_.counters.csv_output) {
+    if (!config_.counters.enabled) {
+        return;
+    }
+    // Snapshots feed both sinks; dump if either consumes them.
+    const bool timeline_counters = config_.timeline.enabled && config_.timeline.counters;
+    if (!config_.counters.csv_output && !timeline_counters) {
         return;
     }
 

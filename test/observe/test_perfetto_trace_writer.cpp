@@ -11,7 +11,6 @@
 ///        wire format with an independent decoder and checks packet structure,
 ///        track-event payloads, and the timeline stream export.
 
-#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -26,6 +25,17 @@
 #include "observe/TimelineData.hpp"
 
 using namespace chronon::observe;
+
+// Always-evaluated check: unlike CHECK(), survives NDEBUG builds, so the test
+// still verifies in Release and -Werror sees no unused result variables.
+#define CHECK(cond)                                                                         \
+    do {                                                                                    \
+        if (!(cond)) {                                                                      \
+            std::cerr << "CHECK failed at " << __FILE__ << ":" << __LINE__ << ": " << #cond \
+                      << "\n";                                                              \
+            std::abort();                                                                   \
+        }                                                                                   \
+    } while (0)
 
 namespace {
 
@@ -47,9 +57,9 @@ struct Decoder {
             value |= static_cast<uint64_t>(byte & 0x7F) << shift;
             if ((byte & 0x80) == 0) return value;
             shift += 7;
-            assert(shift < 64 && "varint too long");
+            CHECK(shift < 64 && "varint too long");
         }
-        assert(false && "truncated varint");
+        CHECK(false && "truncated varint");
         return value;
     }
 
@@ -61,7 +71,7 @@ struct Decoder {
 
     Decoder lenDelimited() {
         uint64_t len = varint();
-        assert(p + len <= end && "length-delimited field overruns buffer");
+        CHECK(p + len <= end && "length-delimited field overruns buffer");
         Decoder sub{p, p + len};
         p += len;
         return sub;
@@ -82,7 +92,7 @@ struct Decoder {
                 lenDelimited();
                 break;
             default:
-                assert(false && "unexpected wire type");
+                CHECK(false && "unexpected wire type");
         }
     }
 };
@@ -116,7 +126,7 @@ struct DecodedTrace {
 
 DecodedTrace decodeFile(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
-    assert(in.is_open());
+    CHECK(in.is_open());
     std::vector<uint8_t> bytes{std::istreambuf_iterator<char>(in),
                                std::istreambuf_iterator<char>()};
 
@@ -124,7 +134,7 @@ DecodedTrace decodeFile(const std::filesystem::path& path) {
     Decoder d{bytes.data(), bytes.data() + bytes.size()};
     while (!d.done()) {
         auto [field, wire] = d.tag();
-        assert(field == 1 && wire == 2 && "top level must be Trace.packet");
+        CHECK(field == 1 && wire == 2 && "top level must be Trace.packet");
         Decoder pkt = d.lenDelimited();
 
         uint64_t timestamp = 0;
@@ -137,7 +147,7 @@ DecodedTrace decodeFile(const std::filesystem::path& path) {
                     break;
                 case 10:  // trusted_packet_sequence_id
                     has_seq_id = true;
-                    assert(pkt.varint() != 0);
+                    CHECK(pkt.varint() != 0);
                     break;
                 case 13:  // sequence_flags
                     if (pkt.varint() & 1) trace.saw_sequence_start = true;
@@ -235,7 +245,7 @@ DecodedTrace decodeFile(const std::filesystem::path& path) {
                     pkt.skip(pw);
             }
         }
-        assert(has_seq_id && "every packet must carry trusted_packet_sequence_id");
+        CHECK(has_seq_id && "every packet must carry trusted_packet_sequence_id");
     }
     return trace;
 }
@@ -261,9 +271,8 @@ void test_tracks_and_events() {
     auto path = tempFile("chronon_pftrace_writer_test.pftrace");
     PerfettoTraceWriter writer;
     const bool opened = writer.open(path);
-    assert(opened);
-    (void)opened;
-    assert(writer.isOpen());
+    CHECK(opened);
+    CHECK(writer.isOpen());
 
     uint64_t process = writer.addProcessTrack("Simulation", 1);
     uint64_t unit_track = writer.addTrack("fetch", process);
@@ -274,44 +283,44 @@ void test_tracks_and_events() {
     writer.instant(unit_track, "trace", "fetched 0xdeadbeef", /*ts_ns=*/123);
     writer.counterValue(counter_track, /*ts_ns=*/200, /*value=*/7);
 
-    assert(writer.eventsWritten() == 3);
+    CHECK(writer.eventsWritten() == 3);
     writer.close();
-    assert(!writer.isOpen());
+    CHECK(!writer.isOpen());
 
     DecodedTrace trace = decodeFile(path);
-    assert(trace.saw_sequence_start);
+    CHECK(trace.saw_sequence_start);
 
     // Tracks: process group, unit track nested under it, counter track.
     const DecodedTrack* proc = findTrack(trace, process);
-    assert(proc && proc->is_process && proc->process_name == "Simulation");
+    CHECK(proc && proc->is_process && proc->process_name == "Simulation");
 
     const DecodedTrack* unit = findTrack(trace, unit_track);
-    assert(unit && unit->name == "fetch" && unit->parent_uuid == process);
-    assert(!unit->is_counter);
+    CHECK(unit && unit->name == "fetch" && unit->parent_uuid == process);
+    CHECK(!unit->is_counter);
 
     const DecodedTrack* counter = findTrack(trace, counter_track);
-    assert(counter && counter->name == "fetch.ops" && counter->is_counter);
-    assert(counter->parent_uuid == process);
+    CHECK(counter && counter->name == "fetch.ops" && counter->is_counter);
+    CHECK(counter->parent_uuid == process);
 
     // Events: slice begin/end pair, instant, counter sample.
-    assert(trace.events.size() == 4);
+    CHECK(trace.events.size() == 4);
 
     const auto& begin = trace.events[0];
-    assert(begin.type == 1 && begin.track_uuid == unit_track);
-    assert(begin.timestamp == 100 && begin.name == "tick" && begin.category == "unit");
-    assert(begin.uint_annotations.at("cycle") == 42);
-    assert(begin.string_annotations.at("detail") == "detail text");
+    CHECK(begin.type == 1 && begin.track_uuid == unit_track);
+    CHECK(begin.timestamp == 100 && begin.name == "tick" && begin.category == "unit");
+    CHECK(begin.uint_annotations.at("cycle") == 42);
+    CHECK(begin.string_annotations.at("detail") == "detail text");
 
     const auto& end = trace.events[1];
-    assert(end.type == 2 && end.track_uuid == unit_track && end.timestamp == 150);
+    CHECK(end.type == 2 && end.track_uuid == unit_track && end.timestamp == 150);
 
     const auto& instant = trace.events[2];
-    assert(instant.type == 3 && instant.track_uuid == unit_track);
-    assert(instant.timestamp == 123 && instant.name == "fetched 0xdeadbeef");
+    CHECK(instant.type == 3 && instant.track_uuid == unit_track);
+    CHECK(instant.timestamp == 123 && instant.name == "fetched 0xdeadbeef");
 
     const auto& sample = trace.events[3];
-    assert(sample.type == 4 && sample.track_uuid == counter_track);
-    assert(sample.timestamp == 200 && sample.counter_value && *sample.counter_value == 7);
+    CHECK(sample.type == 4 && sample.track_uuid == counter_track);
+    CHECK(sample.timestamp == 200 && sample.counter_value && *sample.counter_value == 7);
 
     std::filesystem::remove(path);
     std::cout << "PASSED\n";
@@ -349,33 +358,32 @@ void test_timeline_stream_export() {
     auto path = tempFile("chronon_pftrace_timeline_test.pftrace");
     PerfettoTraceWriter writer;
     const bool opened = writer.open(path);
-    assert(opened);
-    (void)opened;
+    CHECK(opened);
     writeTimeline(writer, data);
     writer.close();
 
     DecodedTrace trace = decodeFile(path);
 
     // One process track + one track per stream.
-    assert(trace.tracks.size() == 3);
-    assert(trace.tracks[0].is_process && trace.tracks[0].process_name == "Chronon Scheduler");
-    assert(trace.tracks[1].name == "stream 0");
-    assert(trace.tracks[2].name == "scheduler");
-    assert(trace.tracks[1].parent_uuid == trace.tracks[0].uuid);
+    CHECK(trace.tracks.size() == 3);
+    CHECK(trace.tracks[0].is_process && trace.tracks[0].process_name == "Chronon Scheduler");
+    CHECK(trace.tracks[1].name == "stream 0");
+    CHECK(trace.tracks[2].name == "scheduler");
+    CHECK(trace.tracks[1].parent_uuid == trace.tracks[0].uuid);
 
     // 3 slices = 6 begin/end events, plus the dropped-events instant.
-    assert(trace.events.size() == 7);
+    CHECK(trace.events.size() == 7);
 
     const auto& stall_begin = trace.events[2];
-    assert(stall_begin.type == 1 && stall_begin.name == "cross-cluster stall");
-    assert(stall_begin.category == "wait" && stall_begin.timestamp == 1300);
-    assert(stall_begin.uint_annotations.at("cycle") == 11);
-    assert(stall_begin.string_annotations.at("detail") == "iq0");
+    CHECK(stall_begin.type == 1 && stall_begin.name == "cross-cluster stall");
+    CHECK(stall_begin.category == "wait" && stall_begin.timestamp == 1300);
+    CHECK(stall_begin.uint_annotations.at("cycle") == 11);
+    CHECK(stall_begin.string_annotations.at("detail") == "iq0");
     const auto& stall_end = trace.events[3];
-    assert(stall_end.type == 2 && stall_end.timestamp == 2000);
+    CHECK(stall_end.type == 2 && stall_end.timestamp == 2000);
 
     const auto& dropped = trace.events.back();
-    assert(dropped.type == 3 && dropped.name == "dropped events: 5");
+    CHECK(dropped.type == 3 && dropped.name == "dropped events: 5");
 
     std::filesystem::remove(path);
     std::cout << "PASSED\n";
@@ -387,21 +395,19 @@ void test_empty_and_reopen() {
     auto path = tempFile("chronon_pftrace_empty_test.pftrace");
     PerfettoTraceWriter writer;
     const bool opened = writer.open(path);
-    assert(opened);
-    (void)opened;
+    CHECK(opened);
     const bool reopened = writer.open(path);
-    assert(!reopened);  // Double open rejected.
-    (void)reopened;
+    CHECK(!reopened);  // Double open rejected.
     writer.close();
 
     // A trace with no packets is a valid (empty) file.
-    assert(std::filesystem::exists(path));
+    CHECK(std::filesystem::exists(path));
     DecodedTrace trace = decodeFile(path);
-    assert(trace.tracks.empty() && trace.events.empty());
+    CHECK(trace.tracks.empty() && trace.events.empty());
 
     // Events on a closed writer are dropped, not crashes.
     writer.instant(1, "x", "y", 0);
-    assert(writer.eventsWritten() == 0);
+    CHECK(writer.eventsWritten() == 0);
 
     std::filesystem::remove(path);
     std::cout << "PASSED\n";

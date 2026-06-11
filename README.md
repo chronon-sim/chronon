@@ -163,6 +163,7 @@ Detailed design documents are available in [`website/docs/guides/`](website/docs
 - C++20 compiler (GCC 12+, Clang 20+)
 - CMake 3.25+
 - stdexec (included via CPM)
+- Perfetto SDK (included via CPM, for timeline.pftrace output)
 - yaml-cpp (for YAML configuration)
 - fmt (for observability formatting)
 

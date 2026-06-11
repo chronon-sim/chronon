@@ -45,6 +45,10 @@ endif()
 # stdexec (header-only, for inplace_stop_token in ObservationBackend)
 target_link_libraries(chronon_observe PUBLIC STDEXEC::stdexec)
 
+# Perfetto SDK (PRIVATE: PerfettoTraceWriter hides it behind a pimpl, so
+# perfetto.h never leaks into chronon headers)
+target_link_libraries(chronon_observe PRIVATE perfetto_sdk)
+
 # Thread support
 find_package(Threads REQUIRED)
 target_link_libraries(chronon_observe PUBLIC Threads::Threads)

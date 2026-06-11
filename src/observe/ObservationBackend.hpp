@@ -117,8 +117,12 @@ public:
 
     const std::filesystem::path& outputDir() const noexcept { return output_dir_; }
 
-    /// True when this backend writes a Perfetto timeline file.
-    bool timelineEnabled() const noexcept { return config_.timeline_enabled; }
+    /// True when this backend has an open Perfetto timeline sink. Reports false
+    /// when the timeline is disabled by config or the file failed to open, so
+    /// callers (scheduler timeline handoff) can fall back to standalone output.
+    bool timelineEnabled() const noexcept {
+        return timeline_sink_open_.load(std::memory_order_acquire);
+    }
 
     /**
      * @brief Submit recorded timeline streams for inclusion in timeline.pftrace.
@@ -282,6 +286,9 @@ private:
     std::vector<std::string> source_name_cache_;
 
     std::unique_ptr<PerfettoTraceWriter> perfetto_writer_;
+    /// Set once the timeline file is open (in start(), before threads spawn);
+    /// cleared when the writer closes at shutdown.
+    std::atomic<bool> timeline_sink_open_{false};
     uint64_t sim_process_uuid_ = 0;
     /// source_id → timeline track uuid (0 = not yet created).
     std::vector<uint64_t> source_track_uuids_;

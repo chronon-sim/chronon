@@ -131,6 +131,7 @@ void ObservationBackend::finalizeTimeline_() {
 
     perfetto_writer_->flush();
     perfetto_writer_->close();
+    timeline_sink_open_.store(false, std::memory_order_release);
 }
 
 // ---------------------------------------------------------------------------
@@ -555,12 +556,13 @@ void ObservationBackend::initializeOutputDir_() {
 
     if (config_.timeline_enabled) {
         perfetto_writer_ = std::make_unique<PerfettoTraceWriter>();
-        const std::string& timeline_file =
+        const std::string timeline_file =
             config_.timeline_file.empty() ? std::string("timeline.pftrace") : config_.timeline_file;
         if (perfetto_writer_->open(output_dir_ / timeline_file)) {
             std::string process_name = config_.simulation_name.empty() ? std::string("Simulation")
                                                                        : config_.simulation_name;
             sim_process_uuid_ = perfetto_writer_->addProcessTrack(process_name, /*pid=*/1);
+            timeline_sink_open_.store(true, std::memory_order_release);
         } else {
             std::cerr << "[observe] failed to open timeline file " << timeline_file
                       << " (timeline output disabled)\n";

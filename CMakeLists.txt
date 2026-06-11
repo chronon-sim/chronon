@@ -97,6 +97,23 @@ if(TARGET stdexec)
     set_target_properties(stdexec PROPERTIES SYSTEM TRUE)
 endif()
 
+# Perfetto SDK (amalgamated C++ sources) for timeline.pftrace output.
+# The cpp-sdk-src release asset contains only perfetto.h + perfetto.cc.
+CPMAddPackage(
+    NAME perfetto
+    URL https://github.com/google/perfetto/releases/download/v56.1/perfetto-cpp-sdk-src.zip
+    DOWNLOAD_ONLY YES
+)
+if(perfetto_ADDED)
+    add_library(perfetto_sdk STATIC ${perfetto_SOURCE_DIR}/perfetto.cc)
+    target_include_directories(perfetto_sdk SYSTEM PUBLIC ${perfetto_SOURCE_DIR})
+    target_compile_features(perfetto_sdk PUBLIC cxx_std_17)
+    # Third-party code: keep it out of our warning/-Werror surface.
+    target_compile_options(perfetto_sdk PRIVATE -w)
+    find_package(Threads REQUIRED)
+    target_link_libraries(perfetto_sdk PUBLIC Threads::Threads)
+endif()
+
 # Add the main framework library
 add_subdirectory(src)
 
