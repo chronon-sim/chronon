@@ -232,24 +232,28 @@ change):
   `runUntilTermination()` (periodic dumps / termination polling) deliberately
   keeps the per-epoch path for its boundaries, so epoch-free is a no-op there;
 - every MPSC input port has fully-resolved per-connection producer progress;
-- **staging headroom suffices for every MPSC connection** (see below).
+- **cross-thread buffer headroom suffices for every connection** (see below).
 
-**Staging-capacity gate.** Without the per-epoch drain, a producer can run ahead
-of a consumer and leave entries staged in a connection's MPSC ring. An
-unlimited-capacity `InPort` never back-pressures, so its ring could silently
-overflow; a bounded port would back-pressure where the barrier flush would not.
-The gate therefore vetoes epoch-free unless each connection can absorb the
-configured run-ahead. The headroom (in cycles) a connection supports is roughly:
+**Cross-thread buffer headroom.** Without the per-epoch drain, a producer can run
+ahead of a consumer and leave entries buffered in the connection's cross-thread
+ring — the per-connection MPSC staging ring for a multi-producer port, or the
+SPSC lock-free ring for a single-producer cross-thread edge. Both rings are
+bounded (typically ~4095 slots) even for an unlimited-capacity `InPort`, which
+never back-pressures, so the ring could silently overflow; a bounded port would
+back-pressure where the barrier flush would not. The gate therefore vetoes
+epoch-free unless each connection can absorb the configured run-ahead. The
+headroom (in cycles) a connection supports is roughly:
 
 ```
-headroom = min(InPort capacity, staging ring slots) / per_cycle_send_rate - edge_delay
+headroom = min(InPort capacity, ring slots) / per_cycle_send_rate - edge_delay
 ```
 
 where `per_cycle_send_rate` is the source `OutPort`'s per-cycle send cap (an
 uncapped source forces a veto) and `edge_delay` accounts for not-yet-due entries
-the consumer cannot drain. If any connection's headroom is `<= max_lookahead_cycles`,
+the consumer cannot drain. Same-thread connections drain synchronously and impose
+no bound. If any cross-thread connection's headroom is `<= max_lookahead_cycles`,
 the run falls back to the barrier path. To use epoch-free with unlimited-capacity
-MPSC fan-in, give the producing `OutPort` a per-cycle send cap and keep
+cross-thread edges, give the producing `OutPort` a per-cycle send cap and keep
 `max_lookahead_cycles + edge_delay` within the ring.
 
 ## Scheduler Timeline Diagnostics
