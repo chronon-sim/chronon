@@ -20,6 +20,7 @@ add_library(chronon_observe
     ObservationManager.cpp
     PerfettoTraceWriter.cpp
     ReorderBuffer.cpp
+    TimelineTrack.cpp
 )
 
 target_include_directories(chronon_observe

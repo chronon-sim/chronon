@@ -35,6 +35,7 @@ public:
         LOG_EVENT = 2,
         EPOCH_COMMIT = 3,
         EPOCH_ROLLBACK = 4,
+        TIMELINE_EVENT = 5,  ///< TimelineRecord: span begin/end, lane instant, counter sample.
         SHUTDOWN = 255
     };
 

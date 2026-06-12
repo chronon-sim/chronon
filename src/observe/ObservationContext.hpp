@@ -23,6 +23,7 @@
 #include "ObservationFilter.hpp"
 #include "ObservationQueue.hpp"
 #include "ThreadContextManager.hpp"
+#include "TimelineApi.hpp"
 #include "Types.hpp"
 
 namespace chronon::observe {
@@ -188,7 +189,148 @@ public:
     void setQueue(ObservationQueue* queue) noexcept { queue_ = queue; }
     ObservationQueue* queue() noexcept { return queue_; }
 
+    /**
+     * @brief Emit a timeline event (span begin/end, lane instant, counter sample).
+     *
+     * Producer-side cost matches the instant trace path: one filter check, a
+     * fixed-size record fill, and a bounded arg memcpy into the SPSC queue.
+     * SpanEnd events skip temporal filtering (only the trace-channel category
+     * gate applies): a span begun inside an observation window must still
+     * close when its end falls outside it. Ends whose begin WAS suppressed
+     * are dropped by the backend's open-span table.
+     */
+    void timelineEvent(CategoryMask category, TimelineEventKind kind, uint32_t track_id,
+                       uint16_t slot, uint16_t name_id, uint64_t payload,
+                       const TimelineArgValue* args, size_t arg_count) noexcept {
+        const bool allowed =
+            (kind == TimelineEventKind::SpanEnd)
+                ? filter_.shouldObserve(category | category::TRACE)
+                : filter_.shouldObserve(category | category::TRACE, currentCycle());
+        if (OBSERVE_LIKELY(!allowed)) {
+            return;
+        }
+
+        const size_t payload_size = sizeof(TimelineRecord) + arg_count * TIMELINE_ARG_SIZE;
+
+        if (lookahead_mode_) {
+            std::byte* dest = nullptr;
+            size_t total_size = 0;
+            if (!lookahead_buffer_.reserveRecord(ObservationQueue::EventType::TIMELINE_EVENT, 1,
+                                                 payload_size, dest, total_size)) {
+                if (queue_) {
+                    queue_->incrementDropped();
+                }
+                stats_.recordDrop<ObservationChannel::Trace>();
+                return;
+            }
+            fillTimelineRecord_(dest, category, kind, track_id, slot, name_id, payload, args,
+                                arg_count);
+            lookahead_buffer_.commitReservedRecord(total_size);
+            stats_.recordEmit<ObservationChannel::Trace>();
+            return;
+        }
+
+        ThreadContext* ctx = ThreadContextManager::instance().getContext();
+        if (!ctx) {
+            stats_.recordDrop<ObservationChannel::Trace>();
+            return;
+        }
+
+        const size_t record_size = sizeof(ObservationQueue::RecordHeader) + payload_size;
+        const size_t aligned_size = (record_size + 7) & ~7;
+
+        auto* ptr = acquireQueueSpace_<ObservationChannel::Trace>(ctx, aligned_size);
+        if (!ptr) {
+            ctx->incrementDropped();
+            stats_.recordDrop<ObservationChannel::Trace>();
+            return;
+        }
+
+        auto* header = reinterpret_cast<ObservationQueue::RecordHeader*>(ptr);
+        header->total_size = static_cast<uint16_t>(aligned_size);
+        header->type = ObservationQueue::EventType::TIMELINE_EVENT;
+        header->flags = 1;  ///< Flag 1 = structured format.
+        header->padding = 0;
+
+        fillTimelineRecord_(ptr + sizeof(ObservationQueue::RecordHeader), category, kind, track_id,
+                            slot, name_id, payload, args, arg_count);
+
+        ctx->queue().finishAndCommitWrite(aligned_size);
+        stats_.recordEmit<ObservationChannel::Trace>();
+    }
+
 private:
+    void fillTimelineRecord_(std::byte* dest, CategoryMask category, TimelineEventKind kind,
+                             uint32_t track_id, uint16_t slot, uint16_t name_id, uint64_t payload,
+                             const TimelineArgValue* args, size_t arg_count) noexcept {
+        auto* rec = reinterpret_cast<TimelineRecord*>(dest);
+        rec->cycle = currentCycle();
+        rec->payload = payload;
+        rec->track_id = track_id;
+        rec->category = static_cast<uint32_t>(category);
+        rec->name_id = name_id;
+        rec->slot = slot;
+        rec->kind = static_cast<uint8_t>(kind);
+        rec->arg_count = static_cast<uint8_t>(arg_count);
+        rec->padding[0] = 0;
+        rec->padding[1] = 0;
+
+        std::byte* arg_dest = dest + sizeof(TimelineRecord);
+        for (size_t i = 0; i < arg_count; ++i) {
+            packTimelineArg(arg_dest + i * TIMELINE_ARG_SIZE, args[i]);
+        }
+    }
+
+    /**
+     * @brief Reserve queue space, applying the channel's backpressure policy.
+     *
+     * Fast path: a single prepareWrite. On full queue: drop, or wake the
+     * backend and spin (bounded or unbounded per policy). @return Write
+     * pointer, or nullptr when the record must be dropped (caller accounts).
+     */
+    template <ObservationChannel Ch>
+    std::byte* acquireQueueSpace_(ThreadContext* ctx, size_t aligned_size) noexcept {
+        auto* ptr = ctx->queue().prepareWrite(aligned_size);
+        if (OBSERVE_LIKELY(ptr != nullptr)) {
+            return ptr;
+        }
+
+        auto policy = ThreadContextManager::instance().backpressurePolicy(Ch);
+        if (policy == BackpressurePolicy::Drop) {
+            return nullptr;
+        }
+        if (OBSERVE_UNLIKELY(aligned_size > ctx->queue().capacity())) {
+            return nullptr;
+        }
+        // Force-publish uncommitted writes: without this, batched commits keep
+        // atomic_writer_pos_ stale and the drain thread sees the queue as empty,
+        // deadlocking the producer.
+        ctx->queue().forceCommitWrite();
+        if (!ThreadContextManager::instance().wakeBackend()) {
+            return nullptr;
+        }
+        const uint32_t max_spins = (policy == BackpressurePolicy::SpinWait)
+                                       ? UINT32_MAX
+                                       : ThreadContextManager::instance().backpressureMaxSpins(Ch);
+        uint32_t spins = 0;
+        do {
+            if (++spins > 64) {
+                std::this_thread::yield();
+                spins = (spins > max_spins) ? max_spins : spins;
+            } else {
+                cpuPause();
+            }
+            ptr = ctx->queue().prepareWrite(aligned_size);
+            if (ptr) break;
+            // Backend may be stopping concurrently; periodically retry wakeup.
+            // If the callback has been deregistered, give up and drop.
+            if ((spins & 0xFFu) == 0u && !ThreadContextManager::instance().wakeBackend()) {
+                break;
+            }
+        } while (spins < max_spins);
+        return ptr;
+    }
+
     /// Phase 1 of two-phase encoding: compute size and cache string lengths so
     /// phase 2 doesn't need to call strlen() again.
     template <typename T>
@@ -261,53 +403,11 @@ private:
                 return;
             }
 
-            auto* ptr = ctx->queue().prepareWrite(aligned_size);
+            auto* ptr = acquireQueueSpace_<Ch>(ctx, aligned_size);
             if (!ptr) {
-                auto policy = ThreadContextManager::instance().backpressurePolicy(Ch);
-                if (policy == BackpressurePolicy::Drop) {
-                    ctx->incrementDropped();
-                    stats_.recordDrop<Ch>();
-                    return;
-                }
-                if (OBSERVE_UNLIKELY(aligned_size > ctx->queue().capacity())) {
-                    ctx->incrementDropped();
-                    stats_.recordDrop<Ch>();
-                    return;
-                }
-                // Force-publish uncommitted writes: without this, batched commits keep
-                // atomic_writer_pos_ stale and the drain thread sees the queue as empty,
-                // deadlocking the producer.
-                ctx->queue().forceCommitWrite();
-                if (!ThreadContextManager::instance().wakeBackend()) {
-                    ctx->incrementDropped();
-                    stats_.recordDrop<Ch>();
-                    return;
-                }
-                const uint32_t max_spins =
-                    (policy == BackpressurePolicy::SpinWait)
-                        ? UINT32_MAX
-                        : ThreadContextManager::instance().backpressureMaxSpins(Ch);
-                uint32_t spins = 0;
-                do {
-                    if (++spins > 64) {
-                        std::this_thread::yield();
-                        spins = (spins > max_spins) ? max_spins : spins;
-                    } else {
-                        cpuPause();
-                    }
-                    ptr = ctx->queue().prepareWrite(aligned_size);
-                    if (ptr) break;
-                    // Backend may be stopping concurrently; periodically retry wakeup.
-                    // If the callback has been deregistered, give up and drop.
-                    if ((spins & 0xFFu) == 0u && !ThreadContextManager::instance().wakeBackend()) {
-                        break;
-                    }
-                } while (spins < max_spins);
-                if (!ptr) {
-                    ctx->incrementDropped();
-                    stats_.recordDrop<Ch>();
-                    return;
-                }
+                ctx->incrementDropped();
+                stats_.recordDrop<Ch>();
+                return;
             }
 
             auto* header = reinterpret_cast<ObservationQueue::RecordHeader*>(ptr);
@@ -383,51 +483,11 @@ private:
                 sizeof(ObservationQueue::RecordHeader) + sizeof(StructuredRecord) + args_size;
             const size_t aligned_size = (record_size + 7) & ~7;
 
-            auto* ptr = ctx->queue().prepareWrite(aligned_size);
+            auto* ptr = acquireQueueSpace_<Ch>(ctx, aligned_size);
             if (!ptr) {
-                auto policy = ThreadContextManager::instance().backpressurePolicy(Ch);
-                if (policy == BackpressurePolicy::Drop) {
-                    ctx->incrementDropped();
-                    stats_.recordDrop<Ch>();
-                    return;
-                }
-                if (OBSERVE_UNLIKELY(aligned_size > ctx->queue().capacity())) {
-                    ctx->incrementDropped();
-                    stats_.recordDrop<Ch>();
-                    return;
-                }
-                // Force-publish uncommitted writes: without this, batched commits keep
-                // atomic_writer_pos_ stale and the drain thread sees the queue as empty,
-                // deadlocking the producer.
-                ctx->queue().forceCommitWrite();
-                if (!ThreadContextManager::instance().wakeBackend()) {
-                    ctx->incrementDropped();
-                    stats_.recordDrop<Ch>();
-                    return;
-                }
-                const uint32_t max_spins =
-                    (policy == BackpressurePolicy::SpinWait)
-                        ? UINT32_MAX
-                        : ThreadContextManager::instance().backpressureMaxSpins(Ch);
-                uint32_t spins = 0;
-                do {
-                    if (++spins > 64) {
-                        std::this_thread::yield();
-                        spins = (spins > max_spins) ? max_spins : spins;
-                    } else {
-                        cpuPause();
-                    }
-                    ptr = ctx->queue().prepareWrite(aligned_size);
-                    if (ptr) break;
-                    if ((spins & 0xFFu) == 0u && !ThreadContextManager::instance().wakeBackend()) {
-                        break;
-                    }
-                } while (spins < max_spins);
-                if (!ptr) {
-                    ctx->incrementDropped();
-                    stats_.recordDrop<Ch>();
-                    return;
-                }
+                ctx->incrementDropped();
+                stats_.recordDrop<Ch>();
+                return;
             }
 
             auto* header = reinterpret_cast<ObservationQueue::RecordHeader*>(ptr);

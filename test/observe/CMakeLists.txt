@@ -207,3 +207,34 @@ add_test(
     COMMAND test_perfetto_trace_writer
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
+
+# ==============================================================================
+# Timeline API (lanes / spans / flows / typed args) Test
+# ==============================================================================
+
+add_executable(test_timeline_api
+    test_timeline_api.cpp
+)
+
+target_include_directories(test_timeline_api PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_link_libraries(test_timeline_api
+    chronon::core
+    chronon_observe
+    chronon_compile_options
+    ZLIB::ZLIB  # independent decoder inflates compressed_packets batches
+)
+
+target_compile_features(test_timeline_api PRIVATE cxx_std_20)
+
+# Add to regress target
+add_dependencies(regress test_timeline_api)
+
+# Add test
+add_test(
+    NAME timeline_api_test
+    COMMAND test_timeline_api
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)

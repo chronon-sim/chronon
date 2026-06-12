@@ -24,17 +24,11 @@ bool ReorderBuffer::extractCycle(ObservationQueue::EventType type, const std::by
                                  size_t data_size, uint64_t& cycle) {
     switch (type) {
         case ObservationQueue::EventType::TRACE_EVENT:
-        case ObservationQueue::EventType::LOG_EVENT: {
-            // StructuredRecord layout: uint64_t cycle, uint32_t format_id, ...
-            if (data_size >= sizeof(uint64_t)) {
-                std::memcpy(&cycle, data, sizeof(uint64_t));
-                return true;
-            }
-            return false;
-        }
-
+        case ObservationQueue::EventType::LOG_EVENT:
+        case ObservationQueue::EventType::TIMELINE_EVENT:
         case ObservationQueue::EventType::COUNTER_SNAPSHOT: {
-            // Counter snapshot format: cycle (8B) + unit_name_length (2B) + ...
+            // StructuredRecord, TimelineRecord, and counter snapshots all lead
+            // with a uint64_t cycle.
             if (data_size >= sizeof(uint64_t)) {
                 std::memcpy(&cycle, data, sizeof(uint64_t));
                 return true;

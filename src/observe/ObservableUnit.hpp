@@ -24,6 +24,7 @@ namespace chronon::observe {
 // Forward declarations
 class Counter;
 class DerivedCounter;
+class TimelineTrackBase;
 
 /**
  * ObservableUnit - Mixin providing observability to simulation units.
@@ -68,6 +69,7 @@ public:
         observe_ctx_ = ctx;
         initializePendingCounters();
         initializePendingDerivedCounters();
+        initializePendingTimelineTracks();
     }
 
     /**
@@ -83,6 +85,15 @@ public:
      * Called by DerivedCounter constructor.
      */
     void registerDerivedCounter(DerivedCounter* dc) { pending_derived_counters_.push_back(dc); }
+
+    /**
+     * Register a timeline lane/counter for initialization when context is attached.
+     *
+     * Called by TimelineTrackBase constructor.
+     */
+    void registerTimelineTrack(TimelineTrackBase* track) {
+        pending_timeline_tracks_.push_back(track);
+    }
 
     /**
      * Get the current cycle for observation timestamps.
@@ -193,6 +204,9 @@ private:
     // Pending derived counters to be initialized when context is attached
     std::vector<DerivedCounter*> pending_derived_counters_;
 
+    // Pending timeline lanes/counters to be initialized when context is attached
+    std::vector<TimelineTrackBase*> pending_timeline_tracks_;
+
     /**
      * Initialize all pending counters.
      *
@@ -207,6 +221,14 @@ private:
      * Defined in DerivedCounter.cpp (needs DerivedCounter to be complete).
      */
     void initializePendingDerivedCounters();
+
+    /**
+     * Initialize all pending timeline lanes/counters.
+     *
+     * Called when observation context is set.
+     * Defined in TimelineTrack.cpp (needs TimelineTrackBase to be complete).
+     */
+    void initializePendingTimelineTracks();
 };
 
 }  // namespace chronon::observe

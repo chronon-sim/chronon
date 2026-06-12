@@ -705,6 +705,13 @@ void ObservationBackend::processEvent_(const ObservationQueue::RecordHeader* hea
             break;
         }
 
+        case ObservationQueue::EventType::TIMELINE_EVENT: {
+            if (config_.timeline_trace_events && perfetto_writer_ && perfetto_writer_->isOpen()) {
+                processTimelineEvent_(data, data_size);
+            }
+            break;
+        }
+
         case ObservationQueue::EventType::LOG_EVENT: {
             if (log_handler_) {
                 log_handler_(header->type, data, data_size);

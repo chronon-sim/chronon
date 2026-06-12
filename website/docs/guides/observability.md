@@ -167,6 +167,9 @@ The timeline contains:
 - **Simulation trace events** — instant events on one track per unit, grouped
   under a "Simulation" process. The timestamp is the simulation cycle (1 cycle
   rendered as 1 ns) and the event name is the formatted trace message.
+- **Timeline lanes** — occupancy spans, lane instants, and push-model counter
+  samples emitted through the declarative `TimelineLane` / `TimelineCounter`
+  members (see below), nested under their owning unit's track.
 - **Counter tracks** — one Perfetto counter track per `unit.counter`, sampled
   at counter dump cycles.
 - **Scheduler execution timeline** — when enabled, wall-clock
@@ -201,6 +204,61 @@ is transparent to ui.perfetto.dev and `trace_processor`:
   where most of the size win comes from: on the bundled CPU pipeline example
   the timeline shrinks from ~115 MB to ~17 MB (~7×) with no measurable change
   in simulation wall time (encoding runs on the backend thread).
+
+## Timeline Lanes and Counters
+
+`trace<>()` emits point events. For microarchitecture state that *occupies*
+something over many cycles — MSHR entries, ROB/LSQ slots, DRAM requests in
+flight, busy functional units — declare timeline lanes as unit members (same
+pattern as `Counter`, no macros or registration calls):
+
+```cpp
+class LSU : public Unit, public ObservableUnit {
+    // One sub-lane per slot; renders as a track group "mshr" with
+    // children mshr[0..7] under this unit's track.
+    TimelineLane mshr_{this, "mshr", /*lanes=*/8};
+    TimelineLane ld_port_{this, "ld_port", 2};
+    // Push-model counter samples (independent of counters.csv).
+    TimelineCounter occ_{this, "lsq_occupancy", "entries"};
+
+    inline static const auto MISS = Category<"dcache_miss", "D$ miss lifetime">{};
+
+    void tick() override {
+        // Span addressed by (lane, slot): begin and end are separate calls
+        // and may land in different tick() invocations — no RAII scopes.
+        mshr_.begin(slot, MISS, "miss"_ev, flow(instr.uid),
+                    arg<"addr">(paddr), arg<"set">(set));
+        ...
+        mshr_.end(slot);              // possibly many cycles later
+
+        occ_.sample(lsq_.size());
+    }
+};
+```
+
+The vocabulary is deliberately SQL-shaped:
+
+- **`"miss"_ev`** — event names are low-cardinality compile-time literals
+  (interned once in the trace), so `SELECT dur FROM slice WHERE name='miss'`
+  style analysis works in `trace_processor`.
+- **`arg<"addr">(value)`** — per-event details go into *typed* debug
+  annotations (uint/int/double/bool/pointer), not formatted into the name.
+- **`flow(uid)`** — pass the instruction/transaction uid the model already
+  carries; Perfetto links the uid's slices across lanes and stages into one
+  flow (click an instruction → see its whole journey).
+
+Semantics under the existing machinery:
+
+- Producers write fixed-size records to their SPSC queue (no allocation, cost
+  at or below the `trace<>()` instant path); all Perfetto encoding happens on
+  the backend thread. With observation disabled, calls are a null-check.
+- Category and temporal filters apply to `begin`/`instant`/`sample`.
+  `end()` skips temporal filters so a span begun inside an observation window
+  still closes outside it; an `end` whose `begin` was suppressed is dropped by
+  the backend's open-span table.
+- A `begin` on an occupied slot implicitly closes the previous span (hardware
+  slot reuse); spans still open at shutdown are closed at the last seen cycle.
+- Lookahead rollback discards speculative lane events; commit publishes them.
 
 ## Pre-Registered Format Strings
 

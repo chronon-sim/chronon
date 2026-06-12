@@ -21,6 +21,8 @@
 #include <perfetto.h>
 #include <zlib.h>
 
+#include <algorithm>
+#include <bit>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -191,10 +193,13 @@ struct PerfettoTraceWriter::Impl {
         bool category_new = false;
     };
 
+    /// At most this many debug annotations per event (producer side enforces).
+    static constexpr size_t MAX_ANNOTATIONS = 8;
+
     EventStrings internEventStrings(SequenceState& seq, pbz::TracePacket* pkt,
                                     std::string_view category, std::string_view name,
-                                    std::initializer_list<std::string_view> annotation_names_used,
-                                    uint64_t* annotation_iids) {
+                                    const std::string_view* annotation_names_used,
+                                    size_t annotation_count, uint64_t* annotation_iids) {
         EventStrings out;
         std::tie(out.name_iid, out.name_new) = seq.event_names.intern(name);
         if (!category.empty()) {
@@ -202,13 +207,11 @@ struct PerfettoTraceWriter::Impl {
         }
 
         bool any_annotation_new = false;
-        std::pair<uint64_t, bool> ann[4];
-        size_t i = 0;
-        for (std::string_view ann_name : annotation_names_used) {
-            ann[i] = seq.annotation_names.intern(ann_name);
+        std::pair<uint64_t, bool> ann[MAX_ANNOTATIONS];
+        for (size_t i = 0; i < annotation_count; ++i) {
+            ann[i] = seq.annotation_names.intern(annotation_names_used[i]);
             annotation_iids[i] = ann[i].first;
             any_annotation_new |= ann[i].second;
-            ++i;
         }
 
         if (out.name_new || out.category_new || any_annotation_new) {
@@ -223,17 +226,59 @@ struct PerfettoTraceWriter::Impl {
                 entry->set_iid(out.name_iid);
                 entry->set_name(chars(name));
             }
-            i = 0;
-            for (std::string_view ann_name : annotation_names_used) {
+            for (size_t i = 0; i < annotation_count; ++i) {
                 if (ann[i].second) {
                     auto* entry = interned->add_debug_annotation_names();
                     entry->set_iid(ann[i].first);
-                    entry->set_name(chars(ann_name));
+                    entry->set_name(chars(annotation_names_used[i]));
                 }
-                ++i;
             }
         }
         return out;
+    }
+
+    /// Interns the strings for an annotated sim-domain event and writes the
+    /// InternedData; @p annotation_iids receives one iid per annotation.
+    EventStrings internAnnotatedEvent(SequenceState& seq, pbz::TracePacket* pkt,
+                                      std::string_view category, std::string_view name,
+                                      std::span<const PerfettoTraceWriter::Annotation> annotations,
+                                      uint64_t* annotation_iids) {
+        std::string_view names[MAX_ANNOTATIONS];
+        const size_t count = std::min(annotations.size(), MAX_ANNOTATIONS);
+        for (size_t i = 0; i < count; ++i) {
+            names[i] = annotations[i].name;
+        }
+        return internEventStrings(seq, pkt, category, name, names, count, annotation_iids);
+    }
+
+    /// Writes typed debug-annotation values (names referenced by iid).
+    static void writeAnnotations(pbz::TrackEvent* event,
+                                 std::span<const PerfettoTraceWriter::Annotation> annotations,
+                                 const uint64_t* annotation_iids) {
+        using Kind = PerfettoTraceWriter::Annotation::Kind;
+        const size_t count = std::min(annotations.size(), MAX_ANNOTATIONS);
+        for (size_t i = 0; i < count; ++i) {
+            const auto& a = annotations[i];
+            auto* da = event->add_debug_annotations();
+            da->set_name_iid(annotation_iids[i]);
+            switch (a.kind) {
+                case Kind::Uint:
+                    da->set_uint_value(a.bits);
+                    break;
+                case Kind::Int:
+                    da->set_int_value(std::bit_cast<int64_t>(a.bits));
+                    break;
+                case Kind::Double:
+                    da->set_double_value(std::bit_cast<double>(a.bits));
+                    break;
+                case Kind::Bool:
+                    da->set_bool_value(a.bits != 0);
+                    break;
+                case Kind::Pointer:
+                    da->set_pointer_value(a.bits);
+                    break;
+            }
+        }
     }
 };
 
@@ -316,11 +361,10 @@ void PerfettoTraceWriter::sliceComplete(uint64_t track_uuid, std::string_view ca
         pkt->set_timestamp(ts_ns);
 
         uint64_t annotation_iids[2] = {0, 0};
-        auto strings = detail.empty()
-                           ? impl_->internEventStrings(impl_->wall, pkt, category, name, {"cycle"},
-                                                       annotation_iids)
-                           : impl_->internEventStrings(impl_->wall, pkt, category, name,
-                                                       {"cycle", "detail"}, annotation_iids);
+        static constexpr std::string_view kSliceAnnotations[2] = {"cycle", "detail"};
+        auto strings =
+            impl_->internEventStrings(impl_->wall, pkt, category, name, kSliceAnnotations,
+                                      detail.empty() ? 1 : 2, annotation_iids);
 
         auto* event = pkt->set_track_event();
         event->set_type(pbz::TrackEvent::TYPE_SLICE_BEGIN);
@@ -364,7 +408,7 @@ void PerfettoTraceWriter::wallInstant(uint64_t track_uuid, std::string_view cate
 
     auto* pkt = impl_->newPacket(impl_->wall, /*needs_incremental_state=*/true);
     pkt->set_timestamp(ts_ns);
-    auto strings = impl_->internEventStrings(impl_->wall, pkt, category, name, {}, nullptr);
+    auto strings = impl_->internEventStrings(impl_->wall, pkt, category, name, nullptr, 0, nullptr);
     auto* event = pkt->set_track_event();
     event->set_type(pbz::TrackEvent::TYPE_INSTANT);
     event->set_track_uuid(track_uuid);
@@ -386,7 +430,7 @@ void PerfettoTraceWriter::instant(uint64_t track_uuid, std::string_view category
     }
 
     auto* pkt = impl_->newSimEventPacket(cycle);
-    auto strings = impl_->internEventStrings(impl_->sim, pkt, category, name, {}, nullptr);
+    auto strings = impl_->internEventStrings(impl_->sim, pkt, category, name, nullptr, 0, nullptr);
     auto* event = pkt->set_track_event();
     event->set_type(pbz::TrackEvent::TYPE_INSTANT);
     event->set_track_uuid(track_uuid);
@@ -394,6 +438,80 @@ void PerfettoTraceWriter::instant(uint64_t track_uuid, std::string_view category
         event->add_category_iids(strings.category_iid);
     }
     event->set_name_iid(strings.name_iid);
+
+    ++events_written_;
+    if (impl_->packets_buffered >= FLUSH_PACKET_COUNT) {
+        flush();
+    }
+}
+
+void PerfettoTraceWriter::instant(uint64_t track_uuid, std::string_view category,
+                                  std::string_view name, uint64_t cycle, uint64_t flow_id,
+                                  std::span<const Annotation> annotations) {
+    if (!isOpen()) {
+        return;
+    }
+
+    auto* pkt = impl_->newSimEventPacket(cycle);
+    uint64_t annotation_iids[Impl::MAX_ANNOTATIONS] = {};
+    auto strings =
+        impl_->internAnnotatedEvent(impl_->sim, pkt, category, name, annotations, annotation_iids);
+    auto* event = pkt->set_track_event();
+    event->set_type(pbz::TrackEvent::TYPE_INSTANT);
+    event->set_track_uuid(track_uuid);
+    if (strings.category_iid != 0) {
+        event->add_category_iids(strings.category_iid);
+    }
+    event->set_name_iid(strings.name_iid);
+    if (flow_id != 0) {
+        event->add_flow_ids(flow_id);
+    }
+    Impl::writeAnnotations(event, annotations, annotation_iids);
+
+    ++events_written_;
+    if (impl_->packets_buffered >= FLUSH_PACKET_COUNT) {
+        flush();
+    }
+}
+
+void PerfettoTraceWriter::sliceBegin(uint64_t track_uuid, std::string_view category,
+                                     std::string_view name, uint64_t cycle, uint64_t flow_id,
+                                     std::span<const Annotation> annotations) {
+    if (!isOpen()) {
+        return;
+    }
+
+    auto* pkt = impl_->newSimEventPacket(cycle);
+    uint64_t annotation_iids[Impl::MAX_ANNOTATIONS] = {};
+    auto strings =
+        impl_->internAnnotatedEvent(impl_->sim, pkt, category, name, annotations, annotation_iids);
+    auto* event = pkt->set_track_event();
+    event->set_type(pbz::TrackEvent::TYPE_SLICE_BEGIN);
+    event->set_track_uuid(track_uuid);
+    if (strings.category_iid != 0) {
+        event->add_category_iids(strings.category_iid);
+    }
+    event->set_name_iid(strings.name_iid);
+    if (flow_id != 0) {
+        event->add_flow_ids(flow_id);
+    }
+    Impl::writeAnnotations(event, annotations, annotation_iids);
+
+    ++events_written_;
+    if (impl_->packets_buffered >= FLUSH_PACKET_COUNT) {
+        flush();
+    }
+}
+
+void PerfettoTraceWriter::sliceEnd(uint64_t track_uuid, uint64_t cycle) {
+    if (!isOpen()) {
+        return;
+    }
+
+    auto* pkt = impl_->newSimEventPacket(cycle);
+    auto* event = pkt->set_track_event();
+    event->set_type(pbz::TrackEvent::TYPE_SLICE_END);
+    event->set_track_uuid(track_uuid);
 
     ++events_written_;
     if (impl_->packets_buffered >= FLUSH_PACKET_COUNT) {

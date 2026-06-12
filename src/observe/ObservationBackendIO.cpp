@@ -13,12 +13,16 @@
 #include <fmt/chrono.h>
 #include <fmt/format.h>
 
+#include <bit>
 #include <chrono>
+#include <cstring>
 #include <iostream>
+#include <span>
 
 #include "ArgFormat.hpp"
 #include "FormatRegistry.hpp"
 #include "ObservationBackend.hpp"
+#include "ObserveApi.hpp"
 
 namespace chronon::observe {
 
@@ -111,6 +115,185 @@ void ObservationBackend::writeCounterToTimeline_(uint64_t cycle, std::string_vie
     local_bytes_written_ += 24;
 }
 
+// ---------------------------------------------------------------------------
+// Timeline lane / counter events (TimelineRecord)
+// ---------------------------------------------------------------------------
+
+std::string_view ObservationBackend::timelineEventName_(uint16_t name_id) {
+    if (name_id >= timeline_event_name_cache_.size()) {
+        timeline_event_name_cache_.resize(static_cast<size_t>(name_id) + 1);
+    }
+    std::string_view& name = timeline_event_name_cache_[name_id];
+    if (name.empty() && name_id != 0) {
+        name = EventNameRegistry::instance().get(name_id);
+    }
+    return name;
+}
+
+std::string_view ObservationBackend::timelineAnnotationKey_(uint16_t key_id) {
+    if (key_id >= timeline_annotation_key_cache_.size()) {
+        timeline_annotation_key_cache_.resize(static_cast<size_t>(key_id) + 1);
+    }
+    std::string_view& key = timeline_annotation_key_cache_[key_id];
+    if (key.empty() && key_id != 0) {
+        key = AnnotationKeyRegistry::instance().get(key_id);
+    }
+    return key;
+}
+
+std::string_view ObservationBackend::timelineCategoryName_(uint32_t category_mask) {
+    const uint32_t user_bits = category_mask & static_cast<uint32_t>(category::USER_CATEGORY_MASK);
+    if (user_bits == 0) {
+        return "timeline";
+    }
+    const uint32_t bit = static_cast<uint32_t>(std::countr_zero(user_bits));
+    std::string_view& name = timeline_category_names_[bit];
+    if (name.empty()) {
+        name = CategoryRegistry::instance().nameForBit(bit);
+        if (name.empty()) {
+            name = "timeline";
+        }
+    }
+    return name;
+}
+
+uint64_t ObservationBackend::timelineSlotTrack_(uint32_t track_id, uint16_t slot) {
+    if (track_id >= timeline_track_uuids_.size()) {
+        timeline_track_uuids_.resize(static_cast<size_t>(track_id) + 1);
+    }
+    TimelineTrackUuids& uuids = timeline_track_uuids_[track_id];
+
+    const TimelineTrackInfo& info = TimelineTrackRegistry::instance().get(track_id);
+    const uint64_t parent = timelineTrackForSource_(info.source_id);
+
+    if (info.kind == TimelineTrackInfo::Kind::Counter) {
+        if (uuids.single == 0) {
+            uuids.single = perfetto_writer_->addCounterTrack(info.name, info.unit, parent);
+        }
+        return uuids.single;
+    }
+
+    if (info.lanes <= 1) {
+        if (uuids.single == 0) {
+            std::string_view name = info.name.empty() ? std::string_view("lane") : info.name;
+            uuids.single = perfetto_writer_->addTrack(name, parent);
+        }
+        return uuids.single;
+    }
+
+    if (uuids.group == 0) {
+        uuids.group = perfetto_writer_->addTrack(info.name, parent);
+    }
+    if (slot >= uuids.slots.size()) {
+        uuids.slots.resize(static_cast<size_t>(slot) + 1, 0);
+    }
+    uint64_t& slot_uuid = uuids.slots[slot];
+    if (slot_uuid == 0) {
+        timeline_msg_buffer_.clear();
+        fmt::format_to(std::back_inserter(timeline_msg_buffer_), "{}[{}]", info.name, slot);
+        slot_uuid = perfetto_writer_->addTrack(
+            std::string_view(timeline_msg_buffer_.data(), timeline_msg_buffer_.size()),
+            uuids.group);
+    }
+    return slot_uuid;
+}
+
+void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t data_size) {
+    if (data_size < sizeof(TimelineRecord)) {
+        return;
+    }
+    TimelineRecord rec;
+    std::memcpy(&rec, data, sizeof(TimelineRecord));
+    if (data_size < sizeof(TimelineRecord) + rec.arg_count * TIMELINE_ARG_SIZE ||
+        rec.arg_count > MAX_TIMELINE_ARGS) {
+        return;
+    }
+
+    if (rec.cycle > timeline_max_cycle_) {
+        timeline_max_cycle_ = rec.cycle;
+    }
+
+    const uint64_t span_key = (static_cast<uint64_t>(rec.track_id) << 16) | rec.slot;
+
+    // Span ends address their begin's track via the open-span table; resolving
+    // the track here would create tracks for orphan ends that get dropped.
+    const auto kind = static_cast<TimelineEventKind>(rec.kind);
+    const uint64_t track_uuid =
+        (kind == TimelineEventKind::SpanEnd) ? 0 : timelineSlotTrack_(rec.track_id, rec.slot);
+
+    // Decode typed args into writer annotations (keys resolved via registry).
+    PerfettoTraceWriter::Annotation annotations[MAX_TIMELINE_ARGS];
+    const std::byte* arg_data = data + sizeof(TimelineRecord);
+    for (size_t i = 0; i < rec.arg_count; ++i) {
+        const TimelineArgValue arg = unpackTimelineArg(arg_data + i * TIMELINE_ARG_SIZE);
+        annotations[i].name = timelineAnnotationKey_(arg.key_id);
+        annotations[i].bits = arg.bits;
+        switch (arg.kind) {
+            case TimelineArgKind::Int:
+                annotations[i].kind = PerfettoTraceWriter::Annotation::Kind::Int;
+                break;
+            case TimelineArgKind::Double:
+                annotations[i].kind = PerfettoTraceWriter::Annotation::Kind::Double;
+                break;
+            case TimelineArgKind::Bool:
+                annotations[i].kind = PerfettoTraceWriter::Annotation::Kind::Bool;
+                break;
+            case TimelineArgKind::Pointer:
+                annotations[i].kind = PerfettoTraceWriter::Annotation::Kind::Pointer;
+                break;
+            case TimelineArgKind::Uint:
+            default:
+                annotations[i].kind = PerfettoTraceWriter::Annotation::Kind::Uint;
+                break;
+        }
+    }
+    const std::span<const PerfettoTraceWriter::Annotation> ann_span(annotations, rec.arg_count);
+
+    switch (kind) {
+        case TimelineEventKind::Instant:
+            perfetto_writer_->instant(track_uuid, timelineCategoryName_(rec.category),
+                                      timelineEventName_(rec.name_id), rec.cycle, rec.payload,
+                                      ann_span);
+            break;
+
+        case TimelineEventKind::SpanBegin: {
+            // Hardware slot reuse: a begin on an occupied slot implicitly
+            // closes the previous span at this cycle.
+            auto [it, inserted] = open_spans_.try_emplace(span_key, track_uuid);
+            if (!inserted) {
+                perfetto_writer_->sliceEnd(it->second, rec.cycle);
+                it->second = track_uuid;
+            }
+            perfetto_writer_->sliceBegin(track_uuid, timelineCategoryName_(rec.category),
+                                         timelineEventName_(rec.name_id), rec.cycle, rec.payload,
+                                         ann_span);
+            break;
+        }
+
+        case TimelineEventKind::SpanEnd: {
+            // Ends without a matching begin are dropped: this is what makes a
+            // temporally suppressed begin suppress its end as well.
+            auto it = open_spans_.find(span_key);
+            if (it == open_spans_.end()) {
+                break;
+            }
+            perfetto_writer_->sliceEnd(it->second, rec.cycle);
+            open_spans_.erase(it);
+            break;
+        }
+
+        case TimelineEventKind::CounterSample:
+            perfetto_writer_->counterValue(track_uuid, rec.cycle,
+                                           static_cast<int64_t>(rec.payload));
+            break;
+
+        default:
+            break;
+    }
+
+    local_bytes_written_ += data_size;
+}
+
 /// Appends timeline streams submitted via submitTimeline() (e.g. the scheduler
 /// execution timeline) and closes the Perfetto writer. Runs on the worker
 /// thread during shutdown, after the final event drain.
@@ -118,6 +301,13 @@ void ObservationBackend::finalizeTimeline_() {
     if (!perfetto_writer_) {
         return;
     }
+
+    // Close dangling spans (dropped or never-emitted ends) at the last cycle
+    // seen, so the trace renders bounded slices instead of open-ended ones.
+    for (const auto& [key, track_uuid] : open_spans_) {
+        perfetto_writer_->sliceEnd(track_uuid, timeline_max_cycle_);
+    }
+    open_spans_.clear();
 
     std::vector<TimelineStreamData> pending;
     {
@@ -560,6 +750,9 @@ void ObservationBackend::initializeOutputDir_() {
         // so a restarted backend re-declares its tracks in the new file.
         source_track_uuids_.clear();
         counter_track_uuids_.clear();
+        timeline_track_uuids_.clear();
+        open_spans_.clear();
+        timeline_max_cycle_ = 0;
         sim_process_uuid_ = 0;
         const std::string timeline_file =
             config_.timeline_file.empty() ? std::string("timeline.pftrace") : config_.timeline_file;

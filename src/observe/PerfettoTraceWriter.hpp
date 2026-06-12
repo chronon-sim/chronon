@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string_view>
 
 namespace chronon::observe {
@@ -64,6 +65,20 @@ public:
         size_t max_interned_strings = 65536;
     };
 
+    /**
+     * @brief Typed debug annotation (SDK-free view; names are interned).
+     *
+     * @c bits carries the value: zero-extended for Uint/Bool/Pointer,
+     * bit-cast int64_t for Int, bit-cast double for Double.
+     */
+    struct Annotation {
+        enum class Kind : uint8_t { Uint, Int, Double, Bool, Pointer };
+
+        std::string_view name;
+        Kind kind;
+        uint64_t bits;
+    };
+
     PerfettoTraceWriter();
     ~PerfettoTraceWriter();
 
@@ -107,6 +122,22 @@ public:
     /// Emit an instant event at @p cycle on the simulation cycle clock.
     void instant(uint64_t track_uuid, std::string_view category, std::string_view name,
                  uint64_t cycle);
+
+    /// Instant with flow id (0 = none) and typed annotations (cycle clock).
+    void instant(uint64_t track_uuid, std::string_view category, std::string_view name,
+                 uint64_t cycle, uint64_t flow_id, std::span<const Annotation> annotations);
+
+    /**
+     * @brief Open a span at @p cycle on the simulation cycle clock.
+     *
+     * The matching sliceEnd() may come many cycles later; pairing is the
+     * caller's responsibility (the backend's open-span table).
+     */
+    void sliceBegin(uint64_t track_uuid, std::string_view category, std::string_view name,
+                    uint64_t cycle, uint64_t flow_id, std::span<const Annotation> annotations);
+
+    /// Close the innermost open span on @p track_uuid at @p cycle.
+    void sliceEnd(uint64_t track_uuid, uint64_t cycle);
 
     /// Emit a counter sample at @p cycle on a counter track.
     void counterValue(uint64_t track_uuid, uint64_t cycle, int64_t value);
