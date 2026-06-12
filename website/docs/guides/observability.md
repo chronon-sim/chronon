@@ -167,6 +167,12 @@ The timeline contains:
 - **Simulation trace events** — instant events on one track per unit, grouped
   under a "Simulation" process. The timestamp is the simulation cycle (1 cycle
   rendered as 1 ns) and the event name is the formatted trace message.
+  Hierarchical unit paths ("cpu0.lsu.mshr") become nested track groups, so the
+  UI sidebar mirrors the design hierarchy; counter tracks nest under their
+  owning unit instead of forming one flat list.
+- **Timeline lanes** — occupancy spans, lane instants, and push-model counter
+  samples emitted through the declarative `TimelineLane` / `TimelineCounter`
+  members (see below), nested under their owning unit's track.
 - **Counter tracks** — one Perfetto counter track per `unit.counter`, sampled
   at counter dump cycles.
 - **Scheduler execution timeline** — when enabled, wall-clock
@@ -178,6 +184,99 @@ The timeline contains:
 The file is produced by `src/observe/PerfettoTraceWriter`, a thin wrapper over
 the Perfetto SDK's protozero message writers (no tracing session or category
 registration — packets are written straight to the file).
+
+### Wire format
+
+The writer uses the size-oriented parts of the Perfetto data model; all of this
+is transparent to ui.perfetto.dev and `trace_processor`:
+
+- **Custom cycle clock** — simulation events are stamped on a sequence-scoped
+  incremental clock (clock id 64, declared via `ClockSnapshot` and paired 1:1
+  with the boot clock), so packets carry small varint cycle *deltas* instead of
+  absolute timestamps. Out-of-order events (e.g. a reorder-buffer force flush)
+  fall back to an absolute timestamp on that packet rather than corrupting the
+  incremental state. The scheduler execution timeline stays on the default
+  wall-clock sequence.
+- **Interning** — event names, categories, and debug-annotation names are
+  emitted once per sequence as `InternedData` and referenced by id afterwards.
+  Incremental state is checkpointed periodically (and whenever an intern table
+  hits its cap) so traces stay seekable and crash-truncation-safe.
+- **Compression** — flushed packet batches are wrapped in zlib-deflated
+  `TracePacket.compressed_packets` (on by default; `timeline.compress: false`
+  disables it). Microarchitecture traces are highly repetitive, so this is
+  where most of the size win comes from: on the bundled CPU pipeline example
+  the timeline shrinks from ~115 MB to ~17 MB (~7×) with no measurable change
+  in simulation wall time (encoding runs on the backend thread).
+
+## Timeline Lanes and Counters
+
+`trace<>()` emits point events. For microarchitecture state that *occupies*
+something over many cycles — MSHR entries, ROB/LSQ slots, DRAM requests in
+flight, busy functional units — declare timeline lanes as unit members (same
+pattern as `Counter`, no macros or registration calls):
+
+```cpp
+class LSU : public Unit, public ObservableUnit {
+    // One sub-lane per slot; renders as a track group "mshr" with
+    // children mshr[0..7] under this unit's track.
+    TimelineLane mshr_{this, "mshr", /*lanes=*/8};
+    TimelineLane ld_port_{this, "ld_port", 2};
+    // Push-model counter samples (independent of counters.csv).
+    TimelineCounter occ_{this, "lsq_occupancy", "entries"};
+
+    inline static const auto MISS = Category<"dcache_miss", "D$ miss lifetime">{};
+
+    void tick() override {
+        // Span addressed by (lane, slot): begin and end are separate calls
+        // and may land in different tick() invocations — no RAII scopes.
+        mshr_.begin(slot, MISS, "miss"_ev, flow(instr.uid),
+                    arg<"addr">(paddr), arg<"set">(set));
+        ...
+        mshr_.end(slot);              // possibly many cycles later
+
+        occ_.sample(lsq_.size());
+    }
+};
+```
+
+The vocabulary is deliberately SQL-shaped:
+
+- **`"miss"_ev`** — event names are low-cardinality compile-time literals
+  (interned once in the trace), so `SELECT dur FROM slice WHERE name='miss'`
+  style analysis works in `trace_processor`.
+- **`arg<"addr">(value)`** — per-event details go into *typed* debug
+  annotations (uint/int/double/bool/pointer), not formatted into the name.
+- **`flow(uid)`** — pass the instruction/transaction uid the model already
+  carries; Perfetto links the uid's slices across lanes and stages into one
+  flow (click an instruction → see its whole journey), and offline analysis
+  can join stages through the flow id to compute per-stage latency
+  distributions. The bundled CPU pipeline example is instrumented this way:
+  every stage stamps `flow(instr_id)` (fetch/dispatch/commit instants, EX
+  occupancy spans per ALU, L2 miss spans), so `examples/cpu_pipeline.yaml`
+  produces a timeline where each instruction's fetch→dispatch→ex→commit
+  journey is one connected flow.
+
+Semantics under the existing machinery:
+
+- Producers write fixed-size records to their SPSC queue (no allocation, cost
+  at or below the `trace<>()` instant path); all Perfetto encoding happens on
+  the backend thread. With observation disabled, calls are a null-check.
+- Category and temporal filters apply to `begin`/`instant`/`sample`.
+  `end()` skips temporal filters so a span begun inside an observation window
+  still closes outside it; an `end` whose `begin` was suppressed is dropped by
+  the backend's open-span table.
+- A `begin` on an occupied slot implicitly closes the previous span (hardware
+  slot reuse); spans still open at shutdown are closed at the last seen cycle.
+- Lookahead rollback discards speculative lane events; commit publishes them.
+
+### Offline analysis
+
+`scripts/trace_sql/` ships canned `trace_processor` queries shaped for this
+data model: per-stage latency through flow edges, span-duration histograms per
+event name, lane occupancy, stall attribution (cycles beyond each event kind's
+best case), and counter statistics — all keyed by the hierarchical track paths,
+so they work unchanged on any model using the timeline API. See
+`scripts/trace_sql/README.md` for usage.
 
 ## Pre-Registered Format Strings
 

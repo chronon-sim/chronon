@@ -174,6 +174,7 @@ simulation:
       file: timeline.pftrace
       trace_events: true       # Simulation trace channel -> instant events
       counters: true           # Counter snapshots -> counter tracks
+      compress: true           # Deflate packet batches (compressed_packets)
       scheduler:               # Scheduler execution timeline (see below)
         enabled: false
 

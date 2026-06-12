@@ -34,6 +34,22 @@ struct Instruction {
 
 enum class OpType { LOAD, STORE, ADD, MUL };
 
+/// Low-cardinality timeline event name per op type, so EX-occupancy spans
+/// aggregate by kind in trace_processor (SELECT dur FROM slice WHERE name='mul').
+inline EventNameRef opEventName(OpType op_type) {
+    switch (op_type) {
+        case OpType::LOAD:
+            return "load"_ev;
+        case OpType::STORE:
+            return "store"_ev;
+        case OpType::ADD:
+            return "add"_ev;
+        case OpType::MUL:
+            return "mul"_ev;
+    }
+    return "op"_ev;
+}
+
 struct DecodedOp {
     OpType op_type;
     uint8_t dest_reg;

@@ -39,6 +39,7 @@
 #include "PerfettoTraceWriter.hpp"
 #include "ReorderBuffer.hpp"
 #include "ThreadContextManager.hpp"
+#include "TimelineApi.hpp"
 #include "TimelineData.hpp"
 #include "Types.hpp"
 
@@ -81,6 +82,7 @@ public:
         std::string timeline_file = "timeline.pftrace";
         bool timeline_trace_events = true;
         bool timeline_counters = true;
+        bool timeline_compress = true;
 
         bool enable_reordering = true;
         uint64_t reorder_watermark_cycles = 1000;
@@ -234,6 +236,28 @@ private:
     /// Track for @p source_id under the simulation process group (lazily created).
     uint64_t timelineTrackForSource_(uint16_t source_id);
 
+    /// Track for a hierarchical unit path ("cpu0.lsu" → group "cpu0" → track
+    /// "lsu"), creating parent group tracks as needed. The unit tree is
+    /// mirrored into Perfetto's parent_uuid chain so the UI sidebar follows
+    /// the design hierarchy.
+    uint64_t timelineTrackForPath_(std::string_view path);
+
+    /// Route a TimelineRecord (span begin/end, lane instant, counter sample)
+    /// to the Perfetto timeline, maintaining the open-span table.
+    void processTimelineEvent_(const std::byte* data, size_t data_size);
+
+    /// Perfetto track for (timeline track id, slot), lazily created under the
+    /// owning unit's track: single track, lane group + per-slot child, or
+    /// counter track depending on the declaration.
+    uint64_t timelineSlotTrack_(uint32_t track_id, uint16_t slot);
+
+    /// Lazily cached registry lookups (string_views point at stable deque storage).
+    std::string_view timelineEventName_(uint16_t name_id);
+    std::string_view timelineAnnotationKey_(uint16_t key_id);
+    /// Perfetto category string for a record's category bit (0..63), or
+    /// "timeline" for TIMELINE_NO_CATEGORY / unregistered bits.
+    std::string_view timelineCategoryName_(uint8_t category_bit);
+
     ObservationQueue& queue_;
     Config config_;
 
@@ -292,9 +316,29 @@ private:
     uint64_t sim_process_uuid_ = 0;
     /// source_id → timeline track uuid (0 = not yet created).
     std::vector<uint64_t> source_track_uuids_;
+    /// Hierarchical path → track uuid (units and their parent group tracks).
+    std::unordered_map<std::string, uint64_t> timeline_path_uuids_;
     /// "unit.counter" → counter track uuid.
     std::unordered_map<std::string, uint64_t> counter_track_uuids_;
     fmt::memory_buffer timeline_msg_buffer_;
+
+    /// @brief Lazily created Perfetto tracks for one declared timeline track.
+    struct TimelineTrackUuids {
+        uint64_t single = 0;          ///< Lane (lanes <= 1) or counter track.
+        uint64_t group = 0;           ///< Lane group (lanes > 1).
+        std::vector<uint64_t> slots;  ///< Per-slot child tracks (lanes > 1).
+    };
+    /// timeline track id → created uuids (index 0 unused; ids are 1-based).
+    std::vector<TimelineTrackUuids> timeline_track_uuids_;
+    /// Open spans keyed by (track_id << 16 | slot) → slot track uuid.
+    std::unordered_map<uint64_t, uint64_t> open_spans_;
+    /// Highest timeline-event cycle seen; used to close dangling spans at shutdown.
+    uint64_t timeline_max_cycle_ = 0;
+    /// Lazy id → name caches over the global registries.
+    std::vector<std::string_view> timeline_event_name_cache_;
+    std::vector<std::string_view> timeline_annotation_key_cache_;
+    /// Category bit (0..63) → registered category name (empty = unresolved).
+    std::array<std::string_view, 64> timeline_category_names_{};
 
     /// Timeline streams handed over via submitTimeline(); written at shutdown.
     std::mutex timeline_submit_mutex_;

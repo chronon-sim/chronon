@@ -14,34 +14,12 @@
 #include <string_view>
 #include <utility>
 
+#include "FixedString.hpp"
 #include "FormatRegistry.hpp"
 #include "ObservationContext.hpp"
 #include "Types.hpp"
 
 namespace chronon::observe {
-
-/** @brief Compile-time string literal usable as a non-type template parameter. */
-template <size_t N>
-struct FixedString {
-    char data[N]{};
-
-    constexpr FixedString() = default;
-
-    constexpr FixedString(const char (&str)[N]) {
-        for (size_t i = 0; i < N; ++i) {
-            data[i] = str[i];
-        }
-    }
-
-    constexpr operator std::string_view() const noexcept { return std::string_view(data, N - 1); }
-
-    constexpr const char* c_str() const noexcept { return data; }
-    constexpr size_t size() const noexcept { return N - 1; }
-    constexpr bool operator==(const FixedString&) const = default;
-};
-
-template <size_t N>
-FixedString(const char (&)[N]) -> FixedString<N>;
 
 /**
  * @brief Global registry that auto-assigns bit positions for user trace categories.
@@ -71,6 +49,18 @@ public:
     }
 
     const std::vector<CategoryEntry>& entries() const { return entries_; }
+
+    /// Thread-safe lookup of a category name by its assigned bit position.
+    /// Returned views reference the categories' static string literals.
+    std::string_view nameForBit(uint32_t bit) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& entry : entries_) {
+            if (entry.bit == bit) {
+                return entry.name;
+            }
+        }
+        return {};
+    }
 
 private:
     CategoryRegistry() : next_bit_(category::USER_CATEGORY_START) {}

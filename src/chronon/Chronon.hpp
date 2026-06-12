@@ -99,6 +99,15 @@ using observe::ObservationStats;
 using observe::toIndex;
 namespace DerivedFormula = observe::DerivedFormula;
 
+// Timeline lanes: spans/instants with flows and typed args, counter samples.
+using observe::arg;
+using observe::EventNameRef;
+using observe::Flow;
+using observe::flow;
+using observe::TimelineCounter;
+using observe::TimelineLane;
+using observe::operator""_ev;
+
 // --- Util ---
 using sender::Phase0;
 using sender::Phase1;

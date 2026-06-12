@@ -217,6 +217,7 @@ private:
         LOAD_IF_PRESENT(node, config, file);
         LOAD_IF_PRESENT(node, config, trace_events);
         LOAD_IF_PRESENT(node, config, counters);
+        LOAD_IF_PRESENT(node, config, compress);
 
 #undef LOAD_IF_PRESENT
 

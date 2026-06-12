@@ -41,5 +41,9 @@
 // Derived (computed) counters
 #include "DerivedCounter.hpp"
 
+// Timeline lanes and push-model counter tracks
+#include "TimelineApi.hpp"
+#include "TimelineTrack.hpp"
+
 /// @file Observe.hpp
 /// @brief Umbrella header for the Chronon observation system.

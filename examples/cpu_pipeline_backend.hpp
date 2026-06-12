@@ -51,6 +51,11 @@ public:
     Counter store_ops_{this, "store_ops", "Store operations", "ops"};
     Counter branch_mispred_{this, "branch_mispred", "Branch mispredictions", "events"};
 
+    /// EX-stage occupancy: span opens when an op enters the pipeline register
+    /// and closes when its result leaves (so output-port stalls stretch the
+    /// slice). The instruction uid rides along as the flow id.
+    TimelineLane ex_{this, "ex"};
+
     CHRONON_UNIT_CONSTRUCTOR(ALUUnit, ParameterSet, params->alu_id, params->flush_probability)
     (uint32_t alu_id = 0, double flush_probability = 0.001)
         : PhasedAutoRegisteredUnit("alu" + std::to_string(alu_id)),
@@ -83,6 +88,8 @@ public:
             in_op.flush();
             out_result.cancelInFlight();
 
+            // The op occupying EX (if any) dies with the flush.
+            ex_.end(0);
             pipeline_reg_.reset();
             first_packet_received_ = true;
             skip_next_validation_ = true;
@@ -116,6 +123,7 @@ public:
                 Result result{
                     .value = result_value, .dest_reg = op.dest_reg, .instr_id = op.instr_id};
                 bool sent = sendWithValidation(result);
+                ex_.end(0);
                 trace<"Execute ALU{}: instr_id={} op_type={} result={} dest_reg=r{}">(
                     trace_cat::EXECUTE, alu_id_, op.instr_id, static_cast<int>(op.op_type),
                     result_value, op.dest_reg);
@@ -138,6 +146,8 @@ public:
         if (can_accept_new) {
             if (auto op = in_op.tryReceive(localCycle())) {
                 validatePacket(*op, validation::hashDecodedOp);
+                ex_.begin(0, trace_cat::EXECUTE, opEventName(op->op_type), flow(op->instr_id),
+                          arg<"pc">(op->pc));
                 pipeline_reg_.template write<P>(*op);
             }
         }
@@ -268,6 +278,9 @@ public:
 
     Counter committed_{this, "committed", "Results committed", "results"};
 
+    /// Commit instants close out each instruction's flow.
+    TimelineLane commit_lane_{this, "commit"};
+
     CHRONON_UNIT_CONSTRUCTOR(WritebackUnit, ParameterSet, params->target_commits)
     (uint64_t target_commits = 0)
         : AutoRegisteredUnit("writeback"), target_commits_(target_commits) {}
@@ -308,6 +321,8 @@ public:
         for (size_t i = 0; i < 4; ++i) {
             while (auto result = ports[i]->tryReceive(localCycle())) {
                 validatePacket(*result, i);
+                commit_lane_.instant(0, trace_cat::COMMIT, "commit"_ev, flow(result->instr_id),
+                                     arg<"reg">(result->dest_reg));
                 trace<"Commit: instr_id={} value=0x{:x} dest_reg=r{}">(
                     trace_cat::COMMIT, result->instr_id, result->value, result->dest_reg);
                 ++committed_;
@@ -370,6 +385,14 @@ public:
 
     Counter l2_hits_{this, "l2_hits", "L2 cache hits", "accesses"};
 
+    /// Requests in flight: one span per request on a free-list-allocated slot
+    /// (like a real MSHR — slots are only reused after their span closes),
+    /// linked into the missing instruction's flow, plus an occupancy counter.
+    /// Requests beyond MISS_SLOTS concurrent are not spanned (slot = -1).
+    static constexpr uint16_t MISS_SLOTS = 16;
+    TimelineLane miss_{this, "miss", MISS_SLOTS};
+    TimelineCounter inflight_{this, "inflight", "reqs"};
+
     CHRONON_UNIT_CONSTRUCTOR(L2CacheUnit, ParameterSet, params->latency, params->cache_lines)
     (uint32_t latency = 10, uint64_t cache_lines = 1000)
         : AutoRegisteredUnit("l2cache"), latency_(latency), cache_line_count_(cache_lines) {
@@ -388,32 +411,66 @@ public:
         while (auto req = in_req.tryReceive(localCycle())) {
             trace<"L2 request: addr=0x{:x} is_write={} req_id={} latency={}">(
                 trace_cat::L2_ACCESS, req->addr, req->is_write, req->req_id, latency_);
+            // Allocate a span slot like an MSHR entry: only reuse a slot once
+            // its span closed. Bursts beyond MISS_SLOTS go unspanned.
+            int slot = -1;
+            if (!free_miss_slots_.empty()) {
+                slot = free_miss_slots_.back();
+                free_miss_slots_.pop_back();
+                miss_.begin(static_cast<uint16_t>(slot), trace_cat::L2_ACCESS, "l2_miss"_ev,
+                            flow(req->req_id), arg<"addr">(req->addr));
+            }
             ++l2_hits_;
-            pending_.push({*req, localCycle() + latency_});
+            pending_.push({*req, localCycle() + latency_, slot});
 
             if (pending_.size() > 50) {
                 warn<"L2 pending queue high: {} requests in flight">(pending_.size());
             }
         }
 
-        while (!pending_.empty() && pending_.front().second <= localCycle()) {
-            auto& [req, _] = pending_.front();
-            trace<"L2 response: addr=0x{:x} req_id={} hit=true">(trace_cat::L2_ACCESS, req.addr,
-                                                                 req.req_id);
+        while (!pending_.empty() && pending_.front().ready_cycle <= localCycle()) {
+            auto& p = pending_.front();
+            trace<"L2 response: addr=0x{:x} req_id={} hit=true">(trace_cat::L2_ACCESS, p.req.addr,
+                                                                 p.req.req_id);
             if (out_resp.send(CacheResponse{
-                    .addr = req.addr, .data = req.addr, .req_id = req.req_id, .hit = true})) {
+                    .addr = p.req.addr, .data = p.req.addr, .req_id = p.req.req_id, .hit = true})) {
+                if (p.slot >= 0) {
+                    miss_.end(static_cast<uint16_t>(p.slot));
+                    free_miss_slots_.push_back(static_cast<uint8_t>(p.slot));
+                }
                 pending_.pop();
             } else {
                 break;
             }
         }
+
+        if (pending_.size() != last_inflight_) {
+            last_inflight_ = pending_.size();
+            inflight_.sample(static_cast<int64_t>(last_inflight_));
+        }
     }
 
 private:
+    struct PendingRequest {
+        CacheRequest req;
+        uint64_t ready_cycle;
+        int slot;  ///< Miss-lane slot, or -1 when none was free.
+    };
+
+    static std::vector<uint8_t> allMissSlots() {
+        std::vector<uint8_t> slots(MISS_SLOTS);
+        for (uint16_t i = 0; i < MISS_SLOTS; ++i) {
+            slots[i] = static_cast<uint8_t>(i);
+        }
+        return slots;
+    }
+
     uint32_t latency_;
     uint64_t cache_line_count_;
     std::set<uint64_t> l2_lines_;
-    std::queue<std::pair<CacheRequest, uint64_t>> pending_;
+    std::queue<PendingRequest> pending_;
+    std::vector<uint8_t> free_miss_slots_ = allMissSlots();
+    size_t last_inflight_ = SIZE_MAX;
 };
 
 }  // namespace cpu_pipeline

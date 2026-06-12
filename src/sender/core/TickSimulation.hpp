@@ -222,25 +222,23 @@ public:
     const std::string& timelineTraceFile() const noexcept { return timeline_trace_.file(); }
 
     /**
-     * @brief Export the scheduler execution timeline at end of run.
+     * @brief Write the scheduler execution timeline at end of run.
      *
-     * When the observation backend is running with a timeline sink, the
-     * recorded streams merge into its unified timeline.pftrace (written during
-     * stopBackend()); otherwise a standalone .pftrace is written at the
-     * configured file path.
-     *
-     * @return true when the timeline was merged into the unified file.
+     * Always written as a standalone file (scheduler_timeline.pftrace) separate
+     * from the simulation's timeline.pftrace.  When the observation backend is
+     * running, the file is placed in its timestamped output directory; otherwise
+     * it is written relative to cwd.
      */
-    bool writeTimelineTrace() {
+    void writeTimelineTrace() {
         if (!timeline_trace_.enabled()) {
-            return false;
+            return;
         }
         auto& obs = observe::ObservationManager::instance();
-        if (obs.isBackendRunning() && obs.timelineEnabled()) {
-            return obs.submitTimeline(timeline_trace_.exportData());
+        if (obs.isBackendRunning() && obs.backend()) {
+            timeline_trace_.write(obs.backend()->outputDir());
+        } else {
+            timeline_trace_.write();
         }
-        timeline_trace_.write();
-        return false;
     }
 
     /// Number of runParallel() invocations that took the epoch-free path.

@@ -54,6 +54,11 @@ public:
     Counter bp_predictions_{this, "bp_predictions", "Predictions made", "preds"};
     Counter flushes_{this, "flushes", "Pipeline flushes", "events"};
 
+    // Instruction-lifetime pilot: every stage stamps its events with
+    // flow(instr_id), so Perfetto links one instruction's journey
+    // fetch → dispatch → ex → commit across units.
+    TimelineLane fetch_lane_{this, "fetch"};
+
     CHRONON_UNIT_CONSTRUCTOR(FetchUnit, ParameterSet, params->max_instructions,
                              params->icache_lines)
     (uint64_t max_instr = 1000000, uint32_t icache_lines = 50)
@@ -156,6 +161,8 @@ public:
             if (hit) {
                 Instruction instr{.pc = pc_, .id = instr_id_};
                 sendWithValidation(instr);
+                fetch_lane_.instant(0, trace_cat::FETCH, "fetch"_ev, flow(instr_id_),
+                                    arg<"pc">(pc_));
                 trace<"I-Cache HIT: pc=0x{:x} cache_line={} instr_id={}">(
                     trace_cat::ICACHE_HIT, pc_, cache_line, instr_id_);
                 ++pc_;
@@ -262,6 +269,9 @@ public:
 
     Counter decoded_{this, "decoded", "Instructions decoded", "instrs"};
 
+    /// Dispatch instants carry the instruction flow plus the target ALU.
+    TimelineLane dispatch_lane_{this, "dispatch"};
+
     CHRONON_UNIT_CONSTRUCTOR(DecodeUnit, ParameterSet, params->decode_width)
     (uint32_t decode_width = 4) : AutoRegisteredUnit("decode"), decode_width_(decode_width) {}
 
@@ -307,6 +317,8 @@ public:
 
             if (ports[op.dispatch_target]->canSend()) {
                 bool sent = sendWithValidation(op, *ports[op.dispatch_target], op.dispatch_target);
+                dispatch_lane_.instant(0, trace_cat::DISPATCH, "dispatch"_ev, flow(op.instr_id),
+                                       arg<"alu">(op.dispatch_target));
                 trace<"Dispatch buffered to ALU{}: instr_id={} op_type={}">(
                     trace_cat::DISPATCH, op.dispatch_target, op.instr_id,
                     static_cast<int>(op.op_type));
@@ -346,6 +358,8 @@ public:
 
             if (ports[op.dispatch_target]->canSend()) {
                 bool sent = sendWithValidation(op, *ports[op.dispatch_target], op.dispatch_target);
+                dispatch_lane_.instant(0, trace_cat::DISPATCH, "dispatch"_ev, flow(op.instr_id),
+                                       arg<"alu">(op.dispatch_target));
                 trace<"Dispatch to ALU{}: instr_id={} op_type={}">(trace_cat::DISPATCH,
                                                                    op.dispatch_target, op.instr_id,
                                                                    static_cast<int>(op.op_type));

@@ -78,6 +78,7 @@ void ObservationManager::initialize(const ObservationYAMLConfig& config) {
     backend_config.timeline_file = config.timeline.file;
     backend_config.timeline_trace_events = config.timeline.trace_events;
     backend_config.timeline_counters = config.timeline.counters;
+    backend_config.timeline_compress = config.timeline.compress;
 
     backend_ = std::make_unique<ObservationBackend>(*shared_queue_, backend_config);
 
