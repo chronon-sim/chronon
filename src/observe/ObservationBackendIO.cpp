@@ -163,15 +163,13 @@ std::string_view ObservationBackend::timelineAnnotationKey_(uint16_t key_id) {
     return key;
 }
 
-std::string_view ObservationBackend::timelineCategoryName_(uint32_t category_mask) {
-    const uint32_t user_bits = category_mask & static_cast<uint32_t>(category::USER_CATEGORY_MASK);
-    if (user_bits == 0) {
+std::string_view ObservationBackend::timelineCategoryName_(uint8_t category_bit) {
+    if (category_bit >= timeline_category_names_.size()) {
         return "timeline";
     }
-    const uint32_t bit = static_cast<uint32_t>(std::countr_zero(user_bits));
-    std::string_view& name = timeline_category_names_[bit];
+    std::string_view& name = timeline_category_names_[category_bit];
     if (name.empty()) {
-        name = CategoryRegistry::instance().nameForBit(bit);
+        name = CategoryRegistry::instance().nameForBit(category_bit);
         if (name.empty()) {
             name = "timeline";
         }
@@ -273,7 +271,7 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
 
     switch (kind) {
         case TimelineEventKind::Instant:
-            perfetto_writer_->instant(track_uuid, timelineCategoryName_(rec.category),
+            perfetto_writer_->instant(track_uuid, timelineCategoryName_(rec.category_bit),
                                       timelineEventName_(rec.name_id), rec.cycle, rec.payload,
                                       ann_span);
             break;
@@ -286,7 +284,7 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
                 perfetto_writer_->sliceEnd(it->second, rec.cycle);
                 it->second = track_uuid;
             }
-            perfetto_writer_->sliceBegin(track_uuid, timelineCategoryName_(rec.category),
+            perfetto_writer_->sliceBegin(track_uuid, timelineCategoryName_(rec.category_bit),
                                          timelineEventName_(rec.name_id), rec.cycle, rec.payload,
                                          ann_span);
             break;

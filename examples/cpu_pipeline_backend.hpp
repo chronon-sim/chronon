@@ -385,9 +385,12 @@ public:
 
     Counter l2_hits_{this, "l2_hits", "L2 cache hits", "accesses"};
 
-    /// Requests in flight: one span per request (slot-addressed by req id),
+    /// Requests in flight: one span per request on a free-list-allocated slot
+    /// (like a real MSHR — slots are only reused after their span closes),
     /// linked into the missing instruction's flow, plus an occupancy counter.
-    TimelineLane miss_{this, "miss", 8};
+    /// Requests beyond MISS_SLOTS concurrent are not spanned (slot = -1).
+    static constexpr uint16_t MISS_SLOTS = 16;
+    TimelineLane miss_{this, "miss", MISS_SLOTS};
     TimelineCounter inflight_{this, "inflight", "reqs"};
 
     CHRONON_UNIT_CONSTRUCTOR(L2CacheUnit, ParameterSet, params->latency, params->cache_lines)
@@ -408,23 +411,33 @@ public:
         while (auto req = in_req.tryReceive(localCycle())) {
             trace<"L2 request: addr=0x{:x} is_write={} req_id={} latency={}">(
                 trace_cat::L2_ACCESS, req->addr, req->is_write, req->req_id, latency_);
-            miss_.begin(static_cast<uint16_t>(req->req_id % 8), trace_cat::L2_ACCESS, "l2_miss"_ev,
-                        flow(req->req_id), arg<"addr">(req->addr));
+            // Allocate a span slot like an MSHR entry: only reuse a slot once
+            // its span closed. Bursts beyond MISS_SLOTS go unspanned.
+            int slot = -1;
+            if (!free_miss_slots_.empty()) {
+                slot = free_miss_slots_.back();
+                free_miss_slots_.pop_back();
+                miss_.begin(static_cast<uint16_t>(slot), trace_cat::L2_ACCESS, "l2_miss"_ev,
+                            flow(req->req_id), arg<"addr">(req->addr));
+            }
             ++l2_hits_;
-            pending_.push({*req, localCycle() + latency_});
+            pending_.push({*req, localCycle() + latency_, slot});
 
             if (pending_.size() > 50) {
                 warn<"L2 pending queue high: {} requests in flight">(pending_.size());
             }
         }
 
-        while (!pending_.empty() && pending_.front().second <= localCycle()) {
-            auto& [req, _] = pending_.front();
-            trace<"L2 response: addr=0x{:x} req_id={} hit=true">(trace_cat::L2_ACCESS, req.addr,
-                                                                 req.req_id);
+        while (!pending_.empty() && pending_.front().ready_cycle <= localCycle()) {
+            auto& p = pending_.front();
+            trace<"L2 response: addr=0x{:x} req_id={} hit=true">(trace_cat::L2_ACCESS, p.req.addr,
+                                                                 p.req.req_id);
             if (out_resp.send(CacheResponse{
-                    .addr = req.addr, .data = req.addr, .req_id = req.req_id, .hit = true})) {
-                miss_.end(static_cast<uint16_t>(req.req_id % 8));
+                    .addr = p.req.addr, .data = p.req.addr, .req_id = p.req.req_id, .hit = true})) {
+                if (p.slot >= 0) {
+                    miss_.end(static_cast<uint16_t>(p.slot));
+                    free_miss_slots_.push_back(static_cast<uint8_t>(p.slot));
+                }
                 pending_.pop();
             } else {
                 break;
@@ -438,10 +451,25 @@ public:
     }
 
 private:
+    struct PendingRequest {
+        CacheRequest req;
+        uint64_t ready_cycle;
+        int slot;  ///< Miss-lane slot, or -1 when none was free.
+    };
+
+    static std::vector<uint8_t> allMissSlots() {
+        std::vector<uint8_t> slots(MISS_SLOTS);
+        for (uint16_t i = 0; i < MISS_SLOTS; ++i) {
+            slots[i] = static_cast<uint8_t>(i);
+        }
+        return slots;
+    }
+
     uint32_t latency_;
     uint64_t cache_line_count_;
     std::set<uint64_t> l2_lines_;
-    std::queue<std::pair<CacheRequest, uint64_t>> pending_;
+    std::queue<PendingRequest> pending_;
+    std::vector<uint8_t> free_miss_slots_ = allMissSlots();
     size_t last_inflight_ = SIZE_MAX;
 };
 

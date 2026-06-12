@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -267,13 +268,16 @@ private:
         rec->cycle = currentCycle();
         rec->payload = payload;
         rec->track_id = track_id;
-        rec->category = static_cast<uint32_t>(category);
         rec->name_id = name_id;
         rec->slot = slot;
         rec->kind = static_cast<uint8_t>(kind);
         rec->arg_count = static_cast<uint8_t>(arg_count);
-        rec->padding[0] = 0;
-        rec->padding[1] = 0;
+        // Only the lowest user bit travels (for backend name resolution);
+        // filtering already ran on the full 64-bit mask.
+        const CategoryMask user_bits = category & category::USER_CATEGORY_MASK;
+        rec->category_bit = user_bits != 0 ? static_cast<uint8_t>(std::countr_zero(user_bits))
+                                           : TIMELINE_NO_CATEGORY;
+        std::memset(rec->padding, 0, sizeof(rec->padding));
 
         std::byte* arg_dest = dest + sizeof(TimelineRecord);
         for (size_t i = 0; i < arg_count; ++i) {

@@ -49,18 +49,25 @@ enum class TimelineEventKind : uint8_t {
  * first uint64_t: ReorderBuffer::extractCycle and the drain loop's watermark
  * peek read it positionally.
  */
+/// Sentinel for TimelineRecord::category_bit: no user category.
+constexpr uint8_t TIMELINE_NO_CATEGORY = 0xFF;
+
 struct TimelineRecord {
     uint64_t cycle;
     /// Flow id for Instant/SpanBegin (0 = none); bit-cast int64_t counter
     /// value for CounterSample.
     uint64_t payload;
     uint32_t track_id;  ///< TimelineTrackRegistry id.
-    uint32_t category;  ///< CategoryMask truncated to 32 bits (as StructuredRecord).
     uint16_t name_id;   ///< EventNameRegistry id (0 = none, e.g. SpanEnd).
     uint16_t slot;      ///< Lane slot; spans are addressed by (track_id, slot).
     uint8_t kind;       ///< TimelineEventKind.
     uint8_t arg_count;
-    uint8_t padding[2];
+    /// Lowest user category bit (0..63) for backend name resolution, or
+    /// TIMELINE_NO_CATEGORY. Filtering already happened producer-side on the
+    /// full 64-bit mask, so the record carries only what the backend needs —
+    /// this keeps categories at bits ≥ 32 intact (unlike a truncated mask).
+    uint8_t category_bit;
+    uint8_t padding[5];
 };
 
 static_assert(sizeof(TimelineRecord) == 32, "TimelineRecord size mismatch");

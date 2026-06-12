@@ -14,6 +14,7 @@
 ///        shutdown close, temporal-filter semantics, lookahead
 ///        commit/rollback, and an informational producer-cost measurement.
 
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -262,6 +263,55 @@ void test_path_track_hierarchy() {
     std::cout << "PASSED\n";
 }
 
+void test_high_bit_category() {
+    std::cout << "Testing category name resolution for bits >= 32... ";
+
+    // Push the auto-assigned bit allocator past bit 32 (#43 review: the
+    // record used to truncate the mask to 32 bits, losing these).
+    for (int i = 0; i < 40; ++i) {
+        CategoryRegistry::instance().registerCategory("hb_filler", "");
+    }
+    static const auto HIGH_CAT = Category<"high_bit_cat", "Category beyond bit 32">{};
+    CHECK(std::countr_zero(HIGH_CAT.mask()) >= 32);
+
+    const std::string out_dir = "/tmp/chronon_timeline_api_highbit";
+    std::filesystem::remove_all(out_dir);
+
+    ObservationQueue queue(256 * 1024);
+    ObservationBackend::Config cfg;
+    cfg.output_dir = out_dir;
+    cfg.enable_counter_csv = false;
+    cfg.enable_reordering = false;
+    cfg.timeline_compress = false;
+
+    ObservationBackend backend(queue, cfg);
+    backend.start();
+
+    {
+        ObservationContext ctx(&queue, []() { return 0ULL; }, 0, "u", 1);
+        ctx.enableCategory(category::TRACE | HIGH_CAT.mask());
+
+        TestUnit unit;
+        unit.setObservationContext(&ctx);
+        unit.cycle = 5;
+        unit.port.instant(0, HIGH_CAT, "high"_ev);
+
+        ThreadContextManager::instance().flushAll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    std::filesystem::path timeline = backend.outputDir() / "timeline.pftrace";
+    backend.stop();
+
+    DecodedTrace trace = decodeFile(timeline);
+    CHECK(trace.events.size() == 1);
+    CHECK(trace.events[0].name == "high");
+    CHECK(trace.events[0].category == "high_bit_cat");
+
+    std::filesystem::remove_all(out_dir);
+    std::cout << "PASSED\n";
+}
+
 void test_temporal_filter_span_semantics() {
     std::cout << "Testing temporal-filter span semantics... ";
 
@@ -445,6 +495,7 @@ int main() {
 
     test_lanes_end_to_end();
     test_path_track_hierarchy();
+    test_high_bit_category();
     test_temporal_filter_span_semantics();
     test_lookahead_commit_rollback();
     measure_producer_cost();

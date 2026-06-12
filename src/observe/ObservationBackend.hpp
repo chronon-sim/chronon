@@ -254,9 +254,9 @@ private:
     /// Lazily cached registry lookups (string_views point at stable deque storage).
     std::string_view timelineEventName_(uint16_t name_id);
     std::string_view timelineAnnotationKey_(uint16_t key_id);
-    /// Perfetto category string for a record's truncated category mask: the
-    /// lowest user category bit's registered name, or "timeline".
-    std::string_view timelineCategoryName_(uint32_t category_mask);
+    /// Perfetto category string for a record's category bit (0..63), or
+    /// "timeline" for TIMELINE_NO_CATEGORY / unregistered bits.
+    std::string_view timelineCategoryName_(uint8_t category_bit);
 
     ObservationQueue& queue_;
     Config config_;
@@ -337,8 +337,8 @@ private:
     /// Lazy id → name caches over the global registries.
     std::vector<std::string_view> timeline_event_name_cache_;
     std::vector<std::string_view> timeline_annotation_key_cache_;
-    /// Category bit (0..31) → registered category name (empty = unresolved).
-    std::array<std::string_view, 32> timeline_category_names_{};
+    /// Category bit (0..63) → registered category name (empty = unresolved).
+    std::array<std::string_view, 64> timeline_category_names_{};
 
     /// Timeline streams handed over via submitTimeline(); written at shutdown.
     std::mutex timeline_submit_mutex_;
