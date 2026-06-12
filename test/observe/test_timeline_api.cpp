@@ -337,6 +337,9 @@ void test_lookahead_commit_rollback() {
     cfg.enable_counter_csv = false;
     cfg.enable_reordering = false;
     cfg.timeline_compress = false;
+    // First-class timeline records must flow even when the legacy trace<>()
+    // instant mirror is disabled (#43 review).
+    cfg.timeline_trace_events = false;
 
     ObservationBackend backend(queue, cfg);
     backend.start();

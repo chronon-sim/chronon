@@ -706,7 +706,10 @@ void ObservationBackend::processEvent_(const ObservationQueue::RecordHeader* hea
         }
 
         case ObservationQueue::EventType::TIMELINE_EVENT: {
-            if (config_.timeline_trace_events && perfetto_writer_ && perfetto_writer_->isOpen()) {
+            // Gated only on the sink: timeline_trace_events controls the
+            // legacy trace<>() instant mirror, not first-class lane/counter
+            // records (which have their own producer-side category filters).
+            if (perfetto_writer_ && perfetto_writer_->isOpen()) {
                 processTimelineEvent_(data, data_size);
             }
             break;

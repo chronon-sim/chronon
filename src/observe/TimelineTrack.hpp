@@ -129,8 +129,11 @@ private:
     void emit_(TimelineEventKind kind, uint16_t slot, Cat category, EventNameRef name,
                Items... items) noexcept {
         constexpr size_t MAX_ITEMS = sizeof...(Items);
-        static_assert(MAX_ITEMS <= MAX_TIMELINE_ARGS + 1,
-                      "too many timeline args (max 8 typed args + one flow)");
+        constexpr size_t FLOW_ITEMS =
+            (static_cast<size_t>(std::is_same_v<std::decay_t<Items>, Flow>) + ... + 0);
+        static_assert(FLOW_ITEMS <= 1, "at most one flow() per timeline event");
+        static_assert(MAX_ITEMS - FLOW_ITEMS <= MAX_TIMELINE_ARGS,
+                      "too many typed timeline args (max 8)");
 
         if (!registered_) {
             return;
