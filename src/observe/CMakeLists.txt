@@ -49,6 +49,9 @@ target_link_libraries(chronon_observe PUBLIC STDEXEC::stdexec)
 # perfetto.h never leaks into chronon headers)
 target_link_libraries(chronon_observe PRIVATE perfetto_sdk)
 
+# zlib for compressed_packets batches in the Perfetto writer
+target_link_libraries(chronon_observe PRIVATE ZLIB::ZLIB)
+
 # Thread support
 find_package(Threads REQUIRED)
 target_link_libraries(chronon_observe PUBLIC Threads::Threads)

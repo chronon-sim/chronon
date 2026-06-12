@@ -496,6 +496,9 @@ void test_timeline_restart_redeclares_tracks() {
     cfg.enable_counter_csv = false;
     cfg.enable_reordering = false;
     cfg.timeline_enabled = true;
+    // The raw wire scan below reads packets directly; keep them uncompressed
+    // (compression round-trips are covered by test_perfetto_trace_writer).
+    cfg.timeline_compress = false;
 
     ObservationBackend backend(queue, cfg);
 

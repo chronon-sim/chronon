@@ -81,6 +81,7 @@ public:
         std::string timeline_file = "timeline.pftrace";
         bool timeline_trace_events = true;
         bool timeline_counters = true;
+        bool timeline_compress = true;
 
         bool enable_reordering = true;
         uint64_t reorder_watermark_cycles = 1000;

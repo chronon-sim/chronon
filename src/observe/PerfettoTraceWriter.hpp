@@ -25,25 +25,54 @@ namespace chronon::observe {
  * headers; no tracing session or category registration is involved — packets are
  * written straight to the file.
  *
- * Timestamps are nanoseconds on the default trace clock. Simulation-domain
- * events use timestamp = cycle (1 cycle rendered as 1 ns); wall-clock-domain
- * events use real nanoseconds since their recorder's base time. The `cycle`
- * debug annotation carries the simulation cycle for slices where the two differ.
+ * Events are split across two packet sequences by time domain:
+ * - Simulation domain (instant(), counterValue()): timestamps are cycles on a
+ *   custom incremental clock (sequence-scoped clock id 64) declared via
+ *   ClockSnapshot and TracePacketDefaults. The clock is paired 1:1 with the
+ *   builtin boot clock, so the rendered axis is unchanged (1 cycle = 1 ns) but
+ *   packets carry varint deltas instead of absolute timestamps. Out-of-order
+ *   cycles fall back to an absolute boot-clock timestamp on that packet so the
+ *   incremental state never corrupts.
+ * - Wall-clock domain (sliceComplete(), wallInstant()): real nanoseconds since
+ *   the recorder's base time on the default trace clock (used by the scheduler
+ *   execution timeline). The `cycle` debug annotation carries the simulation
+ *   cycle for slices where the two domains differ.
+ *
+ * Both sequences intern event names, categories, and debug-annotation names
+ * (InternedData + SEQ_NEEDS_INCREMENTAL_STATE). Incremental state is
+ * checkpointed (SEQ_INCREMENTAL_STATE_CLEARED + fresh clock snapshot) every
+ * Options::checkpoint_interval_packets packets and whenever an intern table
+ * reaches Options::max_interned_strings, which bounds reader memory and keeps
+ * crash-truncated traces decodable.
  *
  * Packets buffer in memory and flush to disk past a threshold, so the file is
  * written incrementally and remains parseable after a crash (Perfetto traces
- * need no footer). NOT thread-safe; intended for a single backend thread.
+ * need no footer). With Options::compress, each flushed batch is wrapped in a
+ * TracePacket.compressed_packets (zlib deflate) — handled natively by
+ * ui.perfetto.dev and trace_processor. NOT thread-safe; intended for a single
+ * backend thread.
  */
 class PerfettoTraceWriter {
 public:
+    struct Options {
+        /// Deflate each flushed packet batch into TracePacket.compressed_packets.
+        bool compress = true;
+        /// Re-emit incremental state (clock snapshot + intern tables) every N
+        /// packets per sequence; bounds reader state and keeps traces seekable.
+        size_t checkpoint_interval_packets = 65536;
+        /// Per-table intern cap; reaching it forces a checkpoint on that sequence.
+        size_t max_interned_strings = 65536;
+    };
+
     PerfettoTraceWriter();
     ~PerfettoTraceWriter();
 
     PerfettoTraceWriter(const PerfettoTraceWriter&) = delete;
     PerfettoTraceWriter& operator=(const PerfettoTraceWriter&) = delete;
 
-    /// Opens @p path for writing; emits the sequence-start packet.
-    bool open(const std::filesystem::path& path);
+    /// Opens @p path for writing; sequence-start packets are emitted lazily.
+    bool open(const std::filesystem::path& path, const Options& options);
+    bool open(const std::filesystem::path& path) { return open(path, Options{}); }
 
     [[nodiscard]] bool isOpen() const noexcept;
 
@@ -63,7 +92,7 @@ public:
                              uint64_t parent_uuid = 0);
 
     /**
-     * @brief Emit a complete slice (paired SLICE_BEGIN / SLICE_END packets).
+     * @brief Emit a complete wall-clock slice (paired SLICE_BEGIN / SLICE_END packets).
      *
      * @p cycle is attached as a debug annotation; @p detail likewise when non-empty.
      */
@@ -71,12 +100,16 @@ public:
                        uint64_t ts_ns, uint64_t dur_ns, uint64_t cycle,
                        std::string_view detail = {});
 
-    /// Emit an instant event at @p ts_ns.
-    void instant(uint64_t track_uuid, std::string_view category, std::string_view name,
-                 uint64_t ts_ns);
+    /// Emit an instant event at @p ts_ns on the wall-clock sequence.
+    void wallInstant(uint64_t track_uuid, std::string_view category, std::string_view name,
+                     uint64_t ts_ns);
 
-    /// Emit a counter sample on a counter track.
-    void counterValue(uint64_t track_uuid, uint64_t ts_ns, int64_t value);
+    /// Emit an instant event at @p cycle on the simulation cycle clock.
+    void instant(uint64_t track_uuid, std::string_view category, std::string_view name,
+                 uint64_t cycle);
+
+    /// Emit a counter sample at @p cycle on a counter track.
+    void counterValue(uint64_t track_uuid, uint64_t cycle, int64_t value);
 
     [[nodiscard]] uint64_t eventsWritten() const noexcept { return events_written_; }
     [[nodiscard]] uint64_t bytesWritten() const noexcept { return bytes_written_; }

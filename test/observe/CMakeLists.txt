@@ -193,6 +193,7 @@ target_include_directories(test_perfetto_trace_writer PRIVATE
 target_link_libraries(test_perfetto_trace_writer
     chronon_observe
     chronon_compile_options
+    ZLIB::ZLIB  # independent decoder inflates compressed_packets batches
 )
 
 target_compile_features(test_perfetto_trace_writer PRIVATE cxx_std_20)

@@ -128,6 +128,9 @@ if(perfetto_ADDED)
     target_link_libraries(perfetto_sdk PUBLIC Threads::Threads)
 endif()
 
+# zlib (system library) for TracePacket.compressed_packets deflate batching.
+find_package(ZLIB REQUIRED)
+
 # Add the main framework library
 add_subdirectory(src)
 

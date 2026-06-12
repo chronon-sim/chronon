@@ -179,6 +179,29 @@ The file is produced by `src/observe/PerfettoTraceWriter`, a thin wrapper over
 the Perfetto SDK's protozero message writers (no tracing session or category
 registration — packets are written straight to the file).
 
+### Wire format
+
+The writer uses the size-oriented parts of the Perfetto data model; all of this
+is transparent to ui.perfetto.dev and `trace_processor`:
+
+- **Custom cycle clock** — simulation events are stamped on a sequence-scoped
+  incremental clock (clock id 64, declared via `ClockSnapshot` and paired 1:1
+  with the boot clock), so packets carry small varint cycle *deltas* instead of
+  absolute timestamps. Out-of-order events (e.g. a reorder-buffer force flush)
+  fall back to an absolute timestamp on that packet rather than corrupting the
+  incremental state. The scheduler execution timeline stays on the default
+  wall-clock sequence.
+- **Interning** — event names, categories, and debug-annotation names are
+  emitted once per sequence as `InternedData` and referenced by id afterwards.
+  Incremental state is checkpointed periodically (and whenever an intern table
+  hits its cap) so traces stay seekable and crash-truncation-safe.
+- **Compression** — flushed packet batches are wrapped in zlib-deflated
+  `TracePacket.compressed_packets` (on by default; `timeline.compress: false`
+  disables it). Microarchitecture traces are highly repetitive, so this is
+  where most of the size win comes from: on the bundled CPU pipeline example
+  the timeline shrinks from ~115 MB to ~17 MB (~7×) with no measurable change
+  in simulation wall time (encoding runs on the backend thread).
+
 ## Pre-Registered Format Strings
 
 Traditional approach (~30ns):

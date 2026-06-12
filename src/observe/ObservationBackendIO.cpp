@@ -563,7 +563,9 @@ void ObservationBackend::initializeOutputDir_() {
         sim_process_uuid_ = 0;
         const std::string timeline_file =
             config_.timeline_file.empty() ? std::string("timeline.pftrace") : config_.timeline_file;
-        if (perfetto_writer_->open(output_dir_ / timeline_file)) {
+        PerfettoTraceWriter::Options writer_options;
+        writer_options.compress = config_.timeline_compress;
+        if (perfetto_writer_->open(output_dir_ / timeline_file, writer_options)) {
             std::string process_name = config_.simulation_name.empty() ? std::string("Simulation")
                                                                        : config_.simulation_name;
             sim_process_uuid_ = perfetto_writer_->addProcessTrack(process_name, /*pid=*/1);

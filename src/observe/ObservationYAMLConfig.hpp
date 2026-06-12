@@ -150,6 +150,7 @@ struct TimelineYAMLConfig {
     std::string file = "timeline.pftrace";  ///< Relative to the run output directory.
     bool trace_events = true;               ///< Simulation trace channel → instant events.
     bool counters = true;                   ///< Counter snapshots → counter tracks.
+    bool compress = true;                   ///< Deflate packet batches (compressed_packets).
 };
 
 /**
