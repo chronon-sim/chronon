@@ -167,6 +167,9 @@ The timeline contains:
 - **Simulation trace events** — instant events on one track per unit, grouped
   under a "Simulation" process. The timestamp is the simulation cycle (1 cycle
   rendered as 1 ns) and the event name is the formatted trace message.
+  Hierarchical unit paths ("cpu0.lsu.mshr") become nested track groups, so the
+  UI sidebar mirrors the design hierarchy; counter tracks nest under their
+  owning unit instead of forming one flat list.
 - **Timeline lanes** — occupancy spans, lane instants, and push-model counter
   samples emitted through the declarative `TimelineLane` / `TimelineCounter`
   members (see below), nested under their owning unit's track.
@@ -265,6 +268,15 @@ Semantics under the existing machinery:
 - A `begin` on an occupied slot implicitly closes the previous span (hardware
   slot reuse); spans still open at shutdown are closed at the last seen cycle.
 - Lookahead rollback discards speculative lane events; commit publishes them.
+
+### Offline analysis
+
+`scripts/trace_sql/` ships canned `trace_processor` queries shaped for this
+data model: per-stage latency through flow edges, span-duration histograms per
+event name, lane occupancy, stall attribution (cycles beyond each event kind's
+best case), and counter statistics — all keyed by the hierarchical track paths,
+so they work unchanged on any model using the timeline API. See
+`scripts/trace_sql/README.md` for usage.
 
 ## Pre-Registered Format Strings
 

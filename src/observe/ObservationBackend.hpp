@@ -236,6 +236,12 @@ private:
     /// Track for @p source_id under the simulation process group (lazily created).
     uint64_t timelineTrackForSource_(uint16_t source_id);
 
+    /// Track for a hierarchical unit path ("cpu0.lsu" → group "cpu0" → track
+    /// "lsu"), creating parent group tracks as needed. The unit tree is
+    /// mirrored into Perfetto's parent_uuid chain so the UI sidebar follows
+    /// the design hierarchy.
+    uint64_t timelineTrackForPath_(std::string_view path);
+
     /// Route a TimelineRecord (span begin/end, lane instant, counter sample)
     /// to the Perfetto timeline, maintaining the open-span table.
     void processTimelineEvent_(const std::byte* data, size_t data_size);
@@ -310,6 +316,8 @@ private:
     uint64_t sim_process_uuid_ = 0;
     /// source_id → timeline track uuid (0 = not yet created).
     std::vector<uint64_t> source_track_uuids_;
+    /// Hierarchical path → track uuid (units and their parent group tracks).
+    std::unordered_map<std::string, uint64_t> timeline_path_uuids_;
     /// "unit.counter" → counter track uuid.
     std::unordered_map<std::string, uint64_t> counter_track_uuids_;
     fmt::memory_buffer timeline_msg_buffer_;

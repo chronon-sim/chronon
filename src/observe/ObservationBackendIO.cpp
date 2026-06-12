@@ -75,8 +75,27 @@ uint64_t ObservationBackend::timelineTrackForSource_(uint16_t source_id) {
         if (source_id > 0 && source_id < source_name_cache_.size()) {
             name = source_name_cache_[source_id];
         }
-        uuid = perfetto_writer_->addTrack(name, sim_process_uuid_);
+        uuid = timelineTrackForPath_(name);
     }
+    return uuid;
+}
+
+uint64_t ObservationBackend::timelineTrackForPath_(std::string_view path) {
+    auto it = timeline_path_uuids_.find(std::string(path));
+    if (it != timeline_path_uuids_.end()) {
+        return it->second;
+    }
+
+    uint64_t parent = sim_process_uuid_;
+    std::string_view leaf = path;
+    const size_t dot = path.rfind('.');
+    if (dot != std::string_view::npos) {
+        parent = timelineTrackForPath_(path.substr(0, dot));
+        leaf = path.substr(dot + 1);
+    }
+
+    const uint64_t uuid = perfetto_writer_->addTrack(leaf, parent);
+    timeline_path_uuids_.emplace(std::string(path), uuid);
     return uuid;
 }
 
@@ -108,7 +127,10 @@ void ObservationBackend::writeCounterToTimeline_(uint64_t cycle, std::string_vie
 
     auto [it, inserted] = counter_track_uuids_.try_emplace(key, 0);
     if (inserted) {
-        it->second = perfetto_writer_->addCounterTrack(key, /*unit_name=*/{}, sim_process_uuid_);
+        // Nest the counter under its unit's track (leaf name only); the unit
+        // path resolves through the same hierarchy as event tracks.
+        const uint64_t parent = timelineTrackForPath_(unit_name);
+        it->second = perfetto_writer_->addCounterTrack(counter_name, /*unit_name=*/{}, parent);
     }
 
     perfetto_writer_->counterValue(it->second, cycle, static_cast<int64_t>(value));
@@ -749,6 +771,7 @@ void ObservationBackend::initializeOutputDir_() {
         // Track caches index into the writer's per-file UUID space; reset them
         // so a restarted backend re-declares its tracks in the new file.
         source_track_uuids_.clear();
+        timeline_path_uuids_.clear();
         counter_track_uuids_.clear();
         timeline_track_uuids_.clear();
         open_spans_.clear();

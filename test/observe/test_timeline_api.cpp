@@ -195,6 +195,73 @@ void test_lanes_end_to_end() {
     std::cout << "PASSED\n";
 }
 
+void test_path_track_hierarchy() {
+    std::cout << "Testing hierarchical path → track tree... ";
+
+    const std::string out_dir = "/tmp/chronon_timeline_api_hier";
+    std::filesystem::remove_all(out_dir);
+
+    ObservationQueue queue(256 * 1024);
+    ObservationBackend::Config cfg;
+    cfg.output_dir = out_dir;
+    cfg.enable_counter_csv = false;
+    cfg.enable_reordering = false;
+    cfg.timeline_compress = false;
+
+    ObservationBackend backend(queue, cfg);
+    backend.setSourceNameLookup(
+        [](uint16_t id) -> std::string_view { return id == 1 ? "cpu0.lsu" : ""; });
+    backend.start();
+
+    {
+        ObservationContext ctx(&queue, []() { return 0ULL; }, 0, "cpu0.lsu", 1);
+        ctx.enableCategory(category::TRACE | LANE_CAT.mask());
+
+        TestUnit unit;
+        unit.setObservationContext(&ctx);
+
+        unit.cycle = 10;
+        unit.mshr.begin(2, LANE_CAT, "miss"_ev);
+        unit.cycle = 20;
+        unit.mshr.end(2);
+        unit.occ.sample(3);
+
+        ThreadContextManager::instance().flushAll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    std::filesystem::path timeline = backend.outputDir() / "timeline.pftrace";
+    backend.stop();
+
+    DecodedTrace trace = decodeFile(timeline);
+
+    // The dotted unit path becomes a parent_uuid chain mirroring the design
+    // hierarchy: process → cpu0 → lsu → mshr → mshr[2].
+    const DecodedTrack* process = nullptr;
+    for (const auto& t : trace.tracks) {
+        if (t.is_process) process = &t;
+    }
+    CHECK(process != nullptr);
+    const DecodedTrack* cpu0 = childTrack(trace, "cpu0", process->uuid);
+    CHECK(cpu0 != nullptr);
+    const DecodedTrack* lsu = childTrack(trace, "lsu", cpu0->uuid);
+    CHECK(lsu != nullptr);
+    const DecodedTrack* mshr = childTrack(trace, "mshr", lsu->uuid);
+    CHECK(mshr != nullptr);
+    const DecodedTrack* mshr2 = childTrack(trace, "mshr[2]", mshr->uuid);
+    CHECK(mshr2 != nullptr);
+    const DecodedTrack* occ = childTrack(trace, "occ", lsu->uuid);
+    CHECK(occ != nullptr && occ->is_counter);
+
+    auto span_events = eventsOn(trace, mshr2->uuid);
+    CHECK(span_events.size() == 2);
+    CHECK(span_events[0].type == 1 && span_events[0].timestamp == 10);
+    CHECK(span_events[1].type == 2 && span_events[1].timestamp == 20);
+
+    std::filesystem::remove_all(out_dir);
+    std::cout << "PASSED\n";
+}
+
 void test_temporal_filter_span_semantics() {
     std::cout << "Testing temporal-filter span semantics... ";
 
@@ -374,6 +441,7 @@ int main() {
     std::cout << "=== Timeline API Tests ===\n";
 
     test_lanes_end_to_end();
+    test_path_track_hierarchy();
     test_temporal_filter_span_semantics();
     test_lookahead_commit_rollback();
     measure_producer_cost();
