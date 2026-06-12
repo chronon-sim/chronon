@@ -179,6 +179,8 @@ struct DecodedTrace {
     std::vector<DecodedTrackEvent> events;
     bool saw_sequence_start = false;
     size_t compressed_wrappers = 0;
+    /// Per-wrapper {compressed payload bytes, inflated bytes}, in file order.
+    std::vector<std::pair<size_t, size_t>> compressed_wrapper_sizes;
     /// sequence id → count of SEQ_INCREMENTAL_STATE_CLEARED packets.
     std::map<uint32_t, size_t> state_clears;
     /// sequence id → total InternedData entries emitted (all three tables).
@@ -279,8 +281,9 @@ inline void decodePacket(Decoder pkt, DecodedTrace& trace,
 
     if (compressed) {
         ++trace.compressed_wrappers;
-        std::vector<uint8_t> inner =
-            inflateBytes(compressed->p, static_cast<size_t>(compressed->end - compressed->p));
+        const size_t payload_size = static_cast<size_t>(compressed->end - compressed->p);
+        std::vector<uint8_t> inner = inflateBytes(compressed->p, payload_size);
+        trace.compressed_wrapper_sizes.emplace_back(payload_size, inner.size());
         decodeTraceBytes(inner.data(), inner.size(), trace, sequences);
         return;
     }

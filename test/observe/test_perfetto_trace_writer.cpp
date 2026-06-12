@@ -308,6 +308,44 @@ void test_compressed_packets() {
     std::cout << "PASSED\n";
 }
 
+void test_compressed_batch_size_cap() {
+    std::cout << "Testing compressed batch splitting at the input cap... ";
+
+    auto path = tempFile("chronon_pftrace_batchcap_test.pftrace");
+    PerfettoTraceWriter writer;
+    CHECK(writer.open(path));  // Default options: compression on.
+
+    // ~3 MB of unique ~1 KB event names in a single flush (close() flushes
+    // once: 3000 packets stay below the 4096-packet auto-flush threshold).
+    // Embedding the index makes every name distinct, so each carries its full
+    // 1 KB into InternedData instead of collapsing onto a few iids.
+    uint64_t track = writer.addTrack("noise");
+    const std::string filler(1024, 'x');
+    for (uint64_t i = 0; i < 3000; ++i) {
+        std::string name = filler;
+        const std::string idx = std::to_string(i);
+        name.replace(0, idx.size(), idx);
+        writer.instant(track, "trace", name, i);
+    }
+    writer.close();
+
+    DecodedTrace trace = decodeFile(path);
+    CHECK(trace.events.size() == 3000);
+
+    // The batch must split into multiple wrappers, each fed at most ~256 KB
+    // of packets (one oversized packet of slack), with the compressed payload
+    // necessarily smaller still.
+    CHECK(trace.compressed_wrappers > 1);
+    constexpr size_t kInputCap = 256 * 1024;
+    for (const auto& [payload, inflated] : trace.compressed_wrapper_sizes) {
+        CHECK(inflated <= kInputCap + 2048);
+        CHECK(payload <= inflated + 1024);
+    }
+
+    std::filesystem::remove(path);
+    std::cout << "PASSED\n";
+}
+
 void test_timeline_stream_export() {
     std::cout << "Testing timeline stream export... ";
 
@@ -456,6 +494,7 @@ int main() {
     test_incremental_state_checkpoints();
     test_intern_cap_forces_checkpoint();
     test_compressed_packets();
+    test_compressed_batch_size_cap();
     test_slices_flows_typed_annotations();
     test_timeline_stream_export();
     test_empty_and_reopen();

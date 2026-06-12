@@ -147,6 +147,11 @@ public:
 
 private:
     struct Impl;
+
+    /// Compresses one packet-aligned chunk into a compressed_packets wrapper
+    /// (raw fallback on deflate failure).
+    void writeChunk_(const uint8_t* data, size_t size);
+
     std::unique_ptr<Impl> impl_;
 
     uint64_t next_uuid_ = 1;

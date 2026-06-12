@@ -52,7 +52,41 @@ constexpr uint32_t BOOT_CLOCK_ID = static_cast<uint32_t>(pbz::BuiltinClock::BUIL
 /// Flush the packet buffer to disk once this many packets accumulate.
 constexpr size_t FLUSH_PACKET_COUNT = 4096;
 
+/// Uncompressed input cap per compressed_packets wrapper. Keeps every wrapper
+/// packet far below reader packet-size limits regardless of event payloads
+/// (upstream Perfetto similarly splits compressed output into bounded slices).
+constexpr size_t MAX_COMPRESSED_BATCH_INPUT = 256 * 1024;
+
 protozero::ConstChars chars(std::string_view s) { return {s.data(), s.size()}; }
+
+bool readVarint(const uint8_t* data, size_t size, size_t& pos, uint64_t& out) {
+    out = 0;
+    int shift = 0;
+    while (pos < size && shift < 64) {
+        uint8_t byte = data[pos++];
+        out |= static_cast<uint64_t>(byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0) {
+            return true;
+        }
+        shift += 7;
+    }
+    return false;
+}
+
+/// @return End offset of the Trace.packet record starting at @p pos, or 0 on
+/// malformed framing.
+size_t nextTopLevelPacketEnd(const uint8_t* data, size_t size, size_t pos) {
+    uint64_t tag = 0;
+    uint64_t len = 0;
+    constexpr uint64_t PACKET_TAG = (1u << 3) | 2u;  // field 1, length-delimited.
+    if (!readVarint(data, size, pos, tag) || tag != PACKET_TAG) {
+        return 0;
+    }
+    if (!readVarint(data, size, pos, len) || len > size - pos) {
+        return 0;
+    }
+    return pos + len;
+}
 
 }  // namespace
 
@@ -542,42 +576,74 @@ void PerfettoTraceWriter::flush() {
     }
     if (impl_->packets_buffered > 0) {
         // Serialized Trace messages concatenate into a valid Perfetto trace,
-        // so each flushed batch is appended as-is (raw or wrapped in one
-        // compressed_packets carrier packet).
+        // so each flushed batch is appended as-is: raw, or split at packet
+        // boundaries into bounded chunks with one compressed_packets carrier
+        // packet each (readers expect compressed wrappers to stay below the
+        // packet-size limit, so a batch is never deflated as one blob).
         std::vector<uint8_t> bytes = impl_->trace.SerializeAsArray();
         impl_->trace.Reset();
         impl_->packets_buffered = 0;
 
-        bool wrote_compressed = false;
         if (impl_->options.compress) {
-            uLongf compressed_size = compressBound(static_cast<uLong>(bytes.size()));
-            std::vector<uint8_t> compressed(compressed_size);
-            // compress2 emits a zlib stream, matching Perfetto's own
-            // compressed_packets producer; readers auto-detect the format.
-            int rc = compress2(compressed.data(), &compressed_size, bytes.data(),
-                               static_cast<uLong>(bytes.size()), Z_DEFAULT_COMPRESSION);
-            if (rc == Z_OK) {
-                protozero::HeapBuffered<pbz::Trace> wrapper;
-                auto* pkt = wrapper->add_packet();
-                pkt->set_trusted_packet_sequence_id(WRAPPER_SEQUENCE_ID);
-                pkt->set_compressed_packets(compressed.data(), compressed_size);
-                std::vector<uint8_t> wrapped = wrapper.SerializeAsArray();
-                impl_->file.write(reinterpret_cast<const char*>(wrapped.data()),
-                                  static_cast<std::streamsize>(wrapped.size()));
-                bytes_written_ += wrapped.size();
-                wrote_compressed = true;
-            } else {
-                std::cerr << "[observe] timeline deflate failed (rc=" << rc
-                          << "); writing batch uncompressed\n";
+            size_t pos = 0;
+            while (pos < bytes.size()) {
+                // Grow the chunk packet-by-packet up to the input cap; a
+                // single oversized packet forms its own chunk.
+                size_t chunk_end = pos;
+                while (chunk_end < bytes.size()) {
+                    size_t next = nextTopLevelPacketEnd(bytes.data(), bytes.size(), chunk_end);
+                    if (next == 0) {
+                        // Malformed self-produced bytes should be impossible;
+                        // fall back to writing the remainder raw.
+                        std::cerr << "[observe] timeline flush: unexpected packet framing; "
+                                     "writing remainder uncompressed\n";
+                        chunk_end = bytes.size();
+                        break;
+                    }
+                    if (next - pos > MAX_COMPRESSED_BATCH_INPUT && chunk_end != pos) {
+                        break;
+                    }
+                    chunk_end = next;
+                    if (chunk_end - pos >= MAX_COMPRESSED_BATCH_INPUT) {
+                        break;
+                    }
+                }
+                writeChunk_(bytes.data() + pos, chunk_end - pos);
+                pos = chunk_end;
             }
-        }
-        if (!wrote_compressed) {
+        } else {
             impl_->file.write(reinterpret_cast<const char*>(bytes.data()),
                               static_cast<std::streamsize>(bytes.size()));
             bytes_written_ += bytes.size();
         }
     }
     impl_->file.flush();
+}
+
+/// Deflates one packet-aligned chunk into a compressed_packets wrapper, or
+/// appends it raw when compression fails.
+void PerfettoTraceWriter::writeChunk_(const uint8_t* data, size_t size) {
+    uLongf compressed_size = compressBound(static_cast<uLong>(size));
+    std::vector<uint8_t> compressed(compressed_size);
+    // compress2 emits a zlib stream, matching Perfetto's own
+    // compressed_packets producer; readers auto-detect the format.
+    int rc = compress2(compressed.data(), &compressed_size, data, static_cast<uLong>(size),
+                       Z_DEFAULT_COMPRESSION);
+    if (rc == Z_OK) {
+        protozero::HeapBuffered<pbz::Trace> wrapper;
+        auto* pkt = wrapper->add_packet();
+        pkt->set_trusted_packet_sequence_id(WRAPPER_SEQUENCE_ID);
+        pkt->set_compressed_packets(compressed.data(), compressed_size);
+        std::vector<uint8_t> wrapped = wrapper.SerializeAsArray();
+        impl_->file.write(reinterpret_cast<const char*>(wrapped.data()),
+                          static_cast<std::streamsize>(wrapped.size()));
+        bytes_written_ += wrapped.size();
+    } else {
+        std::cerr << "[observe] timeline deflate failed (rc=" << rc
+                  << "); writing chunk uncompressed\n";
+        impl_->file.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+        bytes_written_ += size;
+    }
 }
 
 void PerfettoTraceWriter::close() {
