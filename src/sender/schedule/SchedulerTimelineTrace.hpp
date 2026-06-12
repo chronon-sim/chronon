@@ -29,9 +29,10 @@ namespace chronon::sender {
 /** @brief Configuration for SchedulerTimelineTrace (Perfetto). */
 struct SchedulerTimelineTraceConfig {
     bool enabled = false;
-    /// Standalone output path; only used when the observation backend is not
-    /// running — otherwise the streams merge into the unified timeline.pftrace.
-    std::string file = "chronon_timeline.pftrace";
+    /// Output filename (relative to the observation output directory when one
+    /// is active, otherwise relative to cwd).  Always written as a standalone
+    /// file separate from the simulation's timeline.pftrace.
+    std::string file = "scheduler_timeline.pftrace";
     uint64_t max_events = 1'000'000;
     uint64_t start_cycle = 0;
     uint64_t end_cycle = std::numeric_limits<uint64_t>::max();
@@ -162,13 +163,25 @@ public:
         return std::move(data_);
     }
 
-    /// Standalone export: writes a .pftrace file at the configured path.
+    /// Write to the configured filename, resolved relative to @p output_dir.
+    void write(const std::filesystem::path& output_dir) {
+        const std::string& fname =
+            config_.file.empty() ? "scheduler_timeline.pftrace" : config_.file;
+        writeToPath_(output_dir / fname);
+    }
+
+    /// Write to the configured path (relative to cwd when no output dir is known).
     void write() {
+        const std::string& fname =
+            config_.file.empty() ? "scheduler_timeline.pftrace" : config_.file;
+        writeToPath_(std::filesystem::path(fname));
+    }
+
+private:
+    void writeToPath_(const std::filesystem::path& output_path) {
         if (!enabled() || !started_ || written_) return;
         written_ = true;
 
-        std::filesystem::path output_path(config_.file.empty() ? "chronon_timeline.pftrace"
-                                                               : config_.file);
         if (output_path.has_parent_path()) {
             std::error_code ec;
             std::filesystem::create_directories(output_path.parent_path(), ec);
@@ -185,7 +198,6 @@ public:
         writer.close();
     }
 
-private:
     uint64_t relNs(TimePoint tp) const {
         return static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(tp - base_time_).count());
