@@ -245,7 +245,13 @@ The vocabulary is deliberately SQL-shaped:
   annotations (uint/int/double/bool/pointer), not formatted into the name.
 - **`flow(uid)`** — pass the instruction/transaction uid the model already
   carries; Perfetto links the uid's slices across lanes and stages into one
-  flow (click an instruction → see its whole journey).
+  flow (click an instruction → see its whole journey), and offline analysis
+  can join stages through the flow id to compute per-stage latency
+  distributions. The bundled CPU pipeline example is instrumented this way:
+  every stage stamps `flow(instr_id)` (fetch/dispatch/commit instants, EX
+  occupancy spans per ALU, L2 miss spans), so `examples/cpu_pipeline.yaml`
+  produces a timeline where each instruction's fetch→dispatch→ex→commit
+  journey is one connected flow.
 
 Semantics under the existing machinery:
 
