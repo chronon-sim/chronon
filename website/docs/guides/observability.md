@@ -146,60 +146,38 @@ ctx.setLookaheadMode(false);
 ```
 out/
 └── 20260124_143052/
-    ├── counters.csv      # Counter snapshots
-    ├── events.ctrace     # Binary output (FlatBuffers + zstd)
-    └── events.log        # Text output (logs and/or traces)
+    ├── counters.csv         # Counter snapshots
+    ├── timeline.pftrace     # Perfetto protobuf timeline (traces, counters, scheduler)
+    └── events.log           # Text logs (debug/info/warn/error, optional trace mirror)
 ```
 
-Output files are created based on channel format configuration:
-- **events.log** is created if any channel uses `format: text` or `format: both`
-- **events.ctrace** is created if any channel uses `format: binary` or `format: both`
-- **counters.csv** is always created when counters are enabled
+- **events.log** holds text output for the debug/info/warn/error log channels. Trace events are mirrored into it only when the trace channel sets `text: true`.
+- **timeline.pftrace** is the unified Perfetto timeline (see below); created when `observation.timeline.enabled` is true (the default).
+- **counters.csv** is created when counters are enabled with `csv_output: true`.
 
-## Binary Trace Format
+## Perfetto Timeline
 
-Traces are stored in a compact binary format (`.ctrace`) using FlatBuffers with optional zstd compression:
+Trace events, counter snapshots, and (optionally) the scheduler execution
+timeline are written to a single `timeline.pftrace` file in Perfetto protobuf
+format. Open it directly in [ui.perfetto.dev](https://ui.perfetto.dev) (drag
+and drop the file), or query it offline with Perfetto's `trace_processor`.
 
-```
-┌─────────────────────────────────────┐
-│ File Header (64 bytes)              │  Magic "CTRC", version, offsets
-├─────────────────────────────────────┤
-│ Schema Section (FlatBuffers)        │  Format strings, units, arg types
-├─────────────────────────────────────┤
-│ Event Block 0 (zstd compressed)     │  Events packed sequentially
-├─────────────────────────────────────┤
-│ Event Block 1...N                   │
-├─────────────────────────────────────┤
-│ Footer (block index)                │  Cycle-based seeking support
-└─────────────────────────────────────┘
-```
+The timeline contains:
 
-Benefits:
-- **~8x smaller** than text output
-- **~6x faster** write throughput
-- **Self-describing**: Embedded schema for offline analysis
-- **Seekable**: Block index enables cycle-based random access
+- **Simulation trace events** — instant events on one track per unit, grouped
+  under a "Simulation" process. The timestamp is the simulation cycle (1 cycle
+  rendered as 1 ns) and the event name is the formatted trace message.
+- **Counter tracks** — one Perfetto counter track per `unit.counter`, sampled
+  at counter dump cycles.
+- **Scheduler execution timeline** — when enabled, wall-clock
+  unit/wait/epoch/arbitration slices under a "Chronon Scheduler" process
+  group, with one lane per worker stream plus a `scheduler` lane. Slices
+  carry `cycle` and `detail` debug annotations. See
+  [Scheduler Timeline Trace](scheduler-timeline.md).
 
-### trace_reader Tool
-
-Use `trace_reader` to inspect binary traces:
-
-```bash
-# Show file info
-trace_reader info events.ctrace
-
-# Dump all events as text
-trace_reader dump events.ctrace
-
-# Filter by cycle range
-trace_reader filter events.ctrace --cycles 1000-2000
-
-# Filter by unit
-trace_reader filter events.ctrace --unit rob
-
-# Convert to text file
-trace_reader convert events.ctrace -o trace.log
-```
+The file is produced by `src/observe/PerfettoTraceWriter`, a thin wrapper over
+the Perfetto SDK's protozero message writers (no tracing session or category
+registration — packets are written straight to the file).
 
 ## Pre-Registered Format Strings
 
@@ -331,19 +309,17 @@ struct Config {
     std::string output_dir = "out";
     std::chrono::microseconds poll_interval{100};
     bool enable_counter_csv = true;
+    CounterCsvFormat counter_csv_format = CounterCsvFormat::Pivoted;
 
-    // Per-channel formats (default: trace=Binary, logs=Text)
-    OutputFormat trace_format = OutputFormat::Binary;
-    OutputFormat debug_format = OutputFormat::Text;
-    OutputFormat info_format = OutputFormat::Text;
-    OutputFormat warn_format = OutputFormat::Text;
-    OutputFormat error_format = OutputFormat::Text;
+    // Mirror structured trace events to the text log
+    // (the Perfetto timeline is the primary trace sink)
+    bool trace_text = false;
 
-    // Per-category format overrides
-    std::unordered_map<CategoryMask, CategoryFormatOverride> category_format_overrides;
-
-    // Binary trace settings
-    TraceChannelConfig trace_config;  // Compression, block size, etc.
+    // Unified Perfetto timeline (timeline.pftrace)
+    bool timeline_enabled = true;
+    std::string timeline_file = "timeline.pftrace";
+    bool timeline_trace_events = true;
+    bool timeline_counters = true;
 
     // Reorder buffer
     bool enable_reordering = true;
@@ -355,35 +331,13 @@ struct Config {
 };
 ```
 
-### Per-Channel Formats
+### Output Routing
 
-Each event type can independently choose output format:
-
-```cpp
-enum class OutputFormat {
-    Text,    // events.log only
-    Binary,  // events.ctrace only
-    Both,    // Both files
-    None     // Disabled
-};
-```
-
-Example: Traces to binary, logs to text:
-```cpp
-config.trace_format = OutputFormat::Binary;
-config.debug_format = OutputFormat::Text;
-config.info_format = OutputFormat::Text;
-```
-
-### Category-Specific Overrides
-
-Override format for specific categories:
-
-```cpp
-config.category_format_overrides[CACHE_HIT] = {
-    .trace_format = OutputFormat::Both  // Write CACHE_HIT to both text and binary
-};
-```
+Log channels (debug/info/warn/error) are text-only and write to `events.log`.
+Trace events go to the Perfetto timeline; set `trace_text = true` (YAML:
+`trace: { text: true }`) to additionally mirror them into `events.log`. The
+old per-channel output-format selection and per-category format overrides
+have been removed.
 
 ## Debug Build Backpressure (No-Drop Guarantee)
 
@@ -446,4 +400,4 @@ try {
 
 - [Counter System](counters.md) - Detailed counter documentation
 - [Configuration](configuration.md) - YAML observation configuration
-- [Binary Trace Format](binary-trace-format) - Trace file format specification
+- [Scheduler Timeline Trace](scheduler-timeline.md) - Scheduler execution slices in the Perfetto timeline

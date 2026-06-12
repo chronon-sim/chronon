@@ -10,8 +10,8 @@
 
 /// @file ArgFormat.hpp
 /// @brief Shared utilities for computing argument sizes and formatting typed
-///        arguments from binary trace data. Used by both ObservationBackend
-///        (fmt::format_to path) and BinaryTraceReader (snprintf path).
+///        arguments from structured trace records, used by ObservationBackend
+///        (fmt::format_to path).
 
 #include <cstddef>
 #include <cstdint>
@@ -64,8 +64,8 @@ inline size_t argSize(ArgType type, const std::byte* data, const std::byte* end)
 /**
  * @brief Format a typed argument to a string using snprintf.
  *
- * This is the portable formatting path used by BinaryTraceReader and
- * any other consumer that does not depend on fmt.
+ * This is the portable formatting path for consumers that do not depend
+ * on fmt.
  */
 inline std::string formatArgToString(const std::byte* data, ArgType type, bool hex) {
     char buf[32];

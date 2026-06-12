@@ -22,7 +22,6 @@ const sidebars: SidebarsConfig = {
       items: [
         'guides/observability',
         'guides/counters',
-        'guides/binary-trace-format',
         'guides/scheduler-timeline',
       ],
     },

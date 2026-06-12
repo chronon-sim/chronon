@@ -156,17 +156,16 @@ Detailed design documents are available in [`website/docs/guides/`](website/docs
 | [Simulation Observability](website/docs/guides/observability.md) | Unified observability with macro-free API (counters, traces, logs) |
 | [Unit, Port, and Configuration](website/docs/guides/units-and-simulation.md) | Unit lifecycle, port system, and simulation execution |
 | [Configuration](website/docs/guides/configuration.md) | YAML-driven unit instantiation, parameters, and SimulationApp |
-| [Binary Trace Format](website/docs/guides/binary-trace-format.md) | FlatBuffers-based compact binary trace format specification |
+| [Scheduler Timeline](website/docs/guides/scheduler-timeline.md) | Perfetto timeline export for scheduler execution analysis |
 
 ## Dependencies
 
 - C++20 compiler (GCC 12+, Clang 20+)
 - CMake 3.25+
 - stdexec (included via CPM)
-- FlatBuffers (included via CPM, for binary trace output)
+- Perfetto SDK (included via CPM, for timeline.pftrace output)
 - yaml-cpp (for YAML configuration)
 - fmt (for observability formatting)
-- zstd (optional, for binary trace compression)
 
 ## License
 

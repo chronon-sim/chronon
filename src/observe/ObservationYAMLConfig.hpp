@@ -19,15 +19,6 @@
 namespace chronon::observe {
 
 /**
- * @brief How an event channel writes its output.
- *
- * - Text:   Human-readable (events.log).
- * - Binary: Compact binary (events.ctrace).
- * - Both:   Both sinks.
- */
-enum class OutputFormat : uint8_t { Text, Binary, Both };
-
-/**
  * @brief Specifies when observation should be active.
  *
  * RANGE: active for cycles `[range_start, range_end]`.
@@ -83,23 +74,13 @@ struct TemporalFilter {
 };
 
 /**
- * @brief Glob pattern selecting categories, with optional temporal and per-channel format
- * overrides.
+ * @brief Glob pattern selecting categories, with optional temporal overrides.
  *
  * Patterns support `*` ("*" matches all, "icache_*" matches prefixes, etc.).
- * Format priority: channel-specific override > shorthand `format` > channel default.
  */
 struct CategoryPattern {
     std::string pattern;
     bool enabled = true;
-
-    /// Shorthand: sets all channels when no channel-specific override is set.
-    std::optional<OutputFormat> format;
-    std::optional<OutputFormat> trace_format;
-    std::optional<OutputFormat> debug_format;
-    std::optional<OutputFormat> info_format;
-    std::optional<OutputFormat> warn_format;
-    std::optional<OutputFormat> error_format;
 
     std::vector<TemporalFilter> temporal;
 
@@ -114,15 +95,6 @@ struct CategoryPattern {
             }
         }
         return false;
-    }
-
-    /// Channel-specific override wins over the shorthand `format`.
-    [[nodiscard]] std::optional<OutputFormat> getEffectiveFormat(
-        const std::optional<OutputFormat>& channel_override) const noexcept {
-        if (channel_override.has_value()) {
-            return channel_override;
-        }
-        return format;
     }
 };
 
@@ -143,42 +115,48 @@ struct CountersYAMLConfig {
     bool dump_on_shutdown = true;
 };
 
-/** @brief Compression settings for binary traces. */
-struct CompressionConfig {
-    bool enabled = true;
-    std::string algorithm = "zstd";  ///< Only zstd supported.
-    int level = 3;                   ///< 1-22; 3 is the fast default.
-    size_t block_size = 65536;
-};
-
 /** @brief Config for a single log-level channel (debug/info/warn/error). */
 struct ChannelConfig {
     bool enabled = true;
-    OutputFormat format = OutputFormat::Text;
     std::string file;  ///< Empty = default events.log.
     std::optional<BackpressurePolicy> backpressure;
     std::optional<uint32_t> backpressure_max_spins;
 };
 
-/** @brief Trace channel config with binary-specific extensions. */
+/**
+ * @brief Trace channel config.
+ *
+ * Trace events go to timeline.pftrace (when the timeline sink is enabled) and,
+ * when @c text is set, additionally to the text log.
+ */
 struct TraceChannelConfig {
     bool enabled = false;
-    OutputFormat format = OutputFormat::Binary;
-    std::string file;
-
-    CompressionConfig compression;
-    bool embed_schema = true;
-    bool generate_index = true;
+    bool text = false;  ///< Also mirror trace events to the text log.
+    std::string file;   ///< Text mirror destination; empty = default events.log.
 
     std::optional<BackpressurePolicy> backpressure;
     std::optional<uint32_t> backpressure_max_spins;
 };
 
 /**
+ * @brief Unified Perfetto timeline output (timeline.pftrace).
+ *
+ * One file carries simulation trace events (timestamp = cycle, 1 cycle
+ * rendered as 1 ns), counter tracks, and — when the scheduler timeline is
+ * enabled — wall-clock scheduler execution slices. Opens in ui.perfetto.dev.
+ */
+struct TimelineYAMLConfig {
+    bool enabled = true;
+    std::string file = "timeline.pftrace";  ///< Relative to the run output directory.
+    bool trace_events = true;               ///< Simulation trace channel → instant events.
+    bool counters = true;                   ///< Counter snapshots → counter tracks.
+};
+
+/**
  * @brief Unified per-channel configuration for all event output.
  *
  * Each event type (debug/info/warn/error/trace) is an independent channel with
- * its own enable/format settings; categories and temporal filters are shared.
+ * its own enable settings; categories and temporal filters are shared.
  */
 struct UnifiedLoggingConfig {
     bool enabled = true;
@@ -191,41 +169,6 @@ struct UnifiedLoggingConfig {
 
     std::vector<TemporalFilter> temporal;
     std::vector<CategoryPattern> categories;
-
-    [[nodiscard]] bool needsTextOutput() const noexcept { return hasFormat_(OutputFormat::Text); }
-
-    /**
-     * Check if any channel uses Binary or Both format.
-     */
-    [[nodiscard]] bool needsBinaryOutput() const noexcept {
-        return hasFormat_(OutputFormat::Binary);
-    }
-
-private:
-    /// Helper: check if any enabled channel or category override uses the target format (or Both).
-    [[nodiscard]] bool hasFormat_(OutputFormat target) const noexcept {
-        // Check log channels
-        for (const auto* ch : {&debug_channel, &info_channel, &warn_channel, &error_channel}) {
-            if (ch->enabled && (ch->format == target || ch->format == OutputFormat::Both)) {
-                return true;
-            }
-        }
-        // Check trace channel
-        if (trace_channel.enabled &&
-            (trace_channel.format == target || trace_channel.format == OutputFormat::Both)) {
-            return true;
-        }
-        // A category may override a channel's default format.
-        for (const auto& cat : categories) {
-            for (const auto* fmt : {&cat.format, &cat.trace_format, &cat.debug_format,
-                                    &cat.info_format, &cat.warn_format, &cat.error_format}) {
-                if (*fmt == target || *fmt == OutputFormat::Both) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
 };
 
 /** @brief Per-unit configuration overrides. */
@@ -250,6 +193,7 @@ struct ObservationYAMLConfig {
 
     CountersYAMLConfig counters;
     UnifiedLoggingConfig unified_logging;
+    TimelineYAMLConfig timeline;
 
     /// Key = unit instance name.
     std::unordered_map<std::string, UnitObservationOverride> unit_overrides;

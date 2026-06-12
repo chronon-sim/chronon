@@ -210,10 +210,17 @@ int SimulationApp::run(int argc, char* argv[]) {
         result.wall_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
         if (result.simulation->timelineTraceEnabled()) {
-            result.simulation->writeTimelineTrace();
+            const bool merged = result.simulation->writeTimelineTrace();
             if (opts.verbose) {
-                std::cout << "Scheduler timeline trace: " << result.simulation->timelineTraceFile()
-                          << "\n";
+                if (merged) {
+                    auto* backend = observe::ObservationManager::instance().backend();
+                    std::cout << "Scheduler timeline trace: merged into "
+                              << (backend ? backend->outputDir().string() : std::string("<output>"))
+                              << "/timeline.pftrace\n";
+                } else {
+                    std::cout << "Scheduler timeline trace: "
+                              << result.simulation->timelineTraceFile() << "\n";
+                }
             }
         }
 

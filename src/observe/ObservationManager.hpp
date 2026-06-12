@@ -86,6 +86,18 @@ public:
     void stopBackend();
     bool isBackendRunning() const noexcept;
 
+    /// True when the backend writes a unified Perfetto timeline (timeline.pftrace).
+    bool timelineEnabled() const noexcept;
+
+    /**
+     * @brief Hand recorded timeline streams to the backend for timeline.pftrace.
+     *
+     * The streams are written during stopBackend(), after the final event drain.
+     * @return false when the backend is not running or has no timeline sink —
+     *         the caller should fall back to standalone output.
+     */
+    bool submitTimeline(TimelineStreamData&& data);
+
     /// Shared queue used for counter snapshots and lookahead commits.
     ObservationQueue* sharedQueue() noexcept { return shared_queue_.get(); }
 

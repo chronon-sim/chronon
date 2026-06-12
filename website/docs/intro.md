@@ -126,7 +126,7 @@ int main(int argc, char* argv[]) {
 
 - C++20 compiler (GCC 12+, Clang 20+)
 - CMake 3.25+
-- stdexec and FlatBuffers (downloaded via CPM during CMake configuration)
+- stdexec and the Perfetto SDK (downloaded via CPM during CMake configuration)
 - yaml-cpp (provided by your system/package manager)
 
 ## Next Steps

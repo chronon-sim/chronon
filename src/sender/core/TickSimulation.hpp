@@ -220,7 +220,28 @@ public:
     bool isInitialized() const noexcept { return initialized_; }
     bool timelineTraceEnabled() const noexcept { return timeline_trace_.enabled(); }
     const std::string& timelineTraceFile() const noexcept { return timeline_trace_.file(); }
-    void writeTimelineTrace() { timeline_trace_.write(); }
+
+    /**
+     * @brief Export the scheduler execution timeline at end of run.
+     *
+     * When the observation backend is running with a timeline sink, the
+     * recorded streams merge into its unified timeline.pftrace (written during
+     * stopBackend()); otherwise a standalone .pftrace is written at the
+     * configured file path.
+     *
+     * @return true when the timeline was merged into the unified file.
+     */
+    bool writeTimelineTrace() {
+        if (!timeline_trace_.enabled()) {
+            return false;
+        }
+        auto& obs = observe::ObservationManager::instance();
+        if (obs.isBackendRunning() && obs.timelineEnabled()) {
+            return obs.submitTimeline(timeline_trace_.exportData());
+        }
+        timeline_trace_.write();
+        return false;
+    }
 
     /// Number of runParallel() invocations that took the epoch-free path.
     /// Test/bench introspection for the enable_epoch_free_lookahead A/B knob.

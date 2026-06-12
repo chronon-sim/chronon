@@ -12,7 +12,6 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -21,14 +20,18 @@
 #include <utility>
 #include <vector>
 
+#include "../../observe/PerfettoTraceWriter.hpp"
+#include "../../observe/TimelineData.hpp"
 #include "../core/TickableUnit.hpp"
 
 namespace chronon::sender {
 
-/** @brief Configuration for SchedulerTimelineTrace (Chrome Trace / Perfetto). */
+/** @brief Configuration for SchedulerTimelineTrace (Perfetto). */
 struct SchedulerTimelineTraceConfig {
     bool enabled = false;
-    std::string file = "chronon_timeline.json";
+    /// Standalone output path; only used when the observation backend is not
+    /// running — otherwise the streams merge into the unified timeline.pftrace.
+    std::string file = "chronon_timeline.pftrace";
     uint64_t max_events = 1'000'000;
     uint64_t start_cycle = 0;
     uint64_t end_cycle = std::numeric_limits<uint64_t>::max();
@@ -39,7 +42,15 @@ struct SchedulerTimelineTraceConfig {
     uint64_t min_duration_ns = 0;
 };
 
-/** @brief Chrome Trace / Perfetto timeline writer for scheduler execution. */
+/**
+ * @brief Wall-clock timeline recorder for scheduler execution (Perfetto output).
+ *
+ * Records duration slices into per-stream arenas with no per-event allocation
+ * (this measures the scheduler itself, so the record path stays off the
+ * observation queues). At end of run the streams either merge into the
+ * observation backend's unified timeline.pftrace (via exportData()) or are
+ * written standalone (via write()).
+ */
 class SchedulerTimelineTrace {
 public:
     using Clock = std::chrono::steady_clock;
@@ -70,29 +81,27 @@ public:
 
         base_time_ = Clock::now();
         const size_t stream_count = thread_units.empty() ? 1 : thread_units.size();
-        streams_.clear();
-        streams_.resize(stream_count + 1);  // Last stream is the scheduler lane.
-        stream_arenas_.clear();
-        stream_arenas_.resize(stream_count + 1);
-        const size_t reserve_per = config_.max_events / streams_.size();
-        for (auto& s : streams_) {
+        data_ = observe::TimelineStreamData{};
+        data_.streams.resize(stream_count + 1);  // Last stream is the scheduler lane.
+        data_.arenas.resize(stream_count + 1);
+        const size_t reserve_per = config_.max_events / data_.streams.size();
+        for (auto& s : data_.streams) {
             s.reserve(reserve_per);
         }
         // Pre-size each string arena to its share of events (~16 B/event heuristic)
         // so the common case appends without reallocating.
-        for (auto& a : stream_arenas_) {
+        for (auto& a : data_.arenas) {
             a.reserve(reserve_per * 16);
         }
-        stream_names_.clear();
-        stream_names_.reserve(stream_count + 1);
+        data_.stream_names.reserve(stream_count + 1);
 
         for (size_t stream = 0; stream < stream_count; ++stream) {
             std::ostringstream name;
             name << "stream " << stream << " (logical worker)";
-            stream_names_.push_back(name.str());
+            data_.stream_names.push_back(name.str());
         }
         scheduler_stream_ = stream_count;
-        stream_names_.push_back("scheduler");
+        data_.stream_names.push_back("scheduler");
         started_ = true;
     }
 
@@ -106,7 +115,7 @@ public:
     void recordDuration(size_t stream, std::string_view category, std::string_view name,
                         uint64_t cycle, TimePoint begin, TimePoint end,
                         std::string_view detail = {}) {
-        if (!started_ || stream >= streams_.size()) return;
+        if (!started_ || stream >= data_.streams.size()) return;
         if (cycle < config_.start_cycle || cycle >= config_.end_cycle) return;
         if (end < begin) return;
 
@@ -125,7 +134,7 @@ public:
         // reused across events), and because the bytes are copied here the trace
         // owns them — caller-supplied temporaries are safe. Per the contract above,
         // a given stream's arena is written by exactly one thread at a time.
-        std::string& arena = stream_arenas_[stream];
+        std::string& arena = data_.arenas[stream];
         const auto intern = [&arena](std::string_view s) -> std::pair<uint32_t, uint32_t> {
             const uint32_t off = static_cast<uint32_t>(arena.size());
             arena.append(s.data(), s.size());
@@ -134,185 +143,53 @@ public:
         const auto [cat_off, cat_len] = intern(category);
         const auto [name_off, name_len] = intern(name);
         const auto [detail_off, detail_len] = intern(detail);
-        streams_[stream].push_back({cat_off, cat_len, name_off, name_len, detail_off, detail_len,
-                                    cycle, relNs(begin), duration_ns});
+        data_.streams[stream].push_back({cat_off, cat_len, name_off, name_len, detail_off,
+                                         detail_len, cycle, relNs(begin), duration_ns});
     }
 
     size_t schedulerStream() const noexcept { return scheduler_stream_; }
     const std::string& file() const noexcept { return config_.file; }
 
+    /**
+     * @brief Move the recorded streams out for the unified timeline.pftrace.
+     *
+     * Intended for ObservationManager::submitTimeline(). The recorder is left
+     * empty; subsequent write() calls are no-ops.
+     */
+    observe::TimelineStreamData exportData() {
+        written_ = true;
+        data_.dropped_events = dropped_events_.load(std::memory_order_relaxed);
+        return std::move(data_);
+    }
+
+    /// Standalone export: writes a .pftrace file at the configured path.
     void write() {
         if (!enabled() || !started_ || written_) return;
         written_ = true;
 
-        std::filesystem::path output_path(config_.file.empty() ? "chronon_timeline.json"
+        std::filesystem::path output_path(config_.file.empty() ? "chronon_timeline.pftrace"
                                                                : config_.file);
         if (output_path.has_parent_path()) {
             std::error_code ec;
             std::filesystem::create_directories(output_path.parent_path(), ec);
         }
 
-        std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
-        if (!out.is_open()) {
+        observe::PerfettoTraceWriter writer;
+        if (!writer.open(output_path)) {
             std::cerr << "SchedulerTimelineTrace: failed to open " << output_path << "\n";
             return;
         }
 
-        out << "{\"traceEvents\":[\n";
-        bool first = true;
-
-        appendProcessMetadata(out, first, "Chronon Scheduler");
-        for (size_t stream = 0; stream < stream_names_.size(); ++stream) {
-            appendThreadMetadata(out, first, traceTid(stream), "thread_name",
-                                 stream_names_[stream]);
-        }
-
-        for (size_t sid = 0; sid < streams_.size(); ++sid) {
-            const std::string& arena = stream_arenas_[sid];
-            const auto slice = [&arena](uint32_t off, uint32_t len) {
-                return std::string_view(arena.data() + off, len);
-            };
-            for (const auto& event : streams_[sid]) {
-                const std::string_view cat = slice(event.cat_off, event.cat_len);
-                const std::string_view name = slice(event.name_off, event.name_len);
-                const std::string_view detail = slice(event.detail_off, event.detail_len);
-                if (!first) out << ",\n";
-                first = false;
-                out << "{\"name\":\"" << escape(name) << "\",\"cat\":\"" << escape(cat)
-                    << "\",\"cname\":\"" << colorFor(cat, name)
-                    << "\",\"ph\":\"X\",\"pid\":1,\"tid\":" << traceTid(sid) << ",\"ts\":";
-                writeMicros(out, event.ts_ns);
-                out << ",\"dur\":";
-                writeMicros(out, event.dur_ns);
-                out << ",\"args\":{\"cycle\":" << event.cycle << ",\"stream\":" << sid;
-                if (!detail.empty()) {
-                    out << ",\"detail\":\"" << escape(detail) << "\"";
-                }
-                out << "}}";
-            }
-        }
-
-        if (dropped_events_.load(std::memory_order_relaxed) > 0) {
-            if (!first) out << ",\n";
-            first = false;
-            out << "{\"name\":\"dropped events\",\"cat\":\"summary\",\"ph\":\"i\","
-                   "\"s\":\"p\",\"pid\":1,\"tid\":"
-                << traceTid(scheduler_stream_) << ",\"ts\":0,\"args\":{\"count\":"
-                << dropped_events_.load(std::memory_order_relaxed) << "}}";
-        }
-
-        out << "\n],\"displayTimeUnit\":\"ns\"}\n";
+        data_.dropped_events = dropped_events_.load(std::memory_order_relaxed);
+        observe::writeTimeline(writer, data_);
+        writer.close();
     }
 
 private:
-    // POD event: category/name/detail are stored as [offset,len) slices into the
-    // owning per-stream `stream_arenas_` byte arena (copied at record time), so the
-    // record path constructs no std::string and the event is trivially copyable,
-    // yet the trace owns every string and is safe for any caller-supplied input
-    // (temporaries included). Offsets are indices, so arena growth never
-    // invalidates them.
-    struct Event {
-        uint32_t cat_off = 0, cat_len = 0;
-        uint32_t name_off = 0, name_len = 0;
-        uint32_t detail_off = 0, detail_len = 0;
-        uint64_t cycle = 0;
-        uint64_t ts_ns = 0;
-        uint64_t dur_ns = 0;
-    };
-
     uint64_t relNs(TimePoint tp) const {
         return static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(tp - base_time_).count());
     }
-
-    static std::string escape(std::string_view input) {
-        std::string out;
-        out.reserve(input.size());
-        for (char ch : input) {
-            switch (ch) {
-                case '"':
-                    out += "\\\"";
-                    break;
-                case '\\':
-                    out += "\\\\";
-                    break;
-                case '\n':
-                    out += "\\n";
-                    break;
-                case '\r':
-                    out += "\\r";
-                    break;
-                case '\t':
-                    out += "\\t";
-                    break;
-                default:
-                    out += ch;
-                    break;
-            }
-        }
-        return out;
-    }
-
-    /// Map an event to a catapult reserved color name (the "cname" field) so the
-    /// Chrome/Perfetto viewer renders distinct, stable colors. Stalls are red so
-    /// they stand out; scheduler bookkeeping is grey; each unit gets its own color
-    /// hashed from its name (consistent across runs and across all its slices).
-    static const char* colorFor(std::string_view category, std::string_view name) {
-        if (category == "wait") return "terrible";   // red: cross-cluster stalls pop out
-        if (category == "scheduler") return "grey";  // neutral: epoch / arbitration
-        if (category == "summary") return "white";
-        // Curated palette of visually-distinct reserved colors (reds/greys excluded
-        // so units never look like stalls or scheduler events).
-        static constexpr const char* kPalette[] = {
-            "thread_state_running",
-            "rail_response",
-            "rail_animation",
-            "rail_load",
-            "rail_idle",
-            "good",
-            "yellow",
-            "olive",
-            "startup",
-            "generic_work",
-            "vsync_highlighted",
-            "cq_build_running",
-            "cq_build_passed",
-            "thread_state_iowait",
-            "thread_state_runnable",
-        };
-        uint64_t h = 1469598103934665603ULL;  // FNV-1a over the name
-        for (unsigned char c : name) {
-            h ^= c;
-            h *= 1099511628211ULL;
-        }
-        return kPalette[h % (sizeof(kPalette) / sizeof(kPalette[0]))];
-    }
-
-    static void writeMicros(std::ostream& out, uint64_t ns) {
-        const uint64_t us = ns / 1000;
-        const uint32_t frac = static_cast<uint32_t>(ns % 1000);
-        out << us << '.' << static_cast<char>('0' + frac / 100)
-            << static_cast<char>('0' + (frac / 10) % 10) << static_cast<char>('0' + frac % 10);
-    }
-
-    static void appendProcessMetadata(std::ostream& out, bool& first, const std::string& value) {
-        if (!first) out << ",\n";
-        first = false;
-        out << "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"args\":{\"name\":\""
-            << escape(value) << "\"}}";
-    }
-
-    static void appendThreadMetadata(std::ostream& out, bool& first, size_t tid,
-                                     const char* metadata_name, const std::string& value) {
-        if (!first) out << ",\n";
-        first = false;
-        out << "{\"name\":\"" << metadata_name << "\",\"ph\":\"M\",\"pid\":1,\"tid\":" << tid
-            << ",\"args\":{\"name\":\"" << escape(value) << "\"}}";
-    }
-
-    /// 1-based: Perfetto treats tid=0 as special in some Chrome Trace views, which can
-    /// make worker 0 look like a main thread or collapse labels during inspection.
-    static size_t traceTid(size_t stream) noexcept { return stream + 1; }
 
     SchedulerTimelineTraceConfig config_{};
     bool configured_ = false;
@@ -324,10 +201,8 @@ private:
     bool written_ = false;
     TimePoint base_time_{};
     size_t scheduler_stream_ = 0;
-    std::vector<std::vector<Event>> streams_;
-    std::vector<std::string>
-        stream_arenas_;  ///< Per-stream byte arena backing Event string slices.
-    std::vector<std::string> stream_names_;
+    /// Recorded streams: slices, per-stream byte arenas, lane names.
+    observe::TimelineStreamData data_;
     std::atomic<uint64_t> event_count_{0};
     std::atomic<uint64_t> dropped_events_{0};
 };

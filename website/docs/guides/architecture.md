@@ -107,7 +107,7 @@ src/
 │   │   ├── PlatformBenchmark.hpp        # Atomic sync cost measurement
 │   │   ├── CostProfileCache.hpp         # Cached profiling results
 │   │   ├── SimulatedAnnealingPartitioner.hpp  # SA-based partitioner
-│   │   └── SchedulerTimelineTrace.hpp   # Chrome Trace / Perfetto output
+│   │   └── SchedulerTimelineTrace.hpp   # Scheduler timeline recording (Perfetto)
 │   │
 │   ├── util/                            # Utilities
 │   │   ├── Graph.hpp                    # Graph algorithms
@@ -144,8 +144,8 @@ src/
 │   ├── ObservationBackend.hpp           # Backend thread + output
 │   ├── ObservationQueue.hpp             # Lock-free SPSC queue
 │   ├── ObservationFilter.hpp            # Category + temporal filtering
-│   ├── BinaryTraceWriter.hpp            # .ctrace binary output
-│   ├── BinaryTraceReader.hpp            # .ctrace reader API
+│   ├── PerfettoTraceWriter.hpp          # Minimal Perfetto protobuf writer (.pftrace)
+│   ├── TimelineData.hpp                 # Recorded timeline slice storage
 │   ├── ReorderBuffer.hpp                # Cycle-ordered event reordering
 │   ├── SPSCQueue.hpp                    # SPSC ring buffer
 │   ├── ThreadContext.hpp                # Per-thread observation state
@@ -154,13 +154,10 @@ src/
 ├── tree/                                # TreeNode hierarchy
 │   └── TreeNode.hpp                     # Tree structure
 │
-├── params/                              # Parameter system
-│   ├── Param.hpp                        # Self-registering parameters
-│   ├── ParameterSet.hpp                 # Parameter collections
-│   └── UnitConstructorMacros.hpp        # CHRONON_UNIT_CONSTRUCTOR macro
-│
-└── tools/                               # Development tools
-    └── trace_reader.cpp                 # Binary trace reader CLI
+└── params/                              # Parameter system
+    ├── Param.hpp                        # Self-registering parameters
+    ├── ParameterSet.hpp                 # Parameter collections
+    └── UnitConstructorMacros.hpp        # CHRONON_UNIT_CONSTRUCTOR macro
 ```
 
 ## Key Components

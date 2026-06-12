@@ -18,7 +18,6 @@
 #include <thread>
 
 #include "../chronon/CpuPause.hpp"
-#include "BinaryTraceWriter.hpp"
 #include "FormatRegistry.hpp"
 #include "SIMDOps.hpp"
 
@@ -224,13 +223,22 @@ void ObservationBackend::run_() {
         finalizeCounterCsv_();
     }
 
+    // Append submitted timeline streams (scheduler execution timeline) and close
+    // the Perfetto file. Must run after the final drain so simulation trace
+    // events and counter samples are already written.
+    finalizeTimeline_();
+
     // Close files
     if (counter_file_.is_open()) counter_file_.close();
     if (default_sink_ && default_sink_->file.is_open()) default_sink_->file.close();
     for (auto& [name, sink] : custom_sinks_) {
         if (sink->file.is_open()) sink->file.close();
     }
-    if (binary_trace_writer_) binary_trace_writer_->close();
+}
+
+void ObservationBackend::submitTimeline(TimelineStreamData&& data) {
+    std::lock_guard<std::mutex> lock(timeline_submit_mutex_);
+    submitted_timelines_.push_back(std::move(data));
 }
 
 size_t ObservationBackend::drainQueue_() {
@@ -574,7 +582,9 @@ void ObservationBackend::processEvent_(const ObservationQueue::RecordHeader* hea
 
     switch (header->type) {
         case ObservationQueue::EventType::COUNTER_SNAPSHOT: {
-            if (config_.enable_counter_csv) {
+            const bool want_timeline =
+                config_.timeline_counters && perfetto_writer_ && perfetto_writer_->isOpen();
+            if (config_.enable_counter_csv || want_timeline) {
                 if (data_size >= 20) {
                     size_t offset = 0;
                     uint64_t cycle = 0;
@@ -602,7 +612,13 @@ void ObservationBackend::processEvent_(const ObservationQueue::RecordHeader* hea
                             uint64_t value = 0;
                             std::memcpy(&value, data + offset, 8);
 
-                            if (config_.counter_csv_format == CounterCsvFormat::Pivoted) {
+                            if (want_timeline) {
+                                writeCounterToTimeline_(cycle, unit_name, counter_name, value);
+                            }
+
+                            if (!config_.enable_counter_csv) {
+                                // Timeline-only: skip the CSV paths below.
+                            } else if (config_.counter_csv_format == CounterCsvFormat::Pivoted) {
                                 std::string key;
                                 key.reserve(unit_name.size() + 1 + counter_name.size());
                                 key.append(unit_name);
@@ -757,15 +773,11 @@ void ObservationBackend::processStructuredTrace_(const std::byte* data, size_t d
     const std::byte* args_data = data + sizeof(StructuredRecord);
     size_t args_size = data_size - sizeof(StructuredRecord);
 
-    OutputFormat format = resolveTraceFormat_(rec->category);
-
-    if ((format == OutputFormat::Binary || format == OutputFormat::Both) && binary_trace_writer_ &&
-        binary_trace_writer_->isOpen()) {
-        binary_trace_writer_->writeEvent(rec, args_data, args_size);
-        local_bytes_written_ += sizeof(StructuredRecord) + args_size;
+    if (config_.timeline_trace_events && perfetto_writer_ && perfetto_writer_->isOpen()) {
+        writeTraceToTimeline_(rec, args_data, args_size);
     }
 
-    if (format == OutputFormat::Text || format == OutputFormat::Both) {
+    if (config_.trace_text) {
         auto* sink = channel_sink_[static_cast<size_t>(Channel::Trace)];
         if (sink && sink->file.is_open()) {
             writeEventAsText_(rec, args_data, args_size, "TRACE", *sink);
@@ -795,19 +807,9 @@ void ObservationBackend::processStructuredLog_(const std::byte* data, size_t dat
         channel = Channel::Error;
     }
 
-    OutputFormat format = resolveLogFormat_(rec->category);
-
-    if (format == OutputFormat::Text || format == OutputFormat::Both) {
-        auto* sink = channel_sink_[static_cast<size_t>(channel)];
-        if (sink && sink->file.is_open()) {
-            writeEventAsText_(rec, args_data, args_size, level_str, *sink);
-        }
-    }
-
-    if ((format == OutputFormat::Binary || format == OutputFormat::Both) && binary_trace_writer_ &&
-        binary_trace_writer_->isOpen()) {
-        binary_trace_writer_->writeEvent(rec, args_data, args_size);
-        local_bytes_written_ += sizeof(StructuredRecord) + args_size;
+    auto* sink = channel_sink_[static_cast<size_t>(channel)];
+    if (sink && sink->file.is_open()) {
+        writeEventAsText_(rec, args_data, args_size, level_str, *sink);
     }
 }
 

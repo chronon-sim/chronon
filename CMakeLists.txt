@@ -97,29 +97,35 @@ if(TARGET stdexec)
     set_target_properties(stdexec PROPERTIES SYSTEM TRUE)
 endif()
 
-# Add FlatBuffers (header-only, for binary trace format)
+# Perfetto SDK (amalgamated C++ sources) for timeline.pftrace output.
+# The cpp-sdk-src release asset contains only perfetto.h + perfetto.cc.
 CPMAddPackage(
-    NAME flatbuffers
-    GITHUB_REPOSITORY google/flatbuffers
-    GIT_TAG v25.12.19
-    GIT_SHALLOW ON
-    OPTIONS
-        "FLATBUFFERS_BUILD_TESTS OFF"
-        "FLATBUFFERS_BUILD_FLATC ON"
-        "FLATBUFFERS_BUILD_FLATHASH OFF"
+    NAME perfetto
+    URL https://github.com/google/perfetto/releases/download/v56.1/perfetto-cpp-sdk-src.zip
+    DOWNLOAD_ONLY YES
 )
-
-# Mark flatbuffers includes as SYSTEM and suppress -Werror (third-party code)
-if(TARGET flatbuffers)
-    get_target_property(FB_INC flatbuffers INTERFACE_INCLUDE_DIRECTORIES)
-    set_target_properties(flatbuffers PROPERTIES
-        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${FB_INC}"
-    )
-    target_compile_options(flatbuffers PRIVATE -Wno-error)
-endif()
-
-if(TARGET flatc)
-    target_compile_options(flatc PRIVATE -Wno-error)
+if(perfetto_ADDED)
+    add_library(perfetto_sdk STATIC ${perfetto_SOURCE_DIR}/perfetto.cc)
+    target_include_directories(perfetto_sdk SYSTEM PUBLIC ${perfetto_SOURCE_DIR})
+    target_compile_features(perfetto_sdk PUBLIC cxx_std_17)
+    # Third-party code: keep it out of our warning/-Werror surface.
+    target_compile_options(perfetto_sdk PRIVATE -w)
+    # Sanitizer instrumentation must match the rest of the build: protozero's
+    # arena poisoning is split between header-inlined code (compiled into
+    # chronon TUs) and perfetto.cc — mixing instrumented and uninstrumented
+    # TUs trips false use-after-poison reports under clang ASan.
+    if(CHRONON_ENABLE_ASAN)
+        target_compile_options(perfetto_sdk PRIVATE
+            -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(perfetto_sdk PUBLIC -fsanitize=address,undefined)
+    endif()
+    if(CHRONON_ENABLE_TSAN)
+        target_compile_options(perfetto_sdk PRIVATE
+            -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(perfetto_sdk PUBLIC -fsanitize=thread)
+    endif()
+    find_package(Threads REQUIRED)
+    target_link_libraries(perfetto_sdk PUBLIC Threads::Threads)
 endif()
 
 # Add the main framework library

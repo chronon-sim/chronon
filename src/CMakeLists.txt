@@ -64,11 +64,6 @@ add_subdirectory(observe)
 # Alias for observe library
 add_library(chronon::observe ALIAS chronon_observe)
 
-# ============================================================================
-# Add tools (trace_reader, etc.)
-# ============================================================================
-add_subdirectory(tools)
-
 # Link observe library to core (needed for SimulationApp)
 target_link_libraries(chronon PUBLIC chronon_observe)
 

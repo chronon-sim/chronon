@@ -455,7 +455,6 @@ void test_observer_emergency_flush_on_exception() {
         obs_config.counters.csv_output = false;
         obs_config.unified_logging.enabled = true;
         obs_config.unified_logging.info_channel.enabled = true;
-        obs_config.unified_logging.info_channel.format = OutputFormat::Text;
 
         auto& obs_mgr = ObservationManager::instance();
         obs_mgr.reset();
