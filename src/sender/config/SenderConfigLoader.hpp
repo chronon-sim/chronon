@@ -545,6 +545,9 @@ private:
             unit_config.params_yaml = unit_node["params"];
         }
 
+        if (!config.hasUnit(unit_name)) {
+            config.unit_order.push_back(unit_name);
+        }
         config.units[unit_name] = std::move(unit_config);
 
         if (unit_node["port"]) {

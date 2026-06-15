@@ -25,6 +25,7 @@
 #include <bit>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -95,6 +96,7 @@ struct PerfettoTraceWriter::Impl {
     protozero::HeapBuffered<pbz::Trace> trace;
     size_t packets_buffered = 0;
     Options options;
+    std::unordered_map<uint64_t, int32_t> next_child_rank;
 
     /// String → iid map for one InternedData field; iids restart at 1 after
     /// every SEQ_INCREMENTAL_STATE_CLEARED.
@@ -140,6 +142,17 @@ struct PerfettoTraceWriter::Impl {
 
     SequenceState sim{SIM_SEQUENCE_ID, /*uses_cycle_clock=*/true};
     SequenceState wall{WALL_SEQUENCE_ID, /*uses_cycle_clock=*/false};
+
+    int32_t childRank(uint64_t parent_uuid, int32_t requested_rank) {
+        if (requested_rank >= 0) {
+            return requested_rank;
+        }
+        int32_t& rank = next_child_rank[parent_uuid];
+        if (rank == std::numeric_limits<int32_t>::max()) {
+            return rank;
+        }
+        return rank++;
+    }
 
     /// Emits the SEQ_INCREMENTAL_STATE_CLEARED packet that (re)starts @p seq:
     /// resets intern tables and, on the cycle-clock sequence, declares the
@@ -339,6 +352,7 @@ bool PerfettoTraceWriter::open(const std::filesystem::path& path, const Options&
     impl_->options = options;
     impl_->sim.reset();
     impl_->wall.reset();
+    impl_->next_child_rank.clear();
     next_uuid_ = 1;
     events_written_ = 0;
     bytes_written_ = 0;
@@ -350,33 +364,39 @@ uint64_t PerfettoTraceWriter::addProcessTrack(std::string_view process_name, int
     auto* td =
         impl_->newPacket(impl_->sim, /*needs_incremental_state=*/false)->set_track_descriptor();
     td->set_uuid(uuid);
+    td->set_child_ordering(pbz::TrackDescriptor::EXPLICIT);
     auto* process = td->set_process();
     process->set_pid(pid);
     process->set_process_name(chars(process_name));
     return uuid;
 }
 
-uint64_t PerfettoTraceWriter::addTrack(std::string_view name, uint64_t parent_uuid) {
+uint64_t PerfettoTraceWriter::addTrack(std::string_view name, uint64_t parent_uuid,
+                                       int32_t sibling_order_rank) {
     const uint64_t uuid = next_uuid_++;
     auto* td =
         impl_->newPacket(impl_->sim, /*needs_incremental_state=*/false)->set_track_descriptor();
     td->set_uuid(uuid);
     td->set_name(chars(name));
+    td->set_child_ordering(pbz::TrackDescriptor::EXPLICIT);
     if (parent_uuid != 0) {
         td->set_parent_uuid(parent_uuid);
+        td->set_sibling_order_rank(impl_->childRank(parent_uuid, sibling_order_rank));
     }
     return uuid;
 }
 
 uint64_t PerfettoTraceWriter::addCounterTrack(std::string_view name, std::string_view unit_name,
-                                              uint64_t parent_uuid) {
+                                              uint64_t parent_uuid, int32_t sibling_order_rank) {
     const uint64_t uuid = next_uuid_++;
     auto* td =
         impl_->newPacket(impl_->sim, /*needs_incremental_state=*/false)->set_track_descriptor();
     td->set_uuid(uuid);
     td->set_name(chars(name));
+    td->set_child_ordering(pbz::TrackDescriptor::EXPLICIT);
     if (parent_uuid != 0) {
         td->set_parent_uuid(parent_uuid);
+        td->set_sibling_order_rank(impl_->childRank(parent_uuid, sibling_order_rank));
     }
     auto* counter = td->set_counter();
     if (!unit_name.empty()) {

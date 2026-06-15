@@ -11,6 +11,7 @@
 #include <fmt/format.h>
 
 #include <cctype>
+#include <limits>
 
 #include "ObserveApi.hpp"
 
@@ -127,6 +128,52 @@ std::string_view pipelineColorKey(std::string_view source_name, std::string_view
     return id;
 }
 
+uint32_t stageGroupOrder(std::string_view stage_name) {
+    struct StageOrder {
+        std::string_view name;
+        uint32_t order;
+    };
+    static constexpr StageOrder kStageOrders[] = {
+        {"BP", 0},    {"IC", 100},  {"IF", 200},  {"DEC", 300}, {"REN", 400},
+        {"DIS", 500}, {"IQE", 600}, {"ISS", 700}, {"EXE", 800}, {"CMP", 900},
+        {"LI", 1000}, {"SI", 1100}, {"SA", 1200}, {"SR", 1300}, {"RET", 1400},
+    };
+
+    for (const auto& entry : kStageOrders) {
+        if (stage_name == entry.name) {
+            return entry.order;
+        }
+    }
+
+    uint32_t fallback = 2000;
+    for (unsigned char ch : stage_name) {
+        fallback = fallback * 33U + ch;
+    }
+    return fallback;
+}
+
+uint32_t parseStageOrder(std::string_view stage, char pipe_digit) {
+    std::string_view stage_name = stage;
+    uint32_t stage_num = 0;
+    uint32_t multiplier = 1;
+    while (!stage_name.empty() && std::isdigit(static_cast<unsigned char>(stage_name.back()))) {
+        stage_num += static_cast<uint32_t>(stage_name.back() - '0') * multiplier;
+        multiplier *= 10U;
+        stage_name.remove_suffix(1);
+    }
+
+    uint32_t pipe = 0;
+    if (pipe_digit >= '0' && pipe_digit <= '9') {
+        pipe = static_cast<uint32_t>(pipe_digit - '0');
+    }
+
+    uint64_t order = static_cast<uint64_t>(stageGroupOrder(stage_name)) + stage_num * 10ULL + pipe;
+    if (order > std::numeric_limits<uint32_t>::max()) {
+        return std::numeric_limits<uint32_t>::max();
+    }
+    return static_cast<uint32_t>(order);
+}
+
 }  // namespace
 
 bool isPipeCategory(uint32_t category) {
@@ -167,6 +214,7 @@ bool parsePipelineTraceMessage(std::string_view source_name, std::string_view me
     if (stage.empty()) {
         return false;
     }
+    out.stage_order = parseStageOrder(stage, pipe_digit);
 
     out.track_path.clear();
     out.track_path.reserve(source_name.size() + stage.size() + 8);

@@ -88,6 +88,8 @@ struct SimulationYAMLConfig {
 
     /// Keyed by instance name (path) used for port resolution.
     std::unordered_map<std::string, UnitConfig> units;
+    /// Unit instance names in YAML declaration order.
+    std::vector<std::string> unit_order;
 
     std::vector<PortConnectionSpec> connections;
 
@@ -102,6 +104,10 @@ struct SimulationYAMLConfig {
     }
 
     std::vector<std::string> unitNames() const {
+        if (!unit_order.empty()) {
+            return unit_order;
+        }
+
         std::vector<std::string> names;
         names.reserve(units.size());
         for (const auto& [name, _] : units) {

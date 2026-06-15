@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <string>
 #include <string_view>
 
 #include "ArgFormat.hpp"
@@ -27,6 +28,25 @@
 #include "PipelineTraceFormat.hpp"
 
 namespace chronon::observe {
+
+namespace {
+
+void appendInvisibleSortPrefix(std::string& out, uint32_t rank) {
+    static constexpr std::string_view kDigit[4] = {
+        "\xE2\x80\x8B",  // U+200B ZERO WIDTH SPACE
+        "\xE2\x80\x8C",  // U+200C ZERO WIDTH NON-JOINER
+        "\xE2\x80\x8D",  // U+200D ZERO WIDTH JOINER
+        "\xE2\x81\xA0",  // U+2060 WORD JOINER
+    };
+
+    // Fixed-width, big-endian base-4 encoding: raw lexicographic sorting of
+    // track names follows rank while the prefix remains invisible in the UI.
+    for (int shift = 30; shift >= 0; shift -= 2) {
+        out.append(kDigit[(rank >> shift) & 0x3U]);
+    }
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Text event formatting
@@ -83,6 +103,11 @@ uint64_t ObservationBackend::timelineTrackForSource_(uint16_t source_id) {
 }
 
 uint64_t ObservationBackend::timelineTrackForPath_(std::string_view path) {
+    return timelineTrackForPath_(path, -1);
+}
+
+uint64_t ObservationBackend::timelineTrackForPath_(std::string_view path,
+                                                   int32_t sibling_order_rank) {
     auto it = timeline_path_uuids_.find(std::string(path));
     if (it != timeline_path_uuids_.end()) {
         return it->second;
@@ -96,7 +121,16 @@ uint64_t ObservationBackend::timelineTrackForPath_(std::string_view path) {
         leaf = path.substr(dot + 1);
     }
 
-    const uint64_t uuid = perfetto_writer_->addTrack(leaf, parent);
+    std::string ranked_leaf;
+    std::string_view track_name = leaf;
+    if (sibling_order_rank >= 0) {
+        ranked_leaf.reserve(leaf.size() + 48);
+        appendInvisibleSortPrefix(ranked_leaf, static_cast<uint32_t>(sibling_order_rank));
+        ranked_leaf.append(leaf);
+        track_name = ranked_leaf;
+    }
+
+    const uint64_t uuid = perfetto_writer_->addTrack(track_name, parent, sibling_order_rank);
     timeline_path_uuids_.emplace(std::string(path), uuid);
     return uuid;
 }
@@ -130,8 +164,14 @@ void ObservationBackend::writeTraceToTimeline_(const StructuredRecord* rec,
             ann_span = std::span<const PerfettoTraceWriter::Annotation>(annotations, 1);
         }
 
-        perfetto_writer_->instant(timelineTrackForPath_(pipe.track_path), pipe.category,
-                                  pipe.event_name, rec->cycle, pipe.flow_id, ann_span);
+        constexpr uint32_t kPipeTraceRankBase = 100000;
+        constexpr uint32_t kPipeTraceUnitStride = 10000;
+        const uint32_t rank = kPipeTraceRankBase +
+                              static_cast<uint32_t>(rec->source_id) * kPipeTraceUnitStride +
+                              pipe.stage_order;
+        perfetto_writer_->instant(
+            timelineTrackForPath_(pipe.track_path, static_cast<int32_t>(rank)), pipe.category,
+            pipe.event_name, rec->cycle, pipe.flow_id, ann_span);
         local_bytes_written_ += timeline_msg_buffer_.size() + pipe.track_path.size() + 24;
         return;
     }
@@ -809,6 +849,7 @@ void ObservationBackend::initializeOutputDir_() {
             std::string process_name = config_.simulation_name.empty() ? std::string("Simulation")
                                                                        : config_.simulation_name;
             sim_process_uuid_ = perfetto_writer_->addProcessTrack(process_name, /*pid=*/1);
+            predeclareTimelineSourceTracks_();
             timeline_sink_open_.store(true, std::memory_order_release);
         } else {
             std::cerr << "[observe] failed to open timeline file " << timeline_file

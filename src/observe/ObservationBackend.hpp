@@ -241,6 +241,12 @@ private:
     /// mirrored into Perfetto's parent_uuid chain so the UI sidebar follows
     /// the design hierarchy.
     uint64_t timelineTrackForPath_(std::string_view path);
+    uint64_t timelineTrackForPath_(std::string_view path, int32_t sibling_order_rank);
+
+    /// Create source tracks in registry order once the timeline writer opens so
+    /// Perfetto's explicit sibling ranks match YAML unit order, not event arrival
+    /// or lexicographic UI sorting.
+    void predeclareTimelineSourceTracks_();
 
     /// Route a TimelineRecord (span begin/end, lane instant, counter sample)
     /// to the Perfetto timeline, maintaining the open-span table.

@@ -101,11 +101,12 @@ public:
     uint64_t addProcessTrack(std::string_view process_name, int32_t pid);
 
     /// @return Track UUID for a named track, optionally nested under @p parent_uuid.
-    uint64_t addTrack(std::string_view name, uint64_t parent_uuid = 0);
+    uint64_t addTrack(std::string_view name, uint64_t parent_uuid = 0,
+                      int32_t sibling_order_rank = -1);
 
     /// @return Track UUID for a counter track (rendered as a value graph).
     uint64_t addCounterTrack(std::string_view name, std::string_view unit_name,
-                             uint64_t parent_uuid = 0);
+                             uint64_t parent_uuid = 0, int32_t sibling_order_rank = -1);
 
     /**
      * @brief Emit a complete wall-clock slice (paired SLICE_BEGIN / SLICE_END packets).

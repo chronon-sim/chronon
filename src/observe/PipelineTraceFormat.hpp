@@ -20,6 +20,7 @@ struct PipelineTraceFields {
     std::string track_path;
     std::string category;
     std::string event_name;
+    uint32_t stage_order = 0;
     uint64_t flow_id = 0;
 };
 

@@ -141,7 +141,13 @@ private:
     void phaseConfigure(Result& result) {
         auto& registry = factory::SenderFactoryRegistry::instance();
 
-        for (const auto& [name, unit_config] : result.config.units) {
+        for (const auto& name : result.config.unitNames()) {
+            const auto* unit_config_ptr = result.config.getUnit(name);
+            if (!unit_config_ptr) {
+                throw BuildError("CONFIGURING",
+                                 "Unit order references missing unit '" + name + "'");
+            }
+            const auto& unit_config = *unit_config_ptr;
             auto* factory = registry.getFactory(unit_config.type_name);
             if (!factory) {
                 throw BuildError("CONFIGURING", "Unknown unit type '" + unit_config.type_name +
@@ -173,7 +179,12 @@ private:
     void attachObservationContexts(Result& result) {
         auto& obs_mgr = observe::ObservationManager::instance();
 
-        for (auto& [name, unit] : result.unit_map) {
+        for (const auto& name : result.config.unitNames()) {
+            auto it = result.unit_map.find(name);
+            if (it == result.unit_map.end()) {
+                continue;
+            }
+            auto* unit = it->second;
             auto* obs_unit = dynamic_cast<observe::ObservableUnit*>(unit);
             if (obs_unit) {
                 // Hierarchical fullPath() (e.g. "cpu0.fetch") gives per-instance counters.
