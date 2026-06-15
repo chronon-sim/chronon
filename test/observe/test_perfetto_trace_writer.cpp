@@ -106,7 +106,7 @@ void test_tracks_and_events() {
     const auto& instant = trace.events[2];
     CHECK(instant.type == 3 && instant.track_uuid == unit_track);
     CHECK(instant.timestamp == 123 && instant.name == "fetched 0xdeadbeef");
-    CHECK(instant.name_was_interned);
+    CHECK(!instant.name_was_interned);
 
     const auto& sample = trace.events[3];
     CHECK(sample.type == 4 && sample.track_uuid == counter_track);
@@ -137,12 +137,14 @@ void test_interning_reuse() {
     DecodedTrace trace = decodeFile(path);
     CHECK(trace.events.size() == 4);
     for (const auto& ev : trace.events) {
-        CHECK(ev.name_was_interned);
+        CHECK(!ev.name_was_interned);
     }
     CHECK(trace.events[0].name == "miss" && trace.events[1].name == "miss");
     CHECK(trace.events[2].name == "hit" && trace.events[3].name == "miss");
 
     // One sequence, 3 interned entries: "trace" category + 2 distinct names.
+    // Simulation instants still emit direct TrackEvent.name fields so Perfetto
+    // UI coloring can key off the full, non-interned event name.
     CHECK(trace.interned_entries.size() == 1);
     CHECK(trace.interned_entries.begin()->second == 3);
 

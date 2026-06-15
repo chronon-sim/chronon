@@ -18,11 +18,13 @@
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <string_view>
 
 #include "ArgFormat.hpp"
 #include "FormatRegistry.hpp"
 #include "ObservationBackend.hpp"
 #include "ObserveApi.hpp"
+#include "PipelineTraceFormat.hpp"
 
 namespace chronon::observe {
 
@@ -108,11 +110,35 @@ void ObservationBackend::writeTraceToTimeline_(const StructuredRecord* rec,
 
     timeline_msg_buffer_.clear();
     reconstructMessageTo_(timeline_msg_buffer_, fmt_info, rec, args_data, args_size);
+    const std::string_view message(timeline_msg_buffer_.data(), timeline_msg_buffer_.size());
+
+    std::string_view source_name;
+    if (rec->source_id > 0 && rec->source_id < source_name_cache_.size()) {
+        source_name = source_name_cache_[rec->source_id];
+    }
+
+    PipelineTraceFields pipe;
+    if (isPipeCategory(rec->category) && parsePipelineTraceMessage(source_name, message, pipe)) {
+        PerfettoTraceWriter::Annotation annotations[1] = {
+            {.name = "note",
+             .kind = PerfettoTraceWriter::Annotation::Kind::String,
+             .bits = 0,
+             .string = pipe.note},
+        };
+        std::span<const PerfettoTraceWriter::Annotation> ann_span;
+        if (!pipe.note.empty()) {
+            ann_span = std::span<const PerfettoTraceWriter::Annotation>(annotations, 1);
+        }
+
+        perfetto_writer_->instant(timelineTrackForPath_(pipe.track_path), pipe.category,
+                                  pipe.event_name, rec->cycle, pipe.flow_id, ann_span);
+        local_bytes_written_ += timeline_msg_buffer_.size() + pipe.track_path.size() + 24;
+        return;
+    }
 
     // 1 cycle is rendered as 1 ns on the timeline axis.
-    perfetto_writer_->instant(
-        timelineTrackForSource_(rec->source_id), "trace",
-        std::string_view(timeline_msg_buffer_.data(), timeline_msg_buffer_.size()), rec->cycle);
+    perfetto_writer_->instant(timelineTrackForSource_(rec->source_id), "trace", message,
+                              rec->cycle);
 
     local_bytes_written_ += timeline_msg_buffer_.size() + 24;
 }

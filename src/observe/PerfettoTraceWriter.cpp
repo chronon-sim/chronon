@@ -311,6 +311,9 @@ struct PerfettoTraceWriter::Impl {
                 case Kind::Pointer:
                     da->set_pointer_value(a.bits);
                     break;
+                case Kind::String:
+                    da->set_string_value(chars(a.string));
+                    break;
             }
         }
     }
@@ -471,7 +474,7 @@ void PerfettoTraceWriter::instant(uint64_t track_uuid, std::string_view category
     if (strings.category_iid != 0) {
         event->add_category_iids(strings.category_iid);
     }
-    event->set_name_iid(strings.name_iid);
+    event->set_name(chars(name));
 
     ++events_written_;
     if (impl_->packets_buffered >= FLUSH_PACKET_COUNT) {
@@ -496,7 +499,7 @@ void PerfettoTraceWriter::instant(uint64_t track_uuid, std::string_view category
     if (strings.category_iid != 0) {
         event->add_category_iids(strings.category_iid);
     }
-    event->set_name_iid(strings.name_iid);
+    event->set_name(chars(name));
     if (flow_id != 0) {
         event->add_flow_ids(flow_id);
     }

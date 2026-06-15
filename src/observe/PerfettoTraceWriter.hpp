@@ -72,11 +72,12 @@ public:
      * bit-cast int64_t for Int, bit-cast double for Double.
      */
     struct Annotation {
-        enum class Kind : uint8_t { Uint, Int, Double, Bool, Pointer };
+        enum class Kind : uint8_t { Uint, Int, Double, Bool, Pointer, String };
 
         std::string_view name;
         Kind kind;
         uint64_t bits;
+        std::string_view string = {};
     };
 
     PerfettoTraceWriter();
