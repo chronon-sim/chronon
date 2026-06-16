@@ -75,7 +75,8 @@ uint32_t resolvePipelineTrackSlow(uint16_t source_id, std::atomic<uint16_t>& cac
     }
 
     const uint32_t track_id = TimelineTrackRegistry::instance().registerTrack(
-        {track_name, /*unit=*/{}, source_id, /*lanes=*/1, TimelineTrackInfo::Kind::Lane});
+        {track_name, /*unit=*/{}, source_id, /*lanes=*/1, TimelineTrackInfo::Kind::Lane,
+         TimelineTrackInfo::Layout::Pipeline});
     entries.push_back({source_id, track_id});
     cached_track_id.store(track_id, std::memory_order_relaxed);
     cached_source_id.store(source_id, std::memory_order_relaxed);

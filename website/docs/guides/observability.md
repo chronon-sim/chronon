@@ -272,9 +272,14 @@ general debug traces. It has these properties:
   numeric id should be displayed as hexadecimal. The stored id is still a
   number; only the Perfetto event name formatting changes.
 
-Counter tracks are kept under each unit's `counters` subgroup, so dense pipeline
-stage tracks and low-frequency counters remain separately collapsible in the
-Perfetto sidebar.
+Pull-model `Counter` snapshots are kept under each unit's `counters` subgroup,
+so dense pipeline stage tracks and low-frequency counters remain separately
+collapsible in the Perfetto sidebar. Push-model timeline counters
+(`TimelineCounter`, `TimelineGauge`, `TimelineCapacity`, `observe::gauge`, and
+`observe::capacity`) are direct children of the unit track, but Chronon assigns
+Perfetto `sibling_order_rank` values by track type: first-class pipeline lanes
+come first, normal timeline lanes follow, and timeline counters come after the
+pipeline lanes regardless of which event or sample arrives first.
 
 ### Wire format
 
@@ -329,6 +334,55 @@ class LSU : public Unit, public ObservableUnit {
     }
 };
 ```
+
+For common model instrumentation, Chronon also provides a convenience layer
+that uses the same typed vocabulary as pipeline events (`"name"_ev`,
+`arg<"key">(value)`, `flow(uid)`) without requiring every call site to declare
+raw lanes and counters:
+
+```cpp
+class Decode : public Unit, public ObservableUnit {
+    TimelineSpan stall_{this, "stall"};
+    TimelineGauge fetch_occ_{this, "fetch_queue_occupancy", "entries"};
+    TimelineCapacity fetch_cap_{this, "fetch_queue", "entries"};
+
+    void tick() override {
+        // Shared "events" track under this unit.
+        event<"flush">(FLUSH, arg<"removed">(removed_count));
+
+        // Function-style entry mirrors model-level observe::pipeline wrappers.
+        observe::event<"credit_mismatch">(*this, FLOW, arg<"expected">(exp),
+                                          arg<"actual">(got));
+
+        // Boolean state helper: opens once, closes when the condition clears.
+        stall_.update(!fetch_queue_.empty() && !out_uop_queue.canSend(),
+                      STALL, "out_uop_blocked"_ev,
+                      arg<"fq_size">(fetch_queue_.size()),
+                      arg<"out_rem">(out_uop_queue.remainingThisCycle()));
+
+        // Push-model counter samples. sampleOnChange() is available when dense
+        // per-cycle samples would add noise without adding information.
+        fetch_occ_.sampleOnChange(fetch_queue_.size());
+        fetch_cap_.sampleOnChange(fetch_queue_.size(), fetch_queue_size_);
+
+        // Header-only function forms are useful for model-level wrappers.
+        observe::gauge<"rename_credits">(*this, rename_credits_, "credits");
+        observe::capacity<"fetch_queue">(*this, fetch_queue_.size(),
+                                          fetch_queue_size_, "entries");
+    }
+};
+```
+
+Use this layer for:
+
+- **single-point events** such as flushes, credit mismatches, replay markers, or
+  rare protocol transitions (`event<"flush">`, `instant<"track">`);
+- **state spans** such as stalls, blocked ports, busy functional units, or
+  waiting conditions (`TimelineSpan::update`, `spanBegin` / `spanEnd`);
+- **time-varying state** such as queue occupancy, free slots, credits, and port
+  capacity (`TimelineGauge`, `TimelineCapacity`, `gauge`, `capacity`);
+- **aggregate totals** should still use `Counter`; do not turn every counter
+  increment into a timeline event unless the timestamp itself matters.
 
 The vocabulary is deliberately SQL-shaped:
 

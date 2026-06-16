@@ -12,12 +12,14 @@
 
 #pragma once
 
+#include <string_view>
 #include <vector>
 
 #include "Counter.hpp"
 #include "ObservationContext.hpp"
 #include "ObserveApi.hpp"
 #include "PipelineApi.hpp"
+#include "TimelineObserve.hpp"
 #include "Types.hpp"
 
 namespace chronon::observe {
@@ -177,6 +179,59 @@ public:
             chronon::observe::pipeStageHex<Pipe, Stage>(observe_ctx_, category, id,
                                                         std::forward<Items>(items)...);
         }
+    }
+
+    /**
+     * Emit a low-cardinality instant event on this unit's shared "events" track.
+     */
+    template <FixedString Name, typename Cat, typename... Items>
+    void event(Cat category, Items&&... items) {
+        chronon::observe::event<Name>(*this, category, std::forward<Items>(items)...);
+    }
+
+    /**
+     * Emit an instant event on a named track under this unit.
+     */
+    template <FixedString Track, typename Cat, typename... Items>
+    void instant(Cat category, EventNameRef name, Items&&... items) {
+        chronon::observe::instant<Track>(*this, category, name, std::forward<Items>(items)...);
+    }
+
+    /**
+     * Open/close an occupancy span on a named track under this unit.
+     */
+    template <FixedString Track, typename Cat, typename... Items>
+    void spanBegin(Cat category, EventNameRef name, Items&&... items) {
+        chronon::observe::spanBegin<Track>(*this, category, name, std::forward<Items>(items)...);
+    }
+
+    template <FixedString Track, typename Cat, typename... Items>
+    void spanBegin(uint16_t slot, Cat category, EventNameRef name, Items&&... items) {
+        chronon::observe::spanBegin<Track>(*this, slot, category, name,
+                                           std::forward<Items>(items)...);
+    }
+
+    template <FixedString Track>
+    void spanEnd() {
+        chronon::observe::spanEnd<Track>(*this);
+    }
+
+    template <FixedString Track>
+    void spanEnd(uint16_t slot) {
+        chronon::observe::spanEnd<Track>(*this, slot);
+    }
+
+    /**
+     * Emit push-model counter samples under this unit.
+     */
+    template <FixedString Name, typename T>
+    void gauge(T value, std::string_view unit_name = {}) {
+        chronon::observe::gauge<Name>(*this, value, unit_name);
+    }
+
+    template <FixedString Name, typename Used, typename Capacity>
+    void capacity(Used used, Capacity total, std::string_view unit_name = {}) {
+        chronon::observe::capacity<Name>(*this, used, total, unit_name);
     }
 
     /**

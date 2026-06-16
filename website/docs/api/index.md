@@ -27,7 +27,8 @@ Auto-generated C++ API documentation from source code using Doxygen.
 | `Connection<T>` | `chronon/Port.hpp` | Port-to-port connection with configurable delay |
 | `Counter` | `chronon/Observe.hpp` | Per-unit performance counter |
 | `ObservableUnit` | `chronon/Observe.hpp` | Mixin for units with observability |
-| `TimelineLane` / `TimelineCounter` | `chronon/Observe.hpp` | Perfetto occupancy spans and push-model counter tracks |
+| `TimelineLane` / `TimelineCounter` | `chronon/Observe.hpp` | Perfetto occupancy spans and ordered push-model counter tracks |
+| `TimelineSpan` / `TimelineGauge` / `TimelineCapacity` | `chronon/Observe.hpp` | Convenience helpers for Perfetto events, stalls, occupancy, and free capacity |
 | Pipeline trace primitives | `chronon/Observe.hpp` | Typed one-cycle pipeline slices for model-level `observe::pipeline` wrappers |
 | `Param<T>` | `chronon/Params.hpp` | Self-registering parameter wrapper |
 | `SimulationApp` | `chronon/SimulationApp.hpp` | Unified CLI entry point |

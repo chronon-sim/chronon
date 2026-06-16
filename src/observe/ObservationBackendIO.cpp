@@ -46,6 +46,20 @@ void appendInvisibleSortPrefix(std::string& out, uint32_t rank) {
     }
 }
 
+int32_t timelineTrackRank(uint32_t track_id, const TimelineTrackInfo& info) {
+    constexpr int32_t kPipelineRankBase = 10'000;
+    constexpr int32_t kLaneRankBase = 50'000'000;
+    constexpr int32_t kCounterRankBase = 90'000'000;
+
+    if (info.kind == TimelineTrackInfo::Kind::Counter) {
+        return kCounterRankBase + static_cast<int32_t>(track_id);
+    }
+    if (info.layout == TimelineTrackInfo::Layout::Pipeline) {
+        return kPipelineRankBase + static_cast<int32_t>(track_id);
+    }
+    return kLaneRankBase + static_cast<int32_t>(track_id);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -257,7 +271,8 @@ uint64_t ObservationBackend::timelineSlotTrack_(uint32_t track_id, uint16_t slot
 
     if (info.kind == TimelineTrackInfo::Kind::Counter) {
         if (uuids.single == 0) {
-            uuids.single = perfetto_writer_->addCounterTrack(info.name, info.unit, parent);
+            uuids.single = perfetto_writer_->addCounterTrack(info.name, info.unit, parent,
+                                                             timelineTrackRank(track_id, info));
         }
         return uuids.single;
     }
@@ -265,13 +280,15 @@ uint64_t ObservationBackend::timelineSlotTrack_(uint32_t track_id, uint16_t slot
     if (info.lanes <= 1) {
         if (uuids.single == 0) {
             std::string_view name = info.name.empty() ? std::string_view("lane") : info.name;
-            uuids.single = perfetto_writer_->addTrack(name, parent);
+            uuids.single =
+                perfetto_writer_->addTrack(name, parent, timelineTrackRank(track_id, info));
         }
         return uuids.single;
     }
 
     if (uuids.group == 0) {
-        uuids.group = perfetto_writer_->addTrack(info.name, parent);
+        uuids.group =
+            perfetto_writer_->addTrack(info.name, parent, timelineTrackRank(track_id, info));
     }
     if (slot >= uuids.slots.size()) {
         uuids.slots.resize(static_cast<size_t>(slot) + 1, 0);
@@ -281,8 +298,8 @@ uint64_t ObservationBackend::timelineSlotTrack_(uint32_t track_id, uint16_t slot
         timeline_msg_buffer_.clear();
         fmt::format_to(std::back_inserter(timeline_msg_buffer_), "{}[{}]", info.name, slot);
         slot_uuid = perfetto_writer_->addTrack(
-            std::string_view(timeline_msg_buffer_.data(), timeline_msg_buffer_.size()),
-            uuids.group);
+            std::string_view(timeline_msg_buffer_.data(), timeline_msg_buffer_.size()), uuids.group,
+            static_cast<int32_t>(slot));
     }
     return slot_uuid;
 }
