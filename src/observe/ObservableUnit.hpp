@@ -17,6 +17,7 @@
 #include "Counter.hpp"
 #include "ObservationContext.hpp"
 #include "ObserveApi.hpp"
+#include "PipelineApi.hpp"
 #include "Types.hpp"
 
 namespace chronon::observe {
@@ -144,6 +145,37 @@ public:
         if (observe_ctx_ && observe_ctx_->shouldTrace(category)) {
             observe_ctx_->setCurrentCycleValue(getObserveCycle());
             chronon::observe::trace<Fmt>(observe_ctx_, category, std::forward<Args>(args)...);
+        }
+    }
+
+    /**
+     * Emit a first-class pipeline slice whose pipe/stage are compile-time constants.
+     * The item id is both the visible Perfetto slice name and the flow id.
+     */
+    template <uint16_t Pipe, uint16_t Stage, typename Cat, typename... Items>
+    void pipe(Cat category, uint64_t id, Items&&... items) {
+        if (observe_ctx_) {
+            observe_ctx_->setCurrentCycleValue(getObserveCycle());
+            chronon::observe::pipe<Pipe, Stage>(observe_ctx_, category, id,
+                                                std::forward<Items>(items)...);
+        }
+    }
+
+    template <uint16_t Pipe, FixedString Stage, typename Cat, typename... Items>
+    void pipeStage(Cat category, uint64_t id, Items&&... items) {
+        if (observe_ctx_) {
+            observe_ctx_->setCurrentCycleValue(getObserveCycle());
+            chronon::observe::pipeStage<Pipe, Stage>(observe_ctx_, category, id,
+                                                     std::forward<Items>(items)...);
+        }
+    }
+
+    template <uint16_t Pipe, FixedString Stage, typename Cat, typename... Items>
+    void pipeStageHex(Cat category, uint64_t id, Items&&... items) {
+        if (observe_ctx_) {
+            observe_ctx_->setCurrentCycleValue(getObserveCycle());
+            chronon::observe::pipeStageHex<Pipe, Stage>(observe_ctx_, category, id,
+                                                        std::forward<Items>(items)...);
         }
     }
 

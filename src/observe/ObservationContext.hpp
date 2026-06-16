@@ -202,7 +202,7 @@ public:
      */
     void timelineEvent(CategoryMask category, TimelineEventKind kind, uint32_t track_id,
                        uint16_t slot, uint16_t name_id, uint64_t payload,
-                       const TimelineArgValue* args, size_t arg_count) noexcept {
+                       const TimelineArgValue* args, size_t arg_count, uint8_t flags = 0) noexcept {
         const bool allowed =
             (kind == TimelineEventKind::SpanEnd)
                 ? filter_.shouldObserve(category | category::TRACE)
@@ -225,7 +225,7 @@ public:
                 return;
             }
             fillTimelineRecord_(dest, category, kind, track_id, slot, name_id, payload, args,
-                                arg_count);
+                                arg_count, flags);
             lookahead_buffer_.commitReservedRecord(total_size);
             stats_.recordEmit<ObservationChannel::Trace>();
             return;
@@ -254,7 +254,7 @@ public:
         header->padding = 0;
 
         fillTimelineRecord_(ptr + sizeof(ObservationQueue::RecordHeader), category, kind, track_id,
-                            slot, name_id, payload, args, arg_count);
+                            slot, name_id, payload, args, arg_count, flags);
 
         ctx->queue().finishAndCommitWrite(aligned_size);
         stats_.recordEmit<ObservationChannel::Trace>();
@@ -263,7 +263,8 @@ public:
 private:
     void fillTimelineRecord_(std::byte* dest, CategoryMask category, TimelineEventKind kind,
                              uint32_t track_id, uint16_t slot, uint16_t name_id, uint64_t payload,
-                             const TimelineArgValue* args, size_t arg_count) noexcept {
+                             const TimelineArgValue* args, size_t arg_count,
+                             uint8_t flags) noexcept {
         auto* rec = reinterpret_cast<TimelineRecord*>(dest);
         rec->cycle = currentCycle();
         rec->payload = payload;
@@ -278,6 +279,7 @@ private:
         rec->category_bit = user_bits != 0 ? static_cast<uint8_t>(std::countr_zero(user_bits))
                                            : TIMELINE_NO_CATEGORY;
         std::memset(rec->padding, 0, sizeof(rec->padding));
+        rec->padding[0] = flags;
 
         std::byte* arg_dest = dest + sizeof(TimelineRecord);
         for (size_t i = 0; i < arg_count; ++i) {

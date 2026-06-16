@@ -20,11 +20,15 @@ struct PipelineTraceFields {
     std::string track_path;
     std::string category;
     std::string event_name;
-    uint32_t stage_order = 0;
     uint64_t flow_id = 0;
 };
 
 bool isPipeCategory(uint32_t category);
+
+uint64_t pipelineColorHash(uint64_t id);
+uint64_t pipelineColorHash(std::string_view key);
+std::string pipelineColorCategory(uint64_t color_hash);
+std::string pipelineColoredEventName(std::string_view visible_name, uint64_t color_hash);
 
 bool parsePipelineTraceMessage(std::string_view source_name, std::string_view message,
                                PipelineTraceFields& out);

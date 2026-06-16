@@ -39,6 +39,7 @@ enum class TimelineEventKind : uint8_t {
     SpanBegin = 1,
     SpanEnd = 2,
     CounterSample = 3,
+    PipelineSlice = 4,  ///< One-cycle pipeline occupancy slice; payload is item id.
 };
 
 /**
@@ -51,6 +52,7 @@ enum class TimelineEventKind : uint8_t {
  */
 /// Sentinel for TimelineRecord::category_bit: no user category.
 constexpr uint8_t TIMELINE_NO_CATEGORY = 0xFF;
+constexpr uint8_t TIMELINE_FLAG_NAME_HEX = 1u << 0;
 
 struct TimelineRecord {
     uint64_t cycle;

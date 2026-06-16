@@ -31,6 +31,7 @@
 
 // Modern macro-free API
 #include "ObserveApi.hpp"
+#include "PipelineApi.hpp"
 
 // Unit mixin
 #include "ObservableUnit.hpp"

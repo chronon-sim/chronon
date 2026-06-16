@@ -11,7 +11,6 @@
 #include <fmt/format.h>
 
 #include <cctype>
-#include <limits>
 
 #include "ObserveApi.hpp"
 
@@ -74,12 +73,7 @@ uint64_t hashColorKey(std::string_view key) {
     return mixColorKey(hash);
 }
 
-std::string colorCategory(std::string_view key) {
-    return fmt::format("c{:016x}", hashColorKey(key));
-}
-
-void appendInvisibleColorSuffix(std::string& out, std::string_view key) {
-    uint64_t hash = hashColorKey(key);
+void appendInvisibleColorSuffix(std::string& out, uint64_t hash) {
     static constexpr std::string_view kInvisible[4] = {
         "\xE2\x80\x8B",  // U+200B ZERO WIDTH SPACE
         "\xE2\x80\x8C",  // U+200C ZERO WIDTH NON-JOINER
@@ -92,89 +86,26 @@ void appendInvisibleColorSuffix(std::string& out, std::string_view key) {
     }
 }
 
-std::string coloredEventName(std::string_view visible_name, std::string_view color_key) {
-    std::string name(visible_name);
-    appendInvisibleColorSuffix(name, color_key);
-    return name;
-}
-
-std::string_view findNoteValue(std::string_view note, std::string_view key) {
-    const size_t start = note.find(key);
-    if (start == std::string_view::npos) {
-        return {};
-    }
-
-    const size_t value_start = start + key.size();
-    size_t value_end = value_start;
-    while (value_end < note.size() && !std::isspace(static_cast<unsigned char>(note[value_end]))) {
-        ++value_end;
-    }
-    return note.substr(value_start, value_end - value_start);
-}
-
-std::string_view pipelineColorKey(std::string_view source_name, std::string_view id,
-                                  std::string_view note) {
-    if (source_name.find(".lsu") != std::string_view::npos) {
-        if (auto pa = findNoteValue(note, "pa="); !pa.empty()) {
-            return pa;
-        }
-        if (auto va = findNoteValue(note, "va="); !va.empty()) {
-            return va;
-        }
-        if (auto pc = findNoteValue(note, "pc="); !pc.empty()) {
-            return pc;
-        }
-    }
+std::string_view pipelineColorKey(std::string_view /*source_name*/, std::string_view id,
+                                  std::string_view /*note*/) {
     return id;
 }
 
-uint32_t stageGroupOrder(std::string_view stage_name) {
-    struct StageOrder {
-        std::string_view name;
-        uint32_t order;
-    };
-    static constexpr StageOrder kStageOrders[] = {
-        {"BP", 0},    {"IC", 100},  {"IF", 200},  {"DEC", 300}, {"REN", 400},
-        {"DIS", 500}, {"IQE", 600}, {"ISS", 700}, {"EXE", 800}, {"CMP", 900},
-        {"LI", 1000}, {"SI", 1100}, {"SA", 1200}, {"SR", 1300}, {"RET", 1400},
-    };
-
-    for (const auto& entry : kStageOrders) {
-        if (stage_name == entry.name) {
-            return entry.order;
-        }
-    }
-
-    uint32_t fallback = 2000;
-    for (unsigned char ch : stage_name) {
-        fallback = fallback * 33U + ch;
-    }
-    return fallback;
-}
-
-uint32_t parseStageOrder(std::string_view stage, char pipe_digit) {
-    std::string_view stage_name = stage;
-    uint32_t stage_num = 0;
-    uint32_t multiplier = 1;
-    while (!stage_name.empty() && std::isdigit(static_cast<unsigned char>(stage_name.back()))) {
-        stage_num += static_cast<uint32_t>(stage_name.back() - '0') * multiplier;
-        multiplier *= 10U;
-        stage_name.remove_suffix(1);
-    }
-
-    uint32_t pipe = 0;
-    if (pipe_digit >= '0' && pipe_digit <= '9') {
-        pipe = static_cast<uint32_t>(pipe_digit - '0');
-    }
-
-    uint64_t order = static_cast<uint64_t>(stageGroupOrder(stage_name)) + stage_num * 10ULL + pipe;
-    if (order > std::numeric_limits<uint32_t>::max()) {
-        return std::numeric_limits<uint32_t>::max();
-    }
-    return static_cast<uint32_t>(order);
-}
-
 }  // namespace
+
+uint64_t pipelineColorHash(uint64_t id) { return mixColorKey(id); }
+
+uint64_t pipelineColorHash(std::string_view key) { return hashColorKey(key); }
+
+std::string pipelineColorCategory(uint64_t color_hash) {
+    return fmt::format("c{:016x}", color_hash);
+}
+
+std::string pipelineColoredEventName(std::string_view visible_name, uint64_t color_hash) {
+    std::string name(visible_name);
+    appendInvisibleColorSuffix(name, color_hash);
+    return name;
+}
 
 bool isPipeCategory(uint32_t category) {
     for (const auto& entry : CategoryRegistry::instance().entries()) {
@@ -214,8 +145,6 @@ bool parsePipelineTraceMessage(std::string_view source_name, std::string_view me
     if (stage.empty()) {
         return false;
     }
-    out.stage_order = parseStageOrder(stage, pipe_digit);
-
     out.track_path.clear();
     out.track_path.reserve(source_name.size() + stage.size() + 8);
     std::string_view source = source_name.empty() ? std::string_view("unknown") : source_name;
@@ -230,8 +159,9 @@ bool parsePipelineTraceMessage(std::string_view source_name, std::string_view me
     }
 
     const std::string_view color_key = pipelineColorKey(source_name, out.id, out.note);
-    out.category = colorCategory(color_key);
-    out.event_name = coloredEventName(out.id, color_key);
+    const uint64_t color_hash = pipelineColorHash(color_key);
+    out.category = pipelineColorCategory(color_hash);
+    out.event_name = pipelineColoredEventName(out.id, color_hash);
 
     out.flow_id = 0;
     (void)parseFlowId(out.id, out.flow_id);
