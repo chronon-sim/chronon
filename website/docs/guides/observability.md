@@ -12,6 +12,7 @@ Chronon provides a unified observability system with three integrated capabiliti
 |---------|---------|-----|----------|
 | Counters | Statistics collection | `++counter_` / `counter_ += n` | ~1-2ns |
 | Traces | Structured event capture | `trace<"fmt">(CAT, ...)` | ~2ns disabled |
+| Pipeline traces | Typed one-cycle pipeline slices | model-level `observe::pipeline<"STAGE">(...)` | fixed record + typed args |
 | Logs | Debug output | `debug<"fmt">(...)` | ~2ns disabled |
 
 ## Design Principles
@@ -173,8 +174,9 @@ The timeline contains:
 - **Timeline lanes** — occupancy spans, lane instants, and push-model counter
   samples emitted through the declarative `TimelineLane` / `TimelineCounter`
   members (see below), nested under their owning unit's track.
-- **Counter tracks** — one Perfetto counter track per `unit.counter`, sampled
-  at counter dump cycles.
+- **Counter tracks** — one Perfetto counter track per counter, sampled
+  at counter dump cycles and nested under each unit's collapsible `counters`
+  subgroup (`unit.counters.counter_name`).
 - **Scheduler execution timeline** — when enabled, wall-clock
   unit/wait/epoch/arbitration slices under a "Chronon Scheduler" process
   group, with one lane per worker stream plus a `scheduler` lane. Slices
@@ -184,6 +186,95 @@ The timeline contains:
 The file is produced by `src/observe/PerfettoTraceWriter`, a thin wrapper over
 the Perfetto SDK's protozero message writers (no tracing session or category
 registration — packets are written straight to the file).
+
+## Pipeline Trace Events
+
+For cycle-by-cycle pipeline visualization, prefer typed pipeline events over
+encoding pipeline state into formatted trace strings. Traditional trace calls
+such as:
+
+```cpp
+trace<"{}DEC#{};pc=0x{:x} op=0x{:x}">(PIPE, lane, inst.uid, inst.pc, inst.opcode);
+```
+
+work as text, but they force the Perfetto backend to reconstruct structure by
+parsing the formatted message: stage name, pipe/lane, item id, and annotations
+are all hidden inside one string. That is fragile and pushes formatting work
+onto the hot path.
+
+A model should instead expose a small category-binding wrapper, conventionally
+named `observe::pipeline`, on top of Chronon's typed pipeline event primitive.
+The wrapper keeps the call site semantic while the queued record stays
+structured and numeric:
+
+```cpp
+// Instruction uid is the item id; rendered as a one-cycle slice named "1234".
+observe::pipeline<"DEC">(*this,
+                         observe::pipeSlot(lane),
+                         inst.uid,
+                         observe::arg<"pc">(inst.pc),
+                         observe::arg<"op">(inst.opcode));
+
+// Program counter is the item id; stored as uint64_t, rendered as hex in Perfetto.
+observe::pipeline<"BP0">(*this,
+                         observe::pc(fetch_pc),
+                         observe::arg<"seq">(fetch_seq));
+
+// Runtime pipe/lane selection is explicit and typed.
+observe::pipeline<"IF0">(*this,
+                         observe::pipeSlot(if_pipe),
+                         observe::pc(fetch_pc),
+                         observe::arg<"src">(source_id));
+```
+
+The recommended wrapper shape is:
+
+```cpp
+namespace my_model::observe {
+using namespace chronon::observe;
+
+inline const auto PIPE = Category<"pipe", "Pipeline visualization events">{};
+
+struct PipeSlot { uint16_t value = 0; };
+struct PipelineItem { uint64_t value = 0; bool hex_name = false; };
+
+constexpr PipeSlot pipeSlot(uint64_t value) noexcept {
+    return {static_cast<uint16_t>(value)};
+}
+constexpr PipelineItem uid(uint64_t value) noexcept { return {value, false}; }
+constexpr PipelineItem item(uint64_t value) noexcept { return {value, false}; }
+constexpr PipelineItem pc(uint64_t value) noexcept { return {value, true}; }
+
+// Dispatch pipeSlot.value to pipeStage<N, Stage>(...) or pipeStageHex<N, Stage>(...).
+template <FixedString Stage, typename Unit, typename Id, typename... Args>
+void pipeline(Unit& unit, PipeSlot pipe, Id id, Args&&... args);
+
+template <FixedString Stage, typename Unit, typename Id, typename... Args>
+void pipeline(Unit& unit, Id id, Args&&... args);  // defaults to pipe 0
+}
+```
+
+This API is intended to replace pipeline-specific `trace<>()` formatting, not
+general debug traces. It has these properties:
+
+- **Structured hot path** — stage and pipe are compile-time/template state or a
+  small runtime integer; the record carries a numeric item id plus typed
+  annotations. No backend text parsing is required for new pipeline events.
+- **One-cycle slices** — pipeline events render as `[cycle, cycle + 1)` slices,
+  matching hardware stage occupancy better than point instants.
+- **Stable coloring and flow** — the numeric item id is also the Perfetto flow
+  id and color key, so the same instruction/transaction keeps the same color
+  across units, pipes, and stages.
+- **Typed annotations** — details such as `pc`, `op`, `seq`, `addr`, `hit`, or
+  `latency` are queryable debug annotations instead of substrings in the event
+  name.
+- **Display policy is explicit at the item type** — use `pc(value)` when the
+  numeric id should be displayed as hexadecimal. The stored id is still a
+  number; only the Perfetto event name formatting changes.
+
+Counter tracks are kept under each unit's `counters` subgroup, so dense pipeline
+stage tracks and low-frequency counters remain separately collapsible in the
+Perfetto sidebar.
 
 ### Wire format
 
