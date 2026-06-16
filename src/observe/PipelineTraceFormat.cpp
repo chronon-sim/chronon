@@ -133,11 +133,14 @@ bool parsePipelineTraceMessage(std::string_view source_name, std::string_view me
     }
 
     size_t stage_start = 0;
-    char pipe_digit = '\0';
+    std::string_view pipe_id;
     const unsigned char first = static_cast<unsigned char>(header.front());
     if (std::isdigit(first)) {
-        pipe_digit = static_cast<char>(first);
-        stage_start = 1;
+        while (stage_start < header.size() &&
+               std::isdigit(static_cast<unsigned char>(header[stage_start]))) {
+            ++stage_start;
+        }
+        pipe_id = header.substr(0, stage_start);
     } else if (header.front() == '-') {
         stage_start = 1;
     }
@@ -146,16 +149,14 @@ bool parsePipelineTraceMessage(std::string_view source_name, std::string_view me
         return false;
     }
     out.track_path.clear();
-    out.track_path.reserve(source_name.size() + stage.size() + 8);
     std::string_view source = source_name.empty() ? std::string_view("unknown") : source_name;
-    for (char ch : source) {
-        out.track_path.push_back(ch == '.' ? '/' : ch);
-    }
-    out.track_path.push_back(' ');
+    out.track_path.reserve(source.size() + stage.size() + pipe_id.size() + 8);
+    out.track_path.append(source);
+    out.track_path.push_back('.');
     out.track_path.append(stage);
-    if (pipe_digit != '\0') {
+    if (!pipe_id.empty()) {
         out.track_path.append(" pipe");
-        out.track_path.push_back(pipe_digit);
+        out.track_path.append(pipe_id);
     }
 
     const std::string_view color_key = pipelineColorKey(source_name, out.id, out.note);

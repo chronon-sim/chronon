@@ -29,6 +29,7 @@
 #include "observe/ObservationContext.hpp"
 #include "observe/ObservationQueue.hpp"
 #include "observe/ObserveApi.hpp"
+#include "observe/PipelineTraceFormat.hpp"
 #include "observe/ThreadContextManager.hpp"
 #include "observe/TimelineObserve.hpp"
 #include "observe/TimelineTrack.hpp"
@@ -71,6 +72,24 @@ const DecodedTrack* childTrack(const DecodedTrace& trace, std::string_view name,
         }
     }
     return nullptr;
+}
+
+void test_legacy_pipeline_parser() {
+    std::cout << "Testing legacy pipeline trace parser... ";
+
+    PipelineTraceFields pipe;
+    CHECK(parsePipelineTraceMessage("simulation.fetch", "12DEC#42;pc=0x100", pipe));
+    CHECK(pipe.track_path == "simulation.fetch.DEC pipe12");
+    CHECK(pipe.id == "42");
+    CHECK(pipe.note == "pc=0x100");
+    CHECK(pipe.flow_id == 42);
+
+    CHECK(parsePipelineTraceMessage("", "BP0#0x2a", pipe));
+    CHECK(pipe.track_path == "unknown.BP0");
+    CHECK(pipe.id == "0x2a");
+    CHECK(pipe.flow_id == 0x2a);
+
+    std::cout << "PASSED\n";
 }
 
 void test_lanes_end_to_end() {
@@ -711,6 +730,7 @@ void measure_producer_cost() {
 int main() {
     std::cout << "=== Timeline API Tests ===\n";
 
+    test_legacy_pipeline_parser();
     test_lanes_end_to_end();
     test_path_track_hierarchy();
     test_high_bit_category();
