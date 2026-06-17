@@ -196,6 +196,9 @@ void ObservationBackend::writeTraceToTimeline_(const StructuredRecord* rec,
     // 1 cycle is rendered as 1 ns on the timeline axis.
     perfetto_writer_->instant(timelineTrackForSource_(rec->source_id), "trace", message,
                               rec->cycle);
+    if (rec->cycle > timeline_max_cycle_) {
+        timeline_max_cycle_ = rec->cycle;
+    }
 
     local_bytes_written_ += timeline_msg_buffer_.size() + 24;
 }
@@ -221,6 +224,9 @@ void ObservationBackend::writeCounterToTimeline_(uint64_t cycle, std::string_vie
     }
 
     perfetto_writer_->counterValue(it->second, cycle, static_cast<int64_t>(value));
+    if (cycle > timeline_max_cycle_) {
+        timeline_max_cycle_ = cycle;
+    }
     local_bytes_written_ += 24;
 }
 

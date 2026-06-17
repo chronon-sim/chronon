@@ -368,7 +368,7 @@ void test_high_bit_legacy_pipe_category() {
 
     {
         ObservationContext ctx(&queue, []() { return 0ULL; }, 0, "cpu0.fetch", 1);
-        ctx.enableCategory(category::TRACE | PIPE_CAT.mask());
+        ctx.enableCategory(category::TRACE | PIPE_CAT.mask() | LANE_CAT.mask());
 
         TestUnit unit;
         unit.setObservationContext(&ctx);
@@ -376,6 +376,8 @@ void test_high_bit_legacy_pipe_category() {
         unit.mshr.begin(0, PIPE_CAT, "dangling"_ev);
         unit.cycle = 7;
         unit.trace<"12DEC#42;pc=0x100">(PIPE_CAT);
+        unit.cycle = 9;
+        unit.trace<"ordinary trace">(LANE_CAT);
 
         ThreadContextManager::instance().flushAll();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -410,7 +412,7 @@ void test_high_bit_legacy_pipe_category() {
     auto mshr_events = eventsOn(trace, mshr0->uuid);
     CHECK(mshr_events.size() == 2);
     CHECK(mshr_events[0].type == 1 && mshr_events[0].timestamp == 3);
-    CHECK(mshr_events[1].type == 2 && mshr_events[1].timestamp == 8);
+    CHECK(mshr_events[1].type == 2 && mshr_events[1].timestamp == 9);
 
     std::filesystem::remove_all(out_dir);
     std::cout << "PASSED\n";
