@@ -523,7 +523,7 @@ void PerfettoTraceWriter::instant(uint64_t track_uuid, std::string_view category
     if (strings.category_iid != 0) {
         event->add_category_iids(strings.category_iid);
     }
-    event->set_name(chars(name));
+    event->set_name_iid(strings.name_iid);
     if (flow_id != 0) {
         event->add_flow_ids(flow_id);
     }

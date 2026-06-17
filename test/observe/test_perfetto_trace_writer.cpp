@@ -452,6 +452,7 @@ void test_slices_flows_typed_annotations() {
 
     const auto& replay = trace.events[2];
     CHECK(replay.type == 3 && replay.timestamp == 150);
+    CHECK(replay.name == "replay" && replay.name_was_interned);
     CHECK(replay.flow_ids.size() == 1 && replay.flow_ids[0] == 777);
 
     // Same sequence (cycle clock) for all three; deltas on the wire.
