@@ -372,6 +372,8 @@ void test_high_bit_legacy_pipe_category() {
 
         TestUnit unit;
         unit.setObservationContext(&ctx);
+        unit.cycle = 3;
+        unit.mshr.begin(0, PIPE_CAT, "dangling"_ev);
         unit.cycle = 7;
         unit.trace<"12DEC#42;pc=0x100">(PIPE_CAT);
 
@@ -400,6 +402,15 @@ void test_high_bit_legacy_pipe_category() {
     CHECK(events[0].type == 1 && events[0].timestamp == 7);
     CHECK(events[0].name.starts_with("42"));
     CHECK(events[1].type == 2 && events[1].timestamp == 8);
+
+    const DecodedTrack* mshr = childTrack(trace, "mshr", fetch->uuid);
+    CHECK(mshr != nullptr);
+    const DecodedTrack* mshr0 = childTrack(trace, "mshr[0]", mshr->uuid);
+    CHECK(mshr0 != nullptr);
+    auto mshr_events = eventsOn(trace, mshr0->uuid);
+    CHECK(mshr_events.size() == 2);
+    CHECK(mshr_events[0].type == 1 && mshr_events[0].timestamp == 3);
+    CHECK(mshr_events[1].type == 2 && mshr_events[1].timestamp == 8);
 
     std::filesystem::remove_all(out_dir);
     std::cout << "PASSED\n";

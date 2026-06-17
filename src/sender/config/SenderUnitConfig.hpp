@@ -10,6 +10,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -104,14 +105,17 @@ struct SimulationYAMLConfig {
     }
 
     std::vector<std::string> unitNames() const {
-        if (!unit_order.empty()) {
-            return unit_order;
-        }
-
         std::vector<std::string> names;
         names.reserve(units.size());
-        for (const auto& [name, _] : units) {
+
+        for (const auto& name : unit_order) {
             names.push_back(name);
+        }
+
+        for (const auto& [name, _] : units) {
+            if (std::find(names.begin(), names.end(), name) == names.end()) {
+                names.push_back(name);
+            }
         }
         return names;
     }

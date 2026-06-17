@@ -184,7 +184,11 @@ void ObservationBackend::writeTraceToTimeline_(const StructuredRecord* rec,
             timelineTrackForPath_(pipe.track_path, static_cast<int32_t>(rank));
         perfetto_writer_->sliceBegin(track_uuid, pipe.category, pipe.event_name, rec->cycle,
                                      pipe.flow_id, ann_span);
-        perfetto_writer_->sliceEnd(track_uuid, rec->cycle + 1);
+        const uint64_t end_cycle = rec->cycle + 1;
+        perfetto_writer_->sliceEnd(track_uuid, end_cycle);
+        if (end_cycle > timeline_max_cycle_) {
+            timeline_max_cycle_ = end_cycle;
+        }
         local_bytes_written_ += timeline_msg_buffer_.size() + pipe.track_path.size() + 32;
         return;
     }
@@ -370,7 +374,11 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
             const std::string event_name = pipelineColoredEventName(visible_name, color_hash);
             perfetto_writer_->sliceBegin(track_uuid, category, event_name, rec.cycle, rec.payload,
                                          ann_span);
-            perfetto_writer_->sliceEnd(track_uuid, rec.cycle + 1);
+            const uint64_t end_cycle = rec.cycle + 1;
+            perfetto_writer_->sliceEnd(track_uuid, end_cycle);
+            if (end_cycle > timeline_max_cycle_) {
+                timeline_max_cycle_ = end_cycle;
+            }
             break;
         }
 
