@@ -246,9 +246,12 @@ struct PerfettoTraceWriter::Impl {
     EventStrings internEventStrings(SequenceState& seq, pbz::TracePacket* pkt,
                                     std::string_view category, std::string_view name,
                                     const std::string_view* annotation_names_used,
-                                    size_t annotation_count, uint64_t* annotation_iids) {
+                                    size_t annotation_count, uint64_t* annotation_iids,
+                                    bool intern_name = true) {
         EventStrings out;
-        std::tie(out.name_iid, out.name_new) = seq.event_names.intern(name);
+        if (intern_name) {
+            std::tie(out.name_iid, out.name_new) = seq.event_names.intern(name);
+        }
         if (!category.empty()) {
             std::tie(out.category_iid, out.category_new) = seq.categories.intern(category);
         }
@@ -268,7 +271,7 @@ struct PerfettoTraceWriter::Impl {
                 entry->set_iid(out.category_iid);
                 entry->set_name(chars(category));
             }
-            if (out.name_new) {
+            if (intern_name && out.name_new) {
                 auto* entry = interned->add_event_names();
                 entry->set_iid(out.name_iid);
                 entry->set_name(chars(name));
@@ -487,7 +490,8 @@ void PerfettoTraceWriter::instant(uint64_t track_uuid, std::string_view category
     }
 
     auto* pkt = impl_->newSimEventPacket(cycle);
-    auto strings = impl_->internEventStrings(impl_->sim, pkt, category, name, nullptr, 0, nullptr);
+    auto strings = impl_->internEventStrings(impl_->sim, pkt, category, name, nullptr, 0, nullptr,
+                                             /*intern_name=*/false);
     auto* event = pkt->set_track_event();
     event->set_type(pbz::TrackEvent::TYPE_INSTANT);
     event->set_track_uuid(track_uuid);

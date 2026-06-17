@@ -142,11 +142,10 @@ void test_interning_reuse() {
     CHECK(trace.events[0].name == "miss" && trace.events[1].name == "miss");
     CHECK(trace.events[2].name == "hit" && trace.events[3].name == "miss");
 
-    // One sequence, 3 interned entries: "trace" category + 2 distinct names.
-    // Simulation instants still emit direct TrackEvent.name fields so Perfetto
-    // UI coloring can key off the full, non-interned event name.
+    // One sequence, one interned entry: the "trace" category. Simulation
+    // instants emit direct TrackEvent.name fields and do not fill event_names.
     CHECK(trace.interned_entries.size() == 1);
-    CHECK(trace.interned_entries.begin()->second == 3);
+    CHECK(trace.interned_entries.begin()->second == 1);
 
     std::filesystem::remove(path);
     std::cout << "PASSED\n";
@@ -221,15 +220,16 @@ void test_incremental_state_checkpoints() {
               trace.cycle_clock_snapshots[i - 1].timestamp);
         CHECK(trace.cycle_clock_snapshots[i].is_incremental);
     }
-    // Interning restarted after each clear → more entries than distinct strings.
-    CHECK(trace.interned_entries.at(sim_seq) == 2 * trace.state_clears.at(sim_seq));
+    // Interning restarted after each clear; direct instant names stay out of
+    // event_names, so only the category is re-interned per epoch.
+    CHECK(trace.interned_entries.at(sim_seq) == trace.state_clears.at(sim_seq));
 
     std::filesystem::remove(path);
     std::cout << "PASSED\n";
 }
 
-void test_intern_cap_forces_checkpoint() {
-    std::cout << "Testing intern-table cap... ";
+void test_direct_names_do_not_fill_intern_cap() {
+    std::cout << "Testing direct instant names skip intern-table cap... ";
 
     auto path = tempFile("chronon_pftrace_interncap_test.pftrace");
     PerfettoTraceWriter writer;
@@ -250,7 +250,8 @@ void test_intern_cap_forces_checkpoint() {
         CHECK(trace.events[i].timestamp == i);
     }
     uint32_t sim_seq = trace.events[0].sequence_id;
-    CHECK(trace.state_clears.at(sim_seq) > 1);
+    CHECK(trace.state_clears.at(sim_seq) == 1);
+    CHECK(trace.interned_entries.at(sim_seq) == 1);
 
     std::filesystem::remove(path);
     std::cout << "PASSED\n";
@@ -319,8 +320,8 @@ void test_compressed_batch_size_cap() {
 
     // ~3 MB of unique ~1 KB event names in a single flush (close() flushes
     // once: 3000 packets stay below the 4096-packet auto-flush threshold).
-    // Embedding the index makes every name distinct, so each carries its full
-    // 1 KB into InternedData instead of collapsing onto a few iids.
+    // Embedding the index makes every direct TrackEvent.name distinct, keeping
+    // each packet large even though the names are not interned.
     uint64_t track = writer.addTrack("noise");
     const std::string filler(1024, 'x');
     for (uint64_t i = 0; i < 3000; ++i) {
@@ -494,7 +495,7 @@ int main() {
     test_interning_reuse();
     test_incremental_timestamps();
     test_incremental_state_checkpoints();
-    test_intern_cap_forces_checkpoint();
+    test_direct_names_do_not_fill_intern_cap();
     test_compressed_packets();
     test_compressed_batch_size_cap();
     test_slices_flows_typed_annotations();
