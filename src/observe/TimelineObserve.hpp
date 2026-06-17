@@ -243,7 +243,7 @@ inline void spanEnd(Unit& unit, uint16_t slot) {
  */
 template <FixedString Name, typename Unit, typename T>
 inline void gauge(Unit& unit, T value, std::string_view unit_name = {}) {
-    static_assert(std::is_arithmetic_v<std::decay_t<T>>, "gauge value must be arithmetic");
+    static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
     auto* ctx = timeline_observe_detail::contextFor(unit);
     using Site = timeline_observe_detail::CounterTrack<Name>;
     const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
@@ -255,7 +255,7 @@ inline void gauge(Unit& unit, T value, std::string_view unit_name = {}) {
 template <FixedString Name, typename Unit, typename Cat, typename T>
     requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
 inline void gauge(Unit& unit, Cat category, T value, std::string_view unit_name = {}) {
-    static_assert(std::is_arithmetic_v<std::decay_t<T>>, "gauge value must be arithmetic");
+    static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
     auto* ctx = timeline_observe_detail::contextFor(unit);
     using Site = timeline_observe_detail::CounterTrack<Name>;
     const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
@@ -269,9 +269,8 @@ inline void gauge(Unit& unit, Cat category, T value, std::string_view unit_name 
  */
 template <FixedString Name, typename Unit, typename Used, typename Capacity>
 inline void capacity(Unit& unit, Used used, Capacity total, std::string_view unit_name = {}) {
-    static_assert(std::is_arithmetic_v<std::decay_t<Used>>, "used capacity must be arithmetic");
-    static_assert(std::is_arithmetic_v<std::decay_t<Capacity>>,
-                  "total capacity must be arithmetic");
+    static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
+    static_assert(std::is_integral_v<std::decay_t<Capacity>>, "total capacity must be integral");
 
     const int64_t used_value = static_cast<int64_t>(used);
     const int64_t total_value = static_cast<int64_t>(total);
@@ -295,9 +294,8 @@ template <FixedString Name, typename Unit, typename Cat, typename Used, typename
     requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
 inline void capacity(Unit& unit, Cat category, Used used, Capacity total,
                      std::string_view unit_name = {}) {
-    static_assert(std::is_arithmetic_v<std::decay_t<Used>>, "used capacity must be arithmetic");
-    static_assert(std::is_arithmetic_v<std::decay_t<Capacity>>,
-                  "total capacity must be arithmetic");
+    static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
+    static_assert(std::is_integral_v<std::decay_t<Capacity>>, "total capacity must be integral");
 
     const int64_t used_value = static_cast<int64_t>(used);
     const int64_t total_value = static_cast<int64_t>(total);
@@ -407,6 +405,7 @@ public:
 
     template <typename T>
     void sample(T value) noexcept {
+        static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
         const int64_t normalized = static_cast<int64_t>(value);
         if (counter_.sample(normalized)) {
             last_ = normalized;
@@ -417,6 +416,7 @@ public:
     template <typename Cat, typename T>
         requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
     void sample(Cat category, T value) noexcept {
+        static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
         const int64_t normalized = static_cast<int64_t>(value);
         if (counter_.sample(category, normalized)) {
             last_ = normalized;
@@ -426,6 +426,7 @@ public:
 
     template <typename T>
     void sampleOnChange(T value) noexcept {
+        static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
         const int64_t normalized = static_cast<int64_t>(value);
         if (!has_last_ || normalized != last_) {
             sample(normalized);
@@ -435,6 +436,7 @@ public:
     template <typename Cat, typename T>
         requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
     void sampleOnChange(Cat category, T value) noexcept {
+        static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
         const int64_t normalized = static_cast<int64_t>(value);
         if (!has_last_ || normalized != last_) {
             sample(category, normalized);
@@ -458,6 +460,9 @@ public:
 
     template <typename Used, typename Capacity>
     void sample(Used used, Capacity total) noexcept {
+        static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
+        static_assert(std::is_integral_v<std::decay_t<Capacity>>,
+                      "total capacity must be integral");
         const int64_t used_value = static_cast<int64_t>(used);
         const int64_t total_value = static_cast<int64_t>(total);
         const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
@@ -473,6 +478,9 @@ public:
     template <typename Cat, typename Used, typename Capacity>
         requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
     void sample(Cat category, Used used, Capacity total) noexcept {
+        static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
+        static_assert(std::is_integral_v<std::decay_t<Capacity>>,
+                      "total capacity must be integral");
         const int64_t used_value = static_cast<int64_t>(used);
         const int64_t total_value = static_cast<int64_t>(total);
         const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
@@ -487,6 +495,9 @@ public:
 
     template <typename Used, typename Capacity>
     void sampleOnChange(Used used, Capacity total) noexcept {
+        static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
+        static_assert(std::is_integral_v<std::decay_t<Capacity>>,
+                      "total capacity must be integral");
         const int64_t used_value = static_cast<int64_t>(used);
         const int64_t total_value = static_cast<int64_t>(total);
         const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
@@ -498,6 +509,9 @@ public:
     template <typename Cat, typename Used, typename Capacity>
         requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
     void sampleOnChange(Cat category, Used used, Capacity total) noexcept {
+        static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
+        static_assert(std::is_integral_v<std::decay_t<Capacity>>,
+                      "total capacity must be integral");
         const int64_t used_value = static_cast<int64_t>(used);
         const int64_t total_value = static_cast<int64_t>(total);
         const int64_t free_value = total_value > used_value ? total_value - used_value : 0;

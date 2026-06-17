@@ -10,6 +10,7 @@
 
 #include <fmt/format.h>
 
+#include <bit>
 #include <cctype>
 
 #include "ObserveApi.hpp"
@@ -108,10 +109,13 @@ std::string pipelineColoredEventName(std::string_view visible_name, uint64_t col
 }
 
 bool isPipeCategory(CategoryMask category) {
-    for (const auto& entry : CategoryRegistry::instance().entries()) {
-        if ((category & entry.mask) != 0 && entry.name == "pipe") {
+    CategoryMask remaining = category;
+    while (remaining != 0) {
+        const uint32_t bit = static_cast<uint32_t>(std::countr_zero(remaining));
+        if (CategoryRegistry::instance().nameForBit(bit) == "pipe") {
             return true;
         }
+        remaining &= remaining - 1;
     }
     return false;
 }
