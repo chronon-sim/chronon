@@ -74,6 +74,16 @@ const DecodedTrack* childTrack(const DecodedTrace& trace, std::string_view name,
     return nullptr;
 }
 
+const DecodedTrack* childTrackNameEndsWith(const DecodedTrace& trace, std::string_view suffix,
+                                           uint64_t parent_uuid) {
+    for (const auto& t : trace.tracks) {
+        if (t.name.ends_with(suffix) && t.parent_uuid == parent_uuid) {
+            return &t;
+        }
+    }
+    return nullptr;
+}
+
 void test_legacy_pipeline_parser() {
     std::cout << "Testing legacy pipeline trace parser... ";
 
@@ -330,6 +340,66 @@ void test_high_bit_category() {
     CHECK(trace.events.size() == 1);
     CHECK(trace.events[0].name == "high");
     CHECK(trace.events[0].category == "high_bit_cat");
+
+    std::filesystem::remove_all(out_dir);
+    std::cout << "PASSED\n";
+}
+
+void test_high_bit_legacy_pipe_category() {
+    std::cout << "Testing high-bit legacy pipe category... ";
+
+    static const auto PIPE_CAT = Category<"pipe", "Legacy pipeline visualization events">{};
+    CHECK(std::countr_zero(PIPE_CAT.mask()) >= 32);
+
+    const std::string out_dir = "/tmp/chronon_timeline_api_highbit_pipe";
+    std::filesystem::remove_all(out_dir);
+
+    ObservationQueue queue(256 * 1024);
+    ObservationBackend::Config cfg;
+    cfg.output_dir = out_dir;
+    cfg.enable_counter_csv = false;
+    cfg.enable_reordering = false;
+    cfg.timeline_compress = false;
+
+    ObservationBackend backend(queue, cfg);
+    backend.setSourceNameLookup(
+        [](uint16_t id) -> std::string_view { return id == 1 ? "cpu0.fetch" : ""; });
+    backend.start();
+
+    {
+        ObservationContext ctx(&queue, []() { return 0ULL; }, 0, "cpu0.fetch", 1);
+        ctx.enableCategory(category::TRACE | PIPE_CAT.mask());
+
+        TestUnit unit;
+        unit.setObservationContext(&ctx);
+        unit.cycle = 7;
+        unit.trace<"12DEC#42;pc=0x100">(PIPE_CAT);
+
+        ThreadContextManager::instance().flushAll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    std::filesystem::path timeline = backend.outputDir() / "timeline.pftrace";
+    backend.stop();
+
+    DecodedTrace trace = decodeFile(timeline);
+    const DecodedTrack* process = nullptr;
+    for (const auto& t : trace.tracks) {
+        if (t.is_process) process = &t;
+    }
+    CHECK(process != nullptr);
+    const DecodedTrack* cpu0 = childTrack(trace, "cpu0", process->uuid);
+    CHECK(cpu0 != nullptr);
+    const DecodedTrack* fetch = childTrack(trace, "fetch", cpu0->uuid);
+    CHECK(fetch != nullptr);
+    const DecodedTrack* dec = childTrackNameEndsWith(trace, "DEC pipe12", fetch->uuid);
+    CHECK(dec != nullptr);
+
+    auto events = eventsOn(trace, dec->uuid);
+    CHECK(events.size() == 2);
+    CHECK(events[0].type == 1 && events[0].timestamp == 7);
+    CHECK(events[0].name.starts_with("42"));
+    CHECK(events[1].type == 2 && events[1].timestamp == 8);
 
     std::filesystem::remove_all(out_dir);
     std::cout << "PASSED\n";
@@ -734,6 +804,7 @@ int main() {
     test_lanes_end_to_end();
     test_path_track_hierarchy();
     test_high_bit_category();
+    test_high_bit_legacy_pipe_category();
     test_temporal_filter_span_semantics();
     test_timeline_observe_convenience_api();
     test_pipeline_counter_track_ordering();

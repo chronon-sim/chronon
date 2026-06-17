@@ -107,7 +107,7 @@ std::string pipelineColoredEventName(std::string_view visible_name, uint64_t col
     return name;
 }
 
-bool isPipeCategory(uint32_t category) {
+bool isPipeCategory(CategoryMask category) {
     for (const auto& entry : CategoryRegistry::instance().entries()) {
         if ((category & entry.mask) != 0 && entry.name == "pipe") {
             return true;

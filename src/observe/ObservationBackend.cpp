@@ -818,13 +818,13 @@ void ObservationBackend::processStructuredLog_(const std::byte* data, size_t dat
 
     const char* level_str = "INFO";
     Channel channel = Channel::Info;
-    if (rec->category & static_cast<uint32_t>(category::LOG_DEBUG)) {
+    if (rec->category & category::LOG_DEBUG) {
         level_str = "DEBUG";
         channel = Channel::Debug;
-    } else if (rec->category & static_cast<uint32_t>(category::LOG_WARN)) {
+    } else if (rec->category & category::LOG_WARN) {
         level_str = "WARN";
         channel = Channel::Warn;
-    } else if (rec->category & static_cast<uint32_t>(category::LOG_ERROR)) {
+    } else if (rec->category & category::LOG_ERROR) {
         level_str = "ERROR";
         channel = Channel::Error;
     }

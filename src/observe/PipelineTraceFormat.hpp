@@ -12,6 +12,8 @@
 #include <string>
 #include <string_view>
 
+#include "Types.hpp"
+
 namespace chronon::observe {
 
 struct PipelineTraceFields {
@@ -23,7 +25,7 @@ struct PipelineTraceFields {
     uint64_t flow_id = 0;
 };
 
-bool isPipeCategory(uint32_t category);
+bool isPipeCategory(CategoryMask category);
 
 uint64_t pipelineColorHash(uint64_t id);
 uint64_t pipelineColorHash(std::string_view key);

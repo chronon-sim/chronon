@@ -335,8 +335,8 @@ struct ArgTypeOf<unsigned long> {
  */
 struct StructuredRecord {
     uint64_t cycle;
+    CategoryMask category;
     uint32_t format_id;
-    uint32_t category;   ///< CategoryMask truncated to 32 bits.
     uint16_t source_id;  ///< Unit identifier (0 = unknown).
     uint8_t arg_count;
     uint8_t padding[1];

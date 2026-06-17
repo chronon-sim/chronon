@@ -388,7 +388,7 @@ private:
             StructuredRecord rec{};
             rec.cycle = currentCycle();
             rec.format_id = fmt_id;
-            rec.category = static_cast<uint32_t>(category);
+            rec.category = category;
             rec.source_id = source_id_;
             rec.arg_count = 0;
             if (!lookahead_buffer_.bufferEventRaw(type, 1, reinterpret_cast<const std::byte*>(&rec),
@@ -426,7 +426,7 @@ private:
                 reinterpret_cast<StructuredRecord*>(ptr + sizeof(ObservationQueue::RecordHeader));
             rec->cycle = currentCycle();
             rec->format_id = fmt_id;
-            rec->category = static_cast<uint32_t>(category);
+            rec->category = category;
             rec->source_id = source_id_;
             rec->arg_count = 0;
 
@@ -461,7 +461,7 @@ private:
             auto* rec = reinterpret_cast<StructuredRecord*>(payload);
             rec->cycle = currentCycle();
             rec->format_id = fmt_id;
-            rec->category = static_cast<uint32_t>(category);
+            rec->category = category;
             rec->source_id = source_id_;
             rec->arg_count = static_cast<uint8_t>(arg_count);
 
@@ -506,7 +506,7 @@ private:
                 reinterpret_cast<StructuredRecord*>(ptr + sizeof(ObservationQueue::RecordHeader));
             rec->cycle = currentCycle();
             rec->format_id = fmt_id;
-            rec->category = static_cast<uint32_t>(category);
+            rec->category = category;
             rec->source_id = source_id_;
             rec->arg_count = static_cast<uint8_t>(arg_count);
 
