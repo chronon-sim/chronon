@@ -177,20 +177,21 @@ public:
     TimelineCounter(ObservableUnit* owner, std::string_view name, std::string_view unit = {})
         : TimelineTrackBase(owner, name, unit, /*lanes=*/1, TimelineTrackInfo::Kind::Counter) {}
 
-    void sample(int64_t value) noexcept { sample(category::NONE, value); }
+    bool sample(int64_t value) noexcept { return sample(category::NONE, value); }
 
     template <typename Cat>
-    void sample(Cat category, int64_t value) noexcept {
+    bool sample(Cat category, int64_t value) noexcept {
         if (!registered_) {
-            return;
+            return false;
         }
         stampCycle_();  // Before the filter check: temporal filters read the current cycle.
         const CategoryMask cat_mask = static_cast<CategoryMask>(category);
         if (!ctx_->shouldTrace(cat_mask)) {
-            return;
+            return false;
         }
-        ctx_->timelineEvent(cat_mask, TimelineEventKind::CounterSample, track_id_,
-                            /*slot=*/0, /*name_id=*/0, std::bit_cast<uint64_t>(value), nullptr, 0);
+        return ctx_->timelineEvent(cat_mask, TimelineEventKind::CounterSample, track_id_,
+                                   /*slot=*/0, /*name_id=*/0, std::bit_cast<uint64_t>(value),
+                                   nullptr, 0);
     }
 };
 

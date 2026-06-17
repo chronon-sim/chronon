@@ -200,7 +200,7 @@ public:
      * close when its end falls outside it. Ends whose begin WAS suppressed
      * are dropped by the backend's open-span table.
      */
-    void timelineEvent(CategoryMask category, TimelineEventKind kind, uint32_t track_id,
+    bool timelineEvent(CategoryMask category, TimelineEventKind kind, uint32_t track_id,
                        uint16_t slot, uint16_t name_id, uint64_t payload,
                        const TimelineArgValue* args, size_t arg_count, uint8_t flags = 0) noexcept {
         const bool allowed =
@@ -208,7 +208,7 @@ public:
                 ? filter_.shouldObserve(category | category::TRACE)
                 : filter_.shouldObserve(category | category::TRACE, currentCycle());
         if (OBSERVE_LIKELY(!allowed)) {
-            return;
+            return false;
         }
 
         const size_t payload_size = sizeof(TimelineRecord) + arg_count * TIMELINE_ARG_SIZE;
@@ -222,19 +222,19 @@ public:
                     queue_->incrementDropped();
                 }
                 stats_.recordDrop<ObservationChannel::Trace>();
-                return;
+                return false;
             }
             fillTimelineRecord_(dest, category, kind, track_id, slot, name_id, payload, args,
                                 arg_count, flags);
             lookahead_buffer_.commitReservedRecord(total_size);
             stats_.recordEmit<ObservationChannel::Trace>();
-            return;
+            return true;
         }
 
         ThreadContext* ctx = ThreadContextManager::instance().getContext();
         if (!ctx) {
             stats_.recordDrop<ObservationChannel::Trace>();
-            return;
+            return false;
         }
 
         const size_t record_size = sizeof(ObservationQueue::RecordHeader) + payload_size;
@@ -244,7 +244,7 @@ public:
         if (!ptr) {
             ctx->incrementDropped();
             stats_.recordDrop<ObservationChannel::Trace>();
-            return;
+            return false;
         }
 
         auto* header = reinterpret_cast<ObservationQueue::RecordHeader*>(ptr);
@@ -258,6 +258,7 @@ public:
 
         ctx->queue().finishAndCommitWrite(aligned_size);
         stats_.recordEmit<ObservationChannel::Trace>();
+        return true;
     }
 
 private:

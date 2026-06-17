@@ -408,18 +408,20 @@ public:
     template <typename T>
     void sample(T value) noexcept {
         const int64_t normalized = static_cast<int64_t>(value);
-        counter_.sample(normalized);
-        last_ = normalized;
-        has_last_ = true;
+        if (counter_.sample(normalized)) {
+            last_ = normalized;
+            has_last_ = true;
+        }
     }
 
     template <typename Cat, typename T>
         requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
     void sample(Cat category, T value) noexcept {
         const int64_t normalized = static_cast<int64_t>(value);
-        counter_.sample(category, normalized);
-        last_ = normalized;
-        has_last_ = true;
+        if (counter_.sample(category, normalized)) {
+            last_ = normalized;
+            has_last_ = true;
+        }
     }
 
     template <typename T>
@@ -459,11 +461,13 @@ public:
         const int64_t used_value = static_cast<int64_t>(used);
         const int64_t total_value = static_cast<int64_t>(total);
         const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
-        used_.sample(used_value);
-        free_.sample(free_value);
-        last_used_ = used_value;
-        last_free_ = free_value;
-        has_last_ = true;
+        const bool used_sampled = used_.sample(used_value);
+        const bool free_sampled = free_.sample(free_value);
+        if (used_sampled && free_sampled) {
+            last_used_ = used_value;
+            last_free_ = free_value;
+            has_last_ = true;
+        }
     }
 
     template <typename Cat, typename Used, typename Capacity>
@@ -472,11 +476,13 @@ public:
         const int64_t used_value = static_cast<int64_t>(used);
         const int64_t total_value = static_cast<int64_t>(total);
         const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
-        used_.sample(category, used_value);
-        free_.sample(category, free_value);
-        last_used_ = used_value;
-        last_free_ = free_value;
-        has_last_ = true;
+        const bool used_sampled = used_.sample(category, used_value);
+        const bool free_sampled = free_.sample(category, free_value);
+        if (used_sampled && free_sampled) {
+            last_used_ = used_value;
+            last_free_ = free_value;
+            has_last_ = true;
+        }
     }
 
     template <typename Used, typename Capacity>

@@ -432,6 +432,7 @@ void test_temporal_filter_span_semantics() {
     cfg.timeline_compress = false;
 
     ObservationBackend backend(queue, cfg);
+    backend.setSourceNameLookup([](uint16_t id) -> std::string_view { return id == 1 ? "u" : ""; });
     backend.start();
 
     {
@@ -456,6 +457,18 @@ void test_temporal_filter_span_semantics() {
         unit.cycle = 130;
         unit.mshr.end(1);
 
+        ctx.filter().clearCycleRanges();
+        ctx.filter().addCycleRange(200, 300);
+
+        // A suppressed sample must not poison the sample-on-change cache:
+        // the first equal value inside the category window still has to emit.
+        unit.cycle = 190;
+        unit.member_gauge.sampleOnChange(LANE_CAT, 5);
+        unit.member_capacity.sampleOnChange(LANE_CAT, 2, 8);
+        unit.cycle = 210;
+        unit.member_gauge.sampleOnChange(LANE_CAT, 5);
+        unit.member_capacity.sampleOnChange(LANE_CAT, 2, 8);
+
         ThreadContextManager::instance().flushAll();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
@@ -476,6 +489,27 @@ void test_temporal_filter_span_semantics() {
     CHECK(slot0_events[0].type == 1 && slot0_events[0].timestamp == 50);
     CHECK(slot0_events[0].name == "inside");
     CHECK(slot0_events[1].type == 2 && slot0_events[1].timestamp == 150);
+
+    const DecodedTrack* unit_track = findTrackByName(trace, "u");
+    CHECK(unit_track != nullptr);
+    const DecodedTrack* member_gauge = childTrack(trace, "member_gauge", unit_track->uuid);
+    CHECK(member_gauge != nullptr && member_gauge->is_counter);
+    auto gauge_events = eventsOn(trace, member_gauge->uuid);
+    CHECK(gauge_events.size() == 1);
+    CHECK(gauge_events[0].timestamp == 210 && gauge_events[0].counter_value.value() == 5);
+
+    const DecodedTrack* capacity_used = childTrack(trace, "member_capacity.used", unit_track->uuid);
+    const DecodedTrack* capacity_free = childTrack(trace, "member_capacity.free", unit_track->uuid);
+    CHECK(capacity_used != nullptr && capacity_used->is_counter);
+    CHECK(capacity_free != nullptr && capacity_free->is_counter);
+    auto capacity_used_events = eventsOn(trace, capacity_used->uuid);
+    auto capacity_free_events = eventsOn(trace, capacity_free->uuid);
+    CHECK(capacity_used_events.size() == 1);
+    CHECK(capacity_free_events.size() == 1);
+    CHECK(capacity_used_events[0].timestamp == 210 &&
+          capacity_used_events[0].counter_value.value() == 2);
+    CHECK(capacity_free_events[0].timestamp == 210 &&
+          capacity_free_events[0].counter_value.value() == 6);
 
     std::filesystem::remove_all(out_dir);
     std::cout << "PASSED\n";
