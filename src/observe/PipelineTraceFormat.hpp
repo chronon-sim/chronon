@@ -23,6 +23,7 @@ struct PipelineTraceFields {
     std::string category;
     std::string event_name;
     uint64_t flow_id = 0;
+    bool has_flow_id = false;
 };
 
 bool isPipeCategory(CategoryMask category);

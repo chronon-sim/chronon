@@ -93,11 +93,17 @@ void test_legacy_pipeline_parser() {
     CHECK(pipe.id == "42");
     CHECK(pipe.note == "pc=0x100");
     CHECK(pipe.flow_id == 42);
+    CHECK(pipe.has_flow_id);
 
     CHECK(parsePipelineTraceMessage("", "BP0#0x2a", pipe));
     CHECK(pipe.track_path == "unknown.BP0");
     CHECK(pipe.id == "0x2a");
     CHECK(pipe.flow_id == 0x2a);
+    CHECK(pipe.has_flow_id);
+
+    CHECK(parsePipelineTraceMessage("", "DEC#0", pipe));
+    CHECK(pipe.flow_id == 0);
+    CHECK(pipe.has_flow_id);
 
     std::cout << "PASSED\n";
 }
@@ -375,7 +381,7 @@ void test_high_bit_legacy_pipe_category() {
         unit.cycle = 3;
         unit.mshr.begin(0, PIPE_CAT, "dangling"_ev);
         unit.cycle = 7;
-        unit.trace<"12DEC#42;pc=0x100">(PIPE_CAT);
+        unit.trace<"12DEC#0;pc=0x100">(PIPE_CAT);
         unit.cycle = 9;
         unit.trace<"ordinary trace">(LANE_CAT);
 
@@ -402,7 +408,8 @@ void test_high_bit_legacy_pipe_category() {
     auto events = eventsOn(trace, dec->uuid);
     CHECK(events.size() == 2);
     CHECK(events[0].type == 1 && events[0].timestamp == 7);
-    CHECK(events[0].name.starts_with("42"));
+    CHECK(events[0].name.starts_with("0"));
+    CHECK(events[0].flow_ids == std::vector<uint64_t>{0});
     CHECK(events[1].type == 2 && events[1].timestamp == 8);
 
     const DecodedTrack* mshr = childTrack(trace, "mshr", fetch->uuid);

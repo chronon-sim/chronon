@@ -182,8 +182,13 @@ void ObservationBackend::writeTraceToTimeline_(const StructuredRecord* rec,
         const uint32_t rank = static_cast<uint32_t>(rec->source_id) * kPipeTraceRankStride;
         const uint64_t track_uuid =
             timelineTrackForPath_(pipe.track_path, static_cast<int32_t>(rank));
-        perfetto_writer_->sliceBegin(track_uuid, pipe.category, pipe.event_name, rec->cycle,
-                                     pipe.flow_id, ann_span);
+        if (pipe.has_flow_id) {
+            perfetto_writer_->sliceBeginWithFlow(track_uuid, pipe.category, pipe.event_name,
+                                                 rec->cycle, pipe.flow_id, ann_span);
+        } else {
+            perfetto_writer_->sliceBegin(track_uuid, pipe.category, pipe.event_name, rec->cycle,
+                                         pipe.flow_id, ann_span);
+        }
         const uint64_t end_cycle = rec->cycle + 1;
         perfetto_writer_->sliceEnd(track_uuid, end_cycle);
         if (end_cycle > timeline_max_cycle_) {

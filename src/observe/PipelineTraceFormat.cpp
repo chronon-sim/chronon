@@ -169,7 +169,7 @@ bool parsePipelineTraceMessage(std::string_view source_name, std::string_view me
     out.event_name = pipelineColoredEventName(out.id, color_hash);
 
     out.flow_id = 0;
-    (void)parseFlowId(out.id, out.flow_id);
+    out.has_flow_id = parseFlowId(out.id, out.flow_id);
     return true;
 }
 
