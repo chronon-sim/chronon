@@ -109,7 +109,9 @@ struct SimulationYAMLConfig {
         names.reserve(units.size());
 
         for (const auto& name : unit_order) {
-            names.push_back(name);
+            if (hasUnit(name)) {
+                names.push_back(name);
+            }
         }
 
         for (const auto& [name, _] : units) {
