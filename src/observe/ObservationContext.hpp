@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "../chronon/CpuPause.hpp"
 #include "Counter.hpp"
@@ -39,6 +40,7 @@ namespace chronon::observe {
 class ObservationContext {
 public:
     using CycleProvider = std::function<uint64_t()>;
+    enum class LookaheadTransition : uint8_t { None, Commit, Rollback };
 
     /**
      * @param queue          Shared observation queue (owned by simulation).
@@ -131,6 +133,7 @@ public:
         if (lookahead_buffer_.hasEvents() && queue_) {
             lookahead_buffer_.commit(*queue_);
         }
+        lookahead_transition_history_.push_back(LookaheadTransition::Commit);
         ++lookahead_epoch_generation_;
     }
 
@@ -138,15 +141,23 @@ public:
     void rollbackEpoch() noexcept {
         counters_.rollbackAllEpochs();
         lookahead_buffer_.rollback();
+        lookahead_transition_history_.push_back(LookaheadTransition::Rollback);
         ++lookahead_epoch_generation_;
-        ++lookahead_rollback_generation_;
     }
 
     /// When enabled, events buffer locally rather than going to the global queue.
     void setLookaheadMode(bool enabled) noexcept { lookahead_mode_ = enabled; }
     bool isLookaheadMode() const noexcept { return lookahead_mode_; }
     uint64_t lookaheadEpochGeneration() const noexcept { return lookahead_epoch_generation_; }
-    uint64_t lookaheadRollbackGeneration() const noexcept { return lookahead_rollback_generation_; }
+    LookaheadTransition firstLookaheadTransitionAfter(uint64_t generation) const noexcept {
+        if (generation >= lookahead_epoch_generation_) {
+            return LookaheadTransition::None;
+        }
+        if (generation >= lookahead_transition_history_.size()) {
+            return LookaheadTransition::Rollback;
+        }
+        return lookahead_transition_history_[static_cast<size_t>(generation)];
+    }
 
     /// Registers counter addresses with the registry for the pull-model snapshot.
     void registerAllCounters(class CounterRegistry* registry);
@@ -541,8 +552,8 @@ private:
 
     LookaheadBuffer lookahead_buffer_;
     bool lookahead_mode_ = false;
+    std::vector<LookaheadTransition> lookahead_transition_history_;
     uint64_t lookahead_epoch_generation_ = 0;
-    uint64_t lookahead_rollback_generation_ = 0;
 
     ObservationStats stats_{};
 

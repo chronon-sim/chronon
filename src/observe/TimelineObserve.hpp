@@ -128,10 +128,8 @@ struct LookaheadCacheSync {
         }
 
         const uint64_t epoch = ctx->lookaheadEpochGeneration();
-        const uint64_t rollback = ctx->lookaheadRollbackGeneration();
         if (!initialized_) {
             observed_epoch_ = epoch;
-            observed_rollback_ = rollback;
             initialized_ = true;
             return;
         }
@@ -139,18 +137,21 @@ struct LookaheadCacheSync {
             return;
         }
 
-        if (rollback != observed_rollback_) {
-            on_rollback();
-        } else {
-            on_commit();
+        switch (ctx->firstLookaheadTransitionAfter(observed_epoch_)) {
+            case ObservationContext::LookaheadTransition::Commit:
+                on_commit();
+                break;
+            case ObservationContext::LookaheadTransition::Rollback:
+                on_rollback();
+                break;
+            case ObservationContext::LookaheadTransition::None:
+                break;
         }
         observed_epoch_ = epoch;
-        observed_rollback_ = rollback;
     }
 
 private:
     uint64_t observed_epoch_ = 0;
-    uint64_t observed_rollback_ = 0;
     bool initialized_ = false;
 };
 

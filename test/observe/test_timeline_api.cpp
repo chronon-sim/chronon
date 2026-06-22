@@ -812,6 +812,21 @@ void test_lookahead_commit_rollback() {
         unit.mshr.end(0);
         ctx.commitEpoch();
 
+        // A helper can be idle across a committed epoch and then see a later
+        // rollback before its next use. The committed helper cache must win.
+        unit.cycle = 340;
+        unit.stall.update(true, LANE_CAT, "cross_epoch_stall"_ev, arg<"reason">(uint64_t{2}));
+        unit.member_gauge.sampleOnChange(LANE_CAT, 9);
+        unit.member_capacity.sampleOnChange(LANE_CAT, 4, 8);
+        ctx.commitEpoch();
+        ctx.rollbackEpoch();
+
+        unit.cycle = 350;
+        unit.stall.update(false, LANE_CAT, "cross_epoch_stall"_ev);
+        unit.member_gauge.sampleOnChange(LANE_CAT, 9);
+        unit.member_capacity.sampleOnChange(LANE_CAT, 4, 8);
+        ctx.commitEpoch();
+
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
@@ -819,7 +834,7 @@ void test_lookahead_commit_rollback() {
     backend.stop();
 
     DecodedTrace trace = decodeFile(timeline);
-    CHECK(trace.events.size() == 7);
+    CHECK(trace.events.size() == 12);
 
     const DecodedTrack* slot0 = findTrackByName(trace, "mshr[0]");
     CHECK(slot0 != nullptr);
@@ -832,17 +847,22 @@ void test_lookahead_commit_rollback() {
     const DecodedTrack* stall = findTrackByName(trace, "stall");
     CHECK(stall != nullptr);
     auto stall_events = eventsOn(trace, stall->uuid);
-    CHECK(stall_events.size() == 2);
+    CHECK(stall_events.size() == 4);
     CHECK(stall_events[0].type == 1 && stall_events[0].timestamp == 320);
     CHECK(stall_events[0].name == "committed_stall");
     CHECK(stall_events[0].uint_annotations.at("reason") == 1);
     CHECK(stall_events[1].type == 2 && stall_events[1].timestamp == 325);
+    CHECK(stall_events[2].type == 1 && stall_events[2].timestamp == 340);
+    CHECK(stall_events[2].name == "cross_epoch_stall");
+    CHECK(stall_events[2].uint_annotations.at("reason") == 2);
+    CHECK(stall_events[3].type == 2 && stall_events[3].timestamp == 350);
 
     const DecodedTrack* member_gauge = findTrackByName(trace, "member_gauge");
     CHECK(member_gauge != nullptr && member_gauge->is_counter);
     auto gauge_events = eventsOn(trace, member_gauge->uuid);
-    CHECK(gauge_events.size() == 1);
+    CHECK(gauge_events.size() == 2);
     CHECK(gauge_events[0].timestamp == 320 && gauge_events[0].counter_value.value() == 7);
+    CHECK(gauge_events[1].timestamp == 340 && gauge_events[1].counter_value.value() == 9);
 
     const DecodedTrack* capacity_used = findTrackByName(trace, "member_capacity.used");
     const DecodedTrack* capacity_free = findTrackByName(trace, "member_capacity.free");
@@ -850,12 +870,16 @@ void test_lookahead_commit_rollback() {
     CHECK(capacity_free != nullptr && capacity_free->is_counter);
     auto capacity_used_events = eventsOn(trace, capacity_used->uuid);
     auto capacity_free_events = eventsOn(trace, capacity_free->uuid);
-    CHECK(capacity_used_events.size() == 1);
-    CHECK(capacity_free_events.size() == 1);
+    CHECK(capacity_used_events.size() == 2);
+    CHECK(capacity_free_events.size() == 2);
     CHECK(capacity_used_events[0].timestamp == 320 &&
           capacity_used_events[0].counter_value.value() == 3);
     CHECK(capacity_free_events[0].timestamp == 320 &&
           capacity_free_events[0].counter_value.value() == 5);
+    CHECK(capacity_used_events[1].timestamp == 340 &&
+          capacity_used_events[1].counter_value.value() == 4);
+    CHECK(capacity_free_events[1].timestamp == 340 &&
+          capacity_free_events[1].counter_value.value() == 4);
 
     std::filesystem::remove_all(out_dir);
     std::cout << "PASSED\n";
