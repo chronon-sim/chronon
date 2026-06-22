@@ -60,9 +60,8 @@ struct CounterTrack {
 };
 
 template <typename Site>
-uint32_t resolveTrackSlow(ObservationContext* ctx, std::atomic<uint16_t>& cached_source_id,
-                          std::atomic<uint32_t>& cached_track_id, TimelineTrackInfo::Kind kind,
-                          uint16_t lanes, std::string_view unit) {
+uint32_t resolveTrackSlow(ObservationContext* ctx, std::atomic<uint64_t>& cached_entry,
+                          TimelineTrackInfo::Kind kind, uint16_t lanes, std::string_view unit) {
     struct Entry {
         uint16_t source_id;
         uint32_t track_id;
@@ -77,8 +76,8 @@ uint32_t resolveTrackSlow(ObservationContext* ctx, std::atomic<uint16_t>& cached
     std::lock_guard<std::mutex> lock(mutex);
     for (const Entry& entry : entries) {
         if (entry.source_id == source_id) {
-            cached_track_id.store(entry.track_id, std::memory_order_relaxed);
-            cached_source_id.store(source_id, std::memory_order_relaxed);
+            cached_entry.store((static_cast<uint64_t>(source_id) << 32) | entry.track_id,
+                               std::memory_order_relaxed);
             return entry.track_id;
         }
     }
@@ -86,8 +85,8 @@ uint32_t resolveTrackSlow(ObservationContext* ctx, std::atomic<uint16_t>& cached
     const uint32_t track_id = TimelineTrackRegistry::instance().registerTrack(
         {track_name, std::string(unit), source_id, lanes, kind});
     entries.push_back({source_id, track_id});
-    cached_track_id.store(track_id, std::memory_order_relaxed);
-    cached_source_id.store(source_id, std::memory_order_relaxed);
+    cached_entry.store((static_cast<uint64_t>(source_id) << 32) | track_id,
+                       std::memory_order_relaxed);
     return track_id;
 }
 
@@ -98,17 +97,16 @@ uint32_t resolveTrack(ObservationContext* ctx, TimelineTrackInfo::Kind kind, uin
         return 0;
     }
 
-    static std::atomic<uint16_t> cached_source_id{0};
-    static std::atomic<uint32_t> cached_track_id{0};
+    static std::atomic<uint64_t> cached_entry{0};
 
     const uint16_t source_id = ctx->sourceId();
-    const uint32_t track_id = cached_track_id.load(std::memory_order_relaxed);
-    if (OBSERVE_LIKELY(track_id != 0 &&
-                       cached_source_id.load(std::memory_order_relaxed) == source_id)) {
+    const uint64_t entry = cached_entry.load(std::memory_order_relaxed);
+    const uint32_t track_id = static_cast<uint32_t>(entry);
+    if (OBSERVE_LIKELY(track_id != 0 && static_cast<uint16_t>(entry >> 32) == source_id)) {
         return track_id;
     }
 
-    return resolveTrackSlow<Site>(ctx, cached_source_id, cached_track_id, kind, lanes, unit);
+    return resolveTrackSlow<Site>(ctx, cached_entry, kind, lanes, unit);
 }
 
 template <typename Unit>
@@ -120,39 +118,42 @@ ObservationContext* contextFor(Unit& unit) {
     return ctx;
 }
 
-struct LookaheadCacheSync {
-    template <typename CommitFn, typename RollbackFn>
-    void sync(ObservationContext* ctx, CommitFn&& on_commit, RollbackFn&& on_rollback) noexcept {
-        if (!ctx) {
+class LookaheadCacheSync {
+public:
+    using Transition = ObservationContext::LookaheadTransition;
+    using ApplyFn = ObservationContext::LookaheadSyncNode::ApplyFn;
+
+    LookaheadCacheSync(void* owner, ApplyFn apply) noexcept {
+        node_.owner = owner;
+        node_.apply = apply;
+    }
+
+    ~LookaheadCacheSync() noexcept {
+        if (node_.context) {
+            node_.context->unregisterLookaheadSyncNode(node_);
+        }
+    }
+
+    LookaheadCacheSync(const LookaheadCacheSync&) = delete;
+    LookaheadCacheSync& operator=(const LookaheadCacheSync&) = delete;
+    LookaheadCacheSync(LookaheadCacheSync&&) = delete;
+    LookaheadCacheSync& operator=(LookaheadCacheSync&&) = delete;
+
+    void sync(ObservationContext* ctx) noexcept {
+        if (!ctx || !ctx->isLookaheadMode()) {
+            if (node_.context) {
+                node_.context->unregisterLookaheadSyncNode(node_);
+            }
             return;
         }
 
-        const uint64_t epoch = ctx->lookaheadEpochGeneration();
-        if (!initialized_) {
-            observed_epoch_ = epoch;
-            initialized_ = true;
-            return;
+        if (node_.context != ctx) {
+            ctx->registerLookaheadSyncNode(node_);
         }
-        if (epoch == observed_epoch_) {
-            return;
-        }
-
-        switch (ctx->firstLookaheadTransitionAfter(observed_epoch_)) {
-            case ObservationContext::LookaheadTransition::Commit:
-                on_commit();
-                break;
-            case ObservationContext::LookaheadTransition::Rollback:
-                on_rollback();
-                break;
-            case ObservationContext::LookaheadTransition::None:
-                break;
-        }
-        observed_epoch_ = epoch;
     }
 
 private:
-    uint64_t observed_epoch_ = 0;
-    bool initialized_ = false;
+    ObservationContext::LookaheadSyncNode node_;
 };
 
 template <typename... Items>
@@ -367,7 +368,10 @@ inline void portAvailable(Unit& unit, const Port& port, std::string_view unit_na
 class TimelineSpan {
 public:
     TimelineSpan(ObservableUnit* owner, std::string_view name, uint16_t lanes = 1)
-        : lane_(owner, name, lanes), open_(lanes, false), committed_open_(lanes, false) {}
+        : lane_(owner, name, lanes),
+          open_(lanes, false),
+          committed_open_(lanes, false),
+          lookahead_sync_(this, &TimelineSpan::applyLookaheadTransition_) {}
 
     template <typename Cat, typename... Items>
     bool begin(uint16_t slot, Cat category, EventNameRef name, Items&&... items) noexcept {
@@ -431,22 +435,34 @@ public:
     }
 
     [[nodiscard]] bool isOpen(uint16_t slot = 0) const noexcept {
+        const_cast<TimelineSpan*>(this)->syncLookaheadCache_();
         return slot < open_.size() && open_[slot];
     }
 
 private:
     [[nodiscard]] bool validSlot_(uint16_t slot) const noexcept { return slot < open_.size(); }
 
-    void syncLookaheadCache_() noexcept {
-        lookahead_sync_.sync(
-            lane_.observationContext(), [this]() { committed_open_ = open_; },
-            [this]() { open_ = committed_open_; });
-    }
+    void syncLookaheadCache_() noexcept { lookahead_sync_.sync(lane_.observationContext()); }
 
     void updateCommittedOpen_(uint16_t slot) noexcept {
         auto* ctx = lane_.observationContext();
         if (!ctx || !ctx->isLookaheadMode()) {
             committed_open_[slot] = open_[slot];
+        }
+    }
+
+    static void applyLookaheadTransition_(
+        void* owner, ObservationContext::LookaheadTransition transition) noexcept {
+        auto* self = static_cast<TimelineSpan*>(owner);
+        switch (transition) {
+            case ObservationContext::LookaheadTransition::Commit:
+                self->committed_open_ = self->open_;
+                break;
+            case ObservationContext::LookaheadTransition::Rollback:
+                self->open_ = self->committed_open_;
+                break;
+            case ObservationContext::LookaheadTransition::None:
+                break;
         }
     }
 
@@ -462,7 +478,8 @@ private:
 class TimelineGauge {
 public:
     TimelineGauge(ObservableUnit* owner, std::string_view name, std::string_view unit = {})
-        : counter_(owner, name, unit) {}
+        : counter_(owner, name, unit),
+          lookahead_sync_(this, &TimelineGauge::applyLookaheadTransition_) {}
 
     template <typename T>
     void sample(T value) noexcept {
@@ -511,24 +528,30 @@ public:
     }
 
 private:
-    void syncLookaheadCache_() noexcept {
-        lookahead_sync_.sync(
-            counter_.observationContext(),
-            [this]() {
-                committed_last_ = last_;
-                committed_has_last_ = has_last_;
-            },
-            [this]() {
-                last_ = committed_last_;
-                has_last_ = committed_has_last_;
-            });
-    }
+    void syncLookaheadCache_() noexcept { lookahead_sync_.sync(counter_.observationContext()); }
 
     void updateCommittedCache_() noexcept {
         auto* ctx = counter_.observationContext();
         if (!ctx || !ctx->isLookaheadMode()) {
             committed_last_ = last_;
             committed_has_last_ = has_last_;
+        }
+    }
+
+    static void applyLookaheadTransition_(
+        void* owner, ObservationContext::LookaheadTransition transition) noexcept {
+        auto* self = static_cast<TimelineGauge*>(owner);
+        switch (transition) {
+            case ObservationContext::LookaheadTransition::Commit:
+                self->committed_last_ = self->last_;
+                self->committed_has_last_ = self->has_last_;
+                break;
+            case ObservationContext::LookaheadTransition::Rollback:
+                self->last_ = self->committed_last_;
+                self->has_last_ = self->committed_has_last_;
+                break;
+            case ObservationContext::LookaheadTransition::None:
+                break;
         }
     }
 
@@ -547,7 +570,8 @@ class TimelineCapacity {
 public:
     TimelineCapacity(ObservableUnit* owner, std::string_view name, std::string_view unit = {})
         : used_(owner, suffixedName_(name, ".used"), unit),
-          free_(owner, suffixedName_(name, ".free"), unit) {}
+          free_(owner, suffixedName_(name, ".free"), unit),
+          lookahead_sync_(this, &TimelineCapacity::applyLookaheadTransition_) {}
 
     template <typename Used, typename Capacity>
     void sample(Used used, Capacity total) noexcept {
@@ -624,20 +648,7 @@ private:
         return out;
     }
 
-    void syncLookaheadCache_() noexcept {
-        lookahead_sync_.sync(
-            used_.observationContext(),
-            [this]() {
-                committed_last_used_ = last_used_;
-                committed_last_free_ = last_free_;
-                committed_has_last_ = has_last_;
-            },
-            [this]() {
-                last_used_ = committed_last_used_;
-                last_free_ = committed_last_free_;
-                has_last_ = committed_has_last_;
-            });
-    }
+    void syncLookaheadCache_() noexcept { lookahead_sync_.sync(used_.observationContext()); }
 
     void updateCommittedCache_() noexcept {
         auto* ctx = used_.observationContext();
@@ -645,6 +656,25 @@ private:
             committed_last_used_ = last_used_;
             committed_last_free_ = last_free_;
             committed_has_last_ = has_last_;
+        }
+    }
+
+    static void applyLookaheadTransition_(
+        void* owner, ObservationContext::LookaheadTransition transition) noexcept {
+        auto* self = static_cast<TimelineCapacity*>(owner);
+        switch (transition) {
+            case ObservationContext::LookaheadTransition::Commit:
+                self->committed_last_used_ = self->last_used_;
+                self->committed_last_free_ = self->last_free_;
+                self->committed_has_last_ = self->has_last_;
+                break;
+            case ObservationContext::LookaheadTransition::Rollback:
+                self->last_used_ = self->committed_last_used_;
+                self->last_free_ = self->committed_last_free_;
+                self->has_last_ = self->committed_has_last_;
+                break;
+            case ObservationContext::LookaheadTransition::None:
+                break;
         }
     }
 

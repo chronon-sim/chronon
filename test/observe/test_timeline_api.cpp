@@ -794,11 +794,13 @@ void test_lookahead_commit_rollback() {
         unit.cycle = 300;
         unit.mshr.begin(0, LANE_CAT, "speculative"_ev);
         unit.stall.update(true, LANE_CAT, "spec_stall"_ev, arg<"reason">(uint64_t{1}));
+        CHECK(unit.stall.isOpen());
         unit.member_gauge.sampleOnChange(LANE_CAT, 7);
         unit.member_capacity.sampleOnChange(LANE_CAT, 3, 8);
         unit.cycle = 310;
         unit.mshr.end(0);
         ctx.rollbackEpoch();
+        CHECK(!unit.stall.isOpen());
 
         // Committed span survives.
         unit.cycle = 320;
@@ -819,7 +821,12 @@ void test_lookahead_commit_rollback() {
         unit.member_gauge.sampleOnChange(LANE_CAT, 9);
         unit.member_capacity.sampleOnChange(LANE_CAT, 4, 8);
         ctx.commitEpoch();
+        for (int i = 0; i < 80; ++i) {
+            ctx.commitEpoch();
+        }
+        CHECK(unit.stall.isOpen());
         ctx.rollbackEpoch();
+        CHECK(unit.stall.isOpen());
 
         unit.cycle = 350;
         unit.stall.update(false, LANE_CAT, "cross_epoch_stall"_ev);

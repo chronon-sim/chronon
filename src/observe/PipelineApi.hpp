@@ -54,8 +54,7 @@ struct NamedPipelineStage {
 };
 
 template <typename Site>
-uint32_t resolvePipelineTrackSlow(uint16_t source_id, std::atomic<uint16_t>& cached_source_id,
-                                  std::atomic<uint32_t>& cached_track_id) {
+uint32_t resolvePipelineTrackSlow(uint16_t source_id, std::atomic<uint64_t>& cached_entry) {
     struct Entry {
         uint16_t source_id;
         uint32_t track_id;
@@ -68,8 +67,8 @@ uint32_t resolvePipelineTrackSlow(uint16_t source_id, std::atomic<uint16_t>& cac
     std::lock_guard<std::mutex> lock(mutex);
     for (const Entry& entry : entries) {
         if (entry.source_id == source_id) {
-            cached_track_id.store(entry.track_id, std::memory_order_relaxed);
-            cached_source_id.store(source_id, std::memory_order_relaxed);
+            cached_entry.store((static_cast<uint64_t>(source_id) << 32) | entry.track_id,
+                               std::memory_order_relaxed);
             return entry.track_id;
         }
     }
@@ -78,8 +77,8 @@ uint32_t resolvePipelineTrackSlow(uint16_t source_id, std::atomic<uint16_t>& cac
         {track_name, /*unit=*/{}, source_id, /*lanes=*/1, TimelineTrackInfo::Kind::Lane,
          TimelineTrackInfo::Layout::Pipeline});
     entries.push_back({source_id, track_id});
-    cached_track_id.store(track_id, std::memory_order_relaxed);
-    cached_source_id.store(source_id, std::memory_order_relaxed);
+    cached_entry.store((static_cast<uint64_t>(source_id) << 32) | track_id,
+                       std::memory_order_relaxed);
     return track_id;
 }
 
@@ -89,17 +88,16 @@ uint32_t resolvePipelineTrack(ObservationContext* ctx) {
         return 0;
     }
 
-    static std::atomic<uint16_t> cached_source_id{0};
-    static std::atomic<uint32_t> cached_track_id{0};
+    static std::atomic<uint64_t> cached_entry{0};
 
     const uint16_t source_id = ctx->sourceId();
-    const uint32_t track_id = cached_track_id.load(std::memory_order_relaxed);
-    if (OBSERVE_LIKELY(track_id != 0 &&
-                       cached_source_id.load(std::memory_order_relaxed) == source_id)) {
+    const uint64_t entry = cached_entry.load(std::memory_order_relaxed);
+    const uint32_t track_id = static_cast<uint32_t>(entry);
+    if (OBSERVE_LIKELY(track_id != 0 && static_cast<uint16_t>(entry >> 32) == source_id)) {
         return track_id;
     }
 
-    return resolvePipelineTrackSlow<Site>(source_id, cached_source_id, cached_track_id);
+    return resolvePipelineTrackSlow<Site>(source_id, cached_entry);
 }
 
 template <typename... Items>
