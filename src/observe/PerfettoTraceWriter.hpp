@@ -138,6 +138,11 @@ public:
     void sliceBegin(uint64_t track_uuid, std::string_view category, std::string_view name,
                     uint64_t cycle, uint64_t flow_id, std::span<const Annotation> annotations);
 
+    /// Open a span with an explicit flow id; unlike sliceBegin(), flow id 0 is emitted.
+    void sliceBeginWithFlow(uint64_t track_uuid, std::string_view category, std::string_view name,
+                            uint64_t cycle, uint64_t flow_id,
+                            std::span<const Annotation> annotations);
+
     /// Close the innermost open span on @p track_uuid at @p cycle.
     void sliceEnd(uint64_t track_uuid, uint64_t cycle);
 
@@ -153,6 +158,10 @@ private:
     /// Compresses one packet-aligned chunk into a compressed_packets wrapper
     /// (raw fallback on deflate failure).
     void writeChunk_(const uint8_t* data, size_t size);
+
+    void sliceBeginImpl_(uint64_t track_uuid, std::string_view category, std::string_view name,
+                         uint64_t cycle, uint64_t flow_id, bool has_flow_id,
+                         std::span<const Annotation> annotations);
 
     std::unique_ptr<Impl> impl_;
 

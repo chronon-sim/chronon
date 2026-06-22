@@ -538,6 +538,20 @@ void PerfettoTraceWriter::instant(uint64_t track_uuid, std::string_view category
 void PerfettoTraceWriter::sliceBegin(uint64_t track_uuid, std::string_view category,
                                      std::string_view name, uint64_t cycle, uint64_t flow_id,
                                      std::span<const Annotation> annotations) {
+    sliceBeginImpl_(track_uuid, category, name, cycle, flow_id, flow_id != 0, annotations);
+}
+
+void PerfettoTraceWriter::sliceBeginWithFlow(uint64_t track_uuid, std::string_view category,
+                                             std::string_view name, uint64_t cycle,
+                                             uint64_t flow_id,
+                                             std::span<const Annotation> annotations) {
+    sliceBeginImpl_(track_uuid, category, name, cycle, flow_id, /*has_flow_id=*/true, annotations);
+}
+
+void PerfettoTraceWriter::sliceBeginImpl_(uint64_t track_uuid, std::string_view category,
+                                          std::string_view name, uint64_t cycle, uint64_t flow_id,
+                                          bool has_flow_id,
+                                          std::span<const Annotation> annotations) {
     if (!isOpen()) {
         return;
     }
@@ -553,7 +567,7 @@ void PerfettoTraceWriter::sliceBegin(uint64_t track_uuid, std::string_view categ
         event->add_category_iids(strings.category_iid);
     }
     event->set_name_iid(strings.name_iid);
-    if (flow_id != 0) {
+    if (has_flow_id) {
         event->add_flow_ids(flow_id);
     }
     Impl::writeAnnotations(event, annotations, annotation_iids);

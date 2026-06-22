@@ -717,6 +717,10 @@ void test_pipeline_counter_track_ordering() {
         unit.pipeStage<0, "BP0">(LANE_CAT, 100);
         unit.cycle = 12;
         unit.pipeStage<0, "BP1">(LANE_CAT, 101);
+        unit.cycle = 13;
+        unit.pipeStage<0, "BP0">(LANE_CAT, 0);
+        unit.cycle = 14;
+        unit.pipeStage<0, "BP1">(LANE_CAT, 0);
 
         ThreadContextManager::instance().flushAll();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -737,6 +741,17 @@ void test_pipeline_counter_track_ordering() {
     CHECK(bp1 && bp1->sibling_order_rank);
     CHECK(*bp0->sibling_order_rank < *occ->sibling_order_rank);
     CHECK(*bp1->sibling_order_rank < *occ->sibling_order_rank);
+
+    auto bp0_events = eventsOn(trace, bp0->uuid);
+    auto bp1_events = eventsOn(trace, bp1->uuid);
+    CHECK(bp0_events.size() == 4);
+    CHECK(bp1_events.size() == 4);
+    CHECK(bp0_events[2].type == 1 && bp0_events[2].timestamp == 13);
+    CHECK(bp1_events[2].type == 1 && bp1_events[2].timestamp == 14);
+    CHECK(bp0_events[2].name.starts_with("0"));
+    CHECK(bp1_events[2].name.starts_with("0"));
+    CHECK(bp0_events[2].flow_ids == std::vector<uint64_t>{0});
+    CHECK(bp1_events[2].flow_ids == std::vector<uint64_t>{0});
 
     std::filesystem::remove_all(out_dir);
     std::cout << "PASSED\n";

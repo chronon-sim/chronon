@@ -378,8 +378,8 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
             const uint64_t color_hash = pipelineColorHash(rec.payload);
             const std::string category = pipelineColorCategory(color_hash);
             const std::string event_name = pipelineColoredEventName(visible_name, color_hash);
-            perfetto_writer_->sliceBegin(track_uuid, category, event_name, rec.cycle, rec.payload,
-                                         ann_span);
+            perfetto_writer_->sliceBeginWithFlow(track_uuid, category, event_name, rec.cycle,
+                                                 rec.payload, ann_span);
             const uint64_t end_cycle = rec.cycle + 1;
             perfetto_writer_->sliceEnd(track_uuid, end_cycle);
             if (end_cycle > timeline_max_cycle_) {
