@@ -265,17 +265,19 @@ public:
      *
      * Producer-side cost matches the instant trace path: one filter check, a
      * fixed-size record fill, and a bounded arg memcpy into the SPSC queue.
-     * SpanEnd events skip temporal filtering (only the trace-channel category
-     * gate applies): a span begun inside an observation window must still
-     * close when its end falls outside it. Ends whose begin WAS suppressed
-     * are dropped by the backend's open-span table.
+     * SpanEnd events skip temporal filtering: a span begun inside an
+     * observation window must still close when its end falls outside it.
+     * Ends without a preserved category are allowed when observation is
+     * enabled at all; unmatched ends are dropped by the backend's open-span
+     * table.
      */
     bool timelineEvent(CategoryMask category, TimelineEventKind kind, uint32_t track_id,
                        uint16_t slot, uint16_t name_id, uint64_t payload,
                        const TimelineArgValue* args, size_t arg_count, uint8_t flags = 0) noexcept {
         const bool allowed =
             (kind == TimelineEventKind::SpanEnd)
-                ? filter_.shouldObserve(category | category::TRACE)
+                ? (category != category::NONE ? filter_.shouldObserve(category | category::TRACE)
+                                              : filter_.anyEnabled())
                 : filter_.shouldObserve(category | category::TRACE, currentCycle());
         if (OBSERVE_LIKELY(!allowed)) {
             return false;

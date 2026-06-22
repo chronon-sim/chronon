@@ -89,11 +89,12 @@ protected:
  * @endcode
  *
  * Filter semantics: begin/instant pass the standard trace-channel category and
- * temporal filters. end() is only gated on the trace channel itself — a span
- * begun inside an observation window still closes when its end falls outside;
- * ends whose begin was suppressed are dropped by the backend's open-span
- * table. Speculative (lookahead) events buffer locally and vanish on epoch
- * rollback like any other observation.
+ * temporal filters. end() only requires observation to be enabled because the
+ * category from begin() is not stored on the lane; a span begun inside an
+ * observation window still closes when its end falls outside. Ends whose begin
+ * was suppressed are dropped by the backend's open-span table. Speculative
+ * (lookahead) events buffer locally and vanish on epoch rollback like any
+ * other observation.
  */
 class TimelineLane : public TimelineTrackBase {
 public:
@@ -111,7 +112,7 @@ public:
 
     /// Close the (this lane, @p slot) span at the current cycle.
     bool end(uint16_t slot) noexcept {
-        if (!registered_ || !ctx_->filter().shouldObserve(category::TRACE)) {
+        if (!registered_ || !ctx_->filter().anyEnabled()) {
             return false;
         }
         stampCycle_();  // Ends skip temporal filters; the cycle only stamps the record.

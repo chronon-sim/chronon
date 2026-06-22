@@ -444,7 +444,7 @@ void test_temporal_filter_span_semantics() {
 
     {
         ObservationContext ctx(&queue, []() { return 0ULL; }, 0, "u", 1);
-        ctx.enableCategory(category::TRACE | LANE_CAT.mask());
+        ctx.enableCategory(LANE_CAT.mask());
         ctx.filter().addCycleRange(0, 100);  // Observe cycles [0, 100] only.
 
         TestUnit unit;
@@ -454,6 +454,10 @@ void test_temporal_filter_span_semantics() {
         // span (ends are not temporally filtered).
         unit.cycle = 50;
         unit.mshr.begin(0, LANE_CAT, "inside"_ev);
+        unit.cycle = 60;
+        spanBegin<"category_span">(unit, LANE_CAT, "category"_ev);
+        unit.cycle = 70;
+        spanEnd<"category_span">(unit);
         unit.cycle = 150;
         unit.mshr.end(0);
 
@@ -503,6 +507,11 @@ void test_temporal_filter_span_semantics() {
 
     const DecodedTrack* unit_track = findTrackByName(trace, "u");
     CHECK(unit_track != nullptr);
+    const DecodedTrack* category_span = childTrack(trace, "category_span", unit_track->uuid);
+    CHECK(category_span != nullptr);
+    auto category_span_events = eventsOn(trace, category_span->uuid);
+    CHECK(category_span_events.size() == 2);
+    CHECK(category_span_events[1].type == 2 && category_span_events[1].timestamp == 70);
     const DecodedTrack* stall = childTrack(trace, "stall", unit_track->uuid);
     CHECK(stall != nullptr);
     auto stall_events = eventsOn(trace, stall->uuid);
