@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +25,8 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "FixedString.hpp"
 #include "Types.hpp"
@@ -212,6 +215,55 @@ private:
     mutable std::mutex mutex_;
     std::deque<TimelineTrackInfo> tracks_;
 };
+
+namespace timeline_detail {
+
+struct CachedTrackEntry {
+    uint16_t source_id;
+    uint32_t track_id;
+};
+
+template <typename Site>
+uint32_t resolveTrackForSourceSlow(uint16_t source_id, std::atomic<uint64_t>& cached_entry,
+                                   TimelineTrackInfo::Kind kind, uint16_t lanes,
+                                   std::string_view unit, TimelineTrackInfo::Layout layout) {
+    static std::mutex mutex;
+    static std::vector<CachedTrackEntry> entries;
+    static const std::string track_name = Site::trackName();
+
+    std::lock_guard<std::mutex> lock(mutex);
+    for (const CachedTrackEntry& entry : entries) {
+        if (entry.source_id == source_id) {
+            cached_entry.store((static_cast<uint64_t>(source_id) << 32) | entry.track_id,
+                               std::memory_order_relaxed);
+            return entry.track_id;
+        }
+    }
+
+    const uint32_t track_id = TimelineTrackRegistry::instance().registerTrack(
+        {track_name, std::string(unit), source_id, lanes, kind, layout});
+    entries.push_back({source_id, track_id});
+    cached_entry.store((static_cast<uint64_t>(source_id) << 32) | track_id,
+                       std::memory_order_relaxed);
+    return track_id;
+}
+
+template <typename Site>
+uint32_t resolveTrackForSource(
+    uint16_t source_id, TimelineTrackInfo::Kind kind, uint16_t lanes, std::string_view unit = {},
+    TimelineTrackInfo::Layout layout = TimelineTrackInfo::Layout::Normal) {
+    static std::atomic<uint64_t> cached_entry{0};
+
+    const uint64_t entry = cached_entry.load(std::memory_order_relaxed);
+    const uint32_t track_id = static_cast<uint32_t>(entry);
+    if (OBSERVE_LIKELY(track_id != 0 && static_cast<uint16_t>(entry >> 32) == source_id)) {
+        return track_id;
+    }
+
+    return resolveTrackForSourceSlow<Site>(source_id, cached_entry, kind, lanes, unit, layout);
+}
+
+}  // namespace timeline_detail
 
 // ---------------------------------------------------------------------------
 // Producer vocabulary: "name"_ev, arg<"key">(value), flow(uid)

@@ -14,11 +14,9 @@
 
 #pragma once
 
-#include <atomic>
 #include <bit>
 #include <cstdint>
 #include <limits>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -60,53 +58,12 @@ struct CounterTrack {
 };
 
 template <typename Site>
-uint32_t resolveTrackSlow(ObservationContext* ctx, std::atomic<uint64_t>& cached_entry,
-                          TimelineTrackInfo::Kind kind, uint16_t lanes, std::string_view unit) {
-    struct Entry {
-        uint16_t source_id;
-        uint32_t track_id;
-    };
-
-    static std::mutex mutex;
-    static std::vector<Entry> entries;
-    static const std::string track_name = Site::trackName();
-
-    const uint16_t source_id = ctx->sourceId();
-
-    std::lock_guard<std::mutex> lock(mutex);
-    for (const Entry& entry : entries) {
-        if (entry.source_id == source_id) {
-            cached_entry.store((static_cast<uint64_t>(source_id) << 32) | entry.track_id,
-                               std::memory_order_relaxed);
-            return entry.track_id;
-        }
-    }
-
-    const uint32_t track_id = TimelineTrackRegistry::instance().registerTrack(
-        {track_name, std::string(unit), source_id, lanes, kind});
-    entries.push_back({source_id, track_id});
-    cached_entry.store((static_cast<uint64_t>(source_id) << 32) | track_id,
-                       std::memory_order_relaxed);
-    return track_id;
-}
-
-template <typename Site>
 uint32_t resolveTrack(ObservationContext* ctx, TimelineTrackInfo::Kind kind, uint16_t lanes,
                       std::string_view unit = {}) {
     if (!ctx) {
         return 0;
     }
-
-    static std::atomic<uint64_t> cached_entry{0};
-
-    const uint16_t source_id = ctx->sourceId();
-    const uint64_t entry = cached_entry.load(std::memory_order_relaxed);
-    const uint32_t track_id = static_cast<uint32_t>(entry);
-    if (OBSERVE_LIKELY(track_id != 0 && static_cast<uint16_t>(entry >> 32) == source_id)) {
-        return track_id;
-    }
-
-    return resolveTrackSlow<Site>(ctx, cached_entry, kind, lanes, unit);
+    return timeline_detail::resolveTrackForSource<Site>(ctx->sourceId(), kind, lanes, unit);
 }
 
 template <typename Unit>
