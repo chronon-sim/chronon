@@ -605,7 +605,11 @@ void test_counter_group_does_not_collide_with_child_unit() {
             }
         }
     }
-    assert(counter_tracks == 1);
+    if (counter_tracks != 1) {
+        std::cerr << "FAILED: expected one pull-model ticks counter track, got " << counter_tracks
+                  << "\n";
+        std::abort();
+    }
 
     std::filesystem::remove_all(out_dir);
     std::cout << "PASSED\n";
