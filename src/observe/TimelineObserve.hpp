@@ -120,6 +120,40 @@ ObservationContext* contextFor(Unit& unit) {
     return ctx;
 }
 
+struct LookaheadCacheSync {
+    template <typename CommitFn, typename RollbackFn>
+    void sync(ObservationContext* ctx, CommitFn&& on_commit, RollbackFn&& on_rollback) noexcept {
+        if (!ctx) {
+            return;
+        }
+
+        const uint64_t epoch = ctx->lookaheadEpochGeneration();
+        const uint64_t rollback = ctx->lookaheadRollbackGeneration();
+        if (!initialized_) {
+            observed_epoch_ = epoch;
+            observed_rollback_ = rollback;
+            initialized_ = true;
+            return;
+        }
+        if (epoch == observed_epoch_) {
+            return;
+        }
+
+        if (rollback != observed_rollback_) {
+            on_rollback();
+        } else {
+            on_commit();
+        }
+        observed_epoch_ = epoch;
+        observed_rollback_ = rollback;
+    }
+
+private:
+    uint64_t observed_epoch_ = 0;
+    uint64_t observed_rollback_ = 0;
+    bool initialized_ = false;
+};
+
 template <typename... Items>
 void emitTimelineWithItems(ObservationContext* ctx, CategoryMask category, TimelineEventKind kind,
                            uint32_t track_id, uint16_t slot, EventNameRef name, Items&&... items) {
@@ -332,15 +366,17 @@ inline void portAvailable(Unit& unit, const Port& port, std::string_view unit_na
 class TimelineSpan {
 public:
     TimelineSpan(ObservableUnit* owner, std::string_view name, uint16_t lanes = 1)
-        : lane_(owner, name, lanes), open_(lanes, false) {}
+        : lane_(owner, name, lanes), open_(lanes, false), committed_open_(lanes, false) {}
 
     template <typename Cat, typename... Items>
     bool begin(uint16_t slot, Cat category, EventNameRef name, Items&&... items) noexcept {
+        syncLookaheadCache_();
         if (!validSlot_(slot)) {
             return false;
         }
         if (lane_.begin(slot, category, name, std::forward<Items>(items)...)) {
             open_[slot] = true;
+            updateCommittedOpen_(slot);
             return true;
         }
         return false;
@@ -352,11 +388,13 @@ public:
     }
 
     bool end(uint16_t slot = 0) noexcept {
+        syncLookaheadCache_();
         if (!validSlot_(slot) || !open_[slot]) {
             return false;
         }
         if (lane_.end(slot)) {
             open_[slot] = false;
+            updateCommittedOpen_(slot);
             return true;
         }
         return false;
@@ -378,6 +416,7 @@ public:
     template <typename Cat, typename... Items>
     void update(uint16_t slot, bool active, Cat category, EventNameRef name,
                 Items&&... items) noexcept {
+        syncLookaheadCache_();
         if (!validSlot_(slot)) {
             return;
         }
@@ -397,8 +436,23 @@ public:
 private:
     [[nodiscard]] bool validSlot_(uint16_t slot) const noexcept { return slot < open_.size(); }
 
+    void syncLookaheadCache_() noexcept {
+        lookahead_sync_.sync(
+            lane_.observationContext(), [this]() { committed_open_ = open_; },
+            [this]() { open_ = committed_open_; });
+    }
+
+    void updateCommittedOpen_(uint16_t slot) noexcept {
+        auto* ctx = lane_.observationContext();
+        if (!ctx || !ctx->isLookaheadMode()) {
+            committed_open_[slot] = open_[slot];
+        }
+    }
+
     TimelineLane lane_;
     std::vector<bool> open_;
+    std::vector<bool> committed_open_;
+    timeline_observe_detail::LookaheadCacheSync lookahead_sync_;
 };
 
 /**
@@ -412,10 +466,12 @@ public:
     template <typename T>
     void sample(T value) noexcept {
         static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
+        syncLookaheadCache_();
         const int64_t normalized = static_cast<int64_t>(value);
         if (counter_.sample(normalized)) {
             last_ = normalized;
             has_last_ = true;
+            updateCommittedCache_();
         }
     }
 
@@ -423,16 +479,19 @@ public:
         requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
     void sample(Cat category, T value) noexcept {
         static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
+        syncLookaheadCache_();
         const int64_t normalized = static_cast<int64_t>(value);
         if (counter_.sample(category, normalized)) {
             last_ = normalized;
             has_last_ = true;
+            updateCommittedCache_();
         }
     }
 
     template <typename T>
     void sampleOnChange(T value) noexcept {
         static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
+        syncLookaheadCache_();
         const int64_t normalized = static_cast<int64_t>(value);
         if (!has_last_ || normalized != last_) {
             sample(normalized);
@@ -443,6 +502,7 @@ public:
         requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
     void sampleOnChange(Cat category, T value) noexcept {
         static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
+        syncLookaheadCache_();
         const int64_t normalized = static_cast<int64_t>(value);
         if (!has_last_ || normalized != last_) {
             sample(category, normalized);
@@ -450,9 +510,33 @@ public:
     }
 
 private:
+    void syncLookaheadCache_() noexcept {
+        lookahead_sync_.sync(
+            counter_.observationContext(),
+            [this]() {
+                committed_last_ = last_;
+                committed_has_last_ = has_last_;
+            },
+            [this]() {
+                last_ = committed_last_;
+                has_last_ = committed_has_last_;
+            });
+    }
+
+    void updateCommittedCache_() noexcept {
+        auto* ctx = counter_.observationContext();
+        if (!ctx || !ctx->isLookaheadMode()) {
+            committed_last_ = last_;
+            committed_has_last_ = has_last_;
+        }
+    }
+
     TimelineCounter counter_;
     int64_t last_ = 0;
+    int64_t committed_last_ = 0;
     bool has_last_ = false;
+    bool committed_has_last_ = false;
+    timeline_observe_detail::LookaheadCacheSync lookahead_sync_;
 };
 
 /**
@@ -469,6 +553,7 @@ public:
         static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
         static_assert(std::is_integral_v<std::decay_t<Capacity>>,
                       "total capacity must be integral");
+        syncLookaheadCache_();
         const int64_t used_value = static_cast<int64_t>(used);
         const int64_t total_value = static_cast<int64_t>(total);
         const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
@@ -478,6 +563,7 @@ public:
             last_used_ = used_value;
             last_free_ = free_value;
             has_last_ = true;
+            updateCommittedCache_();
         }
     }
 
@@ -487,6 +573,7 @@ public:
         static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
         static_assert(std::is_integral_v<std::decay_t<Capacity>>,
                       "total capacity must be integral");
+        syncLookaheadCache_();
         const int64_t used_value = static_cast<int64_t>(used);
         const int64_t total_value = static_cast<int64_t>(total);
         const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
@@ -496,6 +583,7 @@ public:
             last_used_ = used_value;
             last_free_ = free_value;
             has_last_ = true;
+            updateCommittedCache_();
         }
     }
 
@@ -504,6 +592,7 @@ public:
         static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
         static_assert(std::is_integral_v<std::decay_t<Capacity>>,
                       "total capacity must be integral");
+        syncLookaheadCache_();
         const int64_t used_value = static_cast<int64_t>(used);
         const int64_t total_value = static_cast<int64_t>(total);
         const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
@@ -518,6 +607,7 @@ public:
         static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
         static_assert(std::is_integral_v<std::decay_t<Capacity>>,
                       "total capacity must be integral");
+        syncLookaheadCache_();
         const int64_t used_value = static_cast<int64_t>(used);
         const int64_t total_value = static_cast<int64_t>(total);
         const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
@@ -533,11 +623,39 @@ private:
         return out;
     }
 
+    void syncLookaheadCache_() noexcept {
+        lookahead_sync_.sync(
+            used_.observationContext(),
+            [this]() {
+                committed_last_used_ = last_used_;
+                committed_last_free_ = last_free_;
+                committed_has_last_ = has_last_;
+            },
+            [this]() {
+                last_used_ = committed_last_used_;
+                last_free_ = committed_last_free_;
+                has_last_ = committed_has_last_;
+            });
+    }
+
+    void updateCommittedCache_() noexcept {
+        auto* ctx = used_.observationContext();
+        if (!ctx || !ctx->isLookaheadMode()) {
+            committed_last_used_ = last_used_;
+            committed_last_free_ = last_free_;
+            committed_has_last_ = has_last_;
+        }
+    }
+
     TimelineCounter used_;
     TimelineCounter free_;
     int64_t last_used_ = 0;
     int64_t last_free_ = 0;
+    int64_t committed_last_used_ = 0;
+    int64_t committed_last_free_ = 0;
     bool has_last_ = false;
+    bool committed_has_last_ = false;
+    timeline_observe_detail::LookaheadCacheSync lookahead_sync_;
 };
 
 }  // namespace chronon::observe

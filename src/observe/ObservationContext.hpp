@@ -131,17 +131,22 @@ public:
         if (lookahead_buffer_.hasEvents() && queue_) {
             lookahead_buffer_.commit(*queue_);
         }
+        ++lookahead_epoch_generation_;
     }
 
     /// Discards a speculative epoch: rolls back counters, drops buffered events.
     void rollbackEpoch() noexcept {
         counters_.rollbackAllEpochs();
         lookahead_buffer_.rollback();
+        ++lookahead_epoch_generation_;
+        ++lookahead_rollback_generation_;
     }
 
     /// When enabled, events buffer locally rather than going to the global queue.
     void setLookaheadMode(bool enabled) noexcept { lookahead_mode_ = enabled; }
     bool isLookaheadMode() const noexcept { return lookahead_mode_; }
+    uint64_t lookaheadEpochGeneration() const noexcept { return lookahead_epoch_generation_; }
+    uint64_t lookaheadRollbackGeneration() const noexcept { return lookahead_rollback_generation_; }
 
     /// Registers counter addresses with the registry for the pull-model snapshot.
     void registerAllCounters(class CounterRegistry* registry);
@@ -536,6 +541,8 @@ private:
 
     LookaheadBuffer lookahead_buffer_;
     bool lookahead_mode_ = false;
+    uint64_t lookahead_epoch_generation_ = 0;
+    uint64_t lookahead_rollback_generation_ = 0;
 
     ObservationStats stats_{};
 

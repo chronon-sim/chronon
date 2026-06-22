@@ -41,6 +41,7 @@ public:
     [[nodiscard]] bool isRegistered() const noexcept { return registered_; }
     [[nodiscard]] uint32_t trackId() const noexcept { return track_id_; }
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
+    [[nodiscard]] ObservationContext* observationContext() const noexcept { return ctx_; }
 
 private:
     friend class ObservableUnit;

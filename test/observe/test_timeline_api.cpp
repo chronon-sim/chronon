@@ -793,6 +793,9 @@ void test_lookahead_commit_rollback() {
         // Speculative span discarded by rollback.
         unit.cycle = 300;
         unit.mshr.begin(0, LANE_CAT, "speculative"_ev);
+        unit.stall.update(true, LANE_CAT, "spec_stall"_ev, arg<"reason">(uint64_t{1}));
+        unit.member_gauge.sampleOnChange(LANE_CAT, 7);
+        unit.member_capacity.sampleOnChange(LANE_CAT, 3, 8);
         unit.cycle = 310;
         unit.mshr.end(0);
         ctx.rollbackEpoch();
@@ -800,6 +803,11 @@ void test_lookahead_commit_rollback() {
         // Committed span survives.
         unit.cycle = 320;
         unit.mshr.begin(0, LANE_CAT, "committed"_ev);
+        unit.stall.update(true, LANE_CAT, "committed_stall"_ev, arg<"reason">(uint64_t{1}));
+        unit.member_gauge.sampleOnChange(LANE_CAT, 7);
+        unit.member_capacity.sampleOnChange(LANE_CAT, 3, 8);
+        unit.cycle = 325;
+        unit.stall.update(false, LANE_CAT, "committed_stall"_ev);
         unit.cycle = 330;
         unit.mshr.end(0);
         ctx.commitEpoch();
@@ -811,10 +819,43 @@ void test_lookahead_commit_rollback() {
     backend.stop();
 
     DecodedTrace trace = decodeFile(timeline);
-    CHECK(trace.events.size() == 2);
-    CHECK(trace.events[0].type == 1 && trace.events[0].timestamp == 320);
-    CHECK(trace.events[0].name == "committed");
-    CHECK(trace.events[1].type == 2 && trace.events[1].timestamp == 330);
+    CHECK(trace.events.size() == 7);
+
+    const DecodedTrack* slot0 = findTrackByName(trace, "mshr[0]");
+    CHECK(slot0 != nullptr);
+    auto slot0_events = eventsOn(trace, slot0->uuid);
+    CHECK(slot0_events.size() == 2);
+    CHECK(slot0_events[0].type == 1 && slot0_events[0].timestamp == 320);
+    CHECK(slot0_events[0].name == "committed");
+    CHECK(slot0_events[1].type == 2 && slot0_events[1].timestamp == 330);
+
+    const DecodedTrack* stall = findTrackByName(trace, "stall");
+    CHECK(stall != nullptr);
+    auto stall_events = eventsOn(trace, stall->uuid);
+    CHECK(stall_events.size() == 2);
+    CHECK(stall_events[0].type == 1 && stall_events[0].timestamp == 320);
+    CHECK(stall_events[0].name == "committed_stall");
+    CHECK(stall_events[0].uint_annotations.at("reason") == 1);
+    CHECK(stall_events[1].type == 2 && stall_events[1].timestamp == 325);
+
+    const DecodedTrack* member_gauge = findTrackByName(trace, "member_gauge");
+    CHECK(member_gauge != nullptr && member_gauge->is_counter);
+    auto gauge_events = eventsOn(trace, member_gauge->uuid);
+    CHECK(gauge_events.size() == 1);
+    CHECK(gauge_events[0].timestamp == 320 && gauge_events[0].counter_value.value() == 7);
+
+    const DecodedTrack* capacity_used = findTrackByName(trace, "member_capacity.used");
+    const DecodedTrack* capacity_free = findTrackByName(trace, "member_capacity.free");
+    CHECK(capacity_used != nullptr && capacity_used->is_counter);
+    CHECK(capacity_free != nullptr && capacity_free->is_counter);
+    auto capacity_used_events = eventsOn(trace, capacity_used->uuid);
+    auto capacity_free_events = eventsOn(trace, capacity_free->uuid);
+    CHECK(capacity_used_events.size() == 1);
+    CHECK(capacity_free_events.size() == 1);
+    CHECK(capacity_used_events[0].timestamp == 320 &&
+          capacity_used_events[0].counter_value.value() == 3);
+    CHECK(capacity_free_events[0].timestamp == 320 &&
+          capacity_free_events[0].counter_value.value() == 5);
 
     std::filesystem::remove_all(out_dir);
     std::cout << "PASSED\n";
