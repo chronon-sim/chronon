@@ -463,11 +463,15 @@ void test_temporal_filter_span_semantics() {
         // A suppressed sample must not poison the sample-on-change cache:
         // the first equal value inside the category window still has to emit.
         unit.cycle = 190;
+        unit.stall.update(true, LANE_CAT, "window_stall"_ev, arg<"reason">(uint64_t{1}));
         unit.member_gauge.sampleOnChange(LANE_CAT, 5);
         unit.member_capacity.sampleOnChange(LANE_CAT, 2, 8);
         unit.cycle = 210;
+        unit.stall.update(true, LANE_CAT, "window_stall"_ev, arg<"reason">(uint64_t{1}));
         unit.member_gauge.sampleOnChange(LANE_CAT, 5);
         unit.member_capacity.sampleOnChange(LANE_CAT, 2, 8);
+        unit.cycle = 220;
+        unit.stall.update(false, LANE_CAT, "window_stall"_ev);
 
         ThreadContextManager::instance().flushAll();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -492,6 +496,15 @@ void test_temporal_filter_span_semantics() {
 
     const DecodedTrack* unit_track = findTrackByName(trace, "u");
     CHECK(unit_track != nullptr);
+    const DecodedTrack* stall = childTrack(trace, "stall", unit_track->uuid);
+    CHECK(stall != nullptr);
+    auto stall_events = eventsOn(trace, stall->uuid);
+    CHECK(stall_events.size() == 2);
+    CHECK(stall_events[0].type == 1 && stall_events[0].timestamp == 210);
+    CHECK(stall_events[0].name == "window_stall");
+    CHECK(stall_events[0].uint_annotations.at("reason") == 1);
+    CHECK(stall_events[1].type == 2 && stall_events[1].timestamp == 220);
+
     const DecodedTrack* member_gauge = childTrack(trace, "member_gauge", unit_track->uuid);
     CHECK(member_gauge != nullptr && member_gauge->is_counter);
     auto gauge_events = eventsOn(trace, member_gauge->uuid);

@@ -335,33 +335,39 @@ public:
         : lane_(owner, name, lanes), open_(lanes, false) {}
 
     template <typename Cat, typename... Items>
-    void begin(uint16_t slot, Cat category, EventNameRef name, Items&&... items) noexcept {
+    bool begin(uint16_t slot, Cat category, EventNameRef name, Items&&... items) noexcept {
         if (!validSlot_(slot)) {
-            return;
+            return false;
         }
-        lane_.begin(slot, category, name, std::forward<Items>(items)...);
-        open_[slot] = true;
+        if (lane_.begin(slot, category, name, std::forward<Items>(items)...)) {
+            open_[slot] = true;
+            return true;
+        }
+        return false;
     }
 
     template <typename Cat, typename... Items>
-    void begin(Cat category, EventNameRef name, Items&&... items) noexcept {
-        begin(/*slot=*/0, category, name, std::forward<Items>(items)...);
+    bool begin(Cat category, EventNameRef name, Items&&... items) noexcept {
+        return begin(/*slot=*/0, category, name, std::forward<Items>(items)...);
     }
 
-    void end(uint16_t slot = 0) noexcept {
+    bool end(uint16_t slot = 0) noexcept {
         if (!validSlot_(slot) || !open_[slot]) {
-            return;
+            return false;
         }
-        lane_.end(slot);
-        open_[slot] = false;
+        if (lane_.end(slot)) {
+            open_[slot] = false;
+            return true;
+        }
+        return false;
     }
 
     template <typename Cat, typename... Items>
-    void instant(uint16_t slot, Cat category, EventNameRef name, Items&&... items) noexcept {
+    bool instant(uint16_t slot, Cat category, EventNameRef name, Items&&... items) noexcept {
         if (!validSlot_(slot)) {
-            return;
+            return false;
         }
-        lane_.instant(slot, category, name, std::forward<Items>(items)...);
+        return lane_.instant(slot, category, name, std::forward<Items>(items)...);
     }
 
     template <typename Cat, typename... Items>

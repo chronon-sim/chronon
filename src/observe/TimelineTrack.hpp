@@ -104,29 +104,29 @@ public:
     /// Open the (this lane, @p slot) span. Items: at most one flow() plus up
     /// to MAX_TIMELINE_ARGS typed args, in any order.
     template <typename Cat, typename... Items>
-    void begin(uint16_t slot, Cat category, EventNameRef name, Items... items) noexcept {
-        emit_(TimelineEventKind::SpanBegin, slot, category, name, items...);
+    bool begin(uint16_t slot, Cat category, EventNameRef name, Items... items) noexcept {
+        return emit_(TimelineEventKind::SpanBegin, slot, category, name, items...);
     }
 
     /// Close the (this lane, @p slot) span at the current cycle.
-    void end(uint16_t slot) noexcept {
+    bool end(uint16_t slot) noexcept {
         if (!registered_ || !ctx_->filter().shouldObserve(category::TRACE)) {
-            return;
+            return false;
         }
         stampCycle_();  // Ends skip temporal filters; the cycle only stamps the record.
-        ctx_->timelineEvent(category::NONE, TimelineEventKind::SpanEnd, track_id_, slot,
-                            /*name_id=*/0, /*payload=*/0, nullptr, 0);
+        return ctx_->timelineEvent(category::NONE, TimelineEventKind::SpanEnd, track_id_, slot,
+                                   /*name_id=*/0, /*payload=*/0, nullptr, 0);
     }
 
     /// Point event on the (this lane, @p slot) track.
     template <typename Cat, typename... Items>
-    void instant(uint16_t slot, Cat category, EventNameRef name, Items... items) noexcept {
-        emit_(TimelineEventKind::Instant, slot, category, name, items...);
+    bool instant(uint16_t slot, Cat category, EventNameRef name, Items... items) noexcept {
+        return emit_(TimelineEventKind::Instant, slot, category, name, items...);
     }
 
 private:
     template <typename Cat, typename... Items>
-    void emit_(TimelineEventKind kind, uint16_t slot, Cat category, EventNameRef name,
+    bool emit_(TimelineEventKind kind, uint16_t slot, Cat category, EventNameRef name,
                Items... items) noexcept {
         constexpr size_t MAX_ITEMS = sizeof...(Items);
         constexpr size_t FLOW_ITEMS =
@@ -136,7 +136,7 @@ private:
                       "too many typed timeline args (max 8)");
 
         if (!registered_) {
-            return;
+            return false;
         }
         // Stamp the owner's cycle BEFORE the filter check: temporal filters
         // evaluate against the context's current cycle, which is a shared
@@ -144,18 +144,19 @@ private:
         stampCycle_();
         const CategoryMask cat_mask = static_cast<CategoryMask>(category);
         if (!ctx_->shouldTrace(cat_mask)) {
-            return;
+            return false;
         }
 
         if constexpr (MAX_ITEMS == 0) {
-            ctx_->timelineEvent(cat_mask, kind, track_id_, slot, name.id, /*payload=*/0, nullptr,
-                                0);
+            return ctx_->timelineEvent(cat_mask, kind, track_id_, slot, name.id, /*payload=*/0,
+                                       nullptr, 0);
         } else {
             TimelineArgValue args[MAX_ITEMS];
             size_t arg_count = 0;
             uint64_t flow_id = 0;
             (timeline_detail::foldTimelineItem(args, arg_count, flow_id, items), ...);
-            ctx_->timelineEvent(cat_mask, kind, track_id_, slot, name.id, flow_id, args, arg_count);
+            return ctx_->timelineEvent(cat_mask, kind, track_id_, slot, name.id, flow_id, args,
+                                       arg_count);
         }
     }
 };
