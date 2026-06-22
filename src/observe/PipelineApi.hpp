@@ -146,26 +146,38 @@ template <uint16_t Pipe>
 struct PipelinePipe {
     template <uint16_t Stage, typename Cat, typename... Items>
     void stage(ObservationContext* ctx, Cat category, uint64_t id, Items&&... items) const {
+        const CategoryMask cat_mask = static_cast<CategoryMask>(category);
+        if (!ctx || !ctx->shouldTrace(cat_mask)) {
+            return;
+        }
         using Site = pipeline_detail::NumericPipelineStage<Pipe, Stage>;
         const uint32_t track_id = pipeline_detail::resolvePipelineTrack<Site>(ctx);
-        pipeline_detail::emitPipelineSlice(ctx, static_cast<CategoryMask>(category), track_id, id,
+        pipeline_detail::emitPipelineSlice(ctx, cat_mask, track_id, id,
                                            std::forward<Items>(items)...);
     }
 
     template <FixedString Stage, typename Cat, typename... Items>
     void stageName(ObservationContext* ctx, Cat category, uint64_t id, Items&&... items) const {
+        const CategoryMask cat_mask = static_cast<CategoryMask>(category);
+        if (!ctx || !ctx->shouldTrace(cat_mask)) {
+            return;
+        }
         using Site = pipeline_detail::NamedPipelineStage<Pipe, Stage>;
         const uint32_t track_id = pipeline_detail::resolvePipelineTrack<Site>(ctx);
-        pipeline_detail::emitPipelineSlice(ctx, static_cast<CategoryMask>(category), track_id, id,
+        pipeline_detail::emitPipelineSlice(ctx, cat_mask, track_id, id,
                                            std::forward<Items>(items)...);
     }
 
     template <FixedString Stage, typename Cat, typename... Items>
     void stageNameHex(ObservationContext* ctx, Cat category, uint64_t id, Items&&... items) const {
+        const CategoryMask cat_mask = static_cast<CategoryMask>(category);
+        if (!ctx || !ctx->shouldTrace(cat_mask)) {
+            return;
+        }
         using Site = pipeline_detail::NamedPipelineStage<Pipe, Stage>;
         const uint32_t track_id = pipeline_detail::resolvePipelineTrack<Site>(ctx);
-        pipeline_detail::emitPipelineSliceHex(ctx, static_cast<CategoryMask>(category), track_id,
-                                              id, std::forward<Items>(items)...);
+        pipeline_detail::emitPipelineSliceHex(ctx, cat_mask, track_id, id,
+                                              std::forward<Items>(items)...);
     }
 };
 

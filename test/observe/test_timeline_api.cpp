@@ -729,6 +729,26 @@ void test_pipeline_counter_track_ordering() {
     std::cout << "PASSED\n";
 }
 
+void test_disabled_pipeline_skips_track_registration() {
+    std::cout << "Testing disabled pipeline skips track registration... ";
+
+    ObservationQueue queue(256 * 1024);
+    ObservationContext ctx(&queue, []() { return 0ULL; }, 0, "fetch", 1);
+
+    TestUnit unit;
+    unit.setObservationContext(&ctx);
+    unit.cycle = 20;
+
+    const size_t tracks_before = TimelineTrackRegistry::instance().size();
+    unit.pipe<98, 7>(LANE_CAT, 100, arg<"pc">(0x100ULL));
+    unit.pipeStage<98, "DISABLED">(LANE_CAT, 101, arg<"pc">(0x104ULL));
+    unit.pipeStageHex<98, "DISABLED_HEX">(LANE_CAT, 102, arg<"pc">(0x108ULL));
+
+    CHECK(TimelineTrackRegistry::instance().size() == tracks_before);
+
+    std::cout << "PASSED\n";
+}
+
 void test_lookahead_commit_rollback() {
     std::cout << "Testing lookahead commit/rollback of timeline events... ";
 
@@ -855,6 +875,7 @@ int main() {
     test_temporal_filter_span_semantics();
     test_timeline_observe_convenience_api();
     test_pipeline_counter_track_ordering();
+    test_disabled_pipeline_skips_track_registration();
     test_lookahead_commit_rollback();
     measure_producer_cost();
 
