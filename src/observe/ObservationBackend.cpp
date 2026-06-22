@@ -121,6 +121,18 @@ void ObservationBackend::wakeUp() noexcept {
     wake_cv_.notify_one();
 }
 
+void ObservationBackend::predeclareTimelineSourceTracks_() {
+    if (!perfetto_writer_ || sim_process_uuid_ == 0) {
+        return;
+    }
+
+    for (uint16_t source_id = 1; source_id < source_name_cache_.size(); ++source_id) {
+        if (!source_name_cache_[source_id].empty()) {
+            (void)timelineTrackForSource_(source_id);
+        }
+    }
+}
+
 void ObservationBackend::run_() {
     // Register stop_callback: when the simulation's stop_source fires,
     // set should_stop_ and wake the spin-wait so we drain and exit promptly.
@@ -806,13 +818,13 @@ void ObservationBackend::processStructuredLog_(const std::byte* data, size_t dat
 
     const char* level_str = "INFO";
     Channel channel = Channel::Info;
-    if (rec->category & static_cast<uint32_t>(category::LOG_DEBUG)) {
+    if (rec->category & category::LOG_DEBUG) {
         level_str = "DEBUG";
         channel = Channel::Debug;
-    } else if (rec->category & static_cast<uint32_t>(category::LOG_WARN)) {
+    } else if (rec->category & category::LOG_WARN) {
         level_str = "WARN";
         channel = Channel::Warn;
-    } else if (rec->category & static_cast<uint32_t>(category::LOG_ERROR)) {
+    } else if (rec->category & category::LOG_ERROR) {
         level_str = "ERROR";
         channel = Channel::Error;
     }

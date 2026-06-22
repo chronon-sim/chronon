@@ -156,6 +156,7 @@ target_link_libraries(test_observation_hardening
     chronon::core
     chronon_observe
     chronon_compile_options
+    ZLIB::ZLIB
 )
 
 target_compile_features(test_counter_units PRIVATE cxx_std_20)

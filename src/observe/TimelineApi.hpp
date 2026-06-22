@@ -39,6 +39,7 @@ enum class TimelineEventKind : uint8_t {
     SpanBegin = 1,
     SpanEnd = 2,
     CounterSample = 3,
+    PipelineSlice = 4,  ///< One-cycle pipeline occupancy slice; payload is item id.
 };
 
 /**
@@ -51,6 +52,7 @@ enum class TimelineEventKind : uint8_t {
  */
 /// Sentinel for TimelineRecord::category_bit: no user category.
 constexpr uint8_t TIMELINE_NO_CATEGORY = 0xFF;
+constexpr uint8_t TIMELINE_FLAG_NAME_HEX = 1u << 0;
 
 struct TimelineRecord {
     uint64_t cycle;
@@ -159,12 +161,17 @@ public:
 /** @brief Metadata for one declared timeline track (lane group or counter). */
 struct TimelineTrackInfo {
     enum class Kind : uint8_t { Lane = 0, Counter = 1 };
+    enum class Layout : uint8_t {
+        Normal = 0,
+        Pipeline = 1,
+    };
 
     std::string name;
     std::string unit;    ///< Counter unit string (Counter kind only).
     uint16_t source_id;  ///< Owning unit in the source-name registry.
     uint16_t lanes;      ///< Declared sub-lane count (Lane kind; 1 = single track).
     Kind kind;
+    Layout layout = Layout::Normal;
 };
 
 /**

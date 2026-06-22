@@ -72,11 +72,12 @@ public:
      * bit-cast int64_t for Int, bit-cast double for Double.
      */
     struct Annotation {
-        enum class Kind : uint8_t { Uint, Int, Double, Bool, Pointer };
+        enum class Kind : uint8_t { Uint, Int, Double, Bool, Pointer, String };
 
         std::string_view name;
         Kind kind;
         uint64_t bits;
+        std::string_view string = {};
     };
 
     PerfettoTraceWriter();
@@ -100,11 +101,12 @@ public:
     uint64_t addProcessTrack(std::string_view process_name, int32_t pid);
 
     /// @return Track UUID for a named track, optionally nested under @p parent_uuid.
-    uint64_t addTrack(std::string_view name, uint64_t parent_uuid = 0);
+    uint64_t addTrack(std::string_view name, uint64_t parent_uuid = 0,
+                      int32_t sibling_order_rank = -1);
 
     /// @return Track UUID for a counter track (rendered as a value graph).
     uint64_t addCounterTrack(std::string_view name, std::string_view unit_name,
-                             uint64_t parent_uuid = 0);
+                             uint64_t parent_uuid = 0, int32_t sibling_order_rank = -1);
 
     /**
      * @brief Emit a complete wall-clock slice (paired SLICE_BEGIN / SLICE_END packets).
@@ -136,6 +138,11 @@ public:
     void sliceBegin(uint64_t track_uuid, std::string_view category, std::string_view name,
                     uint64_t cycle, uint64_t flow_id, std::span<const Annotation> annotations);
 
+    /// Open a span with an explicit flow id; unlike sliceBegin(), flow id 0 is emitted.
+    void sliceBeginWithFlow(uint64_t track_uuid, std::string_view category, std::string_view name,
+                            uint64_t cycle, uint64_t flow_id,
+                            std::span<const Annotation> annotations);
+
     /// Close the innermost open span on @p track_uuid at @p cycle.
     void sliceEnd(uint64_t track_uuid, uint64_t cycle);
 
@@ -151,6 +158,10 @@ private:
     /// Compresses one packet-aligned chunk into a compressed_packets wrapper
     /// (raw fallback on deflate failure).
     void writeChunk_(const uint8_t* data, size_t size);
+
+    void sliceBeginImpl_(uint64_t track_uuid, std::string_view category, std::string_view name,
+                         uint64_t cycle, uint64_t flow_id, bool has_flow_id,
+                         std::span<const Annotation> annotations);
 
     std::unique_ptr<Impl> impl_;
 

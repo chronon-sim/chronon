@@ -36,6 +36,8 @@
 #endif
 #endif
 
+#include "PftraceTestDecoder.hpp"
+#include "observe/CounterRegistry.hpp"
 #include "observe/FormatRegistry.hpp"
 #include "observe/LookaheadBuffer.hpp"
 #include "observe/ObservationBackend.hpp"
@@ -46,6 +48,7 @@
 #include "observe/ThreadContextManager.hpp"
 
 using namespace chronon::observe;
+using namespace pftrace_test;
 
 namespace {
 
@@ -538,6 +541,80 @@ void test_timeline_restart_redeclares_tracks() {
     std::cout << "PASSED\n";
 }
 
+void test_counter_group_does_not_collide_with_child_unit() {
+    std::cout << "Testing counter group avoids child unit path collision... ";
+
+    const std::string out_dir = "/tmp/chronon_counter_group_collision";
+    std::filesystem::remove_all(out_dir);
+
+    ObservationQueue queue(64 * 1024);
+    ObservationBackend::Config cfg;
+    cfg.output_dir = out_dir;
+    cfg.enable_counter_csv = false;
+    cfg.enable_reordering = false;
+    cfg.timeline_compress = false;
+
+    ObservationBackend backend(queue, cfg);
+    backend.setSourceNameLookup([](uint16_t id) -> std::string_view {
+        if (id == 1) return "core";
+        if (id == 2) return "core.counters";
+        return "";
+    });
+    backend.start();
+
+    ObservationContext child_ctx(&queue, []() { return 1ULL; }, 0, "core.counters", 2);
+    child_ctx.enableCategory(category::TRACE);
+    const FormatId fmt =
+        FormatRegistry::instance().registerFormat("child", __FILE__, __LINE__, {}, true);
+    child_ctx.trace(category::TRACE, fmt);
+
+    SimpleCounter counter;
+    counter.increment(7);
+    CounterRegistry registry;
+    registry.registerCounter("core", makeCounterId(0), &counter, "ticks");
+    registry.dumpSnapshots(2, &queue, {});
+    ThreadContextManager::instance().flushAll();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    const std::filesystem::path timeline = backend.outputDir() / "timeline.pftrace";
+    backend.stop();
+    DecodedTrace trace = decodeFile(timeline);
+
+    const DecodedTrack* core = nullptr;
+    for (const auto& track : trace.tracks) {
+        if (track.name == "core") {
+            core = &track;
+            break;
+        }
+    }
+    assert(core != nullptr);
+
+    std::vector<uint64_t> counter_group_uuids;
+    for (const auto& track : trace.tracks) {
+        if (track.name == "counters" && track.parent_uuid == core->uuid) {
+            counter_group_uuids.push_back(track.uuid);
+        }
+    }
+    assert(counter_group_uuids.size() == 2);
+
+    size_t counter_tracks = 0;
+    for (uint64_t group_uuid : counter_group_uuids) {
+        for (const auto& track : trace.tracks) {
+            if (track.parent_uuid == group_uuid && track.name == "ticks" && track.is_counter) {
+                ++counter_tracks;
+            }
+        }
+    }
+    if (counter_tracks != 1) {
+        std::cerr << "FAILED: expected one pull-model ticks counter track, got " << counter_tracks
+                  << "\n";
+        std::abort();
+    }
+
+    std::filesystem::remove_all(out_dir);
+    std::cout << "PASSED\n";
+}
+
 }  // namespace
 
 int main() {
@@ -551,6 +628,7 @@ int main() {
     test_pressure_without_backend_drops_instead_of_hanging();
     test_spin_wait_exits_when_wakeup_is_removed();
     test_timeline_restart_redeclares_tracks();
+    test_counter_group_does_not_collide_with_child_unit();
 
     std::cout << "\n=== Observation hardening tests PASSED ===\n";
     return 0;

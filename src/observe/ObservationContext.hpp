@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
@@ -15,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "../chronon/CpuPause.hpp"
 #include "Counter.hpp"
@@ -39,6 +41,17 @@ namespace chronon::observe {
 class ObservationContext {
 public:
     using CycleProvider = std::function<uint64_t()>;
+    enum class LookaheadTransition : uint8_t { None, Commit, Rollback };
+
+    struct LookaheadSyncNode {
+        using ApplyFn = void (*)(void*, LookaheadTransition) noexcept;
+
+        void* owner = nullptr;
+        ApplyFn apply = nullptr;
+        ObservationContext* context = nullptr;
+        LookaheadSyncNode* prev = nullptr;
+        LookaheadSyncNode* next = nullptr;
+    };
 
     /**
      * @param queue          Shared observation queue (owned by simulation).
@@ -58,6 +71,8 @@ public:
         // getUnchecked() on the hot path without resize churn.
         counters_.ensureCapacity(64);
     }
+
+    ~ObservationContext() noexcept { detachLookaheadSyncNodes_(); }
 
     /**
      * @brief Increment a counter.
@@ -131,17 +146,72 @@ public:
         if (lookahead_buffer_.hasEvents() && queue_) {
             lookahead_buffer_.commit(*queue_);
         }
+        recordLookaheadTransition_(LookaheadTransition::Commit);
+        ++lookahead_epoch_generation_;
+        applyLookaheadTransition_(LookaheadTransition::Commit);
     }
 
     /// Discards a speculative epoch: rolls back counters, drops buffered events.
     void rollbackEpoch() noexcept {
         counters_.rollbackAllEpochs();
         lookahead_buffer_.rollback();
+        recordLookaheadTransition_(LookaheadTransition::Rollback);
+        ++lookahead_epoch_generation_;
+        applyLookaheadTransition_(LookaheadTransition::Rollback);
     }
 
     /// When enabled, events buffer locally rather than going to the global queue.
     void setLookaheadMode(bool enabled) noexcept { lookahead_mode_ = enabled; }
     bool isLookaheadMode() const noexcept { return lookahead_mode_; }
+    uint64_t lookaheadEpochGeneration() const noexcept { return lookahead_epoch_generation_; }
+    LookaheadTransition firstLookaheadTransitionAfter(uint64_t generation) const noexcept {
+        if (generation >= lookahead_epoch_generation_) {
+            return LookaheadTransition::None;
+        }
+        if (generation < lookahead_history_begin_generation_ ||
+            generation >= lookahead_history_begin_generation_ + lookahead_history_size_) {
+            return LookaheadTransition::Rollback;
+        }
+        const size_t offset = static_cast<size_t>(generation - lookahead_history_begin_generation_);
+        const size_t slot =
+            (lookahead_history_start_slot_ + offset) % LOOKAHEAD_TRANSITION_HISTORY_CAPACITY;
+        return lookahead_transition_history_[slot];
+    }
+
+    void registerLookaheadSyncNode(LookaheadSyncNode& node) noexcept {
+        if (node.context == this) {
+            return;
+        }
+        if (node.context) {
+            node.context->unregisterLookaheadSyncNode(node);
+        }
+
+        node.context = this;
+        node.prev = nullptr;
+        node.next = lookahead_sync_head_;
+        if (lookahead_sync_head_) {
+            lookahead_sync_head_->prev = &node;
+        }
+        lookahead_sync_head_ = &node;
+    }
+
+    void unregisterLookaheadSyncNode(LookaheadSyncNode& node) noexcept {
+        if (node.context != this) {
+            return;
+        }
+        if (node.prev) {
+            node.prev->next = node.next;
+        } else if (lookahead_sync_head_ == &node) {
+            lookahead_sync_head_ = node.next;
+        }
+        if (node.next) {
+            node.next->prev = node.prev;
+        }
+
+        node.context = nullptr;
+        node.prev = nullptr;
+        node.next = nullptr;
+    }
 
     /// Registers counter addresses with the registry for the pull-model snapshot.
     void registerAllCounters(class CounterRegistry* registry);
@@ -195,20 +265,22 @@ public:
      *
      * Producer-side cost matches the instant trace path: one filter check, a
      * fixed-size record fill, and a bounded arg memcpy into the SPSC queue.
-     * SpanEnd events skip temporal filtering (only the trace-channel category
-     * gate applies): a span begun inside an observation window must still
-     * close when its end falls outside it. Ends whose begin WAS suppressed
-     * are dropped by the backend's open-span table.
+     * SpanEnd events skip temporal filtering: a span begun inside an
+     * observation window must still close when its end falls outside it.
+     * Ends without a preserved category are allowed when observation is
+     * enabled at all; unmatched ends are dropped by the backend's open-span
+     * table.
      */
-    void timelineEvent(CategoryMask category, TimelineEventKind kind, uint32_t track_id,
+    bool timelineEvent(CategoryMask category, TimelineEventKind kind, uint32_t track_id,
                        uint16_t slot, uint16_t name_id, uint64_t payload,
-                       const TimelineArgValue* args, size_t arg_count) noexcept {
+                       const TimelineArgValue* args, size_t arg_count, uint8_t flags = 0) noexcept {
         const bool allowed =
             (kind == TimelineEventKind::SpanEnd)
-                ? filter_.shouldObserve(category | category::TRACE)
+                ? (category != category::NONE ? filter_.shouldObserve(category | category::TRACE)
+                                              : filter_.anyEnabled())
                 : filter_.shouldObserve(category | category::TRACE, currentCycle());
         if (OBSERVE_LIKELY(!allowed)) {
-            return;
+            return false;
         }
 
         const size_t payload_size = sizeof(TimelineRecord) + arg_count * TIMELINE_ARG_SIZE;
@@ -222,19 +294,19 @@ public:
                     queue_->incrementDropped();
                 }
                 stats_.recordDrop<ObservationChannel::Trace>();
-                return;
+                return false;
             }
             fillTimelineRecord_(dest, category, kind, track_id, slot, name_id, payload, args,
-                                arg_count);
+                                arg_count, flags);
             lookahead_buffer_.commitReservedRecord(total_size);
             stats_.recordEmit<ObservationChannel::Trace>();
-            return;
+            return true;
         }
 
         ThreadContext* ctx = ThreadContextManager::instance().getContext();
         if (!ctx) {
             stats_.recordDrop<ObservationChannel::Trace>();
-            return;
+            return false;
         }
 
         const size_t record_size = sizeof(ObservationQueue::RecordHeader) + payload_size;
@@ -244,7 +316,7 @@ public:
         if (!ptr) {
             ctx->incrementDropped();
             stats_.recordDrop<ObservationChannel::Trace>();
-            return;
+            return false;
         }
 
         auto* header = reinterpret_cast<ObservationQueue::RecordHeader*>(ptr);
@@ -254,16 +326,18 @@ public:
         header->padding = 0;
 
         fillTimelineRecord_(ptr + sizeof(ObservationQueue::RecordHeader), category, kind, track_id,
-                            slot, name_id, payload, args, arg_count);
+                            slot, name_id, payload, args, arg_count, flags);
 
         ctx->queue().finishAndCommitWrite(aligned_size);
         stats_.recordEmit<ObservationChannel::Trace>();
+        return true;
     }
 
 private:
     void fillTimelineRecord_(std::byte* dest, CategoryMask category, TimelineEventKind kind,
                              uint32_t track_id, uint16_t slot, uint16_t name_id, uint64_t payload,
-                             const TimelineArgValue* args, size_t arg_count) noexcept {
+                             const TimelineArgValue* args, size_t arg_count,
+                             uint8_t flags) noexcept {
         auto* rec = reinterpret_cast<TimelineRecord*>(dest);
         rec->cycle = currentCycle();
         rec->payload = payload;
@@ -278,6 +352,7 @@ private:
         rec->category_bit = user_bits != 0 ? static_cast<uint8_t>(std::countr_zero(user_bits))
                                            : TIMELINE_NO_CATEGORY;
         std::memset(rec->padding, 0, sizeof(rec->padding));
+        rec->padding[0] = flags;
 
         std::byte* arg_dest = dest + sizeof(TimelineRecord);
         for (size_t i = 0; i < arg_count; ++i) {
@@ -386,7 +461,7 @@ private:
             StructuredRecord rec{};
             rec.cycle = currentCycle();
             rec.format_id = fmt_id;
-            rec.category = static_cast<uint32_t>(category);
+            rec.category = category;
             rec.source_id = source_id_;
             rec.arg_count = 0;
             if (!lookahead_buffer_.bufferEventRaw(type, 1, reinterpret_cast<const std::byte*>(&rec),
@@ -424,7 +499,7 @@ private:
                 reinterpret_cast<StructuredRecord*>(ptr + sizeof(ObservationQueue::RecordHeader));
             rec->cycle = currentCycle();
             rec->format_id = fmt_id;
-            rec->category = static_cast<uint32_t>(category);
+            rec->category = category;
             rec->source_id = source_id_;
             rec->arg_count = 0;
 
@@ -459,7 +534,7 @@ private:
             auto* rec = reinterpret_cast<StructuredRecord*>(payload);
             rec->cycle = currentCycle();
             rec->format_id = fmt_id;
-            rec->category = static_cast<uint32_t>(category);
+            rec->category = category;
             rec->source_id = source_id_;
             rec->arg_count = static_cast<uint8_t>(arg_count);
 
@@ -504,7 +579,7 @@ private:
                 reinterpret_cast<StructuredRecord*>(ptr + sizeof(ObservationQueue::RecordHeader));
             rec->cycle = currentCycle();
             rec->format_id = fmt_id;
-            rec->category = static_cast<uint32_t>(category);
+            rec->category = category;
             rec->source_id = source_id_;
             rec->arg_count = static_cast<uint8_t>(arg_count);
 
@@ -533,8 +608,51 @@ private:
 
     LookaheadBuffer lookahead_buffer_;
     bool lookahead_mode_ = false;
+    static constexpr size_t LOOKAHEAD_TRANSITION_HISTORY_CAPACITY = 64;
+    std::array<LookaheadTransition, LOOKAHEAD_TRANSITION_HISTORY_CAPACITY>
+        lookahead_transition_history_{};
+    uint64_t lookahead_history_begin_generation_ = 0;
+    size_t lookahead_history_start_slot_ = 0;
+    size_t lookahead_history_size_ = 0;
+    uint64_t lookahead_epoch_generation_ = 0;
+    LookaheadSyncNode* lookahead_sync_head_ = nullptr;
 
     ObservationStats stats_{};
+
+    void recordLookaheadTransition_(LookaheadTransition transition) noexcept {
+        if (lookahead_history_size_ < LOOKAHEAD_TRANSITION_HISTORY_CAPACITY) {
+            const size_t slot = (lookahead_history_start_slot_ + lookahead_history_size_) %
+                                LOOKAHEAD_TRANSITION_HISTORY_CAPACITY;
+            lookahead_transition_history_[slot] = transition;
+            ++lookahead_history_size_;
+            return;
+        }
+
+        lookahead_transition_history_[lookahead_history_start_slot_] = transition;
+        lookahead_history_start_slot_ =
+            (lookahead_history_start_slot_ + 1) % LOOKAHEAD_TRANSITION_HISTORY_CAPACITY;
+        ++lookahead_history_begin_generation_;
+    }
+
+    void applyLookaheadTransition_(LookaheadTransition transition) noexcept {
+        for (auto* node = lookahead_sync_head_; node;) {
+            auto* next = node->next;
+            if (node->apply) {
+                node->apply(node->owner, transition);
+            }
+            node = next;
+        }
+    }
+
+    void detachLookaheadSyncNodes_() noexcept {
+        while (lookahead_sync_head_) {
+            auto* node = lookahead_sync_head_;
+            lookahead_sync_head_ = node->next;
+            node->context = nullptr;
+            node->prev = nullptr;
+            node->next = nullptr;
+        }
+    }
 
 public:
     const ObservationStats& observationStats() const noexcept { return stats_; }

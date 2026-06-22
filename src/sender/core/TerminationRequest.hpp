@@ -132,7 +132,7 @@ public:
     /// Only valid after isTerminationRequested() returns true.
     const TerminationRequest& getRequest() const noexcept {
         // Acquire load pairs with release in requestTermination().
-        termination_requested_.load(std::memory_order_acquire);
+        (void)termination_requested_.load(std::memory_order_acquire);
         return request_;
     }
 

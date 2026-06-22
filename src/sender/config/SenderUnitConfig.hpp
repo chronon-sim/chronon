@@ -10,6 +10,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -88,6 +89,8 @@ struct SimulationYAMLConfig {
 
     /// Keyed by instance name (path) used for port resolution.
     std::unordered_map<std::string, UnitConfig> units;
+    /// Unit instance names in YAML declaration order.
+    std::vector<std::string> unit_order;
 
     std::vector<PortConnectionSpec> connections;
 
@@ -104,8 +107,17 @@ struct SimulationYAMLConfig {
     std::vector<std::string> unitNames() const {
         std::vector<std::string> names;
         names.reserve(units.size());
+
+        for (const auto& name : unit_order) {
+            if (hasUnit(name)) {
+                names.push_back(name);
+            }
+        }
+
         for (const auto& [name, _] : units) {
-            names.push_back(name);
+            if (std::find(names.begin(), names.end(), name) == names.end()) {
+                names.push_back(name);
+            }
         }
         return names;
     }

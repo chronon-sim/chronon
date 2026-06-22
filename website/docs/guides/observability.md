@@ -12,6 +12,7 @@ Chronon provides a unified observability system with three integrated capabiliti
 |---------|---------|-----|----------|
 | Counters | Statistics collection | `++counter_` / `counter_ += n` | ~1-2ns |
 | Traces | Structured event capture | `trace<"fmt">(CAT, ...)` | ~2ns disabled |
+| Pipeline traces | Typed one-cycle pipeline slices | model-level `observe::pipeline<"STAGE">(...)` | fixed record + typed args |
 | Logs | Debug output | `debug<"fmt">(...)` | ~2ns disabled |
 
 ## Design Principles
@@ -173,8 +174,9 @@ The timeline contains:
 - **Timeline lanes** — occupancy spans, lane instants, and push-model counter
   samples emitted through the declarative `TimelineLane` / `TimelineCounter`
   members (see below), nested under their owning unit's track.
-- **Counter tracks** — one Perfetto counter track per `unit.counter`, sampled
-  at counter dump cycles.
+- **Counter tracks** — one Perfetto counter track per counter, sampled
+  at counter dump cycles and nested under each unit's collapsible `counters`
+  subgroup (`unit.counters.counter_name`).
 - **Scheduler execution timeline** — when enabled, wall-clock
   unit/wait/epoch/arbitration slices under a "Chronon Scheduler" process
   group, with one lane per worker stream plus a `scheduler` lane. Slices
@@ -184,6 +186,100 @@ The timeline contains:
 The file is produced by `src/observe/PerfettoTraceWriter`, a thin wrapper over
 the Perfetto SDK's protozero message writers (no tracing session or category
 registration — packets are written straight to the file).
+
+## Pipeline Trace Events
+
+For cycle-by-cycle pipeline visualization, prefer typed pipeline events over
+encoding pipeline state into formatted trace strings. Traditional trace calls
+such as:
+
+```cpp
+trace<"{}DEC#{};pc=0x{:x} op=0x{:x}">(PIPE, lane, inst.uid, inst.pc, inst.opcode);
+```
+
+work as text, but they force the Perfetto backend to reconstruct structure by
+parsing the formatted message: stage name, pipe/lane, item id, and annotations
+are all hidden inside one string. That is fragile and pushes formatting work
+onto the hot path.
+
+A model should instead expose a small category-binding wrapper, conventionally
+named `observe::pipeline`, on top of Chronon's typed pipeline event primitive.
+The wrapper keeps the call site semantic while the queued record stays
+structured and numeric:
+
+```cpp
+// Instruction uid is the item id; rendered as a one-cycle slice named "1234".
+observe::pipeline<"DEC">(*this,
+                         observe::pipeSlot(lane),
+                         inst.uid,
+                         observe::arg<"pc">(inst.pc),
+                         observe::arg<"op">(inst.opcode));
+
+// Program counter is the item id; stored as uint64_t, rendered as hex in Perfetto.
+observe::pipeline<"BP0">(*this,
+                         observe::pc(fetch_pc),
+                         observe::arg<"seq">(fetch_seq));
+
+// Runtime pipe/lane selection is explicit and typed.
+observe::pipeline<"IF0">(*this,
+                         observe::pipeSlot(if_pipe),
+                         observe::pc(fetch_pc),
+                         observe::arg<"src">(source_id));
+```
+
+The recommended wrapper shape is:
+
+```cpp
+namespace my_model::observe {
+using namespace chronon::observe;
+
+inline const auto PIPE = Category<"pipe", "Pipeline visualization events">{};
+
+struct PipeSlot { uint16_t value = 0; };
+struct PipelineItem { uint64_t value = 0; bool hex_name = false; };
+
+constexpr PipeSlot pipeSlot(uint64_t value) noexcept {
+    return {static_cast<uint16_t>(value)};
+}
+constexpr PipelineItem uid(uint64_t value) noexcept { return {value, false}; }
+constexpr PipelineItem item(uint64_t value) noexcept { return {value, false}; }
+constexpr PipelineItem pc(uint64_t value) noexcept { return {value, true}; }
+
+// Dispatch pipeSlot.value to pipeStage<N, Stage>(...) or pipeStageHex<N, Stage>(...).
+template <FixedString Stage, typename Unit, typename Id, typename... Args>
+void pipeline(Unit& unit, PipeSlot pipe, Id id, Args&&... args);
+
+template <FixedString Stage, typename Unit, typename Id, typename... Args>
+void pipeline(Unit& unit, Id id, Args&&... args);  // defaults to pipe 0
+}
+```
+
+This API is intended to replace pipeline-specific `trace<>()` formatting, not
+general debug traces. It has these properties:
+
+- **Structured hot path** — stage and pipe are compile-time/template state or a
+  small runtime integer; the record carries a numeric item id plus typed
+  annotations. No backend text parsing is required for new pipeline events.
+- **One-cycle slices** — pipeline events render as `[cycle, cycle + 1)` slices,
+  matching hardware stage occupancy better than point instants.
+- **Stable coloring and flow** — the numeric item id is also the Perfetto flow
+  id and color key, so the same instruction/transaction keeps the same color
+  across units, pipes, and stages.
+- **Typed annotations** — details such as `pc`, `op`, `seq`, `addr`, `hit`, or
+  `latency` are queryable debug annotations instead of substrings in the event
+  name.
+- **Display policy is explicit at the item type** — use `pc(value)` when the
+  numeric id should be displayed as hexadecimal. The stored id is still a
+  number; only the Perfetto event name formatting changes.
+
+Pull-model `Counter` snapshots are kept under each unit's `counters` subgroup,
+so dense pipeline stage tracks and low-frequency counters remain separately
+collapsible in the Perfetto sidebar. Push-model timeline counters
+(`TimelineCounter`, `TimelineGauge`, `TimelineCapacity`, `observe::gauge`, and
+`observe::capacity`) are direct children of the unit track, but Chronon assigns
+Perfetto `sibling_order_rank` values by track type: first-class pipeline lanes
+come first, normal timeline lanes follow, and timeline counters come after the
+pipeline lanes regardless of which event or sample arrives first.
 
 ### Wire format
 
@@ -238,6 +334,55 @@ class LSU : public Unit, public ObservableUnit {
     }
 };
 ```
+
+For common model instrumentation, Chronon also provides a convenience layer
+that uses the same typed vocabulary as pipeline events (`"name"_ev`,
+`arg<"key">(value)`, `flow(uid)`) without requiring every call site to declare
+raw lanes and counters:
+
+```cpp
+class Decode : public Unit, public ObservableUnit {
+    TimelineSpan stall_{this, "stall"};
+    TimelineGauge fetch_occ_{this, "fetch_queue_occupancy", "entries"};
+    TimelineCapacity fetch_cap_{this, "fetch_queue", "entries"};
+
+    void tick() override {
+        // Shared "events" track under this unit.
+        event<"flush">(FLUSH, arg<"removed">(removed_count));
+
+        // Function-style entry mirrors model-level observe::pipeline wrappers.
+        observe::event<"credit_mismatch">(*this, FLOW, arg<"expected">(exp),
+                                          arg<"actual">(got));
+
+        // Boolean state helper: opens once, closes when the condition clears.
+        stall_.update(!fetch_queue_.empty() && !out_uop_queue.canSend(),
+                      STALL, "out_uop_blocked"_ev,
+                      arg<"fq_size">(fetch_queue_.size()),
+                      arg<"out_rem">(out_uop_queue.remainingThisCycle()));
+
+        // Push-model counter samples. sampleOnChange() is available when dense
+        // per-cycle samples would add noise without adding information.
+        fetch_occ_.sampleOnChange(fetch_queue_.size());
+        fetch_cap_.sampleOnChange(fetch_queue_.size(), fetch_queue_size_);
+
+        // Header-only function forms are useful for model-level wrappers.
+        observe::gauge<"rename_credits">(*this, rename_credits_, "credits");
+        observe::capacity<"fetch_queue">(*this, fetch_queue_.size(),
+                                          fetch_queue_size_, "entries");
+    }
+};
+```
+
+Use this layer for:
+
+- **single-point events** such as flushes, credit mismatches, replay markers, or
+  rare protocol transitions (`event<"flush">`, `instant<"track">`);
+- **state spans** such as stalls, blocked ports, busy functional units, or
+  waiting conditions (`TimelineSpan::update`, `spanBegin` / `spanEnd`);
+- **time-varying state** such as queue occupancy, free slots, credits, and port
+  capacity (`TimelineGauge`, `TimelineCapacity`, `gauge`, `capacity`);
+- **aggregate totals** should still use `Counter`; do not turn every counter
+  increment into a timeline event unless the timestamp itself matters.
 
 The vocabulary is deliberately SQL-shaped:
 

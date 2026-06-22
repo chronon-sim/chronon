@@ -25,6 +25,7 @@
 #include <bit>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -95,6 +96,7 @@ struct PerfettoTraceWriter::Impl {
     protozero::HeapBuffered<pbz::Trace> trace;
     size_t packets_buffered = 0;
     Options options;
+    std::unordered_map<uint64_t, int32_t> next_child_rank;
 
     /// String → iid map for one InternedData field; iids restart at 1 after
     /// every SEQ_INCREMENTAL_STATE_CLEARED.
@@ -140,6 +142,17 @@ struct PerfettoTraceWriter::Impl {
 
     SequenceState sim{SIM_SEQUENCE_ID, /*uses_cycle_clock=*/true};
     SequenceState wall{WALL_SEQUENCE_ID, /*uses_cycle_clock=*/false};
+
+    int32_t childRank(uint64_t parent_uuid, int32_t requested_rank) {
+        if (requested_rank >= 0) {
+            return requested_rank;
+        }
+        int32_t& rank = next_child_rank[parent_uuid];
+        if (rank == std::numeric_limits<int32_t>::max()) {
+            return rank;
+        }
+        return rank++;
+    }
 
     /// Emits the SEQ_INCREMENTAL_STATE_CLEARED packet that (re)starts @p seq:
     /// resets intern tables and, on the cycle-clock sequence, declares the
@@ -233,9 +246,12 @@ struct PerfettoTraceWriter::Impl {
     EventStrings internEventStrings(SequenceState& seq, pbz::TracePacket* pkt,
                                     std::string_view category, std::string_view name,
                                     const std::string_view* annotation_names_used,
-                                    size_t annotation_count, uint64_t* annotation_iids) {
+                                    size_t annotation_count, uint64_t* annotation_iids,
+                                    bool intern_name = true) {
         EventStrings out;
-        std::tie(out.name_iid, out.name_new) = seq.event_names.intern(name);
+        if (intern_name) {
+            std::tie(out.name_iid, out.name_new) = seq.event_names.intern(name);
+        }
         if (!category.empty()) {
             std::tie(out.category_iid, out.category_new) = seq.categories.intern(category);
         }
@@ -255,7 +271,7 @@ struct PerfettoTraceWriter::Impl {
                 entry->set_iid(out.category_iid);
                 entry->set_name(chars(category));
             }
-            if (out.name_new) {
+            if (intern_name && out.name_new) {
                 auto* entry = interned->add_event_names();
                 entry->set_iid(out.name_iid);
                 entry->set_name(chars(name));
@@ -311,6 +327,9 @@ struct PerfettoTraceWriter::Impl {
                 case Kind::Pointer:
                     da->set_pointer_value(a.bits);
                     break;
+                case Kind::String:
+                    da->set_string_value(chars(a.string));
+                    break;
             }
         }
     }
@@ -336,6 +355,7 @@ bool PerfettoTraceWriter::open(const std::filesystem::path& path, const Options&
     impl_->options = options;
     impl_->sim.reset();
     impl_->wall.reset();
+    impl_->next_child_rank.clear();
     next_uuid_ = 1;
     events_written_ = 0;
     bytes_written_ = 0;
@@ -347,33 +367,39 @@ uint64_t PerfettoTraceWriter::addProcessTrack(std::string_view process_name, int
     auto* td =
         impl_->newPacket(impl_->sim, /*needs_incremental_state=*/false)->set_track_descriptor();
     td->set_uuid(uuid);
+    td->set_child_ordering(pbz::TrackDescriptor::EXPLICIT);
     auto* process = td->set_process();
     process->set_pid(pid);
     process->set_process_name(chars(process_name));
     return uuid;
 }
 
-uint64_t PerfettoTraceWriter::addTrack(std::string_view name, uint64_t parent_uuid) {
+uint64_t PerfettoTraceWriter::addTrack(std::string_view name, uint64_t parent_uuid,
+                                       int32_t sibling_order_rank) {
     const uint64_t uuid = next_uuid_++;
     auto* td =
         impl_->newPacket(impl_->sim, /*needs_incremental_state=*/false)->set_track_descriptor();
     td->set_uuid(uuid);
     td->set_name(chars(name));
+    td->set_child_ordering(pbz::TrackDescriptor::EXPLICIT);
     if (parent_uuid != 0) {
         td->set_parent_uuid(parent_uuid);
+        td->set_sibling_order_rank(impl_->childRank(parent_uuid, sibling_order_rank));
     }
     return uuid;
 }
 
 uint64_t PerfettoTraceWriter::addCounterTrack(std::string_view name, std::string_view unit_name,
-                                              uint64_t parent_uuid) {
+                                              uint64_t parent_uuid, int32_t sibling_order_rank) {
     const uint64_t uuid = next_uuid_++;
     auto* td =
         impl_->newPacket(impl_->sim, /*needs_incremental_state=*/false)->set_track_descriptor();
     td->set_uuid(uuid);
     td->set_name(chars(name));
+    td->set_child_ordering(pbz::TrackDescriptor::EXPLICIT);
     if (parent_uuid != 0) {
         td->set_parent_uuid(parent_uuid);
+        td->set_sibling_order_rank(impl_->childRank(parent_uuid, sibling_order_rank));
     }
     auto* counter = td->set_counter();
     if (!unit_name.empty()) {
@@ -464,14 +490,15 @@ void PerfettoTraceWriter::instant(uint64_t track_uuid, std::string_view category
     }
 
     auto* pkt = impl_->newSimEventPacket(cycle);
-    auto strings = impl_->internEventStrings(impl_->sim, pkt, category, name, nullptr, 0, nullptr);
+    auto strings = impl_->internEventStrings(impl_->sim, pkt, category, name, nullptr, 0, nullptr,
+                                             /*intern_name=*/false);
     auto* event = pkt->set_track_event();
     event->set_type(pbz::TrackEvent::TYPE_INSTANT);
     event->set_track_uuid(track_uuid);
     if (strings.category_iid != 0) {
         event->add_category_iids(strings.category_iid);
     }
-    event->set_name_iid(strings.name_iid);
+    event->set_name(chars(name));
 
     ++events_written_;
     if (impl_->packets_buffered >= FLUSH_PACKET_COUNT) {
@@ -511,6 +538,20 @@ void PerfettoTraceWriter::instant(uint64_t track_uuid, std::string_view category
 void PerfettoTraceWriter::sliceBegin(uint64_t track_uuid, std::string_view category,
                                      std::string_view name, uint64_t cycle, uint64_t flow_id,
                                      std::span<const Annotation> annotations) {
+    sliceBeginImpl_(track_uuid, category, name, cycle, flow_id, flow_id != 0, annotations);
+}
+
+void PerfettoTraceWriter::sliceBeginWithFlow(uint64_t track_uuid, std::string_view category,
+                                             std::string_view name, uint64_t cycle,
+                                             uint64_t flow_id,
+                                             std::span<const Annotation> annotations) {
+    sliceBeginImpl_(track_uuid, category, name, cycle, flow_id, /*has_flow_id=*/true, annotations);
+}
+
+void PerfettoTraceWriter::sliceBeginImpl_(uint64_t track_uuid, std::string_view category,
+                                          std::string_view name, uint64_t cycle, uint64_t flow_id,
+                                          bool has_flow_id,
+                                          std::span<const Annotation> annotations) {
     if (!isOpen()) {
         return;
     }
@@ -526,7 +567,7 @@ void PerfettoTraceWriter::sliceBegin(uint64_t track_uuid, std::string_view categ
         event->add_category_iids(strings.category_iid);
     }
     event->set_name_iid(strings.name_iid);
-    if (flow_id != 0) {
+    if (has_flow_id) {
         event->add_flow_ids(flow_id);
     }
     Impl::writeAnnotations(event, annotations, annotation_iids);

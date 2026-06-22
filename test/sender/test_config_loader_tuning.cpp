@@ -8,6 +8,7 @@
 
 #include <cassert>
 #include <iostream>
+#include <vector>
 
 #include "sender/config/SenderConfigLoader.hpp"
 
@@ -73,6 +74,55 @@ simulation:
     std::cout << "PASSED\n";
 }
 
+void test_unit_names_include_programmatic_additions() {
+    std::cout << "Testing unitNames includes programmatic additions... ";
+
+    SenderConfigLoader loader;
+    auto config = loader.loadFromString(R"yaml(
+simulation:
+  unit:
+    fetch:
+      type: FetchUnit
+    decode:
+      type: DecodeUnit
+)yaml");
+
+    UnitConfig rename;
+    rename.instance_name = "rename";
+    rename.type_name = "RenameUnit";
+    config.units.emplace(rename.instance_name, rename);
+
+    const std::vector<std::string> names = config.unitNames();
+    const std::vector<std::string> expected = {"fetch", "decode", "rename"};
+    assert(names == expected);
+
+    std::cout << "PASSED\n";
+}
+
+void test_unit_names_skip_programmatic_deletions() {
+    std::cout << "Testing unitNames skips programmatic deletions... ";
+
+    SenderConfigLoader loader;
+    auto config = loader.loadFromString(R"yaml(
+simulation:
+  unit:
+    fetch:
+      type: FetchUnit
+    decode:
+      type: DecodeUnit
+    rename:
+      type: RenameUnit
+)yaml");
+
+    config.units.erase("decode");
+
+    const std::vector<std::string> names = config.unitNames();
+    const std::vector<std::string> expected = {"fetch", "rename"};
+    assert(names == expected);
+
+    std::cout << "PASSED\n";
+}
+
 }  // namespace
 
 int main() {
@@ -80,6 +130,8 @@ int main() {
 
     test_tuning_fields_parse();
     test_tuning_defaults();
+    test_unit_names_include_programmatic_additions();
+    test_unit_names_skip_programmatic_deletions();
 
     std::cout << "\n=== Config loader tuning tests PASSED ===\n";
     return 0;

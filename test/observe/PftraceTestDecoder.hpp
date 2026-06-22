@@ -166,6 +166,7 @@ struct DecodedTrack {
     bool is_process = false;
     bool is_counter = false;
     std::string process_name;
+    std::optional<int32_t> sibling_order_rank;
 };
 
 struct DecodedClock {
@@ -403,6 +404,9 @@ inline void decodePacket(Decoder pkt, DecodedTrace& trace,
                 case 8:  // counter descriptor
                     track.is_counter = true;
                     td.skip(tw);
+                    break;
+                case 12:
+                    track.sibling_order_rank = static_cast<int32_t>(td.varint());
                     break;
                 default:
                     td.skip(tw);

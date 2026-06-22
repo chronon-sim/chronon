@@ -18,13 +18,49 @@
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <string>
+#include <string_view>
 
 #include "ArgFormat.hpp"
 #include "FormatRegistry.hpp"
 #include "ObservationBackend.hpp"
 #include "ObserveApi.hpp"
+#include "PipelineTraceFormat.hpp"
 
 namespace chronon::observe {
+
+namespace {
+
+void appendInvisibleSortPrefix(std::string& out, uint32_t rank) {
+    static constexpr std::string_view kDigit[4] = {
+        "\xE2\x80\x8B",  // U+200B ZERO WIDTH SPACE
+        "\xE2\x80\x8C",  // U+200C ZERO WIDTH NON-JOINER
+        "\xE2\x80\x8D",  // U+200D ZERO WIDTH JOINER
+        "\xE2\x81\xA0",  // U+2060 WORD JOINER
+    };
+
+    // Fixed-width, big-endian base-4 encoding: raw lexicographic sorting of
+    // track names follows rank while the prefix remains invisible in the UI.
+    for (int shift = 30; shift >= 0; shift -= 2) {
+        out.append(kDigit[(rank >> shift) & 0x3U]);
+    }
+}
+
+int32_t timelineTrackRank(uint32_t track_id, const TimelineTrackInfo& info) {
+    constexpr int32_t kPipelineRankBase = 10'000;
+    constexpr int32_t kLaneRankBase = 50'000'000;
+    constexpr int32_t kCounterRankBase = 90'000'000;
+
+    if (info.kind == TimelineTrackInfo::Kind::Counter) {
+        return kCounterRankBase + static_cast<int32_t>(track_id);
+    }
+    if (info.layout == TimelineTrackInfo::Layout::Pipeline) {
+        return kPipelineRankBase + static_cast<int32_t>(track_id);
+    }
+    return kLaneRankBase + static_cast<int32_t>(track_id);
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Text event formatting
@@ -81,6 +117,11 @@ uint64_t ObservationBackend::timelineTrackForSource_(uint16_t source_id) {
 }
 
 uint64_t ObservationBackend::timelineTrackForPath_(std::string_view path) {
+    return timelineTrackForPath_(path, -1);
+}
+
+uint64_t ObservationBackend::timelineTrackForPath_(std::string_view path,
+                                                   int32_t sibling_order_rank) {
     auto it = timeline_path_uuids_.find(std::string(path));
     if (it != timeline_path_uuids_.end()) {
         return it->second;
@@ -94,7 +135,16 @@ uint64_t ObservationBackend::timelineTrackForPath_(std::string_view path) {
         leaf = path.substr(dot + 1);
     }
 
-    const uint64_t uuid = perfetto_writer_->addTrack(leaf, parent);
+    std::string ranked_leaf;
+    std::string_view track_name = leaf;
+    if (sibling_order_rank >= 0) {
+        ranked_leaf.reserve(leaf.size() + 48);
+        appendInvisibleSortPrefix(ranked_leaf, static_cast<uint32_t>(sibling_order_rank));
+        ranked_leaf.append(leaf);
+        track_name = ranked_leaf;
+    }
+
+    const uint64_t uuid = perfetto_writer_->addTrack(track_name, parent, sibling_order_rank);
     timeline_path_uuids_.emplace(std::string(path), uuid);
     return uuid;
 }
@@ -108,11 +158,52 @@ void ObservationBackend::writeTraceToTimeline_(const StructuredRecord* rec,
 
     timeline_msg_buffer_.clear();
     reconstructMessageTo_(timeline_msg_buffer_, fmt_info, rec, args_data, args_size);
+    const std::string_view message(timeline_msg_buffer_.data(), timeline_msg_buffer_.size());
+
+    std::string_view source_name;
+    if (rec->source_id > 0 && rec->source_id < source_name_cache_.size()) {
+        source_name = source_name_cache_[rec->source_id];
+    }
+
+    PipelineTraceFields pipe;
+    if (isPipeCategory(rec->category) && parsePipelineTraceMessage(source_name, message, pipe)) {
+        PerfettoTraceWriter::Annotation annotations[1] = {
+            {.name = "note",
+             .kind = PerfettoTraceWriter::Annotation::Kind::String,
+             .bits = 0,
+             .string = pipe.note},
+        };
+        std::span<const PerfettoTraceWriter::Annotation> ann_span;
+        if (!pipe.note.empty()) {
+            ann_span = std::span<const PerfettoTraceWriter::Annotation>(annotations, 1);
+        }
+
+        constexpr uint32_t kPipeTraceRankStride = 10000;
+        const uint32_t rank = static_cast<uint32_t>(rec->source_id) * kPipeTraceRankStride;
+        const uint64_t track_uuid =
+            timelineTrackForPath_(pipe.track_path, static_cast<int32_t>(rank));
+        if (pipe.has_flow_id) {
+            perfetto_writer_->sliceBeginWithFlow(track_uuid, pipe.category, pipe.event_name,
+                                                 rec->cycle, pipe.flow_id, ann_span);
+        } else {
+            perfetto_writer_->sliceBegin(track_uuid, pipe.category, pipe.event_name, rec->cycle,
+                                         pipe.flow_id, ann_span);
+        }
+        const uint64_t end_cycle = rec->cycle + 1;
+        perfetto_writer_->sliceEnd(track_uuid, end_cycle);
+        if (end_cycle > timeline_max_cycle_) {
+            timeline_max_cycle_ = end_cycle;
+        }
+        local_bytes_written_ += timeline_msg_buffer_.size() + pipe.track_path.size() + 32;
+        return;
+    }
 
     // 1 cycle is rendered as 1 ns on the timeline axis.
-    perfetto_writer_->instant(
-        timelineTrackForSource_(rec->source_id), "trace",
-        std::string_view(timeline_msg_buffer_.data(), timeline_msg_buffer_.size()), rec->cycle);
+    perfetto_writer_->instant(timelineTrackForSource_(rec->source_id), "trace", message,
+                              rec->cycle);
+    if (rec->cycle > timeline_max_cycle_) {
+        timeline_max_cycle_ = rec->cycle;
+    }
 
     local_bytes_written_ += timeline_msg_buffer_.size() + 24;
 }
@@ -127,13 +218,22 @@ void ObservationBackend::writeCounterToTimeline_(uint64_t cycle, std::string_vie
 
     auto [it, inserted] = counter_track_uuids_.try_emplace(key, 0);
     if (inserted) {
-        // Nest the counter under its unit's track (leaf name only); the unit
-        // path resolves through the same hierarchy as event tracks.
-        const uint64_t parent = timelineTrackForPath_(unit_name);
-        it->second = perfetto_writer_->addCounterTrack(counter_name, /*unit_name=*/{}, parent);
+        constexpr int32_t kCounterGroupRank = 100000000;
+        std::string unit_key(unit_name);
+        auto [group_it, group_inserted] = counter_group_uuids_.try_emplace(unit_key, 0);
+        if (group_inserted) {
+            const uint64_t unit_track = timelineTrackForPath_(unit_name);
+            group_it->second =
+                perfetto_writer_->addTrack("counters", unit_track, kCounterGroupRank);
+        }
+        it->second =
+            perfetto_writer_->addCounterTrack(counter_name, /*unit_name=*/{}, group_it->second);
     }
 
     perfetto_writer_->counterValue(it->second, cycle, static_cast<int64_t>(value));
+    if (cycle > timeline_max_cycle_) {
+        timeline_max_cycle_ = cycle;
+    }
     local_bytes_written_ += 24;
 }
 
@@ -188,7 +288,8 @@ uint64_t ObservationBackend::timelineSlotTrack_(uint32_t track_id, uint16_t slot
 
     if (info.kind == TimelineTrackInfo::Kind::Counter) {
         if (uuids.single == 0) {
-            uuids.single = perfetto_writer_->addCounterTrack(info.name, info.unit, parent);
+            uuids.single = perfetto_writer_->addCounterTrack(info.name, info.unit, parent,
+                                                             timelineTrackRank(track_id, info));
         }
         return uuids.single;
     }
@@ -196,13 +297,15 @@ uint64_t ObservationBackend::timelineSlotTrack_(uint32_t track_id, uint16_t slot
     if (info.lanes <= 1) {
         if (uuids.single == 0) {
             std::string_view name = info.name.empty() ? std::string_view("lane") : info.name;
-            uuids.single = perfetto_writer_->addTrack(name, parent);
+            uuids.single =
+                perfetto_writer_->addTrack(name, parent, timelineTrackRank(track_id, info));
         }
         return uuids.single;
     }
 
     if (uuids.group == 0) {
-        uuids.group = perfetto_writer_->addTrack(info.name, parent);
+        uuids.group =
+            perfetto_writer_->addTrack(info.name, parent, timelineTrackRank(track_id, info));
     }
     if (slot >= uuids.slots.size()) {
         uuids.slots.resize(static_cast<size_t>(slot) + 1, 0);
@@ -212,8 +315,8 @@ uint64_t ObservationBackend::timelineSlotTrack_(uint32_t track_id, uint16_t slot
         timeline_msg_buffer_.clear();
         fmt::format_to(std::back_inserter(timeline_msg_buffer_), "{}[{}]", info.name, slot);
         slot_uuid = perfetto_writer_->addTrack(
-            std::string_view(timeline_msg_buffer_.data(), timeline_msg_buffer_.size()),
-            uuids.group);
+            std::string_view(timeline_msg_buffer_.data(), timeline_msg_buffer_.size()), uuids.group,
+            static_cast<int32_t>(slot));
     }
     return slot_uuid;
 }
@@ -270,6 +373,28 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
     const std::span<const PerfettoTraceWriter::Annotation> ann_span(annotations, rec.arg_count);
 
     switch (kind) {
+        case TimelineEventKind::PipelineSlice: {
+            timeline_msg_buffer_.clear();
+            if ((rec.padding[0] & TIMELINE_FLAG_NAME_HEX) != 0) {
+                fmt::format_to(std::back_inserter(timeline_msg_buffer_), "0x{:x}", rec.payload);
+            } else {
+                fmt::format_to(std::back_inserter(timeline_msg_buffer_), "{}", rec.payload);
+            }
+            const std::string_view visible_name(timeline_msg_buffer_.data(),
+                                                timeline_msg_buffer_.size());
+            const uint64_t color_hash = pipelineColorHash(rec.payload);
+            const std::string category = pipelineColorCategory(color_hash);
+            const std::string event_name = pipelineColoredEventName(visible_name, color_hash);
+            perfetto_writer_->sliceBeginWithFlow(track_uuid, category, event_name, rec.cycle,
+                                                 rec.payload, ann_span);
+            const uint64_t end_cycle = rec.cycle + 1;
+            perfetto_writer_->sliceEnd(track_uuid, end_cycle);
+            if (end_cycle > timeline_max_cycle_) {
+                timeline_max_cycle_ = end_cycle;
+            }
+            break;
+        }
+
         case TimelineEventKind::Instant:
             perfetto_writer_->instant(track_uuid, timelineCategoryName_(rec.category_bit),
                                       timelineEventName_(rec.name_id), rec.cycle, rec.payload,
@@ -770,6 +895,7 @@ void ObservationBackend::initializeOutputDir_() {
         // so a restarted backend re-declares its tracks in the new file.
         source_track_uuids_.clear();
         timeline_path_uuids_.clear();
+        counter_group_uuids_.clear();
         counter_track_uuids_.clear();
         timeline_track_uuids_.clear();
         open_spans_.clear();
@@ -783,6 +909,7 @@ void ObservationBackend::initializeOutputDir_() {
             std::string process_name = config_.simulation_name.empty() ? std::string("Simulation")
                                                                        : config_.simulation_name;
             sim_process_uuid_ = perfetto_writer_->addProcessTrack(process_name, /*pid=*/1);
+            predeclareTimelineSourceTracks_();
             timeline_sink_open_.store(true, std::memory_order_release);
         } else {
             std::cerr << "[observe] failed to open timeline file " << timeline_file
