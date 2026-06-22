@@ -218,14 +218,16 @@ void ObservationBackend::writeCounterToTimeline_(uint64_t cycle, std::string_vie
 
     auto [it, inserted] = counter_track_uuids_.try_emplace(key, 0);
     if (inserted) {
-        std::string counter_group_path;
-        counter_group_path.reserve(unit_name.size() + sizeof(".counters"));
-        counter_group_path.append(unit_name);
-        counter_group_path.append(".counters");
-
         constexpr int32_t kCounterGroupRank = 100000000;
-        const uint64_t parent = timelineTrackForPath_(counter_group_path, kCounterGroupRank);
-        it->second = perfetto_writer_->addCounterTrack(counter_name, /*unit_name=*/{}, parent);
+        std::string unit_key(unit_name);
+        auto [group_it, group_inserted] = counter_group_uuids_.try_emplace(unit_key, 0);
+        if (group_inserted) {
+            const uint64_t unit_track = timelineTrackForPath_(unit_name);
+            group_it->second =
+                perfetto_writer_->addTrack("counters", unit_track, kCounterGroupRank);
+        }
+        it->second =
+            perfetto_writer_->addCounterTrack(counter_name, /*unit_name=*/{}, group_it->second);
     }
 
     perfetto_writer_->counterValue(it->second, cycle, static_cast<int64_t>(value));
@@ -893,6 +895,7 @@ void ObservationBackend::initializeOutputDir_() {
         // so a restarted backend re-declares its tracks in the new file.
         source_track_uuids_.clear();
         timeline_path_uuids_.clear();
+        counter_group_uuids_.clear();
         counter_track_uuids_.clear();
         timeline_track_uuids_.clear();
         open_spans_.clear();

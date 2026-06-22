@@ -324,6 +324,8 @@ private:
     std::vector<uint64_t> source_track_uuids_;
     /// Hierarchical path → track uuid (units and their parent group tracks).
     std::unordered_map<std::string, uint64_t> timeline_path_uuids_;
+    /// Pull-model counter unit path → synthetic counter group uuid.
+    std::unordered_map<std::string, uint64_t> counter_group_uuids_;
     /// "unit.counter" → counter track uuid.
     std::unordered_map<std::string, uint64_t> counter_track_uuids_;
     fmt::memory_buffer timeline_msg_buffer_;
