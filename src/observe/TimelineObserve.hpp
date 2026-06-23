@@ -14,11 +14,9 @@
 
 #pragma once
 
-#include <atomic>
 #include <bit>
 #include <cstdint>
 #include <limits>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -60,53 +58,12 @@ struct CounterTrack {
 };
 
 template <typename Site>
-uint32_t resolveTrackSlow(ObservationContext* ctx, std::atomic<uint64_t>& cached_entry,
-                          TimelineTrackInfo::Kind kind, uint16_t lanes, std::string_view unit) {
-    struct Entry {
-        uint16_t source_id;
-        uint32_t track_id;
-    };
-
-    static std::mutex mutex;
-    static std::vector<Entry> entries;
-    static const std::string track_name = Site::trackName();
-
-    const uint16_t source_id = ctx->sourceId();
-
-    std::lock_guard<std::mutex> lock(mutex);
-    for (const Entry& entry : entries) {
-        if (entry.source_id == source_id) {
-            cached_entry.store((static_cast<uint64_t>(source_id) << 32) | entry.track_id,
-                               std::memory_order_relaxed);
-            return entry.track_id;
-        }
-    }
-
-    const uint32_t track_id = TimelineTrackRegistry::instance().registerTrack(
-        {track_name, std::string(unit), source_id, lanes, kind});
-    entries.push_back({source_id, track_id});
-    cached_entry.store((static_cast<uint64_t>(source_id) << 32) | track_id,
-                       std::memory_order_relaxed);
-    return track_id;
-}
-
-template <typename Site>
 uint32_t resolveTrack(ObservationContext* ctx, TimelineTrackInfo::Kind kind, uint16_t lanes,
                       std::string_view unit = {}) {
     if (!ctx) {
         return 0;
     }
-
-    static std::atomic<uint64_t> cached_entry{0};
-
-    const uint16_t source_id = ctx->sourceId();
-    const uint64_t entry = cached_entry.load(std::memory_order_relaxed);
-    const uint32_t track_id = static_cast<uint32_t>(entry);
-    if (OBSERVE_LIKELY(track_id != 0 && static_cast<uint16_t>(entry >> 32) == source_id)) {
-        return track_id;
-    }
-
-    return resolveTrackSlow<Site>(ctx, cached_entry, kind, lanes, unit);
+    return timeline_detail::resolveTrackForSource<Site>(ctx->sourceId(), kind, lanes, unit);
 }
 
 template <typename Unit>
@@ -189,6 +146,44 @@ inline void emitCounterSample(ObservationContext* ctx, CategoryMask category, ui
     }
     ctx->timelineEvent(category, TimelineEventKind::CounterSample, track_id, /*slot=*/0,
                        /*name_id=*/0, std::bit_cast<uint64_t>(value), nullptr, 0);
+}
+
+template <typename T>
+int64_t normalizeIntegral(T value) noexcept {
+    static_assert(std::is_integral_v<std::decay_t<T>>, "timeline value must be integral");
+    return static_cast<int64_t>(value);
+}
+
+struct CapacityValues {
+    int64_t used;
+    int64_t free;
+};
+
+template <typename Used, typename Capacity>
+CapacityValues normalizeCapacity(Used used, Capacity total) noexcept {
+    static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
+    static_assert(std::is_integral_v<std::decay_t<Capacity>>, "total capacity must be integral");
+
+    const int64_t used_value = static_cast<int64_t>(used);
+    const int64_t total_value = static_cast<int64_t>(total);
+    return {.used = used_value, .free = total_value > used_value ? total_value - used_value : 0};
+}
+
+template <FixedString Name, TrackSuffix Suffix = TrackSuffix::None, typename T>
+void emitNamedCounterSample(ObservationContext* ctx, CategoryMask category, T value,
+                            std::string_view unit_name) {
+    using Site = CounterTrack<Name, Suffix>;
+    const uint32_t track_id =
+        resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Counter, /*lanes=*/1, unit_name);
+    emitCounterSample(ctx, category, track_id, normalizeIntegral(value));
+}
+
+template <FixedString Name, typename Used, typename Capacity>
+void emitCapacitySamples(ObservationContext* ctx, CategoryMask category, Used used, Capacity total,
+                         std::string_view unit_name) {
+    const CapacityValues values = normalizeCapacity(used, total);
+    emitNamedCounterSample<Name, TrackSuffix::Used>(ctx, category, values.used, unit_name);
+    emitNamedCounterSample<Name, TrackSuffix::Free>(ctx, category, values.free, unit_name);
 }
 
 }  // namespace timeline_observe_detail
@@ -279,25 +274,16 @@ inline void spanEnd(Unit& unit, uint16_t slot) {
  */
 template <FixedString Name, typename Unit, typename T>
 inline void gauge(Unit& unit, T value, std::string_view unit_name = {}) {
-    static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
     auto* ctx = timeline_observe_detail::contextFor(unit);
-    using Site = timeline_observe_detail::CounterTrack<Name>;
-    const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
-        ctx, TimelineTrackInfo::Kind::Counter, /*lanes=*/1, unit_name);
-    timeline_observe_detail::emitCounterSample(ctx, category::NONE, track_id,
-                                               static_cast<int64_t>(value));
+    timeline_observe_detail::emitNamedCounterSample<Name>(ctx, category::NONE, value, unit_name);
 }
 
 template <FixedString Name, typename Unit, typename Cat, typename T>
     requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
 inline void gauge(Unit& unit, Cat category, T value, std::string_view unit_name = {}) {
-    static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
     auto* ctx = timeline_observe_detail::contextFor(unit);
-    using Site = timeline_observe_detail::CounterTrack<Name>;
-    const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
-        ctx, TimelineTrackInfo::Kind::Counter, /*lanes=*/1, unit_name);
-    timeline_observe_detail::emitCounterSample(ctx, static_cast<CategoryMask>(category), track_id,
-                                               static_cast<int64_t>(value));
+    timeline_observe_detail::emitNamedCounterSample<Name>(ctx, static_cast<CategoryMask>(category),
+                                                          value, unit_name);
 }
 
 /**
@@ -305,51 +291,17 @@ inline void gauge(Unit& unit, Cat category, T value, std::string_view unit_name 
  */
 template <FixedString Name, typename Unit, typename Used, typename Capacity>
 inline void capacity(Unit& unit, Used used, Capacity total, std::string_view unit_name = {}) {
-    static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
-    static_assert(std::is_integral_v<std::decay_t<Capacity>>, "total capacity must be integral");
-
-    const int64_t used_value = static_cast<int64_t>(used);
-    const int64_t total_value = static_cast<int64_t>(total);
-    const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
-
     auto* ctx = timeline_observe_detail::contextFor(unit);
-    using UsedSite =
-        timeline_observe_detail::CounterTrack<Name, timeline_observe_detail::TrackSuffix::Used>;
-    using FreeSite =
-        timeline_observe_detail::CounterTrack<Name, timeline_observe_detail::TrackSuffix::Free>;
-    const uint32_t used_track = timeline_observe_detail::resolveTrack<UsedSite>(
-        ctx, TimelineTrackInfo::Kind::Counter, /*lanes=*/1, unit_name);
-    const uint32_t free_track = timeline_observe_detail::resolveTrack<FreeSite>(
-        ctx, TimelineTrackInfo::Kind::Counter, /*lanes=*/1, unit_name);
-
-    timeline_observe_detail::emitCounterSample(ctx, category::NONE, used_track, used_value);
-    timeline_observe_detail::emitCounterSample(ctx, category::NONE, free_track, free_value);
+    timeline_observe_detail::emitCapacitySamples<Name>(ctx, category::NONE, used, total, unit_name);
 }
 
 template <FixedString Name, typename Unit, typename Cat, typename Used, typename Capacity>
     requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
 inline void capacity(Unit& unit, Cat category, Used used, Capacity total,
                      std::string_view unit_name = {}) {
-    static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
-    static_assert(std::is_integral_v<std::decay_t<Capacity>>, "total capacity must be integral");
-
-    const int64_t used_value = static_cast<int64_t>(used);
-    const int64_t total_value = static_cast<int64_t>(total);
-    const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
-
     auto* ctx = timeline_observe_detail::contextFor(unit);
-    using UsedSite =
-        timeline_observe_detail::CounterTrack<Name, timeline_observe_detail::TrackSuffix::Used>;
-    using FreeSite =
-        timeline_observe_detail::CounterTrack<Name, timeline_observe_detail::TrackSuffix::Free>;
-    const uint32_t used_track = timeline_observe_detail::resolveTrack<UsedSite>(
-        ctx, TimelineTrackInfo::Kind::Counter, /*lanes=*/1, unit_name);
-    const uint32_t free_track = timeline_observe_detail::resolveTrack<FreeSite>(
-        ctx, TimelineTrackInfo::Kind::Counter, /*lanes=*/1, unit_name);
-
-    const CategoryMask cat_mask = static_cast<CategoryMask>(category);
-    timeline_observe_detail::emitCounterSample(ctx, cat_mask, used_track, used_value);
-    timeline_observe_detail::emitCounterSample(ctx, cat_mask, free_track, free_value);
+    timeline_observe_detail::emitCapacitySamples<Name>(ctx, static_cast<CategoryMask>(category),
+                                                       used, total, unit_name);
 }
 
 template <FixedString Name, typename Unit, typename Port>
@@ -483,22 +435,31 @@ public:
 
     template <typename T>
     void sample(T value) noexcept {
-        static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
-        syncLookaheadCache_();
-        const int64_t normalized = static_cast<int64_t>(value);
-        if (counter_.sample(normalized)) {
-            last_ = normalized;
-            has_last_ = true;
-            updateCommittedCache_();
-        }
+        sample_(category::NONE, value);
     }
 
     template <typename Cat, typename T>
         requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
     void sample(Cat category, T value) noexcept {
-        static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
+        sample_(static_cast<CategoryMask>(category), value);
+    }
+
+    template <typename T>
+    void sampleOnChange(T value) noexcept {
+        sampleOnChange_(category::NONE, value);
+    }
+
+    template <typename Cat, typename T>
+        requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
+    void sampleOnChange(Cat category, T value) noexcept {
+        sampleOnChange_(static_cast<CategoryMask>(category), value);
+    }
+
+private:
+    template <typename T>
+    void sample_(CategoryMask category, T value) noexcept {
+        const int64_t normalized = timeline_observe_detail::normalizeIntegral(value);
         syncLookaheadCache_();
-        const int64_t normalized = static_cast<int64_t>(value);
         if (counter_.sample(category, normalized)) {
             last_ = normalized;
             has_last_ = true;
@@ -507,27 +468,14 @@ public:
     }
 
     template <typename T>
-    void sampleOnChange(T value) noexcept {
-        static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
+    void sampleOnChange_(CategoryMask category, T value) noexcept {
+        const int64_t normalized = timeline_observe_detail::normalizeIntegral(value);
         syncLookaheadCache_();
-        const int64_t normalized = static_cast<int64_t>(value);
         if (!has_last_ || normalized != last_) {
-            sample(normalized);
+            sample_(category, normalized);
         }
     }
 
-    template <typename Cat, typename T>
-        requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
-    void sampleOnChange(Cat category, T value) noexcept {
-        static_assert(std::is_integral_v<std::decay_t<T>>, "gauge value must be integral");
-        syncLookaheadCache_();
-        const int64_t normalized = static_cast<int64_t>(value);
-        if (!has_last_ || normalized != last_) {
-            sample(category, normalized);
-        }
-    }
-
-private:
     void syncLookaheadCache_() noexcept { lookahead_sync_.sync(counter_.observationContext()); }
 
     void updateCommittedCache_() noexcept {
@@ -575,73 +523,55 @@ public:
 
     template <typename Used, typename Capacity>
     void sample(Used used, Capacity total) noexcept {
-        static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
-        static_assert(std::is_integral_v<std::decay_t<Capacity>>,
-                      "total capacity must be integral");
-        syncLookaheadCache_();
-        const int64_t used_value = static_cast<int64_t>(used);
-        const int64_t total_value = static_cast<int64_t>(total);
-        const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
-        const bool used_sampled = used_.sample(used_value);
-        const bool free_sampled = free_.sample(free_value);
-        if (used_sampled && free_sampled) {
-            last_used_ = used_value;
-            last_free_ = free_value;
-            has_last_ = true;
-            updateCommittedCache_();
-        }
+        sample_(category::NONE, used, total);
     }
 
     template <typename Cat, typename Used, typename Capacity>
         requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
     void sample(Cat category, Used used, Capacity total) noexcept {
-        static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
-        static_assert(std::is_integral_v<std::decay_t<Capacity>>,
-                      "total capacity must be integral");
+        sample_(static_cast<CategoryMask>(category), used, total);
+    }
+
+    template <typename Used, typename Capacity>
+    void sampleOnChange(Used used, Capacity total) noexcept {
+        sampleOnChange_(category::NONE, used, total);
+    }
+
+    template <typename Cat, typename Used, typename Capacity>
+        requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
+    void sampleOnChange(Cat category, Used used, Capacity total) noexcept {
+        sampleOnChange_(static_cast<CategoryMask>(category), used, total);
+    }
+
+private:
+    template <typename Used, typename Capacity>
+    void sample_(CategoryMask category, Used used, Capacity total) noexcept {
+        const auto values = timeline_observe_detail::normalizeCapacity(used, total);
+        sampleValues_(category, values);
+    }
+
+    void sampleValues_(CategoryMask category,
+                       timeline_observe_detail::CapacityValues values) noexcept {
         syncLookaheadCache_();
-        const int64_t used_value = static_cast<int64_t>(used);
-        const int64_t total_value = static_cast<int64_t>(total);
-        const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
-        const bool used_sampled = used_.sample(category, used_value);
-        const bool free_sampled = free_.sample(category, free_value);
+        const bool used_sampled = used_.sample(category, values.used);
+        const bool free_sampled = free_.sample(category, values.free);
         if (used_sampled && free_sampled) {
-            last_used_ = used_value;
-            last_free_ = free_value;
+            last_used_ = values.used;
+            last_free_ = values.free;
             has_last_ = true;
             updateCommittedCache_();
         }
     }
 
     template <typename Used, typename Capacity>
-    void sampleOnChange(Used used, Capacity total) noexcept {
-        static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
-        static_assert(std::is_integral_v<std::decay_t<Capacity>>,
-                      "total capacity must be integral");
+    void sampleOnChange_(CategoryMask category, Used used, Capacity total) noexcept {
+        const auto values = timeline_observe_detail::normalizeCapacity(used, total);
         syncLookaheadCache_();
-        const int64_t used_value = static_cast<int64_t>(used);
-        const int64_t total_value = static_cast<int64_t>(total);
-        const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
-        if (!has_last_ || used_value != last_used_ || free_value != last_free_) {
-            sample(used_value, total_value);
+        if (!has_last_ || values.used != last_used_ || values.free != last_free_) {
+            sampleValues_(category, values);
         }
     }
 
-    template <typename Cat, typename Used, typename Capacity>
-        requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
-    void sampleOnChange(Cat category, Used used, Capacity total) noexcept {
-        static_assert(std::is_integral_v<std::decay_t<Used>>, "used capacity must be integral");
-        static_assert(std::is_integral_v<std::decay_t<Capacity>>,
-                      "total capacity must be integral");
-        syncLookaheadCache_();
-        const int64_t used_value = static_cast<int64_t>(used);
-        const int64_t total_value = static_cast<int64_t>(total);
-        const int64_t free_value = total_value > used_value ? total_value - used_value : 0;
-        if (!has_last_ || used_value != last_used_ || free_value != last_free_) {
-            sample(category, used_value, total_value);
-        }
-    }
-
-private:
     static std::string suffixedName_(std::string_view name, std::string_view suffix) {
         std::string out(name);
         out.append(suffix);

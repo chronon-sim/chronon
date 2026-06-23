@@ -181,6 +181,24 @@ public:
         }
     }
 
+    template <FixedString Stage, typename Cat, typename... Items>
+    void pipeStage(uint16_t pipe, Cat category, uint64_t id, Items&&... items) {
+        if (observe_ctx_) {
+            observe_ctx_->setCurrentCycleValue(getObserveCycle());
+            chronon::observe::pipeStage<Stage>(observe_ctx_, pipe, category, id,
+                                               std::forward<Items>(items)...);
+        }
+    }
+
+    template <FixedString Stage, typename Cat, typename... Items>
+    void pipeStageHex(uint16_t pipe, Cat category, uint64_t id, Items&&... items) {
+        if (observe_ctx_) {
+            observe_ctx_->setCurrentCycleValue(getObserveCycle());
+            chronon::observe::pipeStageHex<Stage>(observe_ctx_, pipe, category, id,
+                                                  std::forward<Items>(items)...);
+        }
+    }
+
     /**
      * Emit a low-cardinality instant event on this unit's shared "events" track.
      */
