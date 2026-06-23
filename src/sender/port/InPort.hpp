@@ -303,8 +303,8 @@ public:
         if (!multi_producer_queue_raw_) {
             return true;
         }
-        // Per-thread ring physical limit (4095 typically); ensures one hot
-        // producer doesn't exhaust its own ring.
+        // Per-producer ring physical limit; ensures one hot producer doesn't
+        // exhaust its own ring.
         return !multi_producer_queue_raw_->fullForThread(queue_id);
     }
 

@@ -24,9 +24,11 @@ negative on balanced or dependency-bound chains.
 The dispatch gate keeps the per-epoch barrier path (no result change) unless every
 cross-thread connection — MPSC staging ring or SPSC lock-free ring — can absorb the
 configured run-ahead without overflowing or back-pressuring where the barrier flush
-would not. The supported run-ahead per connection is `min(InPort capacity, ring
-slots) / per_cycle_send_rate - edge_delay`; an uncapped source rate forces a
-fallback. Same-thread connections impose no bound. See the
+would not. Bounded ports size their lock-free rings to cover the declared
+capacity; unlimited ports keep the default bounded physical ring. The supported
+run-ahead per connection is `min(InPort capacity, ring slots) /
+per_cycle_send_rate - edge_delay`; an uncapped source rate forces a fallback.
+Same-thread connections impose no bound. See the
 [Scheduling guide](scheduling.md) for details.
 
 ## 2026-05-07 - Scheduler Timeline Trace

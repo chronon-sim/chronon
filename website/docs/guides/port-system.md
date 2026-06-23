@@ -248,7 +248,7 @@ The framework auto-selects queue type based on thread topology during simulation
 |------------|-------------------|----------------|----------|
 | `SingleThreadMessageQueue` | Producer and consumer on same thread | Direct queue access | Zero |
 | `LockFreeQueueAdapter` | Cross-thread, single producer (SPSC) | Lock-free ring buffer with atomics | Near-zero |
-| `MultiProducerQueueAdapter` | Cross-thread, multiple producers (MPSC) | Per-thread SPSC queues | Near-zero |
+| `MultiProducerQueueAdapter` | Cross-thread, multiple producers (MPSC) | Per-producer SPSC rings + merge | Near-zero |
 
 **Manual queue type selection:**
 
@@ -283,7 +283,16 @@ if (consumer->in.canAcceptOnThreadQueue(queue_id)) {
 }
 ```
 
-The consumer polls all per-thread queues and merges messages in arrival-cycle order. Back pressure is checked per-queue: `canAcceptOnThreadQueue(queue_id, pending)` checks the per-producer cycle budget plus the specific producer queue's physical capacity. `isFull()`, `canAcceptFromProducer()`, and the old `canAcceptThreadQueue*()` names remain as deprecated compatibility aliases.
+The consumer polls all per-producer queues and merges messages in arrival-cycle order.
+For bounded `InPort` capacities, Chronon sizes both the per-connection MPSC
+staging ring and the downstream per-producer lock-free ring to cover the declared
+capacity. Unlimited-capacity ports keep a bounded default physical ring, so a
+model that needs large cross-thread burst tolerance should prefer an explicit
+bounded capacity. Back pressure is checked per queue:
+`canAcceptOnThreadQueue(queue_id, pending)` checks the per-producer cycle budget
+plus the specific producer queue's physical capacity. `isFull()`,
+`canAcceptFromProducer()`, and the old `canAcceptThreadQueue*()` names remain as
+deprecated compatibility aliases.
 
 ## Per-Cycle Capacity (OutPort Bandwidth Limiting)
 
@@ -356,7 +365,9 @@ void tick() override {
 - `send()` remains non-blocking. It returns `false` when the destination
   queue (or per-thread MPSC queue) is full.
 - Lock-free SPSC/MPSC queues use ring buffers with one reserved slot; effective
-  storable capacity is `N-1`.
+  storable capacity is `N-1`. For bounded ports, the physical ring is rounded up
+  at initialization so the declared `InPort` capacity is storable. For unlimited
+  ports, the physical lock-free ring remains bounded by the default ring size.
 
 **MPSC back pressure behavior:**
 
@@ -372,7 +383,11 @@ if (in_port.canAcceptOnThreadQueue(queue_id)) {
 }
 ```
 
-Each producer thread has its own queue with dedicated capacity. One producer filling its queue does not block other producers (until the consumer polls and drains queues). The consumer processes all per-thread queues in a round-robin or arrival-cycle-ordered manner.
+Each producer connection has its own staging ring, and the MPSC adapter has a
+per-producer lock-free queue sized from the destination port capacity. One
+producer filling its queue does not block other producers until the consumer
+polls and drains queues. The consumer processes all per-producer queues in
+arrival-cycle order with a stable connection-id tiebreak.
 
 ## Multiple Connections
 

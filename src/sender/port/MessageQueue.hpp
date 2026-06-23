@@ -807,8 +807,8 @@ public:
     }
 
     /// Count of dropped pushes due to a full physical staging ring. Nonzero
-    /// means the lookahead window outran the ring capacity (USABLE_CAPACITY) —
-    /// a correctness failure, surfaced for the epoch-free A/B watchdog.
+    /// means the lookahead window outran the configured ring capacity — a
+    /// correctness failure, surfaced for the epoch-free A/B watchdog.
     uint64_t stagingOverflowEvents() const noexcept {
         return staging_overflow_events_.load(std::memory_order_relaxed);
     }
