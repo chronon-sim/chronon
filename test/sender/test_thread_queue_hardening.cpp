@@ -59,7 +59,7 @@ class SinkUnit : public TickableUnit {
 public:
     explicit SinkUnit(std::string name) : TickableUnit(std::move(name)) {}
 
-    InPort<int> in{this, "in", 8192};
+    InPort<int> in{this, "in", 256};
 
     void tick() override {
         while (auto value = in.tryReceive(localCycle())) {
@@ -134,16 +134,17 @@ void test_tick_simulation_mpsc_delivery() {
     std::cout << "PASSED\n";
 }
 
-void test_mpsc_staging_tracks_large_user_capacity() {
-    std::cout << "Testing MPSC staging tracks large user capacity... ";
+void test_mpsc_staging_capacity_boundary() {
+    std::cout << "Testing MPSC staging capacity boundary... ";
 
-    constexpr size_t kUserCapacity = 8192;
+    constexpr size_t kSupportedCapacity = LockFreeMessageQueue<int>::USABLE_CAPACITY;
+    constexpr size_t kUnsupportedCapacity = kSupportedCapacity + 1;
 
     ManualUnit prod("prod");
     ManualUnit cons("cons");
 
     OutPort<int> out{&prod, "out"};
-    InPort<int> in{&cons, "in", kUserCapacity};
+    InPort<int> in{&cons, "in", kSupportedCapacity};
     auto* conn = out.connect(&in, 1);
 
     conn->optimizeForMPSC();
@@ -154,15 +155,29 @@ void test_mpsc_staging_tracks_large_user_capacity() {
     prod.setCycle(0);
 
     size_t sent = 0;
-    for (size_t i = 0; i < kUserCapacity; ++i) {
+    for (size_t i = 0; i < kSupportedCapacity; ++i) {
         require(out.canSend(), "canSend() rejected before user capacity");
         require(out.send(static_cast<int>(i)), "send() rejected before user capacity");
         ++sent;
     }
 
-    require(sent == kUserCapacity, "did not fill to declared user capacity");
+    require(sent == kSupportedCapacity, "did not fill to declared user capacity");
     require(!out.canSend(), "canSend() accepted beyond user capacity");
     require(!out.send(99999), "send() accepted beyond user capacity");
+
+    ManualUnit large_prod("large_prod");
+    ManualUnit large_cons("large_cons");
+    OutPort<int> large_out{&large_prod, "out"};
+    InPort<int> large_in{&large_cons, "in", kUnsupportedCapacity};
+    auto* large_conn = large_out.connect(&large_in, 1);
+
+    bool rejected = false;
+    try {
+        large_conn->optimizeForMPSC();
+    } catch (const std::length_error&) {
+        rejected = true;
+    }
+    require(rejected, "unsupported large MPSC capacity was not rejected");
 
     std::cout << "PASSED\n";
 }
@@ -272,7 +287,7 @@ int main() {
     std::cout << "=== Thread Queue Hardening Tests ===\n\n";
 
     test_tick_simulation_mpsc_delivery();
-    test_mpsc_staging_tracks_large_user_capacity();
+    test_mpsc_staging_capacity_boundary();
     test_lockfree_backpressure_contract();
     test_small_non_tight_graph_parallel_fallback();
 
