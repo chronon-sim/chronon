@@ -27,6 +27,7 @@ template <typename T>
 class OutPort;
 class Unit;
 class IArbitratablePort;
+void wakeUnitAt(Unit* unit, uint64_t cycle);
 
 /**
  * ConnectionBase - Type-erased base class for connections.
@@ -218,6 +219,7 @@ public:
                 return false;
             }
             ++pushes_this_cycle_;
+            wakeUnitAt(destination(), arrive_cycle);
             return true;
         }
         // SPSC/SingleThread mode: enforce the per-cycle admission bound
@@ -230,7 +232,10 @@ public:
         }
         const bool ok = to_->enqueueCancelable(std::move(data), arrive_cycle, &cancel_epoch_,
                                                epoch_snapshot, send_cycle);
-        if (ok) ++pushes_this_cycle_;
+        if (ok) {
+            ++pushes_this_cycle_;
+            wakeUnitAt(destination(), arrive_cycle);
+        }
         return ok;
     }
 

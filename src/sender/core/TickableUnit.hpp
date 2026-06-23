@@ -52,8 +52,10 @@ public:
     [[gnu::always_inline]] inline void executeTick() {
         detail::TickContextGuard tick_ctx(this, localCycle(), crashName(), crashNameLen(), "tick");
         try {
+            beginActiveTick_();
             arbitrateOwnedMPSCPorts_();
             tick();
+            finishActiveTick_();
             advanceLocalCycle();
         } catch (const TickException&) {
             throw;
@@ -63,6 +65,12 @@ public:
             throw TickException(name(), localCycle(), "unknown exception");
         }
     }
+
+    /// Fast path for inactive cycles: preserve time/progress without running user code.
+    [[gnu::always_inline]] inline void advanceIdleTick() { advanceLocalCycle(); }
+
+    /// Batched inactive-cycle advance used when an entire cluster is idle.
+    [[gnu::always_inline]] inline void advanceIdleTick(uint64_t delta) { advanceLocalCycle(delta); }
 
 private:
     /// Drain MPSC staging on the consumer thread before the user's tick()

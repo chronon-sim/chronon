@@ -103,6 +103,7 @@ and MPSC arbitration work. Perfetto assigns slice colors automatically.
 | Category | Event name | Meaning |
 |----------|------------|---------|
 | `unit` | Unit name | Wall time spent executing one unit tick on that stream. |
+| `unit idle` | Unit name | Lazy wakeup fast path that advances local cycle/progress without running the unit's `tick()` body. Detail includes `cycles=N` when multiple inactive cycles were batched. |
 | `wait` | `cluster dependency` | Time spent spinning because no local cluster is ready. Detail names the blocking predecessor cluster. |
 | `scheduler` | `progress epoch` | Wall time for one progress-based lookahead epoch. |
 | `scheduler` | `mpsc arbitration` | Per-cycle MPSC arbitration in barrier mode. |

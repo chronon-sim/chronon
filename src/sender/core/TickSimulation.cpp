@@ -299,7 +299,7 @@ uint64_t TickSimulation::runSequential(uint64_t num_cycles) {
     try {
         for (uint64_t i = 0; i < num_cycles; ++i) {
             for (auto* unit : unit_ptrs_) {
-                unit->executeTick();
+                executeUnitCycle_(unit, unit->localCycle());
             }
             arbitrateAllMPSCPorts_();
         }
@@ -313,7 +313,7 @@ uint64_t TickSimulation::runSequentialEpoch(uint64_t epoch_cycles) {
     try {
         for (uint64_t i = 0; i < epoch_cycles; ++i) {
             for (auto* unit : unit_ptrs_) {
-                unit->executeTick();
+                executeUnitCycle_(unit, unit->localCycle());
             }
             arbitrateAllMPSCPorts_();
         }
@@ -384,7 +384,7 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
 void TickSimulation::executeUnitToTarget(size_t unit_idx, uint64_t target_cycle) {
     auto* unit = unit_ptrs_[unit_idx];
     while (unit->localCycle() < target_cycle) {
-        unit->executeTick();
+        executeUnitCycle_(unit, unit->localCycle());
     }
     // No try-catch: stdexec propagates exceptions natively in parallel
     // paths; sequential paths use throwTickException.

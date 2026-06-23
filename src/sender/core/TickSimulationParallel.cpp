@@ -449,8 +449,23 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
                 continue;
             }
 
-            executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units);
-            progress.store(cycle + 1, std::memory_order_release);
+            uint64_t idle_target = computeIdleClusterTarget_(cluster, cycle, end_cycle);
+            if (idle_target > cycle) {
+                SchedulerTimelineTrace::TimePoint idle_begin{};
+                if (trace_units) {
+                    idle_begin = SchedulerTimelineTrace::Clock::now();
+                }
+                advanceClusterIdle_(cluster, idle_target - cycle);
+                if (trace_units) {
+                    auto idle_end = SchedulerTimelineTrace::Clock::now();
+                    recordClusterIdle_(thread_idx, cluster, cycle, idle_target - cycle, idle_begin,
+                                       idle_end);
+                }
+                progress.store(idle_target, std::memory_order_release);
+            } else {
+                executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units);
+                progress.store(cycle + 1, std::memory_order_release);
+            }
             // Floor not recomputed per advance (that was an O(num_clusters)
             // cross-core scan on the hot path). It is refreshed lazily, only
             // when a cluster is actually blocked — see below and the spin-wait.
@@ -559,6 +574,61 @@ bool TickSimulation::clusterCanAdvance_(size_t cluster, uint64_t cycle,
     return ready;
 }
 
+uint64_t TickSimulation::computeIdleClusterTarget_(size_t cluster, uint64_t cycle,
+                                                   uint64_t end_cycle) const {
+    if (cluster >= cluster_unit_ptrs_.size()) {
+        return cycle;
+    }
+
+    uint64_t next_active = end_cycle;
+    for (auto* unit : cluster_unit_ptrs_[cluster]) {
+        uint64_t unit_next = unit->nextRunnableCycleAtOrAfter(cycle);
+        if (unit_next <= cycle) {
+            return cycle;
+        }
+        next_active = std::min(next_active, unit_next);
+    }
+
+    uint64_t dep_limit = end_cycle;
+    if (cluster < thread_resolved_deps_.size()) {
+        for (const auto& dep : thread_resolved_deps_[cluster]) {
+            uint64_t observed = dep.progress_ptr->load(std::memory_order_acquire);
+            uint64_t limit =
+                observed > UINT64_MAX - dep.min_delay ? UINT64_MAX : observed + dep.min_delay;
+            dep_limit = std::min(dep_limit, limit);
+        }
+    }
+
+    uint64_t target = std::min(next_active, dep_limit);
+    if (target <= cycle) {
+        return cycle;
+    }
+    return target;
+}
+
+void TickSimulation::advanceClusterIdle_(size_t cluster, uint64_t delta) {
+    if (delta == 0 || cluster >= cluster_unit_ptrs_.size()) {
+        return;
+    }
+    for (auto* unit : cluster_unit_ptrs_[cluster]) {
+        unit->advanceIdleTick(delta);
+    }
+}
+
+void TickSimulation::recordClusterIdle_(size_t thread_idx, size_t cluster, uint64_t cycle,
+                                        uint64_t delta, SchedulerTimelineTrace::TimePoint begin,
+                                        SchedulerTimelineTrace::TimePoint end) {
+    if (delta == 0 || cluster >= cluster_unit_ptrs_.size()) {
+        return;
+    }
+
+    std::string detail = "cycles=" + std::to_string(delta);
+    for (auto* unit : cluster_unit_ptrs_[cluster]) {
+        timeline_trace_.recordDuration(thread_idx, "unit idle", unit->name(), cycle, begin, end,
+                                       detail);
+    }
+}
+
 std::string TickSimulation::formatBlockerDetail_(const BlockedClusterInfo& blocker) const {
     if (blocker.cluster == SIZE_MAX) {
         return "no-ready-cluster";
@@ -577,13 +647,14 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
 
     if (trace_units) {
         auto& points = thread_trace_points_[thread_idx];
+        std::vector<char> active(num_units, 0);
         points[0] = SchedulerTimelineTrace::Clock::now();
         for (size_t u = 0; u < num_units; ++u) {
             const bool sample_tick = config_.enable_dynamic_rebalance && (cycle & 1023u) == 0;
-            units[u]->executeTick();
+            active[u] = executeUnitCycle_(units[u], cycle);
             points[u + 1] = SchedulerTimelineTrace::Clock::now();
 
-            if (__builtin_expect(sample_tick, 0)) {
+            if (__builtin_expect(sample_tick && active[u], 0)) {
                 recordTickSample_(
                     thread_idx, cluster_thread_unit_positions_[cluster][u],
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -592,21 +663,25 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
             }
         }
         for (size_t u = 0; u < num_units; ++u) {
-            timeline_trace_.recordDuration(thread_idx, "unit", units[u]->name(), cycle, points[u],
-                                           points[u + 1]);
+            timeline_trace_.recordDuration(thread_idx, active[u] ? "unit" : "unit idle",
+                                           units[u]->name(), cycle, points[u], points[u + 1],
+                                           active[u] ? "" : "cycles=1");
         }
     } else if (__builtin_expect(config_.enable_dynamic_rebalance && (cycle & 1023u) == 0, 0)) {
         for (size_t u = 0; u < num_units; ++u) {
             auto tp0 = std::chrono::steady_clock::now();
-            units[u]->executeTick();
+            bool active = executeUnitCycle_(units[u], cycle);
             auto tp1 = std::chrono::steady_clock::now();
-            uint64_t elapsed_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(tp1 - tp0).count());
-            recordTickSample_(thread_idx, cluster_thread_unit_positions_[cluster][u], elapsed_ns);
+            if (active) {
+                uint64_t elapsed_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(tp1 - tp0).count());
+                recordTickSample_(thread_idx, cluster_thread_unit_positions_[cluster][u],
+                                  elapsed_ns);
+            }
         }
     } else {
         for (size_t u = 0; u < num_units; ++u) {
-            units[u]->executeTick();
+            executeUnitCycle_(units[u], cycle);
         }
     }
 }

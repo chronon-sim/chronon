@@ -83,6 +83,64 @@ public:
     /// TickSimulation::unit_progress_ atomics, not this counter.
     uint64_t localCycle() const noexcept { return local_cycle_; }
 
+    static constexpr uint64_t NEVER_ACTIVE = std::numeric_limits<uint64_t>::max();
+
+    /// Request that the unit's tick body next runs no earlier than @p cycle.
+    /// This is expressed in the global simulation cycle domain.
+    void sleepUntil(uint64_t cycle) noexcept {
+        activity_control_used_.store(true, std::memory_order_relaxed);
+        setNextActiveCycleMin_(cycle);
+    }
+
+    /// Disable the tick body until an external wakeAt() or port arrival wakes it.
+    void sleepForever() noexcept { activity_control_used_.store(true, std::memory_order_relaxed); }
+
+    /// Wake the unit no later than @p cycle. Safe for cross-thread producers.
+    void wakeAt(uint64_t cycle) noexcept { setNextActiveCycleMin_(cycle); }
+
+    uint64_t nextActiveCycle() const noexcept {
+        return next_active_cycle_.load(std::memory_order_acquire);
+    }
+
+    void setTickInterval(uint32_t interval) noexcept {
+        tick_interval_.store(interval == 0 ? 1 : interval, std::memory_order_release);
+    }
+
+    uint32_t tickInterval() const noexcept {
+        return tick_interval_.load(std::memory_order_acquire);
+    }
+
+    bool shouldRunTickAt(uint64_t cycle) const noexcept {
+        const uint64_t next = next_active_cycle_.load(std::memory_order_acquire);
+        if (cycle < next) {
+            return false;
+        }
+        const uint32_t interval = tick_interval_.load(std::memory_order_acquire);
+        return interval <= 1 || (cycle % interval) == 0;
+    }
+
+    uint64_t nextRunnableCycleAtOrAfter(uint64_t cycle) const noexcept {
+        uint64_t base = std::max(cycle, next_active_cycle_.load(std::memory_order_acquire));
+        if (base == NEVER_ACTIVE) {
+            return NEVER_ACTIVE;
+        }
+
+        const uint32_t interval = tick_interval_.load(std::memory_order_acquire);
+        if (interval <= 1) {
+            return base;
+        }
+
+        uint64_t rem = base % interval;
+        if (rem == 0) {
+            return base;
+        }
+        uint64_t delta = interval - rem;
+        if (base > NEVER_ACTIVE - delta) {
+            return NEVER_ACTIVE;
+        }
+        return base + delta;
+    }
+
     /// Default mode. Eliminates atomic overhead (~80% of tight-loop time).
     void useFastCycleCounter() noexcept { use_atomic_cycle_ = false; }
 
@@ -138,7 +196,26 @@ protected:
         return local_cycle_atomic_.load(std::memory_order_acquire);
     }
 
+    void beginActiveTick_() noexcept {
+        activity_control_used_.store(false, std::memory_order_relaxed);
+        next_active_cycle_.store(NEVER_ACTIVE, std::memory_order_release);
+    }
+
+    void finishActiveTick_() noexcept {
+        if (!activity_control_used_.load(std::memory_order_relaxed)) {
+            setNextActiveCycleMin_(local_cycle_ + 1);
+        }
+    }
+
 private:
+    void setNextActiveCycleMin_(uint64_t cycle) noexcept {
+        uint64_t current = next_active_cycle_.load(std::memory_order_relaxed);
+        while (cycle < current &&
+               !next_active_cycle_.compare_exchange_weak(current, cycle, std::memory_order_release,
+                                                         std::memory_order_relaxed)) {
+        }
+    }
+
     void registerAllPendingPorts() {
         std::string prefix = fullPath();
         for (auto& reg : pending_port_registrations_) {
@@ -154,6 +231,9 @@ private:
     uint64_t local_cycle_ = 0;
     std::atomic<uint64_t> local_cycle_atomic_{0};  ///< mirror used only when use_atomic_cycle_
     bool use_atomic_cycle_ = false;
+    std::atomic<uint64_t> next_active_cycle_{0};
+    std::atomic<uint32_t> tick_interval_{1};
+    std::atomic<bool> activity_control_used_{false};
     uint32_t id_;
     std::vector<PortBase*> ports_;
     tree::TreeNode* tree_node_ = nullptr;
@@ -207,6 +287,12 @@ inline void addPortRegistrationToUnit(Unit* unit,
 inline void recordPortOnOwnerUnit(Unit* unit, PortBase* port) {
     if (unit && port) {
         unit->registerPort(port);
+    }
+}
+
+inline void wakeUnitAt(Unit* unit, uint64_t cycle) {
+    if (unit) {
+        unit->wakeAt(cycle);
     }
 }
 

@@ -315,6 +315,16 @@ private:
     uint64_t runParallelEpoch(uint64_t epoch_cycles, uint64_t executed_offset);
     uint64_t runParallel(uint64_t num_cycles);
 
+    bool executeUnitCycle_(TickableUnit* unit, uint64_t cycle) {
+        if (unit->shouldRunTickAt(cycle)) {
+            unit->executeTick();
+            return true;
+        } else {
+            unit->advanceIdleTick();
+            return false;
+        }
+    }
+
     /**
      * Barrier scheduler: per-cycle parallel advancement across clusters.
      *
@@ -327,9 +337,11 @@ private:
         const size_t num_threads = thread_units_.size();
         if (num_threads == 0) {
             for (uint64_t c = 0; c < epoch_cycles; ++c) {
-                auto work =
-                    stdexec::bulk(stdexec::just(), stdexec::par, units_.size(),
-                                  [this](std::size_t idx) { unit_ptrs_[idx]->executeTick(); });
+                auto work = stdexec::bulk(stdexec::just(), stdexec::par, units_.size(),
+                                          [this](std::size_t idx) {
+                                              auto* unit = unit_ptrs_[idx];
+                                              executeUnitCycle_(unit, unit->localCycle());
+                                          });
                 auto scheduled = stdexec::starts_on(sched, std::move(work));
                 stdexec::sync_wait(std::move(scheduled));
                 arbitrateAllMPSCPorts_();
@@ -343,21 +355,25 @@ private:
                 stdexec::just(), stdexec::par, num_threads, [this, cycle](std::size_t thread_idx) {
                     if (timeline_trace_.traceUnits()) {
                         auto& points = thread_trace_points_[thread_idx];
+                        std::vector<char> active(thread_units_[thread_idx].size(), 0);
                         points[0] = SchedulerTimelineTrace::Clock::now();
                         for (size_t pos = 0; pos < thread_units_[thread_idx].size(); ++pos) {
                             size_t unit_idx = thread_units_[thread_idx][pos];
-                            unit_ptrs_[unit_idx]->executeTick();
+                            active[pos] = executeUnitCycle_(unit_ptrs_[unit_idx],
+                                                            unit_ptrs_[unit_idx]->localCycle());
                             points[pos + 1] = SchedulerTimelineTrace::Clock::now();
                         }
                         for (size_t pos = 0; pos < thread_units_[thread_idx].size(); ++pos) {
                             size_t unit_idx = thread_units_[thread_idx][pos];
-                            timeline_trace_.recordDuration(thread_idx, "unit",
-                                                           unit_ptrs_[unit_idx]->name(), cycle,
-                                                           points[pos], points[pos + 1]);
+                            timeline_trace_.recordDuration(
+                                thread_idx, active[pos] ? "unit" : "unit idle",
+                                unit_ptrs_[unit_idx]->name(), cycle, points[pos], points[pos + 1],
+                                active[pos] ? "" : "cycles=1");
                         }
                     } else {
                         for (size_t unit_idx : thread_units_[thread_idx]) {
-                            unit_ptrs_[unit_idx]->executeTick();
+                            executeUnitCycle_(unit_ptrs_[unit_idx],
+                                              unit_ptrs_[unit_idx]->localCycle());
                         }
                     }
                 });
@@ -507,6 +523,11 @@ private:
     friend struct LookaheadFloorTestAccess;
 
     bool clusterCanAdvance_(size_t cluster, uint64_t cycle, BlockedClusterInfo& blocker) const;
+    uint64_t computeIdleClusterTarget_(size_t cluster, uint64_t cycle, uint64_t end_cycle) const;
+    void advanceClusterIdle_(size_t cluster, uint64_t delta);
+    void recordClusterIdle_(size_t thread_idx, size_t cluster, uint64_t cycle, uint64_t delta,
+                            SchedulerTimelineTrace::TimePoint begin,
+                            SchedulerTimelineTrace::TimePoint end);
     std::string formatBlockerDetail_(const BlockedClusterInfo& blocker) const;
     void executeClusterOneCycle_(size_t thread_idx, size_t cluster, uint64_t cycle,
                                  bool trace_units);

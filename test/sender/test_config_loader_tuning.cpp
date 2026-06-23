@@ -123,6 +123,30 @@ simulation:
     std::cout << "PASSED\n";
 }
 
+void test_unit_tick_interval_parse() {
+    std::cout << "Testing unit tick_interval parse... ";
+
+    SenderConfigLoader loader;
+    auto config = loader.loadFromString(R"yaml(
+simulation:
+  unit:
+    uart:
+      type: UART
+      tick_interval: 1000
+    fetch:
+      type: FetchUnit
+)yaml");
+
+    const auto* uart = config.getUnit("uart");
+    const auto* fetch = config.getUnit("fetch");
+    assert(uart != nullptr);
+    assert(fetch != nullptr);
+    assert(uart->tick_interval == 1000);
+    assert(fetch->tick_interval == 1);
+
+    std::cout << "PASSED\n";
+}
+
 }  // namespace
 
 int main() {
@@ -132,6 +156,7 @@ int main() {
     test_tuning_defaults();
     test_unit_names_include_programmatic_additions();
     test_unit_names_skip_programmatic_deletions();
+    test_unit_tick_interval_parse();
 
     std::cout << "\n=== Config loader tuning tests PASSED ===\n";
     return 0;

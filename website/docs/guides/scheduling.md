@@ -203,6 +203,65 @@ TickSimulation selects execution mode based on topology:
 | Lookahead | No tight connections | Units run ahead within safe boundaries |
 | Cluster-aware | Tight intra-cluster only | Groups on same thread, lookahead between |
 
+### Lazy Wakeup And Multi-Rate Ticks
+
+Chronon can skip a unit's user `tick()` body on cycles where the unit is known to
+be inactive while still advancing its local cycle and scheduler progress. This
+keeps the runtime tick-driven: there is no global event queue and no callback is
+executed on the producer thread.
+
+Units can use activity controls from their own `tick()` body:
+
+```cpp
+class TimerDevice : public TickableUnit {
+public:
+    TimerDevice() : TickableUnit("timer") {
+        setTickInterval(1000);  // only run tick() on global cycles divisible by 1000
+    }
+
+    void tick() override {
+        if (!has_work) {
+            sleepUntil(localCycle() + 500);
+            return;
+        }
+        process();
+        sleepForever();  // wait for a port arrival or explicit wakeAt()
+    }
+};
+```
+
+The scheduler evaluates a unit as active when both conditions are true:
+
+```text
+global_cycle >= unit.nextActiveCycle()
+global_cycle % unit.tickInterval() == 0
+```
+
+When the unit is inactive, Chronon runs a cheap idle path that only advances the
+unit's local cycle. The cluster's completed-cycle progress still advances, so
+downstream lookahead dependencies do not stall behind idle units.
+
+In the progress-based lookahead scheduler, if every unit in a cluster is
+inactive, Chronon advances the whole cluster in one batch to the next active
+unit cycle, dependency boundary, or epoch end. The scheduler timeline still
+records this fast path because dependency progress is advancing, but it uses the
+`unit idle` category instead of `unit`. The slice detail includes `cycles=N` for
+batched idle advances.
+
+Port delivery is an input-driven wakeup source. When a connection successfully
+enqueues a message with arrival cycle `A`, Chronon wakes the destination unit at
+`A`; the destination still receives the message through its `InPort` during its
+own later `tick()` context. This gives event-like behavior without executing
+target-unit code from the producer thread.
+
+`wakeAt()` is intentionally only a scheduler hint. If a model communicates
+through shared memory or another side channel outside Chronon ports, the model
+must still expose the causal relationship to the scheduler, for example by
+converting the side-channel write into a port message or an explicit wake source
+with a conservative dependency. Otherwise an isolated sleeping unit may have
+already advanced past the event's nominal cycle under lookahead and will process
+the wake at its next scheduled opportunity.
+
 ### Epoch-Free Lookahead
 
 By default the persistent-worker lookahead path synchronizes all worker threads

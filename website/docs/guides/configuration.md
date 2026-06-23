@@ -150,7 +150,19 @@ simulation:
       type: DecodeUnit
       params:
         decode_width: 4
+
+    uart:
+      type: UART
+      tick_interval: 1000  # Optional: run tick() only on every 1000th global cycle
+      params:
+        poll_interval: 1
 ```
+
+`tick_interval` is a unit-level scheduler hint, not a constructor parameter. It
+defaults to `1`. Off-edge cycles skip the unit's `tick()` body but still advance
+the unit's local cycle and scheduler progress. Port arrivals and explicit
+`wakeAt()` calls can make a sleeping unit active again; the tick body still runs
+only on an allowed interval edge.
 
 ### Observation Configuration
 
@@ -233,7 +245,8 @@ with a warning. Categories still control enable/disable and temporal filters.
 ### Scheduler Timeline Trace
 
 The scheduler timeline records Chronon scheduler streams, unit tick slices,
-cross-thread spin waits, epoch spans, and MPSC arbitration slices. It is part
+lazy idle fast-path slices, cross-thread spin waits, epoch spans, and MPSC
+arbitration slices. It is part
 of the unified Perfetto timeline: when the observation backend runs with a
 timeline sink, the scheduler slices merge into `timeline.pftrace` under a
 "Chronon Scheduler" process group, with one lane per worker stream (`stream 0`,
