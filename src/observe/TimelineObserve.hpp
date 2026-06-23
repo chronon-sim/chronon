@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <bit>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -26,6 +25,7 @@
 #include "FixedString.hpp"
 #include "ObservationContext.hpp"
 #include "TimelineApi.hpp"
+#include "TimelineEmit.hpp"
 #include "TimelineTrack.hpp"
 #include "Types.hpp"
 
@@ -113,40 +113,55 @@ private:
     ObservationContext::LookaheadSyncNode node_;
 };
 
-template <typename... Items>
-void emitTimelineWithItems(ObservationContext* ctx, CategoryMask category, TimelineEventKind kind,
-                           uint32_t track_id, uint16_t slot, EventNameRef name, Items&&... items) {
-    constexpr size_t item_count = sizeof...(Items);
-    constexpr size_t flow_items =
-        (static_cast<size_t>(std::is_same_v<std::decay_t<Items>, Flow>) + ... + 0);
-    static_assert(flow_items <= 1, "at most one flow() per timeline event");
-    static_assert(item_count - flow_items <= MAX_TIMELINE_ARGS,
-                  "too many typed timeline args (max 8)");
+template <typename T>
+class LookaheadValueCache {
+public:
+    LookaheadValueCache() noexcept
+        : lookahead_sync_(this, &LookaheadValueCache::applyLookaheadTransition_) {}
 
-    if (!ctx || track_id == 0) {
-        return;
+    LookaheadValueCache(const LookaheadValueCache&) = delete;
+    LookaheadValueCache& operator=(const LookaheadValueCache&) = delete;
+
+    void sync(ObservationContext* ctx) noexcept { lookahead_sync_.sync(ctx); }
+
+    [[nodiscard]] bool differsFromLast(ObservationContext* ctx, const T& value) noexcept {
+        sync(ctx);
+        return !has_last_ || !(value == last_);
     }
 
-    if constexpr (item_count == 0) {
-        ctx->timelineEvent(category, kind, track_id, slot, name.id, /*payload=*/0, nullptr, 0);
-    } else {
-        TimelineArgValue args[item_count];
-        size_t arg_count = 0;
-        uint64_t flow_id = 0;
-        (timeline_detail::foldTimelineItem(args, arg_count, flow_id, std::forward<Items>(items)),
-         ...);
-        ctx->timelineEvent(category, kind, track_id, slot, name.id, flow_id, args, arg_count);
+    void recordSample(ObservationContext* ctx, const T& value) noexcept {
+        last_ = value;
+        has_last_ = true;
+        if (!ctx || !ctx->isLookaheadMode()) {
+            committed_last_ = last_;
+            committed_has_last_ = has_last_;
+        }
     }
-}
 
-inline void emitCounterSample(ObservationContext* ctx, CategoryMask category, uint32_t track_id,
-                              int64_t value) {
-    if (!ctx || track_id == 0) {
-        return;
+private:
+    static void applyLookaheadTransition_(
+        void* owner, ObservationContext::LookaheadTransition transition) noexcept {
+        auto* self = static_cast<LookaheadValueCache*>(owner);
+        switch (transition) {
+            case ObservationContext::LookaheadTransition::Commit:
+                self->committed_last_ = self->last_;
+                self->committed_has_last_ = self->has_last_;
+                break;
+            case ObservationContext::LookaheadTransition::Rollback:
+                self->last_ = self->committed_last_;
+                self->has_last_ = self->committed_has_last_;
+                break;
+            case ObservationContext::LookaheadTransition::None:
+                break;
+        }
     }
-    ctx->timelineEvent(category, TimelineEventKind::CounterSample, track_id, /*slot=*/0,
-                       /*name_id=*/0, std::bit_cast<uint64_t>(value), nullptr, 0);
-}
+
+    T last_{};
+    T committed_last_{};
+    bool has_last_ = false;
+    bool committed_has_last_ = false;
+    LookaheadCacheSync lookahead_sync_;
+};
 
 template <typename T>
 int64_t normalizeIntegral(T value) noexcept {
@@ -157,6 +172,8 @@ int64_t normalizeIntegral(T value) noexcept {
 struct CapacityValues {
     int64_t used;
     int64_t free;
+
+    bool operator==(const CapacityValues&) const = default;
 };
 
 template <typename Used, typename Capacity>
@@ -175,7 +192,7 @@ void emitNamedCounterSample(ObservationContext* ctx, CategoryMask category, T va
     using Site = CounterTrack<Name, Suffix>;
     const uint32_t track_id =
         resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Counter, /*lanes=*/1, unit_name);
-    emitCounterSample(ctx, category, track_id, normalizeIntegral(value));
+    timeline_detail::emitCounterSample(ctx, category, track_id, normalizeIntegral(value));
 }
 
 template <FixedString Name, typename Used, typename Capacity>
@@ -200,7 +217,7 @@ inline void event(Unit& unit, Cat category, Items&&... items) {
     using Track = timeline_observe_detail::EventTrack;
     const uint32_t track_id = timeline_observe_detail::resolveTrack<Track>(
         ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
-    timeline_observe_detail::emitTimelineWithItems(
+    timeline_detail::emitEventWithItems(
         ctx, static_cast<CategoryMask>(category), TimelineEventKind::Instant, track_id,
         /*slot=*/0, EventName<Name>::ref(), std::forward<Items>(items)...);
 }
@@ -214,9 +231,9 @@ inline void instant(Unit& unit, Cat category, EventNameRef name, Items&&... item
     using Site = timeline_observe_detail::NamedLaneTrack<Track>;
     const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
         ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
-    timeline_observe_detail::emitTimelineWithItems(ctx, static_cast<CategoryMask>(category),
-                                                   TimelineEventKind::Instant, track_id,
-                                                   /*slot=*/0, name, std::forward<Items>(items)...);
+    timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
+                                        TimelineEventKind::Instant, track_id, /*slot=*/0, name,
+                                        std::forward<Items>(items)...);
 }
 
 /**
@@ -228,9 +245,9 @@ inline void spanBegin(Unit& unit, Cat category, EventNameRef name, Items&&... it
     using Site = timeline_observe_detail::NamedLaneTrack<Track>;
     const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
         ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
-    timeline_observe_detail::emitTimelineWithItems(ctx, static_cast<CategoryMask>(category),
-                                                   TimelineEventKind::SpanBegin, track_id,
-                                                   /*slot=*/0, name, std::forward<Items>(items)...);
+    timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
+                                        TimelineEventKind::SpanBegin, track_id, /*slot=*/0, name,
+                                        std::forward<Items>(items)...);
 }
 
 template <FixedString Track, typename Unit, typename Cat, typename... Items>
@@ -240,9 +257,9 @@ inline void spanBegin(Unit& unit, uint16_t slot, Cat category, EventNameRef name
     using Site = timeline_observe_detail::NamedLaneTrack<Track, true>;
     const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
         ctx, TimelineTrackInfo::Kind::Lane, std::numeric_limits<uint16_t>::max());
-    timeline_observe_detail::emitTimelineWithItems(ctx, static_cast<CategoryMask>(category),
-                                                   TimelineEventKind::SpanBegin, track_id, slot,
-                                                   name, std::forward<Items>(items)...);
+    timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
+                                        TimelineEventKind::SpanBegin, track_id, slot, name,
+                                        std::forward<Items>(items)...);
 }
 
 template <FixedString Track, typename Unit>
@@ -430,8 +447,7 @@ private:
 class TimelineGauge {
 public:
     TimelineGauge(ObservableUnit* owner, std::string_view name, std::string_view unit = {})
-        : counter_(owner, name, unit),
-          lookahead_sync_(this, &TimelineGauge::applyLookaheadTransition_) {}
+        : counter_(owner, name, unit) {}
 
     template <typename T>
     void sample(T value) noexcept {
@@ -459,56 +475,23 @@ private:
     template <typename T>
     void sample_(CategoryMask category, T value) noexcept {
         const int64_t normalized = timeline_observe_detail::normalizeIntegral(value);
-        syncLookaheadCache_();
+        auto* ctx = counter_.observationContext();
+        cache_.sync(ctx);
         if (counter_.sample(category, normalized)) {
-            last_ = normalized;
-            has_last_ = true;
-            updateCommittedCache_();
+            cache_.recordSample(ctx, normalized);
         }
     }
 
     template <typename T>
     void sampleOnChange_(CategoryMask category, T value) noexcept {
         const int64_t normalized = timeline_observe_detail::normalizeIntegral(value);
-        syncLookaheadCache_();
-        if (!has_last_ || normalized != last_) {
+        if (cache_.differsFromLast(counter_.observationContext(), normalized)) {
             sample_(category, normalized);
         }
     }
 
-    void syncLookaheadCache_() noexcept { lookahead_sync_.sync(counter_.observationContext()); }
-
-    void updateCommittedCache_() noexcept {
-        auto* ctx = counter_.observationContext();
-        if (!ctx || !ctx->isLookaheadMode()) {
-            committed_last_ = last_;
-            committed_has_last_ = has_last_;
-        }
-    }
-
-    static void applyLookaheadTransition_(
-        void* owner, ObservationContext::LookaheadTransition transition) noexcept {
-        auto* self = static_cast<TimelineGauge*>(owner);
-        switch (transition) {
-            case ObservationContext::LookaheadTransition::Commit:
-                self->committed_last_ = self->last_;
-                self->committed_has_last_ = self->has_last_;
-                break;
-            case ObservationContext::LookaheadTransition::Rollback:
-                self->last_ = self->committed_last_;
-                self->has_last_ = self->committed_has_last_;
-                break;
-            case ObservationContext::LookaheadTransition::None:
-                break;
-        }
-    }
-
     TimelineCounter counter_;
-    int64_t last_ = 0;
-    int64_t committed_last_ = 0;
-    bool has_last_ = false;
-    bool committed_has_last_ = false;
-    timeline_observe_detail::LookaheadCacheSync lookahead_sync_;
+    timeline_observe_detail::LookaheadValueCache<int64_t> cache_;
 };
 
 /**
@@ -518,8 +501,7 @@ class TimelineCapacity {
 public:
     TimelineCapacity(ObservableUnit* owner, std::string_view name, std::string_view unit = {})
         : used_(owner, suffixedName_(name, ".used"), unit),
-          free_(owner, suffixedName_(name, ".free"), unit),
-          lookahead_sync_(this, &TimelineCapacity::applyLookaheadTransition_) {}
+          free_(owner, suffixedName_(name, ".free"), unit) {}
 
     template <typename Used, typename Capacity>
     void sample(Used used, Capacity total) noexcept {
@@ -552,22 +534,19 @@ private:
 
     void sampleValues_(CategoryMask category,
                        timeline_observe_detail::CapacityValues values) noexcept {
-        syncLookaheadCache_();
+        auto* ctx = used_.observationContext();
+        cache_.sync(ctx);
         const bool used_sampled = used_.sample(category, values.used);
         const bool free_sampled = free_.sample(category, values.free);
         if (used_sampled && free_sampled) {
-            last_used_ = values.used;
-            last_free_ = values.free;
-            has_last_ = true;
-            updateCommittedCache_();
+            cache_.recordSample(ctx, values);
         }
     }
 
     template <typename Used, typename Capacity>
     void sampleOnChange_(CategoryMask category, Used used, Capacity total) noexcept {
         const auto values = timeline_observe_detail::normalizeCapacity(used, total);
-        syncLookaheadCache_();
-        if (!has_last_ || values.used != last_used_ || values.free != last_free_) {
+        if (cache_.differsFromLast(used_.observationContext(), values)) {
             sampleValues_(category, values);
         }
     }
@@ -578,45 +557,9 @@ private:
         return out;
     }
 
-    void syncLookaheadCache_() noexcept { lookahead_sync_.sync(used_.observationContext()); }
-
-    void updateCommittedCache_() noexcept {
-        auto* ctx = used_.observationContext();
-        if (!ctx || !ctx->isLookaheadMode()) {
-            committed_last_used_ = last_used_;
-            committed_last_free_ = last_free_;
-            committed_has_last_ = has_last_;
-        }
-    }
-
-    static void applyLookaheadTransition_(
-        void* owner, ObservationContext::LookaheadTransition transition) noexcept {
-        auto* self = static_cast<TimelineCapacity*>(owner);
-        switch (transition) {
-            case ObservationContext::LookaheadTransition::Commit:
-                self->committed_last_used_ = self->last_used_;
-                self->committed_last_free_ = self->last_free_;
-                self->committed_has_last_ = self->has_last_;
-                break;
-            case ObservationContext::LookaheadTransition::Rollback:
-                self->last_used_ = self->committed_last_used_;
-                self->last_free_ = self->committed_last_free_;
-                self->has_last_ = self->committed_has_last_;
-                break;
-            case ObservationContext::LookaheadTransition::None:
-                break;
-        }
-    }
-
     TimelineCounter used_;
     TimelineCounter free_;
-    int64_t last_used_ = 0;
-    int64_t last_free_ = 0;
-    int64_t committed_last_used_ = 0;
-    int64_t committed_last_free_ = 0;
-    bool has_last_ = false;
-    bool committed_has_last_ = false;
-    timeline_observe_detail::LookaheadCacheSync lookahead_sync_;
+    timeline_observe_detail::LookaheadValueCache<timeline_observe_detail::CapacityValues> cache_;
 };
 
 }  // namespace chronon::observe

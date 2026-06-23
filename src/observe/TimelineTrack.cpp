@@ -45,12 +45,6 @@ void TimelineTrackBase::stampCycle_() noexcept {
     ctx_->setCurrentCycleValue(owner_->getObserveCycle());
 }
 
-void ObservableUnit::initializePendingTimelineTracks() {
-    for (auto* track : pending_timeline_tracks_) {
-        if (track) {
-            track->onContextAttached(observe_ctx_);
-        }
-    }
-}
+void ObservableUnit::initializePendingTimelineTracks() { attachPending_(pending_timeline_tracks_); }
 
 }  // namespace chronon::observe

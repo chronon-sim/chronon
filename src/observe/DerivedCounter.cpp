@@ -14,18 +14,8 @@
 
 namespace chronon::observe {
 
-// Defined here because the body needs DerivedCounter to be a complete type.
 void ObservableUnit::initializePendingDerivedCounters() {
-    if (!observe_ctx_) {
-        return;
-    }
-
-    for (auto* dc : pending_derived_counters_) {
-        if (dc) {
-            dc->onContextAttached(observe_ctx_);
-        }
-    }
-    pending_derived_counters_.clear();
+    attachPending_(pending_derived_counters_);
 }
 
 DerivedCounter::DerivedCounter(ObservableUnit* owner, std::string_view name,
