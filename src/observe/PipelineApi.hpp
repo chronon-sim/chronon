@@ -14,12 +14,16 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "FixedString.hpp"
 #include "ObservationContext.hpp"
@@ -49,6 +53,64 @@ struct NamedPipelineStage {
         return name;
     }
 };
+
+struct RuntimePipelineStageEntry {
+    uint16_t source_id;
+    uint16_t pipe;
+    uint32_t track_id;
+};
+
+inline constexpr size_t MAX_RUNTIME_PIPELINE_SLOTS = 16;
+
+template <FixedString Stage>
+uint32_t resolveRuntimePipelineTrackSlow(uint16_t source_id, uint16_t pipe,
+                                         std::atomic<uint64_t>& cached_entry) {
+    static std::mutex mutex;
+    static std::vector<RuntimePipelineStageEntry> entries;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    for (const auto& entry : entries) {
+        if (entry.source_id == source_id && entry.pipe == pipe) {
+            cached_entry.store((static_cast<uint64_t>(source_id) << 32) | entry.track_id,
+                               std::memory_order_relaxed);
+            return entry.track_id;
+        }
+    }
+
+    std::string name;
+    name.reserve(16 + Stage.size());
+    name.append("pipe ");
+    name.append(std::to_string(pipe));
+    name.append(" stage ");
+    name.append(std::string_view(Stage));
+
+    const uint32_t track_id = TimelineTrackRegistry::instance().registerTrack(
+        {name, /*unit=*/{}, source_id, /*lanes=*/1, TimelineTrackInfo::Kind::Lane,
+         TimelineTrackInfo::Layout::Pipeline});
+    entries.push_back({source_id, pipe, track_id});
+    cached_entry.store((static_cast<uint64_t>(source_id) << 32) | track_id,
+                       std::memory_order_relaxed);
+    return track_id;
+}
+
+template <FixedString Stage>
+uint32_t resolveRuntimePipelineTrack(ObservationContext* ctx, uint16_t pipe) {
+    if (!ctx) {
+        return 0;
+    }
+
+    const uint16_t slot = pipe < MAX_RUNTIME_PIPELINE_SLOTS ? pipe : 0;
+    static std::array<std::atomic<uint64_t>, MAX_RUNTIME_PIPELINE_SLOTS> cached_entries{};
+    std::atomic<uint64_t>& cached_entry = cached_entries[slot];
+    const uint16_t source_id = ctx->sourceId();
+    const uint64_t entry = cached_entry.load(std::memory_order_relaxed);
+    const uint32_t track_id = static_cast<uint32_t>(entry);
+    if (track_id != 0 && static_cast<uint16_t>(entry >> 32) == source_id) {
+        return track_id;
+    }
+
+    return resolveRuntimePipelineTrackSlow<Stage>(source_id, slot, cached_entry);
+}
 
 template <typename Site>
 uint32_t resolvePipelineTrack(ObservationContext* ctx) {
@@ -96,6 +158,17 @@ void emitPipelineSliceHex(ObservationContext* ctx, CategoryMask category, uint32
                           uint64_t id, Items&&... items) {
     emitPipelineSliceWithFlags(ctx, category, track_id, TIMELINE_FLAG_NAME_HEX, id,
                                std::forward<Items>(items)...);
+}
+
+template <FixedString Stage, typename Cat, typename... Items>
+inline void emitRuntimePipelineSlice(ObservationContext* ctx, uint16_t pipe, Cat category,
+                                     uint8_t flags, uint64_t id, Items&&... items) {
+    const CategoryMask cat_mask = static_cast<CategoryMask>(category);
+    if (!ctx || !ctx->shouldTrace(cat_mask)) {
+        return;
+    }
+    const uint32_t track_id = resolveRuntimePipelineTrack<Stage>(ctx, pipe);
+    emitPipelineSliceWithFlags(ctx, cat_mask, track_id, flags, id, std::forward<Items>(items)...);
 }
 
 }  // namespace pipeline_detail
@@ -159,6 +232,20 @@ template <uint16_t Pipe, FixedString Stage, typename Cat, typename... Items>
 inline void pipeStageHex(ObservationContext* ctx, Cat category, uint64_t id, Items&&... items) {
     PipelinePipe<Pipe>{}.template stageNameHex<Stage>(ctx, category, id,
                                                       std::forward<Items>(items)...);
+}
+
+template <FixedString Stage, typename Cat, typename... Items>
+inline void pipeStage(ObservationContext* ctx, uint16_t pipe, Cat category, uint64_t id,
+                      Items&&... items) {
+    pipeline_detail::emitRuntimePipelineSlice<Stage>(ctx, pipe, category, /*flags=*/0, id,
+                                                     std::forward<Items>(items)...);
+}
+
+template <FixedString Stage, typename Cat, typename... Items>
+inline void pipeStageHex(ObservationContext* ctx, uint16_t pipe, Cat category, uint64_t id,
+                         Items&&... items) {
+    pipeline_detail::emitRuntimePipelineSlice<Stage>(ctx, pipe, category, TIMELINE_FLAG_NAME_HEX,
+                                                     id, std::forward<Items>(items)...);
 }
 
 }  // namespace chronon::observe

@@ -239,3 +239,32 @@ add_test(
     COMMAND test_timeline_api
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
+
+# ==============================================================================
+# Runtime Pipeline API Test
+# ==============================================================================
+
+add_executable(test_runtime_pipeline_api
+    test_runtime_pipeline_api.cpp
+)
+
+target_include_directories(test_runtime_pipeline_api PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_link_libraries(test_runtime_pipeline_api
+    chronon::core
+    chronon_observe
+    chronon_compile_options
+    ZLIB::ZLIB
+)
+
+target_compile_features(test_runtime_pipeline_api PRIVATE cxx_std_20)
+
+add_dependencies(regress test_runtime_pipeline_api)
+
+add_test(
+    NAME runtime_pipeline_api_test
+    COMMAND test_runtime_pipeline_api
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
