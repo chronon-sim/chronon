@@ -30,6 +30,7 @@ void TickSimulation::initialize() {
     if (initialized_) return;
 
     buildDependencyGraph();
+    validateNoZeroDelayCycles_();
 
     // Topologically reorder unit_ptrs_ so producers tick before consumers in
     // the per-cycle loop. SCC condensation handles feedback cycles

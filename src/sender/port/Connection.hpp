@@ -163,7 +163,7 @@ public:
  * Connection - Typed connection between OutPort and InPort.
  *
  * Connections specify the communication delay:
- * - delay=0: Tight coupling, same-cycle delivery (delta cycles)
+ * - delay=0: Tight coupling, same-cycle delivery on acyclic paths
  * - delay>0: Loose coupling, future delivery (lookahead possible)
  *
  * Usage:

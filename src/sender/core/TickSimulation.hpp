@@ -386,6 +386,7 @@ private:
 
     void buildDependencyGraph();
     void buildPredecessorCache();
+    void validateNoZeroDelayCycles_() const;
 
     /**
      * Topologically reorder unit_ptrs_ via SCC condensation. Units within
