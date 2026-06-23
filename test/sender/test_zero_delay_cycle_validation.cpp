@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "chronon/Chronon.hpp"
 
@@ -37,6 +38,40 @@ public:
             [[maybe_unused]] bool sent = out.send(*value);
         }
     }
+};
+
+class SourceUnit : public TickableUnit {
+public:
+    explicit SourceUnit(std::string name) : TickableUnit(std::move(name)) {}
+
+    InPort<int> in{this, "in"};
+    OutPort<int> out{this, "out"};
+
+    void tick() override {
+        while (in.tryReceive(localCycle()).has_value()) {
+        }
+        [[maybe_unused]] bool sent = out.send(static_cast<int>(localCycle()));
+    }
+};
+
+class RecordingUnit : public TickableUnit {
+public:
+    explicit RecordingUnit(std::string name) : TickableUnit(std::move(name)) {}
+
+    InPort<int> in{this, "in"};
+    OutPort<int> out{this, "out"};
+
+    void tick() override {
+        while (in.tryReceive(localCycle()).has_value()) {
+            receive_cycles_.push_back(localCycle());
+        }
+        [[maybe_unused]] bool sent = out.send(static_cast<int>(localCycle()));
+    }
+
+    const std::vector<uint64_t>& receiveCycles() const noexcept { return receive_cycles_; }
+
+private:
+    std::vector<uint64_t> receive_cycles_;
 };
 
 bool initializeThrowsZeroDelayCycle(TickSimulation& sim, const std::string& expected_fragment) {
@@ -109,6 +144,28 @@ void test_registered_feedback_allowed() {
     std::cout << "PASSED\n";
 }
 
+void test_registered_feedback_preserves_zero_delay_order() {
+    std::cout << "Testing registered feedback preserves zero-delay order... ";
+
+    TickSimulationConfig cfg;
+    cfg.enable_parallel = false;
+    TickSimulation sim(cfg);
+
+    auto* b = sim.createUnit<RecordingUnit>("b");
+    auto* a = sim.createUnit<SourceUnit>("a");
+
+    sim.connect(a->out, b->in, 0);
+    sim.connect(b->out, a->in, 1);
+
+    sim.initialize();
+    sim.run(1);
+
+    CHECK(b->receiveCycles().size() == 1);
+    CHECK(b->receiveCycles()[0] == 0);
+
+    std::cout << "PASSED\n";
+}
+
 }  // namespace
 
 int main() {
@@ -116,6 +173,7 @@ int main() {
     test_zero_delay_self_loop_rejected();
     test_acyclic_zero_delay_path_allowed();
     test_registered_feedback_allowed();
+    test_registered_feedback_preserves_zero_delay_order();
 
     std::cout << "All zero-delay cycle validation tests passed!\n";
     return 0;
