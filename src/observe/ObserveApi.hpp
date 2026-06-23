@@ -144,44 +144,33 @@ inline void trace(ObservationContext* ctx, Cat category, Args&&... args) {
     }
 }
 
+template <LogLevel Level, FixedString Fmt, typename... Args>
+inline void log(ObservationContext* ctx, Args&&... args) {
+    if (!ctx) return;
+    if (ctx->template shouldLog<Level>()) {
+        static FormatId fmt_id = Format<Fmt>::template getIdWithTypes<Args...>("", 0, true, Level);
+        ctx->template log<Level>(fmt_id, std::forward<Args>(args)...);
+    }
+}
+
 template <FixedString Fmt, typename... Args>
 inline void log_debug(ObservationContext* ctx, Args&&... args) {
-    if (!ctx) return;
-    if (ctx->template shouldLog<LogLevel::Debug>()) {
-        static FormatId fmt_id =
-            Format<Fmt>::template getIdWithTypes<Args...>("", 0, true, LogLevel::Debug);
-        ctx->template log<LogLevel::Debug>(fmt_id, std::forward<Args>(args)...);
-    }
+    log<LogLevel::Debug, Fmt>(ctx, std::forward<Args>(args)...);
 }
 
 template <FixedString Fmt, typename... Args>
 inline void log_info(ObservationContext* ctx, Args&&... args) {
-    if (!ctx) return;
-    if (ctx->template shouldLog<LogLevel::Info>()) {
-        static FormatId fmt_id =
-            Format<Fmt>::template getIdWithTypes<Args...>("", 0, true, LogLevel::Info);
-        ctx->template log<LogLevel::Info>(fmt_id, std::forward<Args>(args)...);
-    }
+    log<LogLevel::Info, Fmt>(ctx, std::forward<Args>(args)...);
 }
 
 template <FixedString Fmt, typename... Args>
 inline void log_warn(ObservationContext* ctx, Args&&... args) {
-    if (!ctx) return;
-    if (ctx->template shouldLog<LogLevel::Warn>()) {
-        static FormatId fmt_id =
-            Format<Fmt>::template getIdWithTypes<Args...>("", 0, true, LogLevel::Warn);
-        ctx->template log<LogLevel::Warn>(fmt_id, std::forward<Args>(args)...);
-    }
+    log<LogLevel::Warn, Fmt>(ctx, std::forward<Args>(args)...);
 }
 
 template <FixedString Fmt, typename... Args>
 inline void log_error(ObservationContext* ctx, Args&&... args) {
-    if (!ctx) return;
-    if (ctx->template shouldLog<LogLevel::Error>()) {
-        static FormatId fmt_id =
-            Format<Fmt>::template getIdWithTypes<Args...>("", 0, true, LogLevel::Error);
-        ctx->template log<LogLevel::Error>(fmt_id, std::forward<Args>(args)...);
-    }
+    log<LogLevel::Error, Fmt>(ctx, std::forward<Args>(args)...);
 }
 
 }  // namespace chronon::observe

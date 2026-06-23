@@ -260,10 +260,7 @@ public:
      */
     template <FixedString Fmt, typename... Args>
     void debug(Args&&... args) {
-        if (observe_ctx_ && observe_ctx_->template shouldLog<LogLevel::Debug>()) {
-            observe_ctx_->setCurrentCycleValue(getObserveCycle());
-            log_debug<Fmt>(observe_ctx_, std::forward<Args>(args)...);
-        }
+        emitLog_<LogLevel::Debug, Fmt>(std::forward<Args>(args)...);
     }
 
     /**
@@ -271,10 +268,7 @@ public:
      */
     template <FixedString Fmt, typename... Args>
     void info(Args&&... args) {
-        if (observe_ctx_ && observe_ctx_->template shouldLog<LogLevel::Info>()) {
-            observe_ctx_->setCurrentCycleValue(getObserveCycle());
-            log_info<Fmt>(observe_ctx_, std::forward<Args>(args)...);
-        }
+        emitLog_<LogLevel::Info, Fmt>(std::forward<Args>(args)...);
     }
 
     /**
@@ -282,10 +276,7 @@ public:
      */
     template <FixedString Fmt, typename... Args>
     void warn(Args&&... args) {
-        if (observe_ctx_ && observe_ctx_->template shouldLog<LogLevel::Warn>()) {
-            observe_ctx_->setCurrentCycleValue(getObserveCycle());
-            log_warn<Fmt>(observe_ctx_, std::forward<Args>(args)...);
-        }
+        emitLog_<LogLevel::Warn, Fmt>(std::forward<Args>(args)...);
     }
 
     /**
@@ -293,16 +284,21 @@ public:
      */
     template <FixedString Fmt, typename... Args>
     void error(Args&&... args) {
-        if (observe_ctx_ && observe_ctx_->template shouldLog<LogLevel::Error>()) {
-            observe_ctx_->setCurrentCycleValue(getObserveCycle());
-            log_error<Fmt>(observe_ctx_, std::forward<Args>(args)...);
-        }
+        emitLog_<LogLevel::Error, Fmt>(std::forward<Args>(args)...);
     }
 
 protected:
     ObservationContext* observe_ctx_ = nullptr;
 
 private:
+    template <LogLevel Level, FixedString Fmt, typename... Args>
+    void emitLog_(Args&&... args) {
+        if (observe_ctx_ && observe_ctx_->template shouldLog<Level>()) {
+            observe_ctx_->setCurrentCycleValue(getObserveCycle());
+            chronon::observe::log<Level, Fmt>(observe_ctx_, std::forward<Args>(args)...);
+        }
+    }
+
     // Pending counters to be initialized when context is attached
     std::vector<Counter*> pending_counters_;
 

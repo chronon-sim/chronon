@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <bit>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -26,6 +25,7 @@
 #include "FixedString.hpp"
 #include "ObservationContext.hpp"
 #include "TimelineApi.hpp"
+#include "TimelineEmit.hpp"
 #include "TimelineTrack.hpp"
 #include "Types.hpp"
 
@@ -113,41 +113,6 @@ private:
     ObservationContext::LookaheadSyncNode node_;
 };
 
-template <typename... Items>
-void emitTimelineWithItems(ObservationContext* ctx, CategoryMask category, TimelineEventKind kind,
-                           uint32_t track_id, uint16_t slot, EventNameRef name, Items&&... items) {
-    constexpr size_t item_count = sizeof...(Items);
-    constexpr size_t flow_items =
-        (static_cast<size_t>(std::is_same_v<std::decay_t<Items>, Flow>) + ... + 0);
-    static_assert(flow_items <= 1, "at most one flow() per timeline event");
-    static_assert(item_count - flow_items <= MAX_TIMELINE_ARGS,
-                  "too many typed timeline args (max 8)");
-
-    if (!ctx || track_id == 0) {
-        return;
-    }
-
-    if constexpr (item_count == 0) {
-        ctx->timelineEvent(category, kind, track_id, slot, name.id, /*payload=*/0, nullptr, 0);
-    } else {
-        TimelineArgValue args[item_count];
-        size_t arg_count = 0;
-        uint64_t flow_id = 0;
-        (timeline_detail::foldTimelineItem(args, arg_count, flow_id, std::forward<Items>(items)),
-         ...);
-        ctx->timelineEvent(category, kind, track_id, slot, name.id, flow_id, args, arg_count);
-    }
-}
-
-inline void emitCounterSample(ObservationContext* ctx, CategoryMask category, uint32_t track_id,
-                              int64_t value) {
-    if (!ctx || track_id == 0) {
-        return;
-    }
-    ctx->timelineEvent(category, TimelineEventKind::CounterSample, track_id, /*slot=*/0,
-                       /*name_id=*/0, std::bit_cast<uint64_t>(value), nullptr, 0);
-}
-
 template <typename T>
 int64_t normalizeIntegral(T value) noexcept {
     static_assert(std::is_integral_v<std::decay_t<T>>, "timeline value must be integral");
@@ -175,7 +140,7 @@ void emitNamedCounterSample(ObservationContext* ctx, CategoryMask category, T va
     using Site = CounterTrack<Name, Suffix>;
     const uint32_t track_id =
         resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Counter, /*lanes=*/1, unit_name);
-    emitCounterSample(ctx, category, track_id, normalizeIntegral(value));
+    timeline_detail::emitCounterSample(ctx, category, track_id, normalizeIntegral(value));
 }
 
 template <FixedString Name, typename Used, typename Capacity>
@@ -200,7 +165,7 @@ inline void event(Unit& unit, Cat category, Items&&... items) {
     using Track = timeline_observe_detail::EventTrack;
     const uint32_t track_id = timeline_observe_detail::resolveTrack<Track>(
         ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
-    timeline_observe_detail::emitTimelineWithItems(
+    timeline_detail::emitEventWithItems(
         ctx, static_cast<CategoryMask>(category), TimelineEventKind::Instant, track_id,
         /*slot=*/0, EventName<Name>::ref(), std::forward<Items>(items)...);
 }
@@ -214,9 +179,9 @@ inline void instant(Unit& unit, Cat category, EventNameRef name, Items&&... item
     using Site = timeline_observe_detail::NamedLaneTrack<Track>;
     const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
         ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
-    timeline_observe_detail::emitTimelineWithItems(ctx, static_cast<CategoryMask>(category),
-                                                   TimelineEventKind::Instant, track_id,
-                                                   /*slot=*/0, name, std::forward<Items>(items)...);
+    timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
+                                        TimelineEventKind::Instant, track_id, /*slot=*/0, name,
+                                        std::forward<Items>(items)...);
 }
 
 /**
@@ -228,9 +193,9 @@ inline void spanBegin(Unit& unit, Cat category, EventNameRef name, Items&&... it
     using Site = timeline_observe_detail::NamedLaneTrack<Track>;
     const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
         ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
-    timeline_observe_detail::emitTimelineWithItems(ctx, static_cast<CategoryMask>(category),
-                                                   TimelineEventKind::SpanBegin, track_id,
-                                                   /*slot=*/0, name, std::forward<Items>(items)...);
+    timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
+                                        TimelineEventKind::SpanBegin, track_id, /*slot=*/0, name,
+                                        std::forward<Items>(items)...);
 }
 
 template <FixedString Track, typename Unit, typename Cat, typename... Items>
@@ -240,9 +205,9 @@ inline void spanBegin(Unit& unit, uint16_t slot, Cat category, EventNameRef name
     using Site = timeline_observe_detail::NamedLaneTrack<Track, true>;
     const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
         ctx, TimelineTrackInfo::Kind::Lane, std::numeric_limits<uint16_t>::max());
-    timeline_observe_detail::emitTimelineWithItems(ctx, static_cast<CategoryMask>(category),
-                                                   TimelineEventKind::SpanBegin, track_id, slot,
-                                                   name, std::forward<Items>(items)...);
+    timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
+                                        TimelineEventKind::SpanBegin, track_id, slot, name,
+                                        std::forward<Items>(items)...);
 }
 
 template <FixedString Track, typename Unit>

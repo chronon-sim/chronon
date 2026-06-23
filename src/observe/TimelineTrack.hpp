@@ -20,6 +20,7 @@
 
 #include "ObservationContext.hpp"
 #include "TimelineApi.hpp"
+#include "TimelineEmit.hpp"
 #include "Types.hpp"
 
 namespace chronon::observe {
@@ -149,17 +150,8 @@ private:
             return false;
         }
 
-        if constexpr (MAX_ITEMS == 0) {
-            return ctx_->timelineEvent(cat_mask, kind, track_id_, slot, name.id, /*payload=*/0,
-                                       nullptr, 0);
-        } else {
-            TimelineArgValue args[MAX_ITEMS];
-            size_t arg_count = 0;
-            uint64_t flow_id = 0;
-            (timeline_detail::foldTimelineItem(args, arg_count, flow_id, items), ...);
-            return ctx_->timelineEvent(cat_mask, kind, track_id_, slot, name.id, flow_id, args,
-                                       arg_count);
-        }
+        return timeline_detail::emitEventWithItems(ctx_, cat_mask, kind, track_id_, slot, name,
+                                                   items...);
     }
 };
 
@@ -192,9 +184,7 @@ public:
         if (!ctx_->shouldTrace(cat_mask)) {
             return false;
         }
-        return ctx_->timelineEvent(cat_mask, TimelineEventKind::CounterSample, track_id_,
-                                   /*slot=*/0, /*name_id=*/0, std::bit_cast<uint64_t>(value),
-                                   nullptr, 0);
+        return timeline_detail::emitCounterSample(ctx_, cat_mask, track_id_, value);
     }
 };
 
