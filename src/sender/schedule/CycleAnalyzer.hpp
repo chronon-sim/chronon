@@ -24,7 +24,7 @@ struct CycleInfo {
     std::vector<uint32_t> delays;
     uint32_t total_delay;
 
-    /// True for zero-delay cycles, which require delta-cycle execution (no lookahead buffer).
+    /// True for zero-delay cycles, which TickSimulation rejects at initialization.
     bool isTight() const { return total_delay == 0; }
 
     uint32_t minEdgeDelay() const {
@@ -40,7 +40,7 @@ struct CycleInfo {
 /** @brief Full cycle/dependency analysis output for a DependencyGraph. */
 struct AnalysisResult {
     std::vector<CycleInfo> all_cycles;
-    std::vector<CycleInfo> tight_cycles;  ///< delay = 0; require delta cycles.
+    std::vector<CycleInfo> tight_cycles;  ///< delay = 0; invalid for TickSimulation.
     std::vector<CycleInfo> loose_cycles;  ///< delay > 0; can use lookahead.
 
     std::set<Unit*> tight_cycle_units;

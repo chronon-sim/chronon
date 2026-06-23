@@ -386,12 +386,14 @@ private:
 
     void buildDependencyGraph();
     void buildPredecessorCache();
+    void validateNoZeroDelayCycles_() const;
 
     /**
-     * Topologically reorder unit_ptrs_ via SCC condensation. Units within
-     * the same SCC are kept in creation order; SCCs are topo-sorted so
-     * producers tick before consumers. Result is stable for a given graph
-     * but not fully canonical (Tarjan traversal order plus builder ids).
+     * Topologically reorder unit_ptrs_ via SCC condensation. Within a full
+     * SCC, members are ordered by their acyclic zero-delay subgraph so
+     * same-cycle producers tick before consumers; creation order is the
+     * tie-breaker. Result is stable for a given graph but not fully canonical
+     * (Tarjan traversal order plus builder ids).
      * Must be followed by buildDependencyGraph() to rebuild graph indices.
      */
     void reorderUnitsTopologically_();

@@ -138,7 +138,7 @@ Chronon performs **static dependency analysis** at initialization time to determ
 
 | Cycle Type | Total Delay | Strategy | Example |
 |------------|-------------|----------|---------|
-| Tight | = 0 | Delta cycles (sequential, convergence-based) | Decode ↔ Rename with zero latency |
+| Tight | = 0 | Invalid combinational feedback | Decode ↔ Rename with zero latency |
 | Loose | > 0 | Lookahead (units run ahead within delay window) | Fetch → Decode with 3-cycle queue |
 | Independent | ∞ (no path) | Fully parallel | Separate cores |
 
@@ -361,7 +361,7 @@ l1_out.connect(&l2_in, 10);          // 10-cycle latency (models bus/NoC)
 ```
 
 - Delay determines both **timing semantics** and **scheduling constraints**
-- `delay=0` forces same-thread execution (delta cycle convergence, like SystemVerilog)
+- `delay=0` gives same-cycle delivery on acyclic paths; zero-delay feedback is rejected at initialization
 - `delay>0` enables lookahead parallelism (units can advance independently within the delay window)
 - Units see time through `localCycle()` — a monotonically increasing counter per unit
 
@@ -453,25 +453,29 @@ Chronon's `delay` parameter on port connections directly corresponds to the numb
 
 Unit B's `tryReceive(T)` reads the value A sent at cycle T-3. This value is already "latched" in the MessageQueue. A's `tick()` at cycle T **cannot** change what B reads at cycle T, so A and B can execute in any order (parallelizable). A can run up to 3 cycles ahead of B (lookahead = delay).
 
-For `delay = 0`, there is **no DFF between the two units** — this is pure combinational feedback:
+For `delay = 0`, there is **no DFF between the two units**. Acyclic paths can be
+evaluated in topological order, but feedback loops are invalid topology:
 
 ```wavedrom
 { "signal": [
   { "name": "clk",                  "wave": "p........" },
   {},
-  { "name": "A.tick() delta 0",     "wave": "x=x=x....", "data": ["run","run"] },
+  { "name": "A.tick()",             "wave": "x=x=x....", "data": ["run","run"] },
   { "name": "A→B (delay=0)",        "wave": "x.=x=x...", "data": ["v0","v1"] },
-  { "name": "B.tick() delta 1",     "wave": "x..=x=x..", "data": ["run","run"] },
+  { "name": "B.tick()",             "wave": "x..=x=x..", "data": ["run","run"] },
   { "name": "B→A (delay=0)",        "wave": "x...=x=x.", "data": ["v0","v1"] },
   {},
-  { "name": "converged",            "wave": "0.....1.0" }
+  { "name": "init error",           "wave": "0.1.....0" }
 ],
-  "head": { "text": "delay=0: combinational loop — delta cycle convergence within one cycle" },
+  "head": { "text": "delay=0 feedback loop — rejected at initialization" },
   "config": { "hscale": 2 }
 }
 ```
 
-No DFF isolation — A's output feeds B's input within the **same cycle**. Evaluation order matters, requiring delta cycle iteration to convergence (analogous to SystemVerilog `always @(*)`). These units must execute on the same thread.
+No DFF isolation means A's output can feed B's input within the **same cycle** on
+an acyclic path. If there is feedback, evaluation order becomes part of the
+observable semantics. Chronon rejects such zero-delay cycles rather than choosing
+an arbitrary unit order.
 
 ### 6.3 Why gem5 and GPGPU-Sim Cannot Exploit This
 
@@ -592,7 +596,7 @@ Among all the frameworks above, **SST** and **Manifold** are architecturally clo
 | Aspect | SST | Manifold | Chronon |
 |--------|-----|----------|---------|
 | **Graph analysis** | Computes a single global min-latency across all cross-partition links (`findSyncInterval`); no per-pair analysis, no cycle detection | Computes global or pairwise lookahead during link setup; no cycle detection or topological analysis | Floyd-Warshall all-pairs shortest paths + Tarjan SCC + Johnson's cycle enumeration; classifies every component pair as tight / loose / independent |
-| **Zero-delay connections** | Prohibited between Components (links must have latency > 0); zero-delay interaction requires SubComponent function calls within the same Component tree | Half-tick minimum for inter-component links; intra-LP links can be zero but require same-LP placement | First-class `delay=0` connections with delta-cycle convergence semantics; CycleAnalyzer automatically detects tight cycles and forces co-location on the same thread |
+| **Zero-delay connections** | Prohibited between Components (links must have latency > 0); zero-delay interaction requires SubComponent function calls within the same Component tree | Half-tick minimum for inter-component links; intra-LP links can be zero but require same-LP placement | First-class `delay=0` connections on acyclic paths; zero-delay feedback cycles are rejected during initialization |
 | **Partitioning** | 5 built-in strategies; `simple` partitioner maximizes cross-cut latency via pairwise swap; balances component *count*, not computational *cost* | Manual only — user specifies LP assignment per component in driver code | Cost-aware WeightedPartitioner: models per-unit compute cost + sync cost scaled by delay (100x penalty for delay=0, 1/N for delay=N); four-phase optimization (LPT + FM refinement + pairwise swap + multi-unit relocate) minimizes max thread execution time |
 | **Synchronization protocol** | Barrier-based with skip-ahead: `MPI_Allreduce` computes global min next-activity time, then advances by the static lookahead period; no null messages | Chandy-Misra-Bryant null-message protocol with multiple variants (basic CMB, tick-optimized, Forecast Null-Message for dynamic lookahead, LBTS barrier, quantum) | No runtime protocol. Lookahead bounds are precomputed from the dependency graph; progress tracking uses cache-line-aligned atomics. Each unit checks only its direct predecessors' progress — no global barrier or null-message exchange |
 | **Lookahead exploitation** | Single global value (min cross-partition latency); all components sync at the same interval regardless of local topology | Global or pairwise; FNM variant allows runtime forecast-based dynamic lookahead per LP pair | Per-unit direct-edge lookahead: each unit independently advances based on its immediate predecessors' progress. Transitive closure penalties do not propagate — if A→B (delay=5) and B→C (delay=3), C uses 3 from B directly, not min(5,3) from the transitive path |
@@ -608,7 +612,7 @@ Among all the frameworks above, **SST** and **Manifold** are architecturally clo
 
 #### Why these differences matter
 
-1. **Zero-delay support enables accurate pipeline modeling.** Real CPU pipelines have combinational paths between stages (e.g., bypass networks, stall signals). SST cannot model these as links — they must be collapsed into a single Component with internal function calls, losing the compositional port abstraction. Manifold's half-tick workaround introduces artificial timing granularity. Chronon handles `delay=0` natively: CycleAnalyzer detects tight cycles, the partitioner forces them onto the same thread, and delta-cycle iteration converges within a single simulation cycle — no special-casing by the model author.
+1. **Zero-delay support enables accurate acyclic pipeline modeling.** Real CPU pipelines have combinational paths between stages (e.g., bypass networks, stall signals). SST cannot model these as links — they must be collapsed into a single Component with internal function calls, losing the compositional port abstraction. Manifold's half-tick workaround introduces artificial timing granularity. Chronon handles acyclic `delay=0` paths natively and rejects zero-delay feedback cycles that would otherwise depend on arbitrary evaluation order.
 
 2. **Per-unit direct-edge lookahead admits more parallelism than global sync intervals.** SST's single global `max_period` is bottlenecked by the shortest cross-partition link in the entire system. A 1-cycle link between two components forces *all* components to synchronize every cycle, even if most have 10+ cycle lookahead. Chronon's per-unit progress tracking means each unit advances at its own safe rate — a tight pair syncs frequently while the rest of the system runs ahead freely.
 
@@ -656,7 +660,7 @@ Beyond SST and Manifold, four other projects tackle subsets of the problems Chro
 
 | Aspect | P-GAS/CRAW/P | Virtual Time III | POSE/CharmDES | DDA-DES | Chronon |
 |--------|-------------|-----------------|---------------|---------|---------|
-| **Zero-delay support** | Not natively — P-GAS's zero-or-one lookahead is a workaround for Godson-T's zero-delay ACK protocol; CRAW/P absorbs zero-delay by forcing router threads to Q=1 (cycle-by-cycle sync) | Yes — zero-delay messages cause CVT to stall (cannot advance past current time via that channel), so events at or above current time are simply processed optimistically. "The framework naturally falls back to optimistic execution precisely where conservative execution would deadlock" | Partially — `POSE_invoke` supports offset=0 (same-timestamp delivery), but zero-delay cycles between objects cause rollback cascades; ordering of same-timestamp events requires manual sequence numbers or `DETERMINISTIC_EVENTS` flag | Yes — data-dependence analysis can identify parallelism between simultaneous events if they share no state variables | Yes — first-class `delay=0` connections with delta-cycle convergence; CycleAnalyzer detects tight cycles and forces co-location on the same thread |
+| **Zero-delay support** | Not natively — P-GAS's zero-or-one lookahead is a workaround for Godson-T's zero-delay ACK protocol; CRAW/P absorbs zero-delay by forcing router threads to Q=1 (cycle-by-cycle sync) | Yes — zero-delay messages cause CVT to stall (cannot advance past current time via that channel), so events at or above current time are simply processed optimistically. "The framework naturally falls back to optimistic execution precisely where conservative execution would deadlock" | Partially — `POSE_invoke` supports offset=0 (same-timestamp delivery), but zero-delay cycles between objects cause rollback cascades; ordering of same-timestamp events requires manual sequence numbers or `DETERMINISTIC_EVENTS` flag | Yes — data-dependence analysis can identify parallelism between simultaneous events if they share no state variables | Yes for acyclic `delay=0` paths; zero-delay feedback cycles are rejected |
 | **Implication** | Minimum effective latency is 1 cycle for RR links; no true combinational modeling across partition boundaries | Zero-delay degrades to optimistic execution (correct but incurs rollback overhead) | Zero-delay cycles may cause cascading rollbacks; model author bears responsibility for correct ordering | Zero-delay parallelism limited by shared state variables | Zero-delay is a scheduling constraint (same-thread), not a correctness problem |
 
 #### Partitioning and Load Balancing
@@ -721,6 +725,6 @@ Beyond SST and Manifold, four other projects tackle subsets of the problems Chro
 | Message cancellation | Generation-tracked `cancelInFlight()` | Event squashing / packet invalidation | Warp mask invalidation |
 | Configuration | YAML + `ParameterSet` auto-registration | Python scripting + SimObject params | Config file + command-line flags |
 | Clock domains | Single (uniform tick) | Multiple (clock domain crossing) | Multiple (core/DRAM/interconnect) |
-| Delta cycles | Yes (zero-delay convergence) | No (events are always ≥ 1 tick apart) | No |
+| Delta cycles | No (zero-delay feedback is rejected) | No (events are always ≥ 1 tick apart) | No |
 | Dynamic rebalancing | Yes (epoch-boundary migration) | No | No |
 | Simulation modes | Tick-based only | Atomic / Timing / Functional | Cycle-accurate only |

@@ -30,10 +30,11 @@ void TickSimulation::initialize() {
     if (initialized_) return;
 
     buildDependencyGraph();
+    validateNoZeroDelayCycles_();
 
-    // Topologically reorder unit_ptrs_ so producers tick before consumers in
-    // the per-cycle loop. SCC condensation handles feedback cycles
-    // (wakeup/flush buses); creation order is preserved within each SCC.
+    // Topologically reorder unit_ptrs_ so zero-delay producers tick before
+    // same-cycle consumers in the per-cycle loop. Full-graph SCC condensation
+    // handles registered feedback; creation order is a tie-break only.
     reorderUnitsTopologically_();
     buildDependencyGraph();
 
@@ -467,8 +468,6 @@ void TickSimulation::reorderUnitsTopologically_() {
 
     auto topo = topologicalSort(condensed);
 
-    // Within each SCC, sort by original creation order (unit id) so the
-    // intra-SCC ordering is deterministic.
     std::vector<TickableUnit*> new_order;
     new_order.reserve(n);
 
@@ -476,6 +475,38 @@ void TickSimulation::reorderUnitsTopologically_() {
         auto& members = sccs.components[scc_idx];
         std::sort(members.begin(), members.end(),
                   [this](size_t a, size_t b) { return unit_ptrs_[a]->id() < unit_ptrs_[b]->id(); });
+
+        // Full-graph SCCs can contain registered feedback, e.g. A->B delay=0
+        // and B->A delay=1. Preserve the same-cycle direction by ordering the
+        // SCC with its acyclic zero-delay subgraph, then use creation order as
+        // the stable tie-break for unrelated members.
+        if (members.size() > 1) {
+            std::vector<size_t> local_index(n, SIZE_MAX);
+            for (size_t i = 0; i < members.size(); ++i) {
+                local_index[members[i]] = i;
+            }
+
+            DirectedGraph zero_delay_subgraph(members.size());
+            for (size_t i = 0; i < members.size(); ++i) {
+                for (const auto& e : graph->neighbors(members[i])) {
+                    if (e.weight == 0 && e.to < local_index.size() &&
+                        local_index[e.to] != SIZE_MAX) {
+                        zero_delay_subgraph.addEdge(i, local_index[e.to], 0);
+                    }
+                }
+            }
+
+            auto zero_topo = topologicalSort(zero_delay_subgraph);
+            if (!zero_topo.has_cycle) {
+                std::vector<size_t> ordered_members;
+                ordered_members.reserve(members.size());
+                for (size_t local : zero_topo.order) {
+                    ordered_members.push_back(members[local]);
+                }
+                members = std::move(ordered_members);
+            }
+        }
+
         for (size_t node_idx : members) {
             new_order.push_back(unit_ptrs_[node_idx]);
         }

@@ -53,27 +53,30 @@ Cycles are classified based on total delay:
 
 | Type | Total Delay | Handling | Example |
 |------|-------------|----------|---------|
-| Tight | = 0 | Delta cycles (sequential) | A <--(0)--> B |
+| Tight | = 0 | Invalid topology (initialization error) | A <--(0)--> B |
 | Loose | > 0 | Lookahead (parallel) | A <--(3,2)--> B |
 
-### Tight Cycles (Delta Cycles)
+### Tight Cycles
 
-When total delay = 0, units must execute sequentially within each cycle via delta cycle convergence:
+When total delay = 0, the topology has combinational feedback with no registered
+state boundary. Chronon rejects this during `TickSimulation::initialize()` because
+the `tick()` API permits side effects and does not provide a pure combinational
+function contract for convergence iteration:
 
 ```wavedrom
 { "signal": [
   { "name": "clk",             "wave": "p.........." },
   {},
-  ["Cycle N (delta iterations)",
-    { "name": "A.tick()",       "wave": "x=x..=x..=x", "data": ["δ0","δ2","δ4"] },
+  ["Cycle N",
+    { "name": "A.tick()",       "wave": "x=x........", "data": ["run"] },
     { "name": "A→B (delay=0)", "wave": "x.=..=..=..", "data": ["v0","v1","v1"] },
-    { "name": "B.tick()",       "wave": "x..=x..=x..", "data": ["δ1","δ3"] },
+    { "name": "B.tick()",       "wave": "x..=x......", "data": ["run"] },
     { "name": "B→A (delay=0)", "wave": "x...=..=...", "data": ["w0","w0"] },
     {},
-    { "name": "converged",      "wave": "0........1." }
+    { "name": "init error",     "wave": "0.1........" }
   ]
 ],
-  "head": { "text": "Tight cycle: delta iterations within one simulation cycle" },
+  "head": { "text": "Tight cycle: zero-delay feedback is rejected" },
   "config": { "hscale": 1.5 }
 }
 ```
@@ -120,10 +123,10 @@ struct AnalysisResult {
     std::vector<CycleInfo> all_cycles;
 
     // Cycles classified by type
-    std::vector<CycleInfo> tight_cycles;   // delay = 0, need delta cycles
+    std::vector<CycleInfo> tight_cycles;   // delay = 0, invalid for TickSimulation
     std::vector<CycleInfo> loose_cycles;   // delay > 0, can use lookahead
 
-    // Units involved in tight cycles (need special handling)
+    // Units involved in tight cycles
     std::set<Unit*> tight_cycle_units;
 
     // Independent groups (no dependencies between groups)
@@ -149,19 +152,16 @@ public:
     static bool hasSelfLoop(const DependencyGraph& dep_graph, Unit* unit);
     static uint32_t minCycleLength(const DependencyGraph& dep_graph, Unit* unit);
 
-    enum class Strategy {
-        FullParallel,    // All units can run independently
-        Lookahead,       // Use lookahead-based scheduling
-        DeltaCycle,      // Must use delta cycle execution
-        Hybrid           // Mix of lookahead and delta cycles
-    };
-    static Strategy suggestStrategy(const AnalysisResult& result);
+    // TickSimulation rejects tight_cycles during initialization.
 };
 ```
 
-## Delta Cycle Handling
+## Zero-Delay Handling
 
-Units with zero-delay feedback loops execute sequentially within each cycle. Tight clusters (groups of units connected by delay=0 edges) are detected during initialization and always assigned to the same thread. Within a cluster, units execute in their fixed order because delay=0 dependencies must remain atomic.
+Acyclic `delay=0` paths are valid and execute in topological order, so a producer
+can make a message visible to its consumer in the same cycle. Zero-delay feedback
+loops are invalid: insert `delay>0` on at least one feedback edge, or collapse the
+combinational logic into a single unit with explicit internal ordering.
 
 ## TickSimulation Execution Model
 
