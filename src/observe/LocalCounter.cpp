@@ -16,20 +16,7 @@
 
 namespace chronon::observe {
 
-// Implementation of ObservableUnit::initializePendingCounters
-// Defined here because it needs Counter to be complete
-void ObservableUnit::initializePendingCounters() {
-    if (!observe_ctx_) {
-        return;
-    }
-
-    for (auto* counter : pending_counters_) {
-        if (counter) {
-            counter->onContextAttached(observe_ctx_);
-        }
-    }
-    pending_counters_.clear();
-}
+void ObservableUnit::initializePendingCounters() { attachPending_(pending_counters_); }
 
 Counter::Counter(ObservableUnit* owner, std::string_view name, std::string_view description,
                  std::string_view unit)

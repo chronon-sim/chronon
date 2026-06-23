@@ -153,20 +153,6 @@ void emitPipelineSliceWithFlags(ObservationContext* ctx, CategoryMask category, 
     }
 }
 
-template <typename... Items>
-void emitPipelineSlice(ObservationContext* ctx, CategoryMask category, uint32_t track_id,
-                       uint64_t id, Items&&... items) {
-    emitPipelineSliceWithFlags(ctx, category, track_id, /*flags=*/0, id,
-                               std::forward<Items>(items)...);
-}
-
-template <typename... Items>
-void emitPipelineSliceHex(ObservationContext* ctx, CategoryMask category, uint32_t track_id,
-                          uint64_t id, Items&&... items) {
-    emitPipelineSliceWithFlags(ctx, category, track_id, TIMELINE_FLAG_NAME_HEX, id,
-                               std::forward<Items>(items)...);
-}
-
 template <FixedString Stage, typename Cat, typename... Items>
 inline void emitRuntimePipelineSlice(ObservationContext* ctx, uint16_t pipe, Cat category,
                                      uint8_t flags, uint64_t id, Items&&... items) {

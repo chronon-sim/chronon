@@ -299,6 +299,19 @@ private:
         }
     }
 
+    template <typename T>
+    void attachPending_(std::vector<T*>& pending) {
+        if (!observe_ctx_) {
+            return;
+        }
+        for (auto* item : pending) {
+            if (item) {
+                item->onContextAttached(observe_ctx_);
+            }
+        }
+        pending.clear();
+    }
+
     // Pending counters to be initialized when context is attached
     std::vector<Counter*> pending_counters_;
 

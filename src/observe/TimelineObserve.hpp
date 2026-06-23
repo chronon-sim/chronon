@@ -114,6 +114,56 @@ private:
 };
 
 template <typename T>
+class LookaheadValueCache {
+public:
+    LookaheadValueCache() noexcept
+        : lookahead_sync_(this, &LookaheadValueCache::applyLookaheadTransition_) {}
+
+    LookaheadValueCache(const LookaheadValueCache&) = delete;
+    LookaheadValueCache& operator=(const LookaheadValueCache&) = delete;
+
+    void sync(ObservationContext* ctx) noexcept { lookahead_sync_.sync(ctx); }
+
+    [[nodiscard]] bool differsFromLast(ObservationContext* ctx, const T& value) noexcept {
+        sync(ctx);
+        return !has_last_ || !(value == last_);
+    }
+
+    void recordSample(ObservationContext* ctx, const T& value) noexcept {
+        last_ = value;
+        has_last_ = true;
+        if (!ctx || !ctx->isLookaheadMode()) {
+            committed_last_ = last_;
+            committed_has_last_ = has_last_;
+        }
+    }
+
+private:
+    static void applyLookaheadTransition_(
+        void* owner, ObservationContext::LookaheadTransition transition) noexcept {
+        auto* self = static_cast<LookaheadValueCache*>(owner);
+        switch (transition) {
+            case ObservationContext::LookaheadTransition::Commit:
+                self->committed_last_ = self->last_;
+                self->committed_has_last_ = self->has_last_;
+                break;
+            case ObservationContext::LookaheadTransition::Rollback:
+                self->last_ = self->committed_last_;
+                self->has_last_ = self->committed_has_last_;
+                break;
+            case ObservationContext::LookaheadTransition::None:
+                break;
+        }
+    }
+
+    T last_{};
+    T committed_last_{};
+    bool has_last_ = false;
+    bool committed_has_last_ = false;
+    LookaheadCacheSync lookahead_sync_;
+};
+
+template <typename T>
 int64_t normalizeIntegral(T value) noexcept {
     static_assert(std::is_integral_v<std::decay_t<T>>, "timeline value must be integral");
     return static_cast<int64_t>(value);
@@ -122,6 +172,8 @@ int64_t normalizeIntegral(T value) noexcept {
 struct CapacityValues {
     int64_t used;
     int64_t free;
+
+    bool operator==(const CapacityValues&) const = default;
 };
 
 template <typename Used, typename Capacity>
@@ -395,8 +447,7 @@ private:
 class TimelineGauge {
 public:
     TimelineGauge(ObservableUnit* owner, std::string_view name, std::string_view unit = {})
-        : counter_(owner, name, unit),
-          lookahead_sync_(this, &TimelineGauge::applyLookaheadTransition_) {}
+        : counter_(owner, name, unit) {}
 
     template <typename T>
     void sample(T value) noexcept {
@@ -424,56 +475,23 @@ private:
     template <typename T>
     void sample_(CategoryMask category, T value) noexcept {
         const int64_t normalized = timeline_observe_detail::normalizeIntegral(value);
-        syncLookaheadCache_();
+        auto* ctx = counter_.observationContext();
+        cache_.sync(ctx);
         if (counter_.sample(category, normalized)) {
-            last_ = normalized;
-            has_last_ = true;
-            updateCommittedCache_();
+            cache_.recordSample(ctx, normalized);
         }
     }
 
     template <typename T>
     void sampleOnChange_(CategoryMask category, T value) noexcept {
         const int64_t normalized = timeline_observe_detail::normalizeIntegral(value);
-        syncLookaheadCache_();
-        if (!has_last_ || normalized != last_) {
+        if (cache_.differsFromLast(counter_.observationContext(), normalized)) {
             sample_(category, normalized);
         }
     }
 
-    void syncLookaheadCache_() noexcept { lookahead_sync_.sync(counter_.observationContext()); }
-
-    void updateCommittedCache_() noexcept {
-        auto* ctx = counter_.observationContext();
-        if (!ctx || !ctx->isLookaheadMode()) {
-            committed_last_ = last_;
-            committed_has_last_ = has_last_;
-        }
-    }
-
-    static void applyLookaheadTransition_(
-        void* owner, ObservationContext::LookaheadTransition transition) noexcept {
-        auto* self = static_cast<TimelineGauge*>(owner);
-        switch (transition) {
-            case ObservationContext::LookaheadTransition::Commit:
-                self->committed_last_ = self->last_;
-                self->committed_has_last_ = self->has_last_;
-                break;
-            case ObservationContext::LookaheadTransition::Rollback:
-                self->last_ = self->committed_last_;
-                self->has_last_ = self->committed_has_last_;
-                break;
-            case ObservationContext::LookaheadTransition::None:
-                break;
-        }
-    }
-
     TimelineCounter counter_;
-    int64_t last_ = 0;
-    int64_t committed_last_ = 0;
-    bool has_last_ = false;
-    bool committed_has_last_ = false;
-    timeline_observe_detail::LookaheadCacheSync lookahead_sync_;
+    timeline_observe_detail::LookaheadValueCache<int64_t> cache_;
 };
 
 /**
@@ -483,8 +501,7 @@ class TimelineCapacity {
 public:
     TimelineCapacity(ObservableUnit* owner, std::string_view name, std::string_view unit = {})
         : used_(owner, suffixedName_(name, ".used"), unit),
-          free_(owner, suffixedName_(name, ".free"), unit),
-          lookahead_sync_(this, &TimelineCapacity::applyLookaheadTransition_) {}
+          free_(owner, suffixedName_(name, ".free"), unit) {}
 
     template <typename Used, typename Capacity>
     void sample(Used used, Capacity total) noexcept {
@@ -517,22 +534,19 @@ private:
 
     void sampleValues_(CategoryMask category,
                        timeline_observe_detail::CapacityValues values) noexcept {
-        syncLookaheadCache_();
+        auto* ctx = used_.observationContext();
+        cache_.sync(ctx);
         const bool used_sampled = used_.sample(category, values.used);
         const bool free_sampled = free_.sample(category, values.free);
         if (used_sampled && free_sampled) {
-            last_used_ = values.used;
-            last_free_ = values.free;
-            has_last_ = true;
-            updateCommittedCache_();
+            cache_.recordSample(ctx, values);
         }
     }
 
     template <typename Used, typename Capacity>
     void sampleOnChange_(CategoryMask category, Used used, Capacity total) noexcept {
         const auto values = timeline_observe_detail::normalizeCapacity(used, total);
-        syncLookaheadCache_();
-        if (!has_last_ || values.used != last_used_ || values.free != last_free_) {
+        if (cache_.differsFromLast(used_.observationContext(), values)) {
             sampleValues_(category, values);
         }
     }
@@ -543,45 +557,9 @@ private:
         return out;
     }
 
-    void syncLookaheadCache_() noexcept { lookahead_sync_.sync(used_.observationContext()); }
-
-    void updateCommittedCache_() noexcept {
-        auto* ctx = used_.observationContext();
-        if (!ctx || !ctx->isLookaheadMode()) {
-            committed_last_used_ = last_used_;
-            committed_last_free_ = last_free_;
-            committed_has_last_ = has_last_;
-        }
-    }
-
-    static void applyLookaheadTransition_(
-        void* owner, ObservationContext::LookaheadTransition transition) noexcept {
-        auto* self = static_cast<TimelineCapacity*>(owner);
-        switch (transition) {
-            case ObservationContext::LookaheadTransition::Commit:
-                self->committed_last_used_ = self->last_used_;
-                self->committed_last_free_ = self->last_free_;
-                self->committed_has_last_ = self->has_last_;
-                break;
-            case ObservationContext::LookaheadTransition::Rollback:
-                self->last_used_ = self->committed_last_used_;
-                self->last_free_ = self->committed_last_free_;
-                self->has_last_ = self->committed_has_last_;
-                break;
-            case ObservationContext::LookaheadTransition::None:
-                break;
-        }
-    }
-
     TimelineCounter used_;
     TimelineCounter free_;
-    int64_t last_used_ = 0;
-    int64_t last_free_ = 0;
-    int64_t committed_last_used_ = 0;
-    int64_t committed_last_free_ = 0;
-    bool has_last_ = false;
-    bool committed_has_last_ = false;
-    timeline_observe_detail::LookaheadCacheSync lookahead_sync_;
+    timeline_observe_detail::LookaheadValueCache<timeline_observe_detail::CapacityValues> cache_;
 };
 
 }  // namespace chronon::observe
