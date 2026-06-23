@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -79,6 +80,12 @@ public:
     void setCycle(uint64_t cycle) { setLocalCycle(cycle); }
 };
 
+void require(bool condition, const char* message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
 void test_tick_simulation_mpsc_delivery() {
     std::cout << "Testing TickSimulation MPSC delivery... ";
 
@@ -123,6 +130,39 @@ void test_tick_simulation_mpsc_delivery() {
     assert(received.size() == 2);
     assert(received[0] == 100);
     assert(received[1] == 200);
+
+    std::cout << "PASSED\n";
+}
+
+void test_mpsc_staging_tracks_large_user_capacity() {
+    std::cout << "Testing MPSC staging tracks large user capacity... ";
+
+    constexpr size_t kUserCapacity = 8192;
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out"};
+    InPort<int> in{&cons, "in", kUserCapacity};
+    auto* conn = out.connect(&in, 1);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+
+    prod.setCycle(0);
+
+    size_t sent = 0;
+    for (size_t i = 0; i < kUserCapacity; ++i) {
+        require(out.canSend(), "canSend() rejected before user capacity");
+        require(out.send(static_cast<int>(i)), "send() rejected before user capacity");
+        ++sent;
+    }
+
+    require(sent == kUserCapacity, "did not fill to declared user capacity");
+    require(!out.canSend(), "canSend() accepted beyond user capacity");
+    require(!out.send(99999), "send() accepted beyond user capacity");
 
     std::cout << "PASSED\n";
 }
@@ -232,6 +272,7 @@ int main() {
     std::cout << "=== Thread Queue Hardening Tests ===\n\n";
 
     test_tick_simulation_mpsc_delivery();
+    test_mpsc_staging_tracks_large_user_capacity();
     test_lockfree_backpressure_contract();
     test_small_non_tight_graph_parallel_fallback();
 
