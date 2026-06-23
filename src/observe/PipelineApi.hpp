@@ -64,15 +64,17 @@ inline constexpr size_t MAX_RUNTIME_PIPELINE_SLOTS = 16;
 
 template <FixedString Stage>
 uint32_t resolveRuntimePipelineTrackSlow(uint16_t source_id, uint16_t pipe,
-                                         std::atomic<uint64_t>& cached_entry) {
+                                         std::atomic<uint64_t>* cached_entry) {
     static std::mutex mutex;
     static std::vector<RuntimePipelineStageEntry> entries;
 
     std::lock_guard<std::mutex> lock(mutex);
     for (const auto& entry : entries) {
         if (entry.source_id == source_id && entry.pipe == pipe) {
-            cached_entry.store((static_cast<uint64_t>(source_id) << 32) | entry.track_id,
-                               std::memory_order_relaxed);
+            if (cached_entry) {
+                cached_entry->store((static_cast<uint64_t>(source_id) << 32) | entry.track_id,
+                                    std::memory_order_relaxed);
+            }
             return entry.track_id;
         }
     }
@@ -88,8 +90,10 @@ uint32_t resolveRuntimePipelineTrackSlow(uint16_t source_id, uint16_t pipe,
         {name, /*unit=*/{}, source_id, /*lanes=*/1, TimelineTrackInfo::Kind::Lane,
          TimelineTrackInfo::Layout::Pipeline});
     entries.push_back({source_id, pipe, track_id});
-    cached_entry.store((static_cast<uint64_t>(source_id) << 32) | track_id,
-                       std::memory_order_relaxed);
+    if (cached_entry) {
+        cached_entry->store((static_cast<uint64_t>(source_id) << 32) | track_id,
+                            std::memory_order_relaxed);
+    }
     return track_id;
 }
 
@@ -99,17 +103,20 @@ uint32_t resolveRuntimePipelineTrack(ObservationContext* ctx, uint16_t pipe) {
         return 0;
     }
 
-    const uint16_t slot = pipe < MAX_RUNTIME_PIPELINE_SLOTS ? pipe : 0;
-    static std::array<std::atomic<uint64_t>, MAX_RUNTIME_PIPELINE_SLOTS> cached_entries{};
-    std::atomic<uint64_t>& cached_entry = cached_entries[slot];
     const uint16_t source_id = ctx->sourceId();
+    if (pipe >= MAX_RUNTIME_PIPELINE_SLOTS) {
+        return resolveRuntimePipelineTrackSlow<Stage>(source_id, pipe, nullptr);
+    }
+
+    static std::array<std::atomic<uint64_t>, MAX_RUNTIME_PIPELINE_SLOTS> cached_entries{};
+    std::atomic<uint64_t>& cached_entry = cached_entries[pipe];
     const uint64_t entry = cached_entry.load(std::memory_order_relaxed);
     const uint32_t track_id = static_cast<uint32_t>(entry);
     if (track_id != 0 && static_cast<uint16_t>(entry >> 32) == source_id) {
         return track_id;
     }
 
-    return resolveRuntimePipelineTrackSlow<Stage>(source_id, slot, cached_entry);
+    return resolveRuntimePipelineTrackSlow<Stage>(source_id, pipe, &cached_entry);
 }
 
 template <typename Site>

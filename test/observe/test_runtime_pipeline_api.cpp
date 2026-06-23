@@ -76,6 +76,8 @@ void test_runtime_pipe_tracks() {
         unit.pipeStage<"RT">(2, PIPE_CAT, 200, arg<"src">(1u));
         unit.cycle = 11;
         unit.pipeStageHex<"RT">(3, PIPE_CAT, 0x300, arg<"src">(2u));
+        unit.cycle = 12;
+        unit.pipeStage<"RT">(17, PIPE_CAT, 1700, arg<"src">(3u));
 
         ThreadContextManager::instance().flushAll();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -89,17 +91,23 @@ void test_runtime_pipe_tracks() {
     CHECK(fetch != nullptr);
     const DecodedTrack* rt2 = childTrack(trace, "pipe 2 stage RT", fetch->uuid);
     const DecodedTrack* rt3 = childTrack(trace, "pipe 3 stage RT", fetch->uuid);
+    const DecodedTrack* rt17 = childTrack(trace, "pipe 17 stage RT", fetch->uuid);
     CHECK(rt2 != nullptr);
     CHECK(rt3 != nullptr);
+    CHECK(rt17 != nullptr);
 
     auto rt2_events = eventsOn(trace, rt2->uuid);
     auto rt3_events = eventsOn(trace, rt3->uuid);
+    auto rt17_events = eventsOn(trace, rt17->uuid);
     CHECK(rt2_events.size() == 2);
     CHECK(rt3_events.size() == 2);
+    CHECK(rt17_events.size() == 2);
     CHECK(rt2_events[0].timestamp == 10 && rt2_events[0].name.starts_with("200"));
     CHECK(rt3_events[0].timestamp == 11 && rt3_events[0].name.starts_with("0x300"));
+    CHECK(rt17_events[0].timestamp == 12 && rt17_events[0].name.starts_with("1700"));
     CHECK(rt2_events[0].flow_ids == std::vector<uint64_t>{200});
     CHECK(rt3_events[0].flow_ids == std::vector<uint64_t>{0x300});
+    CHECK(rt17_events[0].flow_ids == std::vector<uint64_t>{1700});
 
     std::filesystem::remove_all(out_dir);
     std::cout << "PASSED\n";
