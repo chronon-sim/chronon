@@ -6,7 +6,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-#include <cassert>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -16,6 +15,15 @@
 using namespace chronon::sender;
 
 namespace {
+
+#define CHECK(cond)                                                                        \
+    do {                                                                                   \
+        if (!(cond)) {                                                                     \
+            std::cerr << "  FAIL: " << #cond << " (" << __FILE__ << ":" << __LINE__ << ")" \
+                      << std::endl;                                                        \
+            std::exit(1);                                                                  \
+        }                                                                                  \
+    } while (0)
 
 class PassUnit : public TickableUnit {
 public:
@@ -52,7 +60,7 @@ void test_two_unit_zero_delay_cycle_rejected() {
     sim.connect(a->out, b->in, 0);
     sim.connect(b->out, a->in, 0);
 
-    assert(initializeThrowsZeroDelayCycle(sim, "a -> b"));
+    CHECK(initializeThrowsZeroDelayCycle(sim, "a -> b"));
 
     std::cout << "PASSED\n";
 }
@@ -65,7 +73,7 @@ void test_zero_delay_self_loop_rejected() {
 
     sim.connect(unit->out, unit->in, 0);
 
-    assert(initializeThrowsZeroDelayCycle(sim, "loop"));
+    CHECK(initializeThrowsZeroDelayCycle(sim, "loop"));
 
     std::cout << "PASSED\n";
 }
