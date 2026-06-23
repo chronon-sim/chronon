@@ -347,17 +347,17 @@ public:
         // below the model-visible limit, otherwise canTransfer() and the
         // physical push path disagree for large ports.
         const size_t user_cap = to_->capacity();
-        if (user_cap != InPort<T>::UNLIMITED_CAPACITY &&
-            user_cap > kMaxBoundedMPSCStagingCapacity) {
-            throw std::length_error(
-                "Bounded MPSC InPort capacity exceeds the lock-free downstream queue capacity");
-        }
         const size_t requested = (user_cap == InPort<T>::UNLIMITED_CAPACITY)
                                      ? kDefaultUnlimitedStagingRing
                                      : (user_cap + 1);
         size_t phys = 1;
         const size_t target = std::max(requested, kStagingRingMin);
-        while (phys < target) phys <<= 1;
+        while (phys < target) {
+            if (phys > (std::numeric_limits<size_t>::max() / 2)) {
+                throw std::length_error("MPSC staging ring capacity is too large");
+            }
+            phys <<= 1;
+        }
         staging_buf_.assign(phys, Staged{});
         staging_mask_ = phys - 1;
         staging_head_.store(0, std::memory_order_relaxed);
@@ -449,8 +449,6 @@ private:
     /// optimizeForMPSC() time based on to_->capacity().
     static constexpr size_t kStagingRingMin = 16;
     static constexpr size_t kDefaultUnlimitedStagingRing = 4096;
-    static constexpr size_t kMaxBoundedMPSCStagingCapacity =
-        LockFreeMessageQueue<typename InPort<T>::StoredMessage>::USABLE_CAPACITY;
     std::vector<Staged> staging_buf_;
     size_t staging_mask_ = 0;                          ///< buffer size - 1 (power of 2)
     alignas(64) std::atomic<size_t> staging_head_{0};  ///< consumer reads/advances

@@ -39,7 +39,7 @@ public:
     WorkUnit(std::string name, uint64_t work) : TickableUnit(std::move(name)), work_(work) {}
 
     OutPort<int> out{this, "out"};
-    InPort<int> in{this, "in", 256};
+    InPort<int> in{this, "in", 4096};
 
     void tick() override {
         while (in.tryReceive(localCycle()).has_value()) {
