@@ -110,6 +110,23 @@ void test_fill_to_capacity() {
     CHECK(!q.tryPush(654321, 0));
 }
 
+void test_custom_capacity() {
+    constexpr size_t kUserCapacity = 8192;
+    LockFreeMessageQueue<int> q{
+        LockFreeMessageQueue<int>::physicalCapacityForUserCapacity(kUserCapacity)};
+
+    CHECK(q.usableCapacity() >= kUserCapacity);
+    for (size_t i = 0; i < kUserCapacity; ++i) {
+        CHECK(q.tryPush(static_cast<int>(i), 0));
+    }
+    CHECK(q.size() == kUserCapacity);
+    for (size_t i = 0; i < kUserCapacity; ++i) {
+        auto value = q.tryPop(0);
+        CHECK(value.has_value() && *value == static_cast<int>(i));
+    }
+    CHECK(q.empty());
+}
+
 // 3. Push/pop far more than CAPACITY total so head/tail wrap many times.
 //    Verifies exact FIFO payload sequence across wraps.
 void test_wraparound_integrity() {
@@ -268,6 +285,7 @@ int main() {
 
     RUN_TEST(test_fifo_and_arrive_cycle_gating);
     RUN_TEST(test_fill_to_capacity);
+    RUN_TEST(test_custom_capacity);
     RUN_TEST(test_wraparound_integrity);
     RUN_TEST(test_empty_nonempty_oscillation);
     RUN_TEST(test_clear_refreshes_cache);

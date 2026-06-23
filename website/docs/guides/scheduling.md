@@ -237,24 +237,27 @@ change):
 **Cross-thread buffer headroom.** Without the per-epoch drain, a producer can run
 ahead of a consumer and leave entries buffered in the connection's cross-thread
 ring — the per-connection MPSC staging ring for a multi-producer port, or the
-SPSC lock-free ring for a single-producer cross-thread edge. Both rings are
-bounded (typically ~4095 slots) even for an unlimited-capacity `InPort`, which
-never back-pressures, so the ring could silently overflow; a bounded port would
-back-pressure where the barrier flush would not. The gate therefore vetoes
-epoch-free unless each connection can absorb the configured run-ahead. The
-headroom (in cycles) a connection supports is roughly:
+SPSC lock-free ring for a single-producer cross-thread edge. For bounded
+`InPort`s, lock-free rings are sized at initialization so the declared capacity
+fits. For unlimited-capacity `InPort`s, the physical lock-free rings remain
+bounded by the default ring size, and the port never model-side back-pressures,
+so a producer could silently overflow the physical ring. The gate therefore
+vetoes epoch-free unless each connection can absorb the configured run-ahead.
+The headroom (in cycles) a connection supports is roughly:
 
 ```
 headroom = min(InPort capacity, ring slots) / per_cycle_send_rate - edge_delay
 ```
 
 where `per_cycle_send_rate` is the source `OutPort`'s per-cycle send cap (an
-uncapped source forces a veto) and `edge_delay` accounts for not-yet-due entries
-the consumer cannot drain. Same-thread connections drain synchronously and impose
-no bound. If any cross-thread connection's headroom is `<= max_lookahead_cycles`,
-the run falls back to the barrier path. To use epoch-free with unlimited-capacity
-cross-thread edges, give the producing `OutPort` a per-cycle send cap and keep
-`max_lookahead_cycles + edge_delay` within the ring.
+uncapped source forces a veto), `ring slots` is the usable physical ring
+capacity, and `edge_delay` accounts for not-yet-due entries the consumer cannot
+drain. Same-thread connections drain synchronously and impose no bound. If any
+cross-thread connection's headroom is `<= max_lookahead_cycles`, the run falls
+back to the barrier path. To use epoch-free with unlimited-capacity cross-thread
+edges, give the producing `OutPort` a per-cycle send cap and keep
+`max_lookahead_cycles + edge_delay` within the default physical ring, or use an
+explicit bounded `InPort` capacity large enough for the desired run-ahead.
 
 ## Scheduler Timeline Diagnostics
 

@@ -8,12 +8,15 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -234,8 +237,24 @@ public:
     static constexpr size_t CAPACITY = 4096;
     static constexpr size_t USABLE_CAPACITY = CAPACITY - 1;
 
-    LockFreeMessageQueue()
-        : buffer_(CAPACITY), head_(0), cached_tail_(0), tail_(0), cached_head_(0) {}
+    explicit LockFreeMessageQueue(size_t physical_capacity = CAPACITY)
+        : capacity_(roundUpPhysicalCapacity_(physical_capacity)),
+          usable_capacity_(capacity_ - 1),
+          buffer_(capacity_),
+          head_(0),
+          cached_tail_(0),
+          tail_(0),
+          cached_head_(0) {}
+
+    static size_t physicalCapacityForUserCapacity(size_t user_capacity) {
+        if (user_capacity == std::numeric_limits<size_t>::max()) {
+            return CAPACITY;
+        }
+        if (user_capacity == std::numeric_limits<size_t>::max() - 1) {
+            throw std::length_error("LockFreeMessageQueue requested capacity is too large");
+        }
+        return roundUpPhysicalCapacity_(std::max(CAPACITY, user_capacity + 1));
+    }
 
     /**
      * Push a message (producer only).
@@ -249,7 +268,7 @@ public:
      */
     bool tryPush(T data, uint64_t arrive_cycle, uint32_t sender_id = 0) {
         size_t tail = tail_.load(std::memory_order_relaxed);
-        size_t next = (tail + 1) % CAPACITY;
+        size_t next = (tail + 1) % capacity_;
 
         // Re-read the consumer's head_ (a cross-core load) only when the cached
         // copy says full; a stale cached_head_ is conservative (looks more full).
@@ -289,7 +308,7 @@ public:
         }
 
         T data = std::move(buffer_[head].data);
-        head_.store((head + 1) % CAPACITY, std::memory_order_release);
+        head_.store((head + 1) % capacity_, std::memory_order_release);
         return data;
     }
 
@@ -326,12 +345,19 @@ public:
         if (tail >= head) {
             return tail - head;
         }
-        return CAPACITY - (head - tail);
+        return capacity_ - (head - tail);
     }
 
-    bool full() const noexcept { return size() >= USABLE_CAPACITY; }
+    bool full() const noexcept { return size() >= usable_capacity_; }
 
-    size_t available() const noexcept { return USABLE_CAPACITY - size(); }
+    size_t available() const noexcept {
+        const size_t sz = size();
+        return sz < usable_capacity_ ? usable_capacity_ - sz : 0;
+    }
+
+    size_t capacity() const noexcept { return capacity_; }
+
+    size_t usableCapacity() const noexcept { return usable_capacity_; }
 
     /**
      * Clear all pending messages (consumer-side).
@@ -348,12 +374,26 @@ public:
     }
 
 private:
+    static size_t roundUpPhysicalCapacity_(size_t capacity) {
+        size_t phys = 2;
+        const size_t target = std::max(capacity, size_t{2});
+        while (phys < target) {
+            if (phys > (std::numeric_limits<size_t>::max() / 2)) {
+                throw std::length_error("LockFreeMessageQueue physical capacity is too large");
+            }
+            phys <<= 1;
+        }
+        return phys;
+    }
+
     struct Entry {
         T data;
         uint64_t arrive_cycle;
         uint32_t sender_id;
     };
 
+    const size_t capacity_;
+    const size_t usable_capacity_;
     std::vector<Entry> buffer_;
     // Each side's atomic and its private cache of the opposite index sit on one
     // cache line, kept apart from the other side's to avoid false sharing.
@@ -594,7 +634,8 @@ template <typename T>
 class LockFreeQueueAdapter : public IMessageQueue<T> {
 public:
     explicit LockFreeQueueAdapter(size_t capacity = LockFreeMessageQueue<T>::USABLE_CAPACITY)
-        : queue_(), user_capacity_(std::min(capacity, LockFreeMessageQueue<T>::USABLE_CAPACITY)) {}
+        : queue_(LockFreeMessageQueue<T>::physicalCapacityForUserCapacity(capacity)),
+          user_capacity_(std::min(capacity, queue_.usableCapacity())) {}
 
     bool push(T data, uint64_t arrive_cycle) override {
         // Model-side admission is enforced upstream (Connection::transfer
@@ -641,7 +682,7 @@ public:
         return sz < user_capacity_ ? user_capacity_ - sz : 0;
     }
     void setCapacity(size_t capacity) override {
-        user_capacity_ = std::min(capacity, LockFreeMessageQueue<T>::USABLE_CAPACITY);
+        user_capacity_ = std::min(capacity, queue_.usableCapacity());
     }
     void clear() override { queue_.clear(); }
 
@@ -687,15 +728,14 @@ public:
     /**
      * Construct an MPSC adapter with an initial user-visible capacity.
      *
-     * The per-thread physical LockFreeMessageQueue ring capacity
-     * (USABLE_CAPACITY, typically 4095 slots) is fixed and remains
-     * unchanged. user_capacity_ is a *soft* aggregate gate consulted by
-     * capacity()/full(); it is only honored by
-     * the arbiter/canAccept layer before admitting a push. The push path
-     * itself (pushFromThread) does NOT enforce user_capacity_ — enforcing
-     * it there would reintroduce a wall-clock race where two producer
-     * threads racing against each other could both see size < cap and
-     * both succeed even though their joint push exceeds the soft cap.
+     * The per-thread physical LockFreeMessageQueue ring capacity is chosen
+     * at construction from the bounded user capacity. user_capacity_ is a
+     * *soft* aggregate gate consulted by capacity()/full(); it is only
+     * honored by the arbiter/canAccept layer before admitting a push. The
+     * push path itself (pushFromThread) does NOT enforce user_capacity_ —
+     * enforcing it there would reintroduce a wall-clock race where two
+     * producer threads racing against each other could both see size < cap
+     * and both succeed even though their joint push exceeds the soft cap.
      *
      * If the user does not override capacity explicitly, we still want
      * full() to never fire for a well-sized system, so the default
@@ -703,7 +743,9 @@ public:
      * for typical configurations).
      */
     explicit MultiProducerQueueAdapter(size_t capacity = std::numeric_limits<size_t>::max())
-        : user_capacity_(capacity) {}
+        : per_thread_queue_capacity_(
+              LockFreeMessageQueue<T>::physicalCapacityForUserCapacity(capacity)),
+          user_capacity_(capacity) {}
 
     /**
      * Register a new source thread and create its queue.
@@ -718,7 +760,8 @@ public:
         }
 
         size_t id = thread_queues_.size();
-        thread_queues_.push_back(std::make_unique<LockFreeMessageQueue<T>>());
+        thread_queues_.push_back(
+            std::make_unique<LockFreeMessageQueue<T>>(per_thread_queue_capacity_));
         thread_to_queue_id_[thread_id] = id;
         return id;
     }
@@ -764,8 +807,8 @@ public:
     }
 
     /// Count of dropped pushes due to a full physical staging ring. Nonzero
-    /// means the lookahead window outran the ring capacity (USABLE_CAPACITY) —
-    /// a correctness failure, surfaced for the epoch-free A/B watchdog.
+    /// means the lookahead window outran the configured ring capacity — a
+    /// correctness failure, surfaced for the epoch-free A/B watchdog.
     uint64_t stagingOverflowEvents() const noexcept {
         return staging_overflow_events_.load(std::memory_order_relaxed);
     }
@@ -880,14 +923,20 @@ public:
     /**
      * Set the soft user-visible capacity.
      *
-     * Per-thread physical ring capacity (USABLE_CAPACITY) is unchanged.
-     * Only the soft aggregate gate is updated. pushFromThread() still
-     * does NOT enforce this cap — per-thread ring fullness
-     * (fullForThread()) continues to govern push failure on the push
-     * path to avoid wall-clock races between producer threads. The
-     * MPSC arbiter consults full() before admitting a message.
+     * Per-thread physical ring capacity is unchanged. Only the soft
+     * aggregate gate is updated. pushFromThread() still does NOT enforce
+     * this cap — per-thread ring fullness (fullForThread()) continues to
+     * govern push failure on the push path to avoid wall-clock races
+     * between producer threads. The MPSC arbiter consults full() before
+     * admitting a message.
      */
-    void setCapacity(size_t cap) override { user_capacity_ = cap; }
+    void setCapacity(size_t cap) override {
+        if (cap != std::numeric_limits<size_t>::max() && cap > perThreadUsableCapacity_()) {
+            throw std::length_error(
+                "MultiProducerQueueAdapter capacity exceeds its fixed per-thread queue capacity");
+        }
+        user_capacity_ = cap;
+    }
 
     void clear() override {
         for (auto& q : thread_queues_) {
@@ -896,8 +945,11 @@ public:
     }
 
 private:
+    size_t perThreadUsableCapacity_() const noexcept { return per_thread_queue_capacity_ - 1; }
+
     std::vector<std::unique_ptr<LockFreeMessageQueue<T>>> thread_queues_;
     std::unordered_map<size_t, size_t> thread_to_queue_id_;  // thread_id -> queue_id
+    size_t per_thread_queue_capacity_;
     size_t user_capacity_;  // Soft aggregate cap consulted by arbiter/full().
     std::atomic<uint64_t> staging_overflow_events_{0};  // full-ring drops (watchdog)
 };

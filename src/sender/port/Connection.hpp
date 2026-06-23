@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -341,13 +343,21 @@ public:
         // The producer back-pressures on stagingSize() >= to_->capacity(),
         // so the physical ring only needs room for the user cap plus one
         // reserved slot (tail+1 == head signals full). Round up to a power
-        // of 2 for fast masking; enforce a minimum and cap at a sane max.
+        // of 2 for fast masking. Bounded user capacities must not be capped
+        // below the model-visible limit, otherwise canTransfer() and the
+        // physical push path disagree for large ports.
         const size_t user_cap = to_->capacity();
-        const size_t requested =
-            (user_cap == InPort<T>::UNLIMITED_CAPACITY) ? 4096 : (user_cap + 1);
-        const size_t clamped = std::clamp<size_t>(requested, kStagingRingMin, kStagingRingMax);
+        const size_t requested = (user_cap == InPort<T>::UNLIMITED_CAPACITY)
+                                     ? kDefaultUnlimitedStagingRing
+                                     : (user_cap + 1);
         size_t phys = 1;
-        while (phys < clamped) phys <<= 1;
+        const size_t target = std::max(requested, kStagingRingMin);
+        while (phys < target) {
+            if (phys > (std::numeric_limits<size_t>::max() / 2)) {
+                throw std::length_error("MPSC staging ring capacity is too large");
+            }
+            phys <<= 1;
+        }
         staging_buf_.assign(phys, Staged{});
         staging_mask_ = phys - 1;
         staging_head_.store(0, std::memory_order_relaxed);
@@ -438,7 +448,7 @@ private:
     /// appends concurrently with the arbiter drains. Sizing is chosen at
     /// optimizeForMPSC() time based on to_->capacity().
     static constexpr size_t kStagingRingMin = 16;
-    static constexpr size_t kStagingRingMax = 4096;
+    static constexpr size_t kDefaultUnlimitedStagingRing = 4096;
     std::vector<Staged> staging_buf_;
     size_t staging_mask_ = 0;                          ///< buffer size - 1 (power of 2)
     alignas(64) std::atomic<size_t> staging_head_{0};  ///< consumer reads/advances
