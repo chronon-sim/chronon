@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <exception>
+#include <limits>
 #include <new>
 #include <string>
 #include <unordered_map>
@@ -28,6 +29,11 @@ namespace {
 /// Throttle for the slow-path floor refresh: scan once per 256 spins (refresh
 /// fires when (spin & mask) == 0) to keep the cross-core scan off the hot path.
 constexpr uint64_t kFloorRefreshSpinMask = 0xFF;
+
+uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
+    const uint64_t max = std::numeric_limits<uint64_t>::max();
+    return delta > max - base ? max : base + delta;
+}
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -276,7 +282,7 @@ uint64_t TickSimulation::executeRunProgressBased(uint64_t total_cycles) {
 
     const uint64_t run_start =
         thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
-    const uint64_t run_target = run_start + total_cycles;
+    const uint64_t run_target = saturatingCycleAdd(run_start, total_cycles);
 
     // Shared with the barrier completion. Written only in the completion (one
     // thread, peers parked) or before launch; the barrier supplies the
@@ -371,7 +377,7 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
 
     const uint64_t run_start =
         thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
-    const uint64_t run_target = run_start + total_cycles;
+    const uint64_t run_target = saturatingCycleAdd(run_start, total_cycles);
 
     // Single run-spanning window: no per-epoch barrier. Run-ahead is bounded
     // solely by the lookahead_floor_ + max_lookahead_cycles synthetic dep

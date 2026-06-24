@@ -177,6 +177,43 @@ void verify_run_until_termination_uses_epoch_free(unsigned hw) {
     check(sim.epochFreeRunCount() > 0, "runUntilTermination uses epoch-free with timeline");
 }
 
+void verify_run_until_termination_default_max_after_warmup(unsigned hw) {
+    if (hw < 2) return;
+    TickSimulationConfig cfg;
+    cfg.num_threads = 2;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_dynamic_rebalance = false;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.max_lookahead_cycles = 64;
+    cfg.epoch_size = 16;
+
+    TickSimulation sim(cfg);
+    sim.createUnit<TerminatorNode>(20);
+    constexpr uint32_t kWork = 1500;
+    auto* A = sim.createUnit<Node>("A", 11, kWork);
+    auto* B = sim.createUnit<Node>("B", 22, kWork);
+    auto* C = sim.createUnit<Node>("C", 33, kWork);
+    auto* D = sim.createUnit<Node>("D", 44, kWork);
+    sim.connect(A->out, B->in, 1);
+    sim.connect(B->out, C->in, 1);
+    sim.connect(C->out, D->in, 1);
+    sim.connect(D->out, A->in, 1);
+    sim.initialize();
+
+    sim.run(10);
+    const uint64_t warm_cycle = sim.currentCycle();
+    const uint64_t warm_epoch_free_runs = sim.epochFreeRunCount();
+    uint64_t executed = sim.runUntilTermination();
+
+    check(executed > 0, "default-max runUntilTermination advances after warmup");
+    check(executed < 1000, "default-max runUntilTermination stops at unit termination");
+    check(sim.currentCycle() > warm_cycle, "default-max runUntilTermination updates current cycle");
+    check(sim.wasTerminationRequested(), "default-max runUntilTermination receives termination");
+    check(sim.epochFreeRunCount() > warm_epoch_free_runs,
+          "default-max runUntilTermination uses epoch-free after warmup");
+}
+
 void verify(uint32_t dA, uint32_t dB, uint64_t cycles, unsigned hw) {
     const std::string base = "dA=" + std::to_string(dA) + " dB=" + std::to_string(dB);
     const uint64_t ref = runOnce(dA, dB, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
@@ -306,6 +343,7 @@ int main() {
     verify_spsc_gate(cycles, hw);
     verify_scheduler_timeline_does_not_veto_epoch_free(cycles, hw);
     verify_run_until_termination_uses_epoch_free(hw);
+    verify_run_until_termination_default_max_after_warmup(hw);
 
     std::cout << "\n=== Results: " << g_pass << " passed, " << g_fail << " failed ===\n";
     return g_fail == 0 ? 0 : 1;
