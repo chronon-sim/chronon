@@ -10,11 +10,28 @@
 #include <iostream>
 #include <vector>
 
+#include "params/ParameterSet.hpp"
 #include "sender/config/SenderConfigLoader.hpp"
+#include "sender/config/SenderSimulationBuilder.hpp"
+#include "sender/factory/SenderFactory.hpp"
 
 using namespace chronon::sender::config;
 
 namespace {
+
+class DefaultIntervalYamlUnit
+    : public chronon::sender::factory::AutoRegisteredUnit<DefaultIntervalYamlUnit> {
+public:
+    using ParameterSet = chronon::params::ParameterSet;
+    static constexpr const char* unit_type_name = "DefaultIntervalYamlUnit";
+    static constexpr const char* unit_description = "Unit with constructor default tick interval";
+
+    explicit DefaultIntervalYamlUnit(const ParameterSet*) : DefaultIntervalYamlUnit() {}
+
+    DefaultIntervalYamlUnit() : AutoRegisteredUnit("default_interval_yaml") { setTickInterval(7); }
+
+    void tick() override {}
+};
 
 void test_tuning_fields_parse() {
     std::cout << "Testing tuning fields parse... ";
@@ -144,7 +161,36 @@ simulation:
     assert(uart != nullptr);
     assert(fetch != nullptr);
     assert(uart->tick_interval == 1000);
+    assert(uart->has_tick_interval);
     assert(fetch->tick_interval == 1);
+    assert(!fetch->has_tick_interval);
+
+    std::cout << "PASSED\n";
+}
+
+void test_builder_preserves_constructor_tick_interval_when_yaml_omits_override() {
+    std::cout << "Testing builder preserves constructor tick_interval defaults... ";
+
+    SenderSimulationBuilder builder;
+    auto result = builder.buildFromYAMLString(R"yaml(
+simulation:
+  name: tick_interval_builder
+  num_workers: 1
+  enable_parallel: false
+  unit:
+    omitted:
+      type: DefaultIntervalYamlUnit
+    explicit:
+      type: DefaultIntervalYamlUnit
+      tick_interval: 2
+)yaml");
+
+    auto* omitted = result.unit_map.at("omitted");
+    auto* explicit_unit = result.unit_map.at("explicit");
+    (void)omitted;
+    (void)explicit_unit;
+    assert(omitted->tickInterval() == 7);
+    assert(explicit_unit->tickInterval() == 2);
 
     std::cout << "PASSED\n";
 }
@@ -159,6 +205,7 @@ int main() {
     test_unit_names_include_programmatic_additions();
     test_unit_names_skip_programmatic_deletions();
     test_unit_tick_interval_parse();
+    test_builder_preserves_constructor_tick_interval_when_yaml_omits_override();
 
     std::cout << "\n=== Config loader tuning tests PASSED ===\n";
     return 0;

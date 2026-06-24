@@ -547,6 +547,7 @@ private:
 
         if (unit_node["tick_interval"]) {
             unit_config.tick_interval = unit_node["tick_interval"].as<uint32_t>();
+            unit_config.has_tick_interval = true;
             if (unit_config.tick_interval == 0) {
                 throw ConfigLoadError(source,
                                       "Unit '" + unit_name + "' tick_interval must be >= 1");

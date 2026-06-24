@@ -28,6 +28,7 @@ struct UnitConfig {
     std::string type_name;       ///< Factory type name, e.g. "FetchUnit".
     YAML::Node params_yaml;      ///< Raw YAML node for parameter deserialization.
     uint32_t tick_interval = 1;  ///< Execute tick() only on global cycles divisible by this.
+    bool has_tick_interval = false;
 
     bool isValid() const { return !instance_name.empty() && !type_name.empty(); }
 };

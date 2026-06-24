@@ -92,6 +92,21 @@ public:
     }
 };
 
+class TwoMessageDriverUnit : public TickableUnit {
+public:
+    OutPort<int> out{this, "out"};
+
+    TwoMessageDriverUnit() : TickableUnit("two_message_driver") {}
+
+    void tick() override {
+        if (localCycle() == 0 || localCycle() == 1) {
+            bool sent = out.send(static_cast<int>(localCycle()));
+            (void)sent;
+            assert(sent);
+        }
+    }
+};
+
 class SleepingReceiverUnit : public TickableUnit {
 public:
     InPort<int> in{this, "in"};
@@ -189,6 +204,23 @@ void test_port_arrival_wakes_sleeping_receiver(const ModeConfig& mode) {
     assert(receiver->localCycle() == 12);
 }
 
+void test_multiple_future_port_arrivals_keep_later_wake(const ModeConfig& mode) {
+    TickSimulation sim(makeConfig(mode));
+    auto* driver = sim.createUnit<TwoMessageDriverUnit>();
+    auto* receiver = sim.createUnit<SleepingReceiverUnit>();
+    for (int i = 0; i < 8; ++i) {
+        sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
+    }
+    sim.connect(driver->out, receiver->in, 5);
+
+    sim.run(8);
+
+    assert((receiver->received == std::vector<int>{0, 1}));
+    assert((receiver->receive_cycles == std::vector<uint64_t>{5, 6}));
+    assert(receiver->ticks == 3);  // initial poll at cycle 0, then wakes at 5 and 6
+    assert(receiver->localCycle() == 8);
+}
+
 int main() {
     const ModeConfig modes[] = {
         {"sequential", false, false},
@@ -215,6 +247,10 @@ int main() {
 
         std::cout << "Testing lazy wakeup port arrival (" << mode.name << ")... ";
         test_port_arrival_wakes_sleeping_receiver(mode);
+        std::cout << "PASSED\n";
+
+        std::cout << "Testing lazy wakeup multiple future arrivals (" << mode.name << ")... ";
+        test_multiple_future_port_arrivals_keep_later_wake(mode);
         std::cout << "PASSED\n";
     }
 

@@ -18,6 +18,8 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -101,7 +103,10 @@ public:
 
     /// Wake the unit no later than @p cycle. Safe for cross-thread producers.
     void wakeAt(uint64_t cycle) noexcept {
-        setCycleMin_(pending_wake_cycle_, cycle);
+        {
+            std::lock_guard lock(pending_wake_mutex_);
+            pending_wake_cycles_.insert(cycle);
+        }
         setNextActiveCycleMin_(cycle);
     }
 
@@ -206,7 +211,7 @@ protected:
     void beginActiveTick_() noexcept {
         activity_control_used_.store(false, std::memory_order_relaxed);
         consumeCyclesThrough_(next_active_cycle_, local_cycle_);
-        consumeCyclesThrough_(pending_wake_cycle_, local_cycle_);
+        consumePendingWakesThrough_(local_cycle_);
     }
 
     void finishActiveTick_() noexcept {
@@ -217,16 +222,9 @@ protected:
 
 private:
     void setSleepTarget_(uint64_t cycle) noexcept {
-        const uint64_t pending = pending_wake_cycle_.load(std::memory_order_acquire);
-        const uint64_t target = std::min(cycle, pending);
-        next_active_cycle_.store(target, std::memory_order_release);
-
-        // If a cross-thread wake races between the pending_wake_cycle_ load
-        // above and this store, re-apply it so a sleep request cannot hide it.
-        const uint64_t pending_after = pending_wake_cycle_.load(std::memory_order_acquire);
-        if (pending_after < target) {
-            setNextActiveCycleMin_(pending_after);
-        }
+        std::lock_guard lock(pending_wake_mutex_);
+        next_active_cycle_.store(std::min(cycle, earliestPendingWakeLocked_()),
+                                 std::memory_order_release);
     }
 
     void setNextActiveCycleMin_(uint64_t cycle) noexcept {
@@ -249,6 +247,17 @@ private:
         }
     }
 
+    uint64_t earliestPendingWakeLocked_() const noexcept {
+        return pending_wake_cycles_.empty() ? NEVER_ACTIVE : *pending_wake_cycles_.begin();
+    }
+
+    void consumePendingWakesThrough_(uint64_t cycle) noexcept {
+        std::lock_guard lock(pending_wake_mutex_);
+        while (!pending_wake_cycles_.empty() && *pending_wake_cycles_.begin() <= cycle) {
+            pending_wake_cycles_.erase(pending_wake_cycles_.begin());
+        }
+    }
+
     void registerAllPendingPorts() {
         std::string prefix = fullPath();
         for (auto& reg : pending_port_registrations_) {
@@ -265,7 +274,8 @@ private:
     std::atomic<uint64_t> local_cycle_atomic_{0};  ///< mirror used only when use_atomic_cycle_
     bool use_atomic_cycle_ = false;
     std::atomic<uint64_t> next_active_cycle_{0};
-    std::atomic<uint64_t> pending_wake_cycle_{NEVER_ACTIVE};
+    std::mutex pending_wake_mutex_;
+    std::multiset<uint64_t> pending_wake_cycles_;
     std::atomic<uint32_t> tick_interval_{1};
     std::atomic<bool> activity_control_used_{false};
     uint32_t id_;
