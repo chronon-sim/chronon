@@ -66,6 +66,22 @@ public:
         }
     }
 
+    /// Hot path for units that have not opted into activity scheduling.
+    [[gnu::always_inline]] inline void executeTickAlwaysActive() {
+        detail::TickContextGuard tick_ctx(this, localCycle(), crashName(), crashNameLen(), "tick");
+        try {
+            arbitrateOwnedMPSCPorts_();
+            tick();
+            advanceLocalCycle();
+        } catch (const TickException&) {
+            throw;
+        } catch (const std::exception& e) {
+            throw TickException(name(), localCycle(), e.what());
+        } catch (...) {
+            throw TickException(name(), localCycle(), "unknown exception");
+        }
+    }
+
     /// Fast path for inactive cycles: preserve time/progress without running user code.
     [[gnu::always_inline]] inline void advanceIdleTick() { advanceLocalCycle(); }
 

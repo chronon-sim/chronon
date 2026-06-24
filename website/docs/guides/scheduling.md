@@ -254,6 +254,13 @@ enqueues a message with arrival cycle `A`, Chronon wakes the destination unit at
 own later `tick()` context. This gives event-like behavior without executing
 target-unit code from the producer thread.
 
+For always-active units, port delivery avoids the wakeup atomic entirely. A unit
+starts accepting port wakeups after it uses `sleepUntil()`, `sleepForever()`, or
+`setTickInterval(N > 1)`. If a receiver may go to sleep on its first tick and
+must preserve future arrivals sent earlier in that same cycle, call
+`enableActivityScheduling()` in the receiver constructor so those initial port
+wakeups are recorded.
+
 `wakeAt()` is intentionally only a scheduler hint. If a model communicates
 through shared memory or another side channel outside Chronon ports, the model
 must still expose the causal relationship to the scheduler, for example by

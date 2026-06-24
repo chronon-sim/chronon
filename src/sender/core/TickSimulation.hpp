@@ -318,6 +318,10 @@ private:
     bool epochFreeLookaheadEligible_() const;
 
     bool executeUnitCycle_(TickableUnit* unit, uint64_t cycle) {
+        if (!unit->usesActivityScheduling()) {
+            unit->executeTickAlwaysActive();
+            return true;
+        }
         if (unit->shouldRunTickAt(cycle)) {
             unit->executeTick();
             return true;

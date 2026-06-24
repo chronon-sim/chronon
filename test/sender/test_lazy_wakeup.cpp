@@ -111,7 +111,7 @@ class SleepingReceiverUnit : public TickableUnit {
 public:
     InPort<int> in{this, "in"};
 
-    SleepingReceiverUnit() : TickableUnit("receiver") {}
+    SleepingReceiverUnit() : TickableUnit("receiver") { enableActivityScheduling(); }
 
     void tick() override {
         ++ticks;
