@@ -173,7 +173,7 @@ uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
         if (do_periodic_dump && next_dump_cycle > current_cycle_) {
             step_cycles = std::min(step_cycles, next_dump_cycle - current_cycle_);
         }
-        if (!use_parallel || (config_.enable_dynamic_rebalance && !use_epoch_free_chunk)) {
+        if (!use_epoch_free_chunk) {
             step_cycles = std::min(step_cycles, config_.epoch_size);
         }
         uint64_t epoch_executed = 0;
