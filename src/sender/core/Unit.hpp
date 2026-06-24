@@ -139,12 +139,14 @@ public:
         const uint32_t normalized = interval == 0 ? 1 : interval;
         tick_interval_.store(normalized, std::memory_order_release);
         if (normalized > 1) {
-            const bool has_existing_target =
-                activity_control_used_.load(std::memory_order_relaxed) ||
-                next_active_cycle_.load(std::memory_order_acquire) != NEVER_ACTIVE;
+            // Only a sleepUntil()/sleepForever() target should defer interval
+            // ticking. An explicit future wakeAt() lowers next_active_cycle_
+            // too, but it is an additional wake hint and must not suppress the
+            // normal interval cadence.
+            const bool has_sleep_target = activity_control_used_.load(std::memory_order_relaxed);
             wake_tracking_enabled_.store(true, std::memory_order_release);
             enableActivityScheduling_();
-            if (!has_existing_target) {
+            if (!has_sleep_target) {
                 setNextActiveCycleMin_(local_cycle_);
             }
         }
