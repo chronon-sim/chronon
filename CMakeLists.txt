@@ -130,6 +130,32 @@ endif()
 
 # zlib (system library) for TracePacket.compressed_packets deflate batching.
 find_package(ZLIB REQUIRED)
+if(APPLE AND TARGET ZLIB::ZLIB)
+    # FindZLIB may expose the SDK's usr/include root as an imported target
+    # include directory. If that SDK does not match the compiler's implicit SDK,
+    # adding it explicitly breaks libc++ include_next resolution on macOS.
+    set(_chronon_zlib_removed_sdk_include OFF)
+    foreach(_chronon_zlib_include_prop
+            INTERFACE_INCLUDE_DIRECTORIES
+            INTERFACE_SYSTEM_INCLUDE_DIRECTORIES)
+        get_target_property(_chronon_zlib_includes
+            ZLIB::ZLIB
+            ${_chronon_zlib_include_prop})
+        if(_chronon_zlib_includes)
+            set(_chronon_zlib_filtered_includes "${_chronon_zlib_includes}")
+            list(FILTER _chronon_zlib_filtered_includes EXCLUDE REGEX
+                ".*/[^/]+\\.sdk/usr/include/?$")
+            if(NOT _chronon_zlib_filtered_includes STREQUAL _chronon_zlib_includes)
+                set_target_properties(ZLIB::ZLIB PROPERTIES
+                    ${_chronon_zlib_include_prop} "${_chronon_zlib_filtered_includes}")
+                set(_chronon_zlib_removed_sdk_include ON)
+            endif()
+        endif()
+    endforeach()
+    if(_chronon_zlib_removed_sdk_include)
+        message(STATUS "ZLIB: using compiler SDK search path instead of explicit SDK include root")
+    endif()
+endif()
 
 # Add the main framework library
 add_subdirectory(src)

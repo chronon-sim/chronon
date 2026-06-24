@@ -139,6 +139,8 @@ simulation:
 
     const auto* uart = config.getUnit("uart");
     const auto* fetch = config.getUnit("fetch");
+    (void)uart;
+    (void)fetch;
     assert(uart != nullptr);
     assert(fetch != nullptr);
     assert(uart->tick_interval == 1000);

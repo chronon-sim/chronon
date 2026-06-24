@@ -59,6 +59,7 @@ public:
     void tick() override {
         if (localCycle() == 5) {
             bool sent = out.send(42);
+            (void)sent;
             assert(sent);
         }
     }
@@ -87,6 +88,7 @@ public:
 void test_sleep_forever_advances_cycle(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<SleepForeverUnit>();
+    (void)unit;
     for (int i = 0; i < 8; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
@@ -100,6 +102,7 @@ void test_sleep_forever_advances_cycle(const ModeConfig& mode) {
 void test_tick_interval(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<IntervalUnit>();
+    (void)unit;
     for (int i = 0; i < 8; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
