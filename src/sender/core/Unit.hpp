@@ -276,10 +276,6 @@ private:
         std::lock_guard lock(pending_wake_mutex_);
         uint64_t target = std::min(cycle, earliestPendingWakeLocked_());
         target = std::min(target, earliestPortArrival_());
-        const uint64_t observed_next = next_active_cycle_.load(std::memory_order_acquire);
-        if (observed_next > local_cycle_) {
-            target = std::min(target, observed_next);
-        }
         next_active_cycle_.store(target, std::memory_order_release);
     }
 

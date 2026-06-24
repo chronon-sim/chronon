@@ -90,6 +90,25 @@ public:
     std::vector<uint64_t> tick_cycles;
 };
 
+class OverrideSleepTargetUnit : public TickableUnit {
+public:
+    OverrideSleepTargetUnit() : TickableUnit("override_sleep") {}
+
+    void tick() override {
+        ++ticks;
+        tick_cycles.push_back(localCycle());
+        if (localCycle() == 0) {
+            sleepUntil(5);
+            sleepForever();
+        } else {
+            sleepForever();
+        }
+    }
+
+    uint64_t ticks = 0;
+    std::vector<uint64_t> tick_cycles;
+};
+
 class DriverUnit : public TickableUnit {
 public:
     OutPort<int> out{this, "out"};
@@ -309,6 +328,37 @@ void test_multiple_future_wake_requests_survive_sleep_after_initial_tick(const M
     assert(unit->localCycle() == 10);
 }
 
+void test_later_sleep_overrides_prior_sleep_target_in_same_tick(const ModeConfig& mode) {
+    TickSimulation sim(makeConfig(mode));
+    auto* unit = sim.createUnit<OverrideSleepTargetUnit>();
+    (void)unit;
+    for (int i = 0; i < 8; ++i) {
+        sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
+    }
+
+    sim.run(8);
+
+    assert(unit->ticks == 1);
+    assert((unit->tick_cycles == std::vector<uint64_t>{0}));
+    assert(unit->localCycle() == 8);
+}
+
+void test_explicit_wake_survives_later_sleep_override_in_same_tick(const ModeConfig& mode) {
+    TickSimulation sim(makeConfig(mode));
+    auto* unit = sim.createUnit<OverrideSleepTargetUnit>();
+    (void)unit;
+    for (int i = 0; i < 8; ++i) {
+        sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
+    }
+
+    unit->wakeAt(5);
+    sim.run(8);
+
+    assert(unit->ticks == 2);
+    assert((unit->tick_cycles == std::vector<uint64_t>{0, 5}));
+    assert(unit->localCycle() == 8);
+}
+
 void test_port_arrival_wakes_sleeping_receiver(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* driver = sim.createUnit<DriverUnit>();
@@ -416,6 +466,16 @@ int main() {
 
         std::cout << "Testing lazy wakeup multiple explicit future wakes (" << mode.name << ")... ";
         test_multiple_future_wake_requests_survive_sleep_after_initial_tick(mode);
+        std::cout << "PASSED\n";
+
+        std::cout << "Testing lazy wakeup later sleep overrides prior sleep target (" << mode.name
+                  << ")... ";
+        test_later_sleep_overrides_prior_sleep_target_in_same_tick(mode);
+        std::cout << "PASSED\n";
+
+        std::cout << "Testing lazy wakeup explicit wake survives sleep override (" << mode.name
+                  << ")... ";
+        test_explicit_wake_survives_later_sleep_override_in_same_tick(mode);
         std::cout << "PASSED\n";
 
         std::cout << "Testing lazy wakeup port arrival (" << mode.name << ")... ";
