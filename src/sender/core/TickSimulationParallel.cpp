@@ -342,9 +342,7 @@ uint64_t TickSimulation::executeRunProgressBased(uint64_t total_cycles) {
 
     if (captured) std::rethrow_exception(captured);
 
-    const uint64_t reached =
-        thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
-    return reached - run_start;
+    return completedCyclesForRun_(run_start, run_target);
 }
 
 bool TickSimulation::allMPSCPortsHaveConnProgress_() const noexcept {
@@ -352,6 +350,23 @@ bool TickSimulation::allMPSCPortsHaveConnProgress_() const noexcept {
         if (!p->mpscConnProgressFullyResolved()) return false;
     }
     return true;
+}
+
+uint64_t TickSimulation::completedCyclesForRun_(uint64_t run_start,
+                                                uint64_t run_target) const noexcept {
+    uint64_t reached = thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
+
+    if (termination_ctrl_.isTerminationRequested()) {
+        const auto& request = termination_ctrl_.getRequest();
+        if (request.cycle >= run_start) {
+            const uint64_t stop_reached =
+                std::min(saturatingCycleAdd(request.cycle, 1), run_target);
+            reached = std::max(reached, stop_reached);
+        }
+    }
+
+    reached = std::min(reached, run_target);
+    return reached > run_start ? reached - run_start : 0;
 }
 
 bool TickSimulation::crossThreadHeadroomFits_(uint64_t max_lookahead) const noexcept {
@@ -433,9 +448,7 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
         unit_progress_[i].store(unit_ptrs_[i]->localCycle(), std::memory_order_release);
     }
 
-    const uint64_t reached =
-        thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
-    return reached - run_start;
+    return completedCyclesForRun_(run_start, run_target);
 }
 
 // ---------------------------------------------------------------------------

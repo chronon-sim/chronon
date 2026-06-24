@@ -96,6 +96,30 @@ private:
     uint64_t stop_cycle_;
 };
 
+class LaggingUnit : public TickableUnit {
+public:
+    explicit LaggingUnit(uint32_t work) : TickableUnit("lagging"), work_(work) {}
+
+    void tick() override {
+        uint64_t v = localCycle() + 1;
+        for (uint32_t i = 0; i < work_; ++i) {
+            v = v * 6364136223846793005ULL + 1442695040888963407ULL;
+        }
+        sink_ ^= v;
+    }
+
+private:
+    uint32_t work_;
+    uint64_t sink_ = 0;
+};
+
+class EmptyUnit : public TickableUnit {
+public:
+    explicit EmptyUnit(std::string name) : TickableUnit(std::move(name)) {}
+
+    void tick() override {}
+};
+
 struct RunResult {
     uint64_t checksum;
     uint64_t epoch_free_runs;
@@ -212,6 +236,40 @@ void verify_run_until_termination_default_max_after_warmup(unsigned hw) {
     check(sim.wasTerminationRequested(), "default-max runUntilTermination receives termination");
     check(sim.epochFreeRunCount() > warm_epoch_free_runs,
           "default-max runUntilTermination uses epoch-free after warmup");
+}
+
+void verify_run_until_termination_accounts_nonzero_worker(unsigned hw) {
+    if (hw < 2) return;
+    TickSimulationConfig cfg;
+    cfg.num_threads = 2;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_weighted_partitioning = false;
+    cfg.enable_dynamic_rebalance = false;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.max_lookahead_cycles = 64;
+    cfg.epoch_size = 16;
+
+    TickSimulation sim(cfg);
+    auto* lagging = sim.createUnit<LaggingUnit>(200000);
+    auto* terminator = sim.createUnit<TerminatorNode>(100);
+    sim.createUnit<EmptyUnit>("empty0");
+    sim.createUnit<EmptyUnit>("empty1");
+    sim.createUnit<EmptyUnit>("empty2");
+    sim.createUnit<EmptyUnit>("empty3");
+    sim.initialize();
+
+    check(sim.assignedThread(lagging) != sim.assignedThread(terminator),
+          "termination regression places lagging and terminating units on different streams");
+
+    const uint64_t executed = sim.runUntilTermination(1000);
+
+    check(sim.wasTerminationRequested(), "nonzero-worker termination requested");
+    const auto& request = sim.terminationRequest();
+    const uint64_t covered_cycle = request.cycle + 1;
+    check(sim.epochFreeRunCount() > 0, "nonzero-worker termination uses epoch-free");
+    check(executed >= covered_cycle, "epoch-free return covers nonzero-worker stop cycle");
+    check(sim.currentCycle() >= covered_cycle, "currentCycle covers nonzero-worker stop cycle");
 }
 
 void verify(uint32_t dA, uint32_t dB, uint64_t cycles, unsigned hw) {
@@ -358,6 +416,7 @@ int main() {
     verify_scheduler_timeline_does_not_veto_epoch_free(cycles, hw);
     verify_run_until_termination_uses_epoch_free(hw);
     verify_run_until_termination_default_max_after_warmup(hw);
+    verify_run_until_termination_accounts_nonzero_worker(hw);
 
     std::cout << "\n=== Results: " << g_pass << " passed, " << g_fail << " failed ===\n";
     return g_fail == 0 ? 0 : 1;

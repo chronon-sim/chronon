@@ -501,6 +501,12 @@ private:
      */
     uint64_t executeRunEpochFree_(uint64_t total_cycles);
 
+    /// Completed cycles reported by a run-spanning worker launch. When a unit
+    /// requests termination on a nonzero cluster, cluster 0 may lag behind the
+    /// terminating tick; account for the request cycle so runUntilTermination()
+    /// advances current_cycle_ far enough to cover the observed stop point.
+    uint64_t completedCyclesForRun_(uint64_t run_start, uint64_t run_target) const noexcept;
+
     /// True iff every MPSC InPort has fully resolved per-connection producer
     /// progress, so the consumer-driven drain needs no per-epoch central flush.
     /// Precondition for executeRunEpochFree_ (see enable_epoch_free_lookahead).
