@@ -291,18 +291,19 @@ back to the per-epoch path. Scheduler timeline tracing does not veto epoch-free
 lookahead; idle fast paths are then paced by dependency progress and
 `max_lookahead_cycles`, not by `epoch_size`.
 
-Epoch-free lookahead also takes precedence over dynamic rebalance when the safety
-gate accepts it. Dynamic rebalance is epoch-boundary based, so it remains active
-only on runs that fall back to the per-epoch path.
+Dynamic rebalance vetoes epoch-free lookahead. Rebalance decisions are made at
+epoch boundaries, so `enable_dynamic_rebalance: true` keeps the per-epoch driver
+even when the dependency and buffer-headroom gates would otherwise allow
+epoch-free execution.
 
 **When it engages.** The dispatch gate keeps the per-epoch barrier path unless
 *all* of the following hold; otherwise it transparently falls back (no result
 change):
 
 - `enable_epoch_free_lookahead` is set and `max_lookahead_cycles > 0`;
+- `enable_dynamic_rebalance` is not set;
 - the run uses the persistent path — reached via `TickSimulation::run()` or
-  `runUntilTermination()` chunks that do not need dynamic-rebalance epoch
-  boundaries;
+  `runUntilTermination()`;
 - every MPSC input port has fully-resolved per-connection producer progress;
 - **cross-thread buffer headroom suffices for every connection** (see below).
 
@@ -417,7 +418,8 @@ per-stream total sampled work, and migrates whole tight clusters at epoch
 boundaries when the heaviest stream is more than
 `rebalance_imbalance_threshold` above the active-stream average. Set
 `enable_dynamic_rebalance: true` when runtime migration is more important than
-dependency/lookahead-paced epoch-free execution.
+dependency/lookahead-paced epoch-free execution; doing so vetoes the epoch-free
+path and keeps the explicit epoch boundary driver.
 `rebalance_min_gain` can suppress migrations with too little predicted speedup,
 and `rebalance_cooldown_cycles` can enforce a minimum cycle gap between applied
 rebalances.

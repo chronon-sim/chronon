@@ -359,7 +359,8 @@ bool TickSimulation::persistentLookaheadEligible_() const {
 
 bool TickSimulation::epochFreeLookaheadEligible_() const {
     return persistentLookaheadEligible_() && config_.enable_epoch_free_lookahead &&
-           config_.max_lookahead_cycles > 0 && allMPSCPortsHaveConnProgress_() &&
+           !config_.enable_dynamic_rebalance && config_.max_lookahead_cycles > 0 &&
+           allMPSCPortsHaveConnProgress_() &&
            crossThreadHeadroomFits_(config_.max_lookahead_cycles);
 }
 
@@ -377,8 +378,9 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
         if (config_.enable_epoch_free_lookahead && !epoch_free && observe_ctx_) {
             observe::log_info<
                 "epoch-free lookahead requested but vetoed (max_lookahead={}, "
-                "mpsc_progress_full={}, headroom_fits={}); "
+                "dynamic_rebalance={}, mpsc_progress_full={}, headroom_fits={}); "
                 "using barrier path">(observe_ctx_, config_.max_lookahead_cycles,
+                                      config_.enable_dynamic_rebalance,
                                       allMPSCPortsHaveConnProgress_(),
                                       crossThreadHeadroomFits_(config_.max_lookahead_cycles));
         }

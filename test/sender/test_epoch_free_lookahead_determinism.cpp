@@ -105,12 +105,12 @@ struct RunResult {
 // loop so producer rates are coupled.
 RunResult runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, bool epoch_free,
                   uint32_t max_lookahead, uint64_t cycles, size_t out_rate = 1,
-                  bool scheduler_timeline = false) {
+                  bool scheduler_timeline = false, bool dynamic_rebalance = false) {
     TickSimulationConfig cfg;
     cfg.num_threads = num_threads;
     cfg.enable_parallel = (num_threads > 1);
     cfg.enable_lookahead = lookahead;
-    cfg.enable_dynamic_rebalance = false;  // required for the persistent path
+    cfg.enable_dynamic_rebalance = dynamic_rebalance;
     cfg.enable_epoch_free_lookahead = epoch_free;
     cfg.max_lookahead_cycles = max_lookahead;
     cfg.epoch_size = 64;
@@ -324,6 +324,19 @@ void verify_spsc_gate(uint64_t cycles, unsigned hw) {
     check(veto.epoch_free_runs == 0, "spsc-gate vetoes epoch-free past SPSC ring");
 }
 
+void verify_dynamic_rebalance_vetoes_epoch_free(uint64_t cycles, unsigned hw) {
+    if (hw < 2) return;
+    const uint64_t ref = runOnce(2, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
+                                 /*max_lookahead=*/100, cycles)
+                             .checksum;
+
+    RunResult dynamic = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                                /*max_lookahead=*/64, cycles, /*out_rate=*/1,
+                                /*scheduler_timeline=*/false, /*dynamic_rebalance=*/true);
+    check(dynamic.checksum == ref, "dynamic-rebalance veto epoch-free == ref");
+    check(dynamic.epoch_free_runs == 0, "dynamic rebalance vetoes epoch-free");
+}
+
 }  // namespace
 
 int main() {
@@ -341,6 +354,7 @@ int main() {
 
     verify_staging_veto(cycles, hw);
     verify_spsc_gate(cycles, hw);
+    verify_dynamic_rebalance_vetoes_epoch_free(cycles, hw);
     verify_scheduler_timeline_does_not_veto_epoch_free(cycles, hw);
     verify_run_until_termination_uses_epoch_free(hw);
     verify_run_until_termination_default_max_after_warmup(hw);
