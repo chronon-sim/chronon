@@ -162,7 +162,9 @@ simulation:
 defaults to `1`. Off-edge cycles skip the unit's `tick()` body but still advance
 the unit's local cycle and scheduler progress. Port arrivals and explicit
 `wakeAt()` calls can make a sleeping unit active again; the tick body still runs
-only on an allowed interval edge.
+only on an allowed interval edge. Applying `tick_interval` from YAML preserves
+any constructor-established `sleepUntil()` or `sleepForever()` target; it only
+seeds cycle 0 activity when the unit has not already deferred itself.
 
 ### Observation Configuration
 
