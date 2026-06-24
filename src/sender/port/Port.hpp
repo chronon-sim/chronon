@@ -307,6 +307,9 @@ public:
      */
     virtual void arbitrateMPSCConsumerDriven() noexcept {}
 
+    /// True if this port owns any MPSC staging queues that need consumer-side drains.
+    virtual bool hasMPSCConnections() const noexcept { return false; }
+
     /// Earliest pending arrival visible through this port, if any.
     virtual std::optional<uint64_t> minArrivalCycle() const { return std::nullopt; }
 

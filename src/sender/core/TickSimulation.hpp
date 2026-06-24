@@ -326,7 +326,7 @@ private:
             unit->executeTick();
             return true;
         } else {
-            unit->advanceIdleTick();
+            unit->advanceIdleTick(1);
             return false;
         }
     }

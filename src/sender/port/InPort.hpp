@@ -442,7 +442,7 @@ public:
         last_arbitrated_cycle_.store(s, std::memory_order_relaxed);
     }
 
-    bool hasMPSCConnections() const noexcept { return !mpsc_connections_.empty(); }
+    bool hasMPSCConnections() const noexcept override { return !mpsc_connections_.empty(); }
 
     /**
      * Install the set of `completed_cycle` atomics for the predecessor
