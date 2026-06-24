@@ -142,6 +142,7 @@ public:
             const bool has_existing_target =
                 activity_control_used_.load(std::memory_order_relaxed) ||
                 next_active_cycle_.load(std::memory_order_acquire) != NEVER_ACTIVE;
+            wake_tracking_enabled_.store(true, std::memory_order_release);
             enableActivityScheduling_();
             if (!has_existing_target) {
                 setNextActiveCycleMin_(local_cycle_);
