@@ -493,28 +493,37 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
 
             uint64_t idle_target = computeIdleClusterTarget_(cluster, cycle, end_cycle);
             if (idle_target > cycle) {
+                const bool cluster_has_mpsc =
+                    clusterHasMPSCConnections(cluster_unit_ptrs_[cluster]);
+                if (cluster_has_mpsc) {
+                    // MPSC-owning idle units drain staging queues during
+                    // advanceIdleTick(), so their idle advance has observable
+                    // queue/back-pressure side effects and cannot be safely
+                    // rolled back after a refreshed wake. Keep those clusters
+                    // interruptible by advancing one idle cycle at a time; any
+                    // future explicit wakeAt(A) observed during this step is
+                    // picked up by the next scheduler iteration before the
+                    // cluster can publish progress past A.
+                    idle_target = std::min(idle_target, cycle + 1);
+                }
                 SchedulerTimelineTrace::TimePoint idle_begin{};
                 if (trace_units) {
                     idle_begin = SchedulerTimelineTrace::Clock::now();
                 }
                 advanceClusterIdle_(cluster, idle_target - cycle);
                 uint64_t reached_cycle = idle_target;
-                const uint64_t refreshed_target =
-                    computeIdleClusterTarget_(cluster, cycle, idle_target);
-                if (refreshed_target < idle_target &&
-                    !clusterHasMPSCConnections(cluster_unit_ptrs_[cluster])) {
+                if (!cluster_has_mpsc) {
+                    const uint64_t refreshed_target =
+                        computeIdleClusterTarget_(cluster, cycle, idle_target);
                     // A cross-thread wakeAt() may lower next_active_cycle_ while
                     // this worker is in the bulk idle path. Re-sample before
                     // publishing completed_cycle so peers never observe an idle
-                    // hop past an already-visible wake. This trims only the
-                    // side-effect-free idle path; MPSC-owning units perform
-                    // per-cycle arbitration during advanceIdleTick(), so rolling
-                    // their local cycles back could make queue/back-pressure
-                    // state inconsistent. Port-driven MPSC wakes are bounded by
-                    // the dependency limit used to compute idle_target.
-                    reached_cycle = refreshed_target;
-                    for (auto* unit : cluster_unit_ptrs_[cluster]) {
-                        unit->setLocalCycle(reached_cycle);
+                    // hop past an already-visible wake.
+                    if (refreshed_target < idle_target) {
+                        reached_cycle = refreshed_target;
+                        for (auto* unit : cluster_unit_ptrs_[cluster]) {
+                            unit->setLocalCycle(reached_cycle);
+                        }
                     }
                 }
                 if (trace_units) {
