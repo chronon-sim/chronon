@@ -382,6 +382,11 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
     // MPSC progress (so no port needs a per-epoch central flush).
     lookahead_floor_.store(run_start, std::memory_order_relaxed);
 
+    SchedulerTimelineTrace::TimePoint run_begin{};
+    if (timeline_trace_.traceEpochs()) {
+        run_begin = SchedulerTimelineTrace::Clock::now();
+    }
+
     std::exception_ptr captured;
     std::atomic_flag captured_set = ATOMIC_FLAG_INIT;
 
@@ -410,6 +415,13 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
     // unarbitrated; commit them once here. Mirrors the epoch-end flush in
     // executeEpochProgressBased, but runs once per run instead of per epoch.
     arbitrateAllMPSCPorts_();
+
+    if (timeline_trace_.traceEpochs()) {
+        auto run_end = SchedulerTimelineTrace::Clock::now();
+        timeline_trace_.recordDuration(timeline_trace_.schedulerStream(), "scheduler",
+                                       "epoch-free lookahead run", run_start, run_begin, run_end,
+                                       "cycles=" + std::to_string(total_cycles));
+    }
 
     for (size_t i = 0; i < units_.size(); ++i) {
         unit_progress_[i].store(unit_ptrs_[i]->localCycle(), std::memory_order_release);

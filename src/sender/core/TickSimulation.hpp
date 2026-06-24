@@ -314,6 +314,8 @@ private:
     uint64_t runSequentialEpoch(uint64_t epoch_cycles);
     uint64_t runParallelEpoch(uint64_t epoch_cycles, uint64_t executed_offset);
     uint64_t runParallel(uint64_t num_cycles);
+    bool persistentLookaheadEligible_() const;
+    bool epochFreeLookaheadEligible_() const;
 
     bool executeUnitCycle_(TickableUnit* unit, uint64_t cycle) {
         if (unit->shouldRunTickAt(cycle)) {

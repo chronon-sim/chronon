@@ -264,32 +264,37 @@ the wake at its next scheduled opportunity.
 
 ### Epoch-Free Lookahead
 
-By default the persistent-worker lookahead path synchronizes all worker threads
-at a `std::barrier` every `epoch_size` cycles. Within an epoch, clusters advance
-out of order on their own predecessor dependencies, but the per-epoch barrier
-still makes every thread wait for the slowest one at each boundary — a straggler
-tax that hurts most when load is imbalanced.
+The persistent-worker lookahead path can either synchronize all worker threads
+at a `std::barrier` every `epoch_size` cycles, or use epoch-free lookahead. The
+per-epoch barrier is a conservative fallback: within an epoch, clusters advance
+out of order on their own predecessor dependencies, but every thread still waits
+for the slowest one at each boundary.
 
-`enable_epoch_free_lookahead` (default **off**) removes that barrier: the whole
-run becomes a single window in which run-ahead is bounded solely by
+`enable_epoch_free_lookahead` (default **on**) removes that barrier when the
+runtime can prove it is safe: the whole run becomes a single window in which
+run-ahead is bounded solely by
 `lookahead_floor_ + max_lookahead_cycles` (refreshed lazily as the global-minimum
 cluster advances) and per-connection MPSC arbitration, with one MPSC flush at the
 end of the run instead of one per epoch. Results stay bit-identical to every other
 mode; only wall-clock changes.
 
-It is an opt-in A/B knob, not a universal default — it wins on imbalanced,
-high-worker-count topologies (where the straggler tax is real) and is neutral or
-slightly negative on balanced or dependency-bound chains (where the lazy floor
-refresh costs more than the barrier it removes). Measure on your own model.
+If the safety gate rejects epoch-free execution, Chronon transparently falls
+back to the per-epoch path. Scheduler timeline tracing does not veto epoch-free
+lookahead; idle fast paths are then paced by dependency progress and
+`max_lookahead_cycles`, not by `epoch_size`.
+
+Epoch-free lookahead also takes precedence over dynamic rebalance when the safety
+gate accepts it. Dynamic rebalance is epoch-boundary based, so it remains active
+only on runs that fall back to the per-epoch path.
 
 **When it engages.** The dispatch gate keeps the per-epoch barrier path unless
 *all* of the following hold; otherwise it transparently falls back (no result
 change):
 
 - `enable_epoch_free_lookahead` is set and `max_lookahead_cycles > 0`;
-- the run uses the persistent path — reached via `TickSimulation::run()`;
-  `runUntilTermination()` (periodic dumps / termination polling) deliberately
-  keeps the per-epoch path for its boundaries, so epoch-free is a no-op there;
+- the run uses the persistent path — reached via `TickSimulation::run()` or
+  `runUntilTermination()` chunks that do not need dynamic-rebalance epoch
+  boundaries;
 - every MPSC input port has fully-resolved per-connection producer progress;
 - **cross-thread buffer headroom suffices for every connection** (see below).
 
@@ -378,7 +383,7 @@ struct TickSimulationConfig {
     // Lookahead configuration
     uint32_t max_lookahead_cycles = 100;    // Max cycles a unit can run ahead
     uint64_t epoch_size = 64;               // Cycles per epoch before sync
-    bool enable_epoch_free_lookahead = false; // Drop the per-epoch barrier (see below)
+    bool enable_epoch_free_lookahead = true;  // Drop the per-epoch barrier when safe
 
     // Debug options
     bool trace_execution = false;           // Log execution mode selection
@@ -389,7 +394,7 @@ struct TickSimulationConfig {
     uint64_t profiling_measurement_cycles = 1024; // Measurement window
 
     // Dynamic rebalancing
-    bool enable_dynamic_rebalance = true;
+    bool enable_dynamic_rebalance = false;
     double rebalance_imbalance_threshold = 1.3;
     uint64_t rebalance_check_interval_cycles = 8192;
     double rebalance_min_gain = 0.05;
@@ -399,12 +404,12 @@ struct TickSimulationConfig {
 
 These settings can be configured via YAML (`enable_parallel`, `enable_lookahead`) or set directly in code. All scheduling modes produce identical cycle-accurate results — they differ only in wall-clock performance.
 
-Dynamic rebalance is enabled by default for throughput-oriented runs. It samples
-unit tick cost periodically, computes per-stream total sampled work, and
-migrates whole tight clusters at epoch boundaries when the heaviest stream is
-more than `rebalance_imbalance_threshold` above the active-stream average. Set
-`enable_dynamic_rebalance: false` for deterministic partitioning studies or
-A/B runs that must preserve a fixed initial assignment.
+Dynamic rebalance is opt-in. It samples unit tick cost periodically, computes
+per-stream total sampled work, and migrates whole tight clusters at epoch
+boundaries when the heaviest stream is more than
+`rebalance_imbalance_threshold` above the active-stream average. Set
+`enable_dynamic_rebalance: true` when runtime migration is more important than
+dependency/lookahead-paced epoch-free execution.
 `rebalance_min_gain` can suppress migrations with too little predicted speedup,
 and `rebalance_cooldown_cycles` can enforce a minimum cycle gap between applied
 rebalances.

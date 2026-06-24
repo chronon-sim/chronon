@@ -8,16 +8,16 @@ sidebar_label: "Changelog"
 
 ### New Feature
 
-`TickSimulationConfig::enable_epoch_free_lookahead` (default off) collapses the
+`TickSimulationConfig::enable_epoch_free_lookahead` collapses the
 per-epoch `std::barrier` of the persistent-worker lookahead path into a single
 run-spanning window. Run-ahead is then bounded only by `lookahead_floor_ +
 max_lookahead_cycles` and per-connection MPSC arbitration, with one MPSC flush at
 the end of the run instead of one per epoch. Results stay bit-identical across all
 scheduling modes; only wall-clock changes.
 
-It is an opt-in A/B knob: it wins on imbalanced, high-worker-count topologies
-where the per-epoch barrier's straggler wait dominates, and is neutral or slightly
-negative on balanced or dependency-bound chains.
+It now defaults on when the safety gate can prove that cross-thread connection
+headroom can absorb the configured run-ahead; otherwise Chronon falls back to the
+per-epoch path.
 
 ### Safety
 
@@ -162,7 +162,7 @@ New `TickSimulationConfig` fields:
 | `enable_weighted_partitioning` | `true` | Enable cost-aware weighted partitioning |
 | `profiling_warmup_cycles` | `512` | Warmup ticks before measuring |
 | `profiling_measurement_cycles` | `1024` | Measurement window for tick costs |
-| `enable_dynamic_rebalance` | `true` | Runtime rebalancing based on tick samples |
+| `enable_dynamic_rebalance` | `false` | Runtime rebalancing based on tick samples |
 | `rebalance_imbalance_threshold` | `1.3` | Imbalance ratio to trigger rebalance |
 | `rebalance_check_interval_cycles` | `8192` | Cycles between rebalance checks |
 | `rebalance_min_gain` | `0.05` | Skip rebalance if predicted gain is below this fraction |

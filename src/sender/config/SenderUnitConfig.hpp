@@ -67,14 +67,14 @@ struct SimulationYAMLConfig {
     bool enable_lookahead = true;
     bool trace_execution = false;  ///< Print execution policy details.
     uint32_t max_lookahead_cycles = 100;
-    uint64_t epoch_size = 64;                  ///< Synchronization period in cycles.
-    bool enable_epoch_free_lookahead = false;  ///< Drop the per-epoch barrier (A/B knob).
-    uint64_t run_cycles = 0;                   ///< 0 = run until completion.
+    uint64_t epoch_size = 64;                 ///< Synchronization period in cycles.
+    bool enable_epoch_free_lookahead = true;  ///< Drop the per-epoch barrier when safe.
+    uint64_t run_cycles = 0;                  ///< 0 = run until completion.
     std::string name = "simulation";
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< Default 1 GHz.
 
     bool enable_weighted_partitioning = true;
-    bool enable_dynamic_rebalance = true;
+    bool enable_dynamic_rebalance = false;
     double rebalance_imbalance_threshold = 1.3;
     uint64_t rebalance_check_interval_cycles = 8192;
     double rebalance_min_gain = 0.05;

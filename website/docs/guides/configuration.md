@@ -133,7 +133,7 @@ simulation:
   num_workers: 4
   enable_parallel: true    # Enable parallel execution (requires num_workers > 1)
   enable_lookahead: true   # Enable lookahead scheduling for parallel epochs
-  enable_epoch_free_lookahead: false  # Opt-in: drop the per-epoch barrier (see Scheduling guide)
+  enable_epoch_free_lookahead: true   # Drop the per-epoch barrier when safe
   run_cycles: 1000000
 
   unit:

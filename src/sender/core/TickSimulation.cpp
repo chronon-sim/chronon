@@ -168,15 +168,26 @@ uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
             break;
         }
 
-        uint64_t epoch_cycles = std::min(config_.epoch_size, max_cycles - executed);
+        const bool use_epoch_free_chunk = use_parallel && epochFreeLookaheadEligible_();
+        uint64_t step_cycles = max_cycles - executed;
+        if (do_periodic_dump && next_dump_cycle > current_cycle_) {
+            step_cycles = std::min(step_cycles, next_dump_cycle - current_cycle_);
+        }
+        if (!use_parallel || (config_.enable_dynamic_rebalance && !use_epoch_free_chunk)) {
+            step_cycles = std::min(step_cycles, config_.epoch_size);
+        }
         uint64_t epoch_executed = 0;
 
         if (use_parallel) {
-            // Offset is reserved for future schedulers; current parallel
-            // epoch reads current_cycle_/thread_progress_array_ directly.
-            epoch_executed = runParallelEpoch(epoch_cycles, 0);
+            if (config_.enable_dynamic_rebalance && !use_epoch_free_chunk) {
+                // Dynamic rebalance is epoch-boundary based, so keep the
+                // explicit epoch driver when it is enabled.
+                epoch_executed = runParallelEpoch(step_cycles, 0);
+            } else {
+                epoch_executed = runParallel(step_cycles);
+            }
         } else {
-            epoch_executed = runSequentialEpoch(epoch_cycles);
+            epoch_executed = runSequentialEpoch(step_cycles);
         }
 
         executed += epoch_executed;
@@ -187,7 +198,7 @@ uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
             next_dump_cycle += dump_period;
         }
 
-        if (config_.enable_dynamic_rebalance && use_parallel) {
+        if (config_.enable_dynamic_rebalance && use_parallel && !use_epoch_free_chunk) {
             cycles_since_last_rebalance_ += epoch_executed;
             cycles_since_last_actual_rebalance_ += epoch_executed;
             if (cycles_since_last_rebalance_ >= config_.rebalance_check_interval_cycles) {
@@ -214,7 +225,7 @@ uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
             }
         }
 
-        if (epoch_executed < epoch_cycles) {
+        if (epoch_executed < step_cycles) {
             break;
         }
     }
@@ -340,23 +351,29 @@ uint64_t TickSimulation::runParallelEpoch(uint64_t epoch_cycles, uint64_t /*exec
     return epoch_cycles;
 }
 
+bool TickSimulation::persistentLookaheadEligible_() const {
+    const bool use_lookahead = config_.enable_lookahead && !has_tight_inter_cluster_;
+    return use_lookahead && thread_progress_count_ > 0 &&
+           thread_units_.size() <= pool_.available_parallelism();
+}
+
+bool TickSimulation::epochFreeLookaheadEligible_() const {
+    return persistentLookaheadEligible_() && config_.enable_epoch_free_lookahead &&
+           config_.max_lookahead_cycles > 0 && allMPSCPortsHaveConnProgress_() &&
+           crossThreadHeadroomFits_(config_.max_lookahead_cycles);
+}
+
 uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
     // Persistent-worker fast path (see executeRunProgressBased): only safe with a
-    // fixed thread layout and no tracing; runUntilTermination keeps the per-epoch
-    // path for its dump/termination boundaries.
-    const bool use_lookahead = config_.enable_lookahead && !has_tight_inter_cluster_;
-    const bool can_persist = use_lookahead && thread_progress_count_ > 0 &&
-                             !config_.enable_dynamic_rebalance && !timeline_trace_.enabled() &&
-                             thread_units_.size() <= pool_.available_parallelism();
+    // fixed thread layout. runUntilTermination() reaches this path for chunks
+    // that do not need dynamic-rebalance epoch boundaries.
+    const bool can_persist = persistentLookaheadEligible_();
     if (can_persist) {
         // Epoch-free (A/B): drop the per-epoch barrier when the lookahead floor
         // can be the sole run-ahead cap (max_lookahead_cycles > 0) and every
         // MPSC port is fully covered by per-connection progress (so no port
         // needs the per-epoch central flush). Otherwise keep the barrier path.
-        const bool epoch_free = config_.enable_epoch_free_lookahead &&
-                                config_.max_lookahead_cycles > 0 &&
-                                allMPSCPortsHaveConnProgress_() &&
-                                crossThreadHeadroomFits_(config_.max_lookahead_cycles);
+        const bool epoch_free = epochFreeLookaheadEligible_();
         if (config_.enable_epoch_free_lookahead && !epoch_free && observe_ctx_) {
             observe::log_info<
                 "epoch-free lookahead requested but vetoed (max_lookahead={}, "
@@ -369,7 +386,9 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
             ++epoch_free_run_count_;
             return executeRunEpochFree_(num_cycles);
         }
-        return executeRunProgressBased(num_cycles);
+        if (!config_.enable_dynamic_rebalance) {
+            return executeRunProgressBased(num_cycles);
+        }
     }
 
     uint64_t executed = 0;

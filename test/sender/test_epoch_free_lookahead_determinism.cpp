@@ -81,6 +81,21 @@ private:
     uint32_t work_;
 };
 
+class TerminatorNode : public TickableUnit {
+public:
+    explicit TerminatorNode(uint64_t stop_cycle)
+        : TickableUnit("terminator"), stop_cycle_(stop_cycle) {}
+
+    void tick() override {
+        if (localCycle() >= stop_cycle_) {
+            requestTermination(TerminationReason::Completed, 0, "done");
+        }
+    }
+
+private:
+    uint64_t stop_cycle_;
+};
+
 struct RunResult {
     uint64_t checksum;
     uint64_t epoch_free_runs;
@@ -89,7 +104,8 @@ struct RunResult {
 // A and B fan in to C with delays (dA, dB); C -> D -> {A, B} closes a feedback
 // loop so producer rates are coupled.
 RunResult runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, bool epoch_free,
-                  uint32_t max_lookahead, uint64_t cycles, size_t out_rate = 1) {
+                  uint32_t max_lookahead, uint64_t cycles, size_t out_rate = 1,
+                  bool scheduler_timeline = false) {
     TickSimulationConfig cfg;
     cfg.num_threads = num_threads;
     cfg.enable_parallel = (num_threads > 1);
@@ -98,6 +114,8 @@ RunResult runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, 
     cfg.enable_epoch_free_lookahead = epoch_free;
     cfg.max_lookahead_cycles = max_lookahead;
     cfg.epoch_size = 64;
+    cfg.timeline_trace.enabled = scheduler_timeline;
+    cfg.timeline_trace.end_cycle = cycles;
 
     TickSimulation sim(cfg);
     constexpr uint32_t kWork = 1500;  // spread the 4 units across workers
@@ -113,6 +131,50 @@ RunResult runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, 
     sim.initialize();
     sim.run(cycles);
     return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount()};
+}
+
+void verify_scheduler_timeline_does_not_veto_epoch_free(uint64_t cycles, unsigned hw) {
+    if (hw < 2) return;
+    const uint64_t ref = runOnce(2, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
+                                 /*max_lookahead=*/100, cycles)
+                             .checksum;
+
+    RunResult traced = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                               /*max_lookahead=*/64, cycles, /*out_rate=*/1,
+                               /*scheduler_timeline=*/true);
+    check(traced.checksum == ref, "scheduler timeline epoch-free == ref");
+    check(traced.epoch_free_runs > 0, "scheduler timeline does not veto epoch-free");
+}
+
+void verify_run_until_termination_uses_epoch_free(unsigned hw) {
+    if (hw < 2) return;
+    TickSimulationConfig cfg;
+    cfg.num_threads = 2;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_dynamic_rebalance = false;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.max_lookahead_cycles = 64;
+    cfg.timeline_trace.enabled = true;
+    cfg.timeline_trace.end_cycle = 256;
+
+    TickSimulation sim(cfg);
+    sim.createUnit<TerminatorNode>(100);
+    constexpr uint32_t kWork = 1500;
+    auto* A = sim.createUnit<Node>("A", 11, kWork);
+    auto* B = sim.createUnit<Node>("B", 22, kWork);
+    auto* C = sim.createUnit<Node>("C", 33, kWork);
+    auto* D = sim.createUnit<Node>("D", 44, kWork);
+    sim.connect(A->out, B->in, 1);
+    sim.connect(B->out, C->in, 1);
+    sim.connect(C->out, D->in, 1);
+    sim.connect(D->out, A->in, 1);
+    sim.initialize();
+
+    uint64_t executed = sim.runUntilTermination(1000);
+    check(sim.wasTerminationRequested(), "runUntilTermination receives unit termination");
+    check(executed < 1000, "runUntilTermination stops before max cycles");
+    check(sim.epochFreeRunCount() > 0, "runUntilTermination uses epoch-free with timeline");
 }
 
 void verify(uint32_t dA, uint32_t dB, uint64_t cycles, unsigned hw) {
@@ -242,6 +304,8 @@ int main() {
 
     verify_staging_veto(cycles, hw);
     verify_spsc_gate(cycles, hw);
+    verify_scheduler_timeline_does_not_veto_epoch_free(cycles, hw);
+    verify_run_until_termination_uses_epoch_free(hw);
 
     std::cout << "\n=== Results: " << g_pass << " passed, " << g_fail << " failed ===\n";
     return g_fail == 0 ? 0 : 1;
