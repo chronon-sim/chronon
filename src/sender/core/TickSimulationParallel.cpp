@@ -34,6 +34,17 @@ uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
     const uint64_t max = std::numeric_limits<uint64_t>::max();
     return delta > max - base ? max : base + delta;
 }
+
+bool clusterHasMPSCConnections(const std::vector<TickableUnit*>& units) noexcept {
+    for (const auto* unit : units) {
+        for (const auto* port : unit->ports()) {
+            if (port->hasMPSCConnections()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -487,12 +498,31 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
                     idle_begin = SchedulerTimelineTrace::Clock::now();
                 }
                 advanceClusterIdle_(cluster, idle_target - cycle);
+                uint64_t reached_cycle = idle_target;
+                const uint64_t refreshed_target =
+                    computeIdleClusterTarget_(cluster, cycle, idle_target);
+                if (refreshed_target < idle_target &&
+                    !clusterHasMPSCConnections(cluster_unit_ptrs_[cluster])) {
+                    // A cross-thread wakeAt() may lower next_active_cycle_ while
+                    // this worker is in the bulk idle path. Re-sample before
+                    // publishing completed_cycle so peers never observe an idle
+                    // hop past an already-visible wake. This trims only the
+                    // side-effect-free idle path; MPSC-owning units perform
+                    // per-cycle arbitration during advanceIdleTick(), so rolling
+                    // their local cycles back could make queue/back-pressure
+                    // state inconsistent. Port-driven MPSC wakes are bounded by
+                    // the dependency limit used to compute idle_target.
+                    reached_cycle = refreshed_target;
+                    for (auto* unit : cluster_unit_ptrs_[cluster]) {
+                        unit->setLocalCycle(reached_cycle);
+                    }
+                }
                 if (trace_units) {
                     auto idle_end = SchedulerTimelineTrace::Clock::now();
-                    recordClusterIdle_(thread_idx, cluster, cycle, idle_target - cycle, idle_begin,
-                                       idle_end);
+                    recordClusterIdle_(thread_idx, cluster, cycle, reached_cycle - cycle,
+                                       idle_begin, idle_end);
                 }
-                progress.store(idle_target, std::memory_order_release);
+                progress.store(reached_cycle, std::memory_order_release);
             } else {
                 executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units);
                 progress.store(cycle + 1, std::memory_order_release);
