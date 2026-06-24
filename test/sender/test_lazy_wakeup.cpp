@@ -63,6 +63,19 @@ public:
     std::vector<uint64_t> tick_cycles;
 };
 
+class InitiallyDeferredForeverUnit : public TickableUnit {
+public:
+    InitiallyDeferredForeverUnit() : TickableUnit("initially_deferred_forever") { sleepForever(); }
+
+    void tick() override {
+        ++ticks;
+        tick_cycles.push_back(localCycle());
+    }
+
+    uint64_t ticks = 0;
+    std::vector<uint64_t> tick_cycles;
+};
+
 class FutureWakeSleepUnit : public TickableUnit {
 public:
     FutureWakeSleepUnit() : TickableUnit("future_wake_sleep") {}
@@ -170,6 +183,36 @@ void test_initial_sleep_until_defers_first_tick(const ModeConfig& mode) {
     assert(unit->localCycle() == 8);
 }
 
+void test_tick_interval_preserves_constructor_sleep_target(const ModeConfig& mode) {
+    TickSimulation sim(makeConfig(mode));
+    auto* unit = sim.createUnit<InitiallyDeferredUnit>();
+    unit->setTickInterval(3);
+    for (int i = 0; i < 8; ++i) {
+        sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
+    }
+
+    sim.run(10);
+
+    assert(unit->ticks == 2);  // sleepUntil(5) plus interval 3 -> cycles 6, 9
+    assert((unit->tick_cycles == std::vector<uint64_t>{6, 9}));
+    assert(unit->localCycle() == 10);
+}
+
+void test_tick_interval_preserves_constructor_sleep_forever(const ModeConfig& mode) {
+    TickSimulation sim(makeConfig(mode));
+    auto* unit = sim.createUnit<InitiallyDeferredForeverUnit>();
+    unit->setTickInterval(3);
+    for (int i = 0; i < 8; ++i) {
+        sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
+    }
+
+    sim.run(10);
+
+    assert(unit->ticks == 0);
+    assert(unit->tick_cycles.empty());
+    assert(unit->localCycle() == 10);
+}
+
 void test_future_wake_survives_sleep_after_initial_tick(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<FutureWakeSleepUnit>();
@@ -239,6 +282,16 @@ int main() {
 
         std::cout << "Testing lazy wakeup initial sleepUntil (" << mode.name << ")... ";
         test_initial_sleep_until_defers_first_tick(mode);
+        std::cout << "PASSED\n";
+
+        std::cout << "Testing lazy wakeup tick_interval preserves sleepUntil (" << mode.name
+                  << ")... ";
+        test_tick_interval_preserves_constructor_sleep_target(mode);
+        std::cout << "PASSED\n";
+
+        std::cout << "Testing lazy wakeup tick_interval preserves sleepForever (" << mode.name
+                  << ")... ";
+        test_tick_interval_preserves_constructor_sleep_forever(mode);
         std::cout << "PASSED\n";
 
         std::cout << "Testing lazy wakeup pending future wake (" << mode.name << ")... ";

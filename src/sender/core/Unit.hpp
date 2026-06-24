@@ -120,11 +120,13 @@ public:
 
     /// Wake the unit no later than @p cycle. Safe for cross-thread producers.
     void wakeAt(uint64_t cycle) noexcept {
-        setNextActiveCycleMin_(cycle);
         if (wake_tracking_enabled_.load(std::memory_order_acquire)) {
             std::lock_guard lock(pending_wake_mutex_);
             pending_wake_cycles_.insert(cycle);
+            setNextActiveCycleMin_(cycle);
+            return;
         }
+        setNextActiveCycleMin_(cycle);
     }
 
     uint64_t nextActiveCycle() const noexcept {
@@ -141,8 +143,13 @@ public:
         const uint32_t normalized = interval == 0 ? 1 : interval;
         tick_interval_.store(normalized, std::memory_order_release);
         if (normalized > 1) {
+            const bool has_existing_target =
+                activity_control_used_.load(std::memory_order_relaxed) ||
+                next_active_cycle_.load(std::memory_order_acquire) != NEVER_ACTIVE;
             enableActivityScheduling_();
-            setNextActiveCycleMin_(0);
+            if (!has_existing_target) {
+                setNextActiveCycleMin_(local_cycle_);
+            }
         }
     }
 
