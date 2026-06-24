@@ -120,6 +120,21 @@ public:
     }
 };
 
+class EarlyMessageDriverUnit : public TickableUnit {
+public:
+    OutPort<int> out{this, "out"};
+
+    EarlyMessageDriverUnit() : TickableUnit("early_message_driver") {}
+
+    void tick() override {
+        if (localCycle() == 0) {
+            bool sent = out.send(7);
+            (void)sent;
+            assert(sent);
+        }
+    }
+};
+
 class SleepingReceiverUnit : public TickableUnit {
 public:
     InPort<int> in{this, "in"};
@@ -133,6 +148,28 @@ public:
             receive_cycles.push_back(localCycle());
         }
         sleepForever();
+    }
+
+    uint64_t ticks = 0;
+    std::vector<int> received;
+    std::vector<uint64_t> receive_cycles;
+};
+
+class LateSleepingReceiverUnit : public TickableUnit {
+public:
+    InPort<int> in{this, "in"};
+
+    LateSleepingReceiverUnit() : TickableUnit("late_sleeping_receiver") {}
+
+    void tick() override {
+        ++ticks;
+        while (auto msg = in.tryReceive(localCycle())) {
+            received.push_back(*msg);
+            receive_cycles.push_back(localCycle());
+        }
+        if (localCycle() >= 2) {
+            sleepForever();
+        }
     }
 
     uint64_t ticks = 0;
@@ -264,6 +301,23 @@ void test_multiple_future_port_arrivals_keep_later_wake(const ModeConfig& mode) 
     assert(receiver->localCycle() == 8);
 }
 
+void test_delayed_port_arrival_before_first_sleep_is_preserved(const ModeConfig& mode) {
+    TickSimulation sim(makeConfig(mode));
+    auto* driver = sim.createUnit<EarlyMessageDriverUnit>();
+    auto* receiver = sim.createUnit<LateSleepingReceiverUnit>();
+    for (int i = 0; i < 8; ++i) {
+        sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
+    }
+    sim.connect(driver->out, receiver->in, 5);
+
+    sim.run(8);
+
+    assert((receiver->received == std::vector<int>{7}));
+    assert((receiver->receive_cycles == std::vector<uint64_t>{5}));
+    assert(receiver->ticks == 4);  // cycles 0, 1, 2, then preserved wake at cycle 5
+    assert(receiver->localCycle() == 8);
+}
+
 int main() {
     const ModeConfig modes[] = {
         {"sequential", false, false},
@@ -304,6 +358,11 @@ int main() {
 
         std::cout << "Testing lazy wakeup multiple future arrivals (" << mode.name << ")... ";
         test_multiple_future_port_arrivals_keep_later_wake(mode);
+        std::cout << "PASSED\n";
+
+        std::cout << "Testing lazy wakeup delayed arrival before first sleep (" << mode.name
+                  << ")... ";
+        test_delayed_port_arrival_before_first_sleep_is_preserved(mode);
         std::cout << "PASSED\n";
     }
 

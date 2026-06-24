@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -148,6 +149,9 @@ public:
      * docs/mpsc-atomic-publish.md.
      */
     virtual size_t arbitrateAdmitBoundedErased(size_t budget, uint64_t max_send_cycle) = 0;
+
+    /// Earliest arrival currently staged on this MPSC connection, if any.
+    virtual std::optional<uint64_t> minStagedArrivalCycle() const { return std::nullopt; }
 
     /**
      * Register this MPSC connection on its destination InPort and return
@@ -302,6 +306,17 @@ public:
             ++admitted;
         }
         return admitted;
+    }
+
+    std::optional<uint64_t> minStagedArrivalCycle() const override {
+        if (thread_queue_id_ == SIZE_MAX) {
+            return std::nullopt;
+        }
+        const size_t head = staging_head_.load(std::memory_order_relaxed);
+        if (head == staging_tail_.load(std::memory_order_acquire)) {
+            return std::nullopt;
+        }
+        return staging_buf_[head].arrive_cycle;
     }
 
     /// True if the destination can accept data (back-pressure preflight).

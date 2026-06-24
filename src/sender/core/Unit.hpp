@@ -278,6 +278,7 @@ private:
     void setSleepTarget_(uint64_t cycle) noexcept {
         std::lock_guard lock(pending_wake_mutex_);
         uint64_t target = std::min(cycle, earliestPendingWakeLocked_());
+        target = std::min(target, earliestPortArrival_());
         const uint64_t observed_next = next_active_cycle_.load(std::memory_order_acquire);
         if (observed_next > local_cycle_) {
             target = std::min(target, observed_next);
@@ -307,6 +308,16 @@ private:
 
     uint64_t earliestPendingWakeLocked_() const noexcept {
         return pending_wake_cycles_.empty() ? NEVER_ACTIVE : *pending_wake_cycles_.begin();
+    }
+
+    uint64_t earliestPortArrival_() const {
+        uint64_t earliest = NEVER_ACTIVE;
+        for (const auto* port : ports_) {
+            if (auto arrival = port->minArrivalCycle()) {
+                earliest = std::min(earliest, *arrival);
+            }
+        }
+        return earliest;
     }
 
     void consumePendingWakesThrough_(uint64_t cycle) noexcept {
