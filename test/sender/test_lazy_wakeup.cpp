@@ -265,6 +265,22 @@ void test_future_wake_survives_sleep_after_initial_tick(const ModeConfig& mode) 
     assert(unit->localCycle() == 8);
 }
 
+void test_multiple_future_wake_requests_survive_sleep_after_initial_tick(const ModeConfig& mode) {
+    TickSimulation sim(makeConfig(mode));
+    auto* unit = sim.createUnit<FutureWakeSleepUnit>();
+    for (int i = 0; i < 8; ++i) {
+        sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
+    }
+
+    unit->wakeAt(5);
+    unit->wakeAt(7);
+    sim.run(10);
+
+    assert(unit->ticks == 3);  // default cycle 0 tick, then preserved wakes at 5 and 7
+    assert((unit->tick_cycles == std::vector<uint64_t>{0, 5, 7}));
+    assert(unit->localCycle() == 10);
+}
+
 void test_port_arrival_wakes_sleeping_receiver(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* driver = sim.createUnit<DriverUnit>();
@@ -350,6 +366,10 @@ int main() {
 
         std::cout << "Testing lazy wakeup pending future wake (" << mode.name << ")... ";
         test_future_wake_survives_sleep_after_initial_tick(mode);
+        std::cout << "PASSED\n";
+
+        std::cout << "Testing lazy wakeup multiple explicit future wakes (" << mode.name << ")... ";
+        test_multiple_future_wake_requests_survive_sleep_after_initial_tick(mode);
         std::cout << "PASSED\n";
 
         std::cout << "Testing lazy wakeup port arrival (" << mode.name << ")... ";

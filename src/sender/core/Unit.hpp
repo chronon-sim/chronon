@@ -120,12 +120,8 @@ public:
 
     /// Wake the unit no later than @p cycle. Safe for cross-thread producers.
     void wakeAt(uint64_t cycle) noexcept {
-        if (wake_tracking_enabled_.load(std::memory_order_acquire)) {
-            std::lock_guard lock(pending_wake_mutex_);
-            pending_wake_cycles_.insert(cycle);
-            setNextActiveCycleMin_(cycle);
-            return;
-        }
+        std::lock_guard lock(pending_wake_mutex_);
+        pending_wake_cycles_.insert(cycle);
         setNextActiveCycleMin_(cycle);
     }
 
