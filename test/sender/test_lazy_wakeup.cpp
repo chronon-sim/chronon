@@ -50,6 +50,33 @@ public:
     uint64_t ticks = 0;
 };
 
+class InitiallyDeferredUnit : public TickableUnit {
+public:
+    InitiallyDeferredUnit() : TickableUnit("initially_deferred") { sleepUntil(5); }
+
+    void tick() override {
+        ++ticks;
+        tick_cycles.push_back(localCycle());
+    }
+
+    uint64_t ticks = 0;
+    std::vector<uint64_t> tick_cycles;
+};
+
+class FutureWakeSleepUnit : public TickableUnit {
+public:
+    FutureWakeSleepUnit() : TickableUnit("future_wake_sleep") {}
+
+    void tick() override {
+        ++ticks;
+        tick_cycles.push_back(localCycle());
+        sleepForever();
+    }
+
+    uint64_t ticks = 0;
+    std::vector<uint64_t> tick_cycles;
+};
+
 class DriverUnit : public TickableUnit {
 public:
     OutPort<int> out{this, "out"};
@@ -113,6 +140,36 @@ void test_tick_interval(const ModeConfig& mode) {
     assert(unit->localCycle() == 10);
 }
 
+void test_initial_sleep_until_defers_first_tick(const ModeConfig& mode) {
+    TickSimulation sim(makeConfig(mode));
+    auto* unit = sim.createUnit<InitiallyDeferredUnit>();
+    (void)unit;
+    for (int i = 0; i < 8; ++i) {
+        sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
+    }
+
+    sim.run(8);
+
+    assert(unit->ticks == 3);  // cycles 5, 6, 7
+    assert((unit->tick_cycles == std::vector<uint64_t>{5, 6, 7}));
+    assert(unit->localCycle() == 8);
+}
+
+void test_future_wake_survives_sleep_after_initial_tick(const ModeConfig& mode) {
+    TickSimulation sim(makeConfig(mode));
+    auto* unit = sim.createUnit<FutureWakeSleepUnit>();
+    for (int i = 0; i < 8; ++i) {
+        sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
+    }
+
+    unit->wakeAt(5);
+    sim.run(8);
+
+    assert(unit->ticks == 2);  // default cycle 0 tick, then preserved wake at cycle 5
+    assert((unit->tick_cycles == std::vector<uint64_t>{0, 5}));
+    assert(unit->localCycle() == 8);
+}
+
 void test_port_arrival_wakes_sleeping_receiver(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* driver = sim.createUnit<DriverUnit>();
@@ -146,6 +203,14 @@ int main() {
 
         std::cout << "Testing lazy wakeup tick_interval (" << mode.name << ")... ";
         test_tick_interval(mode);
+        std::cout << "PASSED\n";
+
+        std::cout << "Testing lazy wakeup initial sleepUntil (" << mode.name << ")... ";
+        test_initial_sleep_until_defers_first_tick(mode);
+        std::cout << "PASSED\n";
+
+        std::cout << "Testing lazy wakeup pending future wake (" << mode.name << ")... ";
+        test_future_wake_survives_sleep_after_initial_tick(mode);
         std::cout << "PASSED\n";
 
         std::cout << "Testing lazy wakeup port arrival (" << mode.name << ")... ";
