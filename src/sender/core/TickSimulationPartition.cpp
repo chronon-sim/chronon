@@ -261,7 +261,8 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
             size_t units_on_thread = thread_units_[t].size();
             thread_sampling_[t].tick_times.resize(units_on_thread * ThreadSamplingState::RING_SIZE,
                                                   0);
-            thread_sampling_[t].write_idx = 0;
+            thread_sampling_[t].unit_write_idx.assign(units_on_thread, 0);
+            thread_sampling_[t].unit_sample_count.assign(units_on_thread, 0);
             thread_sampling_[t].sample_count = 0;
         }
     }
@@ -376,23 +377,23 @@ bool TickSimulation::shouldRebalance_() const {
 
     for (size_t t = 0; t < thread_units_.size(); ++t) {
         const auto& state = thread_sampling_[t];
-        if (state.sample_count == 0 || thread_units_[t].empty()) continue;
+        if (thread_units_[t].empty()) continue;
 
         double total = 0.0;
         size_t sampled_units = 0;
         for (size_t u_idx = 0; u_idx < thread_units_[t].size(); ++u_idx) {
             size_t base = u_idx * ThreadSamplingState::RING_SIZE;
             if (base >= state.tick_times.size()) continue;
+            if (u_idx >= state.unit_sample_count.size() || state.unit_sample_count[u_idx] == 0) {
+                continue;
+            }
 
             double unit_sum = 0.0;
-            size_t unit_count = 0;
-            size_t ring_end =
-                std::min(base + ThreadSamplingState::RING_SIZE, state.tick_times.size());
+            size_t unit_count =
+                std::min(state.unit_sample_count[u_idx], ThreadSamplingState::RING_SIZE);
+            size_t ring_end = std::min(base + unit_count, state.tick_times.size());
             for (size_t i = base; i < ring_end; ++i) {
-                if (state.tick_times[i] > 0) {
-                    unit_sum += static_cast<double>(state.tick_times[i]);
-                    unit_count++;
-                }
+                unit_sum += static_cast<double>(state.tick_times[i]);
             }
             if (unit_count == 0) continue;
             total += unit_sum / static_cast<double>(unit_count);
@@ -448,7 +449,10 @@ void TickSimulation::maybeRebalanceAfterEpoch_(uint64_t epoch_executed) {
 
 bool TickSimulation::performRebalance_() {
     if (!thread_sampling_.empty()) {
-        std::vector<double> sampled_unit_costs(unit_ptrs_.size(), 0.0);
+        std::vector<double> sampled_unit_costs = unit_costs_;
+        if (sampled_unit_costs.size() < unit_ptrs_.size()) {
+            sampled_unit_costs.resize(unit_ptrs_.size(), 0.0);
+        }
         bool has_window_sample = false;
 
         for (size_t t = 0; t < thread_units_.size(); ++t) {
@@ -459,16 +463,17 @@ bool TickSimulation::performRebalance_() {
                 size_t u = thread_units_[t][u_idx];
                 size_t base = u_idx * ThreadSamplingState::RING_SIZE;
                 if (base >= state.tick_times.size()) continue;
+                if (u_idx >= state.unit_sample_count.size() ||
+                    state.unit_sample_count[u_idx] == 0) {
+                    continue;
+                }
 
                 double sum = 0.0;
-                size_t count = 0;
-                size_t ring_end =
-                    std::min(base + ThreadSamplingState::RING_SIZE, state.tick_times.size());
+                size_t count =
+                    std::min(state.unit_sample_count[u_idx], ThreadSamplingState::RING_SIZE);
+                size_t ring_end = std::min(base + count, state.tick_times.size());
                 for (size_t i = base; i < ring_end; ++i) {
-                    if (state.tick_times[i] > 0) {
-                        sum += static_cast<double>(state.tick_times[i]);
-                        count++;
-                    }
+                    sum += static_cast<double>(state.tick_times[i]);
                 }
                 if (count > 0 && u < sampled_unit_costs.size()) {
                     sampled_unit_costs[u] = sum / static_cast<double>(count);
@@ -554,11 +559,10 @@ bool TickSimulation::performRebalance_() {
     }
     const double logged_balance_gain = std::max(0.0, balance_gain);
 
-    if (config_.rebalance_min_gain > 0.0 && gain < config_.rebalance_min_gain &&
-        balance_gain < config_.rebalance_min_gain) {
+    if (config_.rebalance_min_gain > 0.0 && gain < config_.rebalance_min_gain) {
         if (observe_ctx_) {
             observe::log_info<
-                "Dynamic rebalance SKIPPED (gain={}%, balance_gain={}% < min_gain={}%)">(
+                "Dynamic rebalance SKIPPED (gain={}%, balance_gain={}%, min_gain={}%)">(
                 observe_ctx_, static_cast<uint64_t>(gain * 100),
                 static_cast<uint64_t>(logged_balance_gain * 100),
                 static_cast<uint64_t>(config_.rebalance_min_gain * 100));
@@ -627,7 +631,8 @@ bool TickSimulation::performRebalance_() {
     for (size_t t = 0; t < num_threads; ++t) {
         auto& state = thread_sampling_[t];
         state.tick_times.assign(thread_units_[t].size() * ThreadSamplingState::RING_SIZE, 0);
-        state.write_idx = 0;
+        state.unit_write_idx.assign(thread_units_[t].size(), 0);
+        state.unit_sample_count.assign(thread_units_[t].size(), 0);
         state.sample_count = 0;
     }
 
@@ -660,12 +665,19 @@ bool TickSimulation::performRebalance_() {
 void TickSimulation::recordTickSample_(size_t thread_idx, size_t unit_local_idx, uint64_t ticks) {
     if (thread_idx >= thread_sampling_.size()) return;
     auto& state = thread_sampling_[thread_idx];
+    if (unit_local_idx >= state.unit_write_idx.size()) {
+        state.unit_write_idx.resize(unit_local_idx + 1, 0);
+    }
+    if (unit_local_idx >= state.unit_sample_count.size()) {
+        state.unit_sample_count.resize(unit_local_idx + 1, 0);
+    }
     size_t slot = unit_local_idx * ThreadSamplingState::RING_SIZE +
-                  (state.write_idx % ThreadSamplingState::RING_SIZE);
+                  (state.unit_write_idx[unit_local_idx] % ThreadSamplingState::RING_SIZE);
     if (slot < state.tick_times.size()) {
         state.tick_times[slot] = ticks;
     }
-    state.write_idx++;
+    state.unit_write_idx[unit_local_idx]++;
+    state.unit_sample_count[unit_local_idx]++;
     state.sample_count++;
 }
 
