@@ -403,7 +403,7 @@ struct TickSimulationConfig {
     uint64_t profiling_measurement_cycles = 1024; // Measurement window
 
     // Dynamic rebalancing
-    bool enable_dynamic_rebalance = true;
+    bool enable_dynamic_rebalance = false;
     double rebalance_imbalance_threshold = 1.3;
     uint64_t rebalance_check_interval_cycles = 8192;
     double rebalance_min_gain = 0.05;
@@ -413,10 +413,10 @@ struct TickSimulationConfig {
 
 These settings can be configured via YAML (`enable_parallel`, `enable_lookahead`) or set directly in code. All scheduling modes produce identical cycle-accurate results — they differ only in wall-clock performance.
 
-Dynamic rebalance is enabled by default. It samples unit tick cost periodically,
-computes per-stream total sampled work, and migrates whole tight clusters at
-epoch boundaries when the heaviest stream is more than
-`rebalance_imbalance_threshold` above the assigned-stream average. Set
+Dynamic rebalance is opt-in. It samples unit tick cost periodically, computes
+per-stream total sampled work, and migrates whole tight clusters at epoch
+boundaries when the heaviest stream is more than
+`rebalance_imbalance_threshold` above the assigned-stream average. Leave
 `enable_dynamic_rebalance: false` when a fixed initial layout or
 dependency/lookahead-paced epoch-free execution is more important; dynamic
 rebalance vetoes the epoch-free path and keeps the explicit epoch boundary

@@ -233,13 +233,14 @@ simulation:
   enable_weighted_partitioning: true     # Cost-aware thread assignment (default)
   profiling_warmup_cycles: 512           # Warmup ticks before measuring
   profiling_measurement_cycles: 1024     # Measurement window for tick costs
-  enable_dynamic_rebalance: true         # Runtime cluster migration
+  enable_dynamic_rebalance: false        # Runtime cluster migration (opt-in)
   rebalance_check_interval_cycles: 8192  # Epoch-boundary imbalance checks
   rebalance_min_gain: 0.05               # Skip if predicted gain is too small
   rebalance_cooldown_cycles: 0           # Minimum cycles between rebalances
 ```
 
-Dynamic rebalance is most useful when timeline traces show one stream doing
+Dynamic rebalance is an opt-in epoch-boundary migration path. It is most useful
+when timeline traces show one stream doing
 most unit work while others spend time in dependency waits. The rebalancer
 samples unit tick cost, sums sampled work per stream, and migrates whole
 tight clusters at epoch boundaries; it never splits a delay=0 cluster. Use

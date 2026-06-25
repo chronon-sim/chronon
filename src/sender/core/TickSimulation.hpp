@@ -651,9 +651,9 @@ private:
 
     struct alignas(64) ThreadSamplingState {
         std::vector<uint64_t> tick_times;
+        std::vector<uint8_t> active_samples;
         std::vector<size_t> unit_write_idx;
         std::vector<size_t> unit_sample_count;
-        std::vector<size_t> unit_active_sample_count;
         size_t sample_count = 0;
         static constexpr size_t RING_SIZE = 128;
     };
