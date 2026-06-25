@@ -745,7 +745,6 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
             auto tp1 = std::chrono::steady_clock::now();
             uint64_t elapsed_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(tp1 - tp0).count());
-            elapsed_ns /= std::max<uint32_t>(1, units[u]->tickInterval());
             recordTickSample_(thread_idx, cluster_thread_unit_positions_[cluster][u], elapsed_ns,
                               active);
         }

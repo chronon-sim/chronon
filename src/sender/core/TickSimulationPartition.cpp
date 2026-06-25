@@ -424,6 +424,10 @@ void TickSimulation::maybeRebalanceAfterEpoch_(uint64_t epoch_executed) {
         return;
     }
 
+    if (observe_ctx_) {
+        observe_ctx_->setCurrentCycleValue(current_cycle_);
+    }
+
     cycles_since_last_rebalance_ = 0;
     bool cooldown_ok = (config_.rebalance_cooldown_cycles == 0) ||
                        (cycles_since_last_actual_rebalance_ >= config_.rebalance_cooldown_cycles);
@@ -454,6 +458,7 @@ bool TickSimulation::performRebalance_() {
         if (sampled_unit_costs.size() < unit_ptrs_.size()) {
             sampled_unit_costs.resize(unit_ptrs_.size(), 0.0);
         }
+        std::vector<bool> sampled_units(unit_ptrs_.size(), false);
         bool has_window_sample = false;
 
         for (size_t t = 0; t < thread_units_.size(); ++t) {
@@ -478,12 +483,19 @@ bool TickSimulation::performRebalance_() {
                 }
                 if (count > 0 && u < sampled_unit_costs.size()) {
                     sampled_unit_costs[u] = sum / static_cast<double>(count);
+                    sampled_units[u] = true;
                     has_window_sample = true;
                 }
             }
         }
 
         if (has_window_sample) {
+            constexpr double kUnsampledCostDecay = 0.875;
+            for (size_t u = 0; u < sampled_unit_costs.size(); ++u) {
+                if (u >= sampled_units.size() || !sampled_units[u]) {
+                    sampled_unit_costs[u] *= kUnsampledCostDecay;
+                }
+            }
             unit_costs_ = std::move(sampled_unit_costs);
         }
     }
@@ -580,6 +592,14 @@ bool TickSimulation::performRebalance_() {
 
     std::vector<size_t> result_thread_cluster_count(num_threads, 0);
     std::vector<size_t> result_thread_single_cluster(num_threads, SIZE_MAX);
+    std::vector<size_t> old_thread_cluster_count(num_threads, 0);
+    std::vector<size_t> old_thread_single_cluster(num_threads, SIZE_MAX);
+    for (size_t c = 0; c < num_clusters; ++c) {
+        size_t thread = old_assignment[c];
+        if (thread >= num_threads) continue;
+        old_thread_cluster_count[thread]++;
+        old_thread_single_cluster[thread] = c;
+    }
     for (size_t c = 0; c < num_clusters; ++c) {
         size_t thread = result.unit_to_thread[c];
         if (thread >= num_threads) continue;
@@ -592,6 +612,9 @@ bool TickSimulation::performRebalance_() {
         if (result_thread_cluster_count[t] != 1) continue;
         size_t c = result_thread_single_cluster[t];
         if (c >= num_clusters) continue;
+        bool was_same_singleton =
+            old_thread_cluster_count[t] == 1 && old_thread_single_cluster[t] == c;
+        if (was_same_singleton) continue;
 
         if (clusters_.clusters[c].size() == 1) {
             size_t u = clusters_.clusters[c].front();
