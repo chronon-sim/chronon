@@ -595,13 +595,15 @@ bool TickSimulation::performRebalance_() {
 
         if (clusters_.clusters[c].size() == 1) {
             size_t u = clusters_.clusters[c].front();
-            if (u < unit_ptrs_.size() && unit_ptrs_[u]->tickInterval() > 1) {
+            if (u < unit_ptrs_.size() &&
+                (unit_ptrs_[u]->tickInterval() > 1 || unit_ptrs_[u]->usesActivityScheduling())) {
                 if (observe_ctx_) {
                     std::string names = buildUnitNameList_(clusters_.clusters[c]);
                     observe::log_info<
-                        "Dynamic rebalance SKIPPED (would isolate interval-ticked cluster {} "
-                        "[{}], tick_interval={})">(observe_ctx_, c, names.c_str(),
-                                                   unit_ptrs_[u]->tickInterval());
+                        "Dynamic rebalance SKIPPED (would isolate activity-scheduled cluster {} "
+                        "[{}], tick_interval={}, activity_scheduled={})">(
+                        observe_ctx_, c, names.c_str(), unit_ptrs_[u]->tickInterval(),
+                        unit_ptrs_[u]->usesActivityScheduling() ? 1 : 0);
                 }
                 return false;
             }
