@@ -12,6 +12,7 @@
 /// analysis, and dynamic rebalancing.
 
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string>
@@ -556,22 +557,6 @@ bool TickSimulation::performRebalance_() {
 
     auto result = runRebalanceSolver_(input);
 
-    double gain = 0.0;
-    if (old_max_time > 0.0) {
-        gain = (old_max_time - result.estimated_max_thread_time_ns) / old_max_time;
-    }
-
-    auto new_thread_costs_for_gate =
-        WeightedPartitioner::evaluatePerThread(input, result.unit_to_thread);
-    new_thread_costs_for_gate.resize(num_threads, 0.0);
-    double balance_gain = 0.0;
-    const double old_balance_score = balanceScore(old_thread_costs);
-    if (old_balance_score > 0.0) {
-        balance_gain =
-            (old_balance_score - balanceScore(new_thread_costs_for_gate)) / old_balance_score;
-    }
-    const double logged_balance_gain = std::max(0.0, balance_gain);
-
     std::vector<size_t> cluster_sample_count(num_clusters, 0);
     std::vector<size_t> cluster_active_sample_count(num_clusters, 0);
     for (size_t t = 0; t < thread_units_.size(); ++t) {
@@ -590,8 +575,6 @@ bool TickSimulation::performRebalance_() {
         }
     }
 
-    std::vector<size_t> result_thread_cluster_count(num_threads, 0);
-    std::vector<size_t> result_thread_single_cluster(num_threads, SIZE_MAX);
     std::vector<size_t> old_thread_cluster_count(num_threads, 0);
     std::vector<size_t> old_thread_single_cluster(num_threads, SIZE_MAX);
     for (size_t c = 0; c < num_clusters; ++c) {
@@ -600,52 +583,117 @@ bool TickSimulation::performRebalance_() {
         old_thread_cluster_count[thread]++;
         old_thread_single_cluster[thread] = c;
     }
-    for (size_t c = 0; c < num_clusters; ++c) {
-        size_t thread = result.unit_to_thread[c];
-        if (thread >= num_threads) continue;
-        result_thread_cluster_count[thread]++;
-        result_thread_single_cluster[thread] = c;
-    }
     constexpr size_t kMinSingletonSamples = 4;
     constexpr size_t kLowActivityDenominator = 4;  // active/sample <= 25%.
-    for (size_t t = 0; t < num_threads; ++t) {
-        if (result_thread_cluster_count[t] != 1) continue;
-        size_t c = result_thread_single_cluster[t];
-        if (c >= num_clusters) continue;
-        bool was_same_singleton =
-            old_thread_cluster_count[t] == 1 && old_thread_single_cluster[t] == c;
-        if (was_same_singleton) continue;
+    std::vector<std::string> protected_repair_logs;
 
+    auto protectedSingletonReason = [&](size_t c) -> const char* {
+        if (c >= num_clusters) return nullptr;
         if (clusters_.clusters[c].size() == 1) {
             size_t u = clusters_.clusters[c].front();
             if (u < unit_ptrs_.size() &&
                 (unit_ptrs_[u]->tickInterval() > 1 || unit_ptrs_[u]->usesActivityScheduling())) {
-                if (observe_ctx_) {
-                    std::string names = buildUnitNameList_(clusters_.clusters[c]);
-                    observe::log_info<
-                        "Dynamic rebalance SKIPPED (would isolate activity-scheduled cluster {} "
-                        "[{}], tick_interval={}, activity_scheduled={})">(
-                        observe_ctx_, c, names.c_str(), unit_ptrs_[u]->tickInterval(),
-                        unit_ptrs_[u]->usesActivityScheduling() ? 1 : 0);
+                return "activity-scheduled";
+            }
+        }
+        if (cluster_sample_count[c] >= kMinSingletonSamples &&
+            cluster_active_sample_count[c] * kLowActivityDenominator <= cluster_sample_count[c]) {
+            return "low-activity";
+        }
+        return nullptr;
+    };
+
+    auto repairProtectedSingletons = [&]() {
+        bool changed = false;
+        bool changed_this_pass = true;
+        while (changed_this_pass) {
+            changed_this_pass = false;
+
+            std::vector<size_t> result_thread_cluster_count(num_threads, 0);
+            std::vector<size_t> result_thread_single_cluster(num_threads, SIZE_MAX);
+            for (size_t c = 0; c < num_clusters; ++c) {
+                size_t thread = result.unit_to_thread[c];
+                if (thread >= num_threads) continue;
+                result_thread_cluster_count[thread]++;
+                result_thread_single_cluster[thread] = c;
+            }
+
+            for (size_t t = 0; t < num_threads; ++t) {
+                if (result_thread_cluster_count[t] != 1) continue;
+                size_t c = result_thread_single_cluster[t];
+                if (c >= num_clusters) continue;
+
+                bool was_same_singleton =
+                    old_thread_cluster_count[t] == 1 && old_thread_single_cluster[t] == c;
+                if (was_same_singleton) continue;
+
+                const char* reason = protectedSingletonReason(c);
+                if (!reason) continue;
+
+                size_t best_thread = SIZE_MAX;
+                double best_cost = std::numeric_limits<double>::infinity();
+                for (size_t target = 0; target < num_threads; ++target) {
+                    if (target == t || result_thread_cluster_count[target] == 0) continue;
+
+                    auto candidate = result.unit_to_thread;
+                    candidate[c] = target;
+                    double candidate_cost =
+                        WeightedPartitioner::evaluatePartition(input, candidate);
+                    if (candidate_cost < best_cost) {
+                        best_cost = candidate_cost;
+                        best_thread = target;
+                    }
                 }
-                return false;
+
+                if (best_thread == SIZE_MAX) {
+                    if (observe_ctx_) {
+                        std::string names = buildUnitNameList_(clusters_.clusters[c]);
+                        observe::log_info<
+                            "Dynamic rebalance SKIPPED (would isolate {} cluster {} [{}], no "
+                            "merge target)">(observe_ctx_, reason, c, names.c_str());
+                    }
+                    return false;
+                }
+
+                std::ostringstream repair_log;
+                repair_log << "  Repaired protected singleton: merged " << reason << " cluster "
+                           << c << " [" << buildUnitNameList_(clusters_.clusters[c]) << "] T" << t
+                           << " -> T" << best_thread;
+                protected_repair_logs.push_back(repair_log.str());
+                result.unit_to_thread[c] = best_thread;
+                result.estimated_max_thread_time_ns = best_cost;
+                changed = true;
+                changed_this_pass = true;
+                break;
             }
         }
 
-        if (cluster_sample_count[c] < kMinSingletonSamples) continue;
-        if (cluster_active_sample_count[c] * kLowActivityDenominator > cluster_sample_count[c]) {
-            continue;
+        if (changed) {
+            result.estimated_max_thread_time_ns =
+                WeightedPartitioner::evaluatePartition(input, result.unit_to_thread);
         }
-        if (observe_ctx_) {
-            std::string names = buildUnitNameList_(clusters_.clusters[c]);
-            observe::log_info<
-                "Dynamic rebalance SKIPPED (would isolate low-activity cluster {} [{}], "
-                "active_samples={}, samples={})">(observe_ctx_, c, names.c_str(),
-                                                  cluster_active_sample_count[c],
-                                                  cluster_sample_count[c]);
-        }
+        return true;
+    };
+
+    if (!repairProtectedSingletons()) {
         return false;
     }
+
+    double gain = 0.0;
+    if (old_max_time > 0.0) {
+        gain = (old_max_time - result.estimated_max_thread_time_ns) / old_max_time;
+    }
+
+    auto new_thread_costs_for_gate =
+        WeightedPartitioner::evaluatePerThread(input, result.unit_to_thread);
+    new_thread_costs_for_gate.resize(num_threads, 0.0);
+    double balance_gain = 0.0;
+    const double old_balance_score = balanceScore(old_thread_costs);
+    if (old_balance_score > 0.0) {
+        balance_gain =
+            (old_balance_score - balanceScore(new_thread_costs_for_gate)) / old_balance_score;
+    }
+    const double logged_balance_gain = std::max(0.0, balance_gain);
 
     if (config_.rebalance_min_gain > 0.0 && gain < config_.rebalance_min_gain) {
         if (observe_ctx_) {
@@ -681,6 +729,10 @@ bool TickSimulation::performRebalance_() {
             "Dynamic rebalance #{}: imbalance={}%, predicted_gain={}%, balance_gain={}%">(
             observe_ctx_, rebalance_count_ + 1, static_cast<uint64_t>(result.imbalance_ratio * 100),
             static_cast<uint64_t>(gain * 100), static_cast<uint64_t>(logged_balance_gain * 100));
+
+        for (const auto& repair_log : protected_repair_logs) {
+            observe::log_info<"{}">(observe_ctx_, repair_log.c_str());
+        }
 
         observe::log_info<"  OLD assignment:">(observe_ctx_);
         for (size_t t = 0; t < num_threads; ++t) {
