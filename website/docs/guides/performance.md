@@ -239,7 +239,8 @@ simulation:
   rebalance_cooldown_cycles: 0           # Minimum cycles between rebalances
 ```
 
-Dynamic rebalance is most useful when timeline traces show one stream doing
+Dynamic rebalance is an opt-in epoch-boundary migration path. It is most useful
+when timeline traces show one stream doing
 most unit work while others spend time in dependency waits. The rebalancer
 samples unit tick cost, sums sampled work per stream, and migrates whole
 tight clusters at epoch boundaries; it never splits a delay=0 cluster. Use

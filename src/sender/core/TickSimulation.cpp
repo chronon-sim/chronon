@@ -130,6 +130,20 @@ uint64_t TickSimulation::run(uint64_t num_cycles) {
 
     uint64_t executed = 0;
 
+    if (shouldUseParallelExecution_() && config_.enable_dynamic_rebalance) {
+        while (executed < num_cycles) {
+            uint64_t step_cycles = std::min(config_.epoch_size, num_cycles - executed);
+            uint64_t epoch_executed = runParallelEpoch(step_cycles, executed);
+            executed += epoch_executed;
+            current_cycle_ += epoch_executed;
+            maybeRebalanceAfterEpoch_(epoch_executed);
+            if (epoch_executed < step_cycles) {
+                break;
+            }
+        }
+        return executed;
+    }
+
     if (shouldUseParallelExecution_()) {
         executed = runParallel(num_cycles);
     } else {
@@ -199,30 +213,7 @@ uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
         }
 
         if (config_.enable_dynamic_rebalance && use_parallel && !use_epoch_free_chunk) {
-            cycles_since_last_rebalance_ += epoch_executed;
-            cycles_since_last_actual_rebalance_ += epoch_executed;
-            if (cycles_since_last_rebalance_ >= config_.rebalance_check_interval_cycles) {
-                cycles_since_last_rebalance_ = 0;
-                bool cooldown_ok =
-                    (config_.rebalance_cooldown_cycles == 0) ||
-                    (cycles_since_last_actual_rebalance_ >= config_.rebalance_cooldown_cycles);
-                if (cooldown_ok && shouldRebalance_()) {
-                    SchedulerTimelineTrace::TimePoint rebalance_begin{};
-                    if (timeline_trace_.enabled()) {
-                        rebalance_begin = SchedulerTimelineTrace::Clock::now();
-                    }
-                    if (performRebalance_()) {
-                        cycles_since_last_actual_rebalance_ = 0;
-                        if (timeline_trace_.enabled()) {
-                            auto rebalance_end = SchedulerTimelineTrace::Clock::now();
-                            timeline_trace_.recordDuration(timeline_trace_.schedulerStream(),
-                                                           "scheduler", "dynamic rebalance",
-                                                           current_cycle_, rebalance_begin,
-                                                           rebalance_end, last_rebalance_detail_);
-                        }
-                    }
-                }
-            }
+            maybeRebalanceAfterEpoch_(epoch_executed);
         }
 
         if (epoch_executed < step_cycles) {

@@ -12,6 +12,7 @@
 /// analysis, and dynamic rebalancing.
 
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string>
@@ -35,6 +36,14 @@ struct PairHash {
         return k.u ^ (k.v * 0x9e3779b97f4a7c15ULL + (k.u << 6) + (k.u >> 2));
     }
 };
+
+double balanceScore(const std::vector<double>& thread_times) {
+    double score = 0.0;
+    for (double time : thread_times) {
+        score += time * time;
+    }
+    return score;
+}
 }  // namespace
 
 void TickSimulation::buildPartitionAdjacency_(
@@ -253,7 +262,10 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
             size_t units_on_thread = thread_units_[t].size();
             thread_sampling_[t].tick_times.resize(units_on_thread * ThreadSamplingState::RING_SIZE,
                                                   0);
-            thread_sampling_[t].write_idx = 0;
+            thread_sampling_[t].active_samples.resize(
+                units_on_thread * ThreadSamplingState::RING_SIZE, 0);
+            thread_sampling_[t].unit_write_idx.assign(units_on_thread, 0);
+            thread_sampling_[t].unit_sample_count.assign(units_on_thread, 0);
             thread_sampling_[t].sample_count = 0;
         }
     }
@@ -359,27 +371,32 @@ bool TickSimulation::shouldRebalance_() const {
     // thread hides imbalance when one stream owns more active units; sum
     // per-unit averages instead.
     std::vector<double> thread_times(thread_units_.size(), 0.0);
-    size_t active_threads = 0;
+    size_t candidate_threads = 0;
+    for (const auto& units : thread_units_) {
+        if (!units.empty()) {
+            candidate_threads++;
+        }
+    }
 
     for (size_t t = 0; t < thread_units_.size(); ++t) {
         const auto& state = thread_sampling_[t];
-        if (state.sample_count == 0 || thread_units_[t].empty()) continue;
+        if (thread_units_[t].empty()) continue;
 
         double total = 0.0;
         size_t sampled_units = 0;
         for (size_t u_idx = 0; u_idx < thread_units_[t].size(); ++u_idx) {
             size_t base = u_idx * ThreadSamplingState::RING_SIZE;
             if (base >= state.tick_times.size()) continue;
+            if (u_idx >= state.unit_sample_count.size() || state.unit_sample_count[u_idx] == 0) {
+                continue;
+            }
 
             double unit_sum = 0.0;
-            size_t unit_count = 0;
-            size_t ring_end =
-                std::min(base + ThreadSamplingState::RING_SIZE, state.tick_times.size());
+            size_t unit_count =
+                std::min(state.unit_sample_count[u_idx], ThreadSamplingState::RING_SIZE);
+            size_t ring_end = std::min(base + unit_count, state.tick_times.size());
             for (size_t i = base; i < ring_end; ++i) {
-                if (state.tick_times[i] > 0) {
-                    unit_sum += static_cast<double>(state.tick_times[i]);
-                    unit_count++;
-                }
+                unit_sum += static_cast<double>(state.tick_times[i]);
             }
             if (unit_count == 0) continue;
             total += unit_sum / static_cast<double>(unit_count);
@@ -387,24 +404,65 @@ bool TickSimulation::shouldRebalance_() const {
         }
         if (sampled_units == 0) continue;
 
-        active_threads++;
         thread_times[t] = total;
     }
 
-    if (active_threads < 2) return false;
+    if (candidate_threads < 2) return false;
 
     double max_time = *std::max_element(thread_times.begin(), thread_times.end());
     double total_time = 0.0;
     for (double t : thread_times) {
         total_time += t;
     }
-    double avg_time = total_time / static_cast<double>(active_threads);
+    double avg_time = total_time / static_cast<double>(candidate_threads);
 
     return avg_time > 0 && (max_time / avg_time) > config_.rebalance_imbalance_threshold;
 }
 
+void TickSimulation::maybeRebalanceAfterEpoch_(uint64_t epoch_executed) {
+    cycles_since_last_rebalance_ += epoch_executed;
+    cycles_since_last_actual_rebalance_ += epoch_executed;
+    if (cycles_since_last_rebalance_ < config_.rebalance_check_interval_cycles) {
+        return;
+    }
+
+    if (observe_ctx_) {
+        observe_ctx_->setCurrentCycleValue(current_cycle_);
+    }
+
+    cycles_since_last_rebalance_ = 0;
+    bool cooldown_ok = (config_.rebalance_cooldown_cycles == 0) ||
+                       (cycles_since_last_actual_rebalance_ >= config_.rebalance_cooldown_cycles);
+    if (!cooldown_ok || !shouldRebalance_()) {
+        return;
+    }
+
+    SchedulerTimelineTrace::TimePoint rebalance_begin{};
+    if (timeline_trace_.enabled()) {
+        rebalance_begin = SchedulerTimelineTrace::Clock::now();
+    }
+    if (!performRebalance_()) {
+        return;
+    }
+
+    cycles_since_last_actual_rebalance_ = 0;
+    if (timeline_trace_.enabled()) {
+        auto rebalance_end = SchedulerTimelineTrace::Clock::now();
+        timeline_trace_.recordDuration(timeline_trace_.schedulerStream(), "scheduler",
+                                       "dynamic rebalance", current_cycle_, rebalance_begin,
+                                       rebalance_end, last_rebalance_detail_);
+    }
+}
+
 bool TickSimulation::performRebalance_() {
     if (!thread_sampling_.empty()) {
+        std::vector<double> sampled_unit_costs = unit_costs_;
+        if (sampled_unit_costs.size() < unit_ptrs_.size()) {
+            sampled_unit_costs.resize(unit_ptrs_.size(), 0.0);
+        }
+        std::vector<bool> sampled_units(unit_ptrs_.size(), false);
+        bool has_window_sample = false;
+
         for (size_t t = 0; t < thread_units_.size(); ++t) {
             const auto& state = thread_sampling_[t];
             if (state.sample_count == 0) continue;
@@ -413,21 +471,34 @@ bool TickSimulation::performRebalance_() {
                 size_t u = thread_units_[t][u_idx];
                 size_t base = u_idx * ThreadSamplingState::RING_SIZE;
                 if (base >= state.tick_times.size()) continue;
+                if (u_idx >= state.unit_sample_count.size() ||
+                    state.unit_sample_count[u_idx] == 0) {
+                    continue;
+                }
 
                 double sum = 0.0;
-                size_t count = 0;
-                size_t ring_end =
-                    std::min(base + ThreadSamplingState::RING_SIZE, state.tick_times.size());
+                size_t count =
+                    std::min(state.unit_sample_count[u_idx], ThreadSamplingState::RING_SIZE);
+                size_t ring_end = std::min(base + count, state.tick_times.size());
                 for (size_t i = base; i < ring_end; ++i) {
-                    if (state.tick_times[i] > 0) {
-                        sum += static_cast<double>(state.tick_times[i]);
-                        count++;
-                    }
+                    sum += static_cast<double>(state.tick_times[i]);
                 }
-                if (count > 0 && u < unit_costs_.size()) {
-                    unit_costs_[u] = sum / static_cast<double>(count);
+                if (count > 0 && u < sampled_unit_costs.size()) {
+                    sampled_unit_costs[u] = sum / static_cast<double>(count);
+                    sampled_units[u] = true;
+                    has_window_sample = true;
                 }
             }
+        }
+
+        if (has_window_sample) {
+            constexpr double kUnsampledCostDecay = 0.875;
+            for (size_t u = 0; u < sampled_unit_costs.size(); ++u) {
+                if (u >= sampled_units.size() || !sampled_units[u]) {
+                    sampled_unit_costs[u] *= kUnsampledCostDecay;
+                }
+            }
+            unit_costs_ = std::move(sampled_unit_costs);
         }
     }
 
@@ -486,16 +557,194 @@ bool TickSimulation::performRebalance_() {
     }
 
     auto result = runRebalanceSolver_(input);
+    auto improveFromCurrentAssignment = [&]() -> PartitionResult {
+        std::vector<size_t> assignment = old_assignment;
+        double current_max = old_max_time;
+        bool improved_any = false;
+        const size_t max_iterations = num_clusters * std::max<size_t>(1, num_threads);
+        for (size_t iter = 0; iter < max_iterations; ++iter) {
+            auto thread_costs = WeightedPartitioner::evaluatePerThread(input, assignment);
+            thread_costs.resize(num_threads, 0.0);
+            size_t heaviest = 0;
+            for (size_t t = 1; t < num_threads; ++t) {
+                if (thread_costs[t] > thread_costs[heaviest]) {
+                    heaviest = t;
+                }
+            }
+            double best_cost = current_max - 0.01;
+            size_t best_cluster = SIZE_MAX;
+            size_t best_target = SIZE_MAX;
+            for (size_t c = 0; c < num_clusters; ++c) {
+                if (assignment[c] != heaviest) continue;
+                for (size_t target = 0; target < num_threads; ++target) {
+                    if (target == heaviest) continue;
+                    auto candidate = assignment;
+                    candidate[c] = target;
+                    double candidate_cost =
+                        WeightedPartitioner::evaluatePartition(input, candidate);
+                    if (candidate_cost < best_cost) {
+                        best_cost = candidate_cost;
+                        best_cluster = c;
+                        best_target = target;
+                    }
+                }
+            }
+            if (best_cluster == SIZE_MAX) break;
+            assignment[best_cluster] = best_target;
+            current_max = best_cost;
+            improved_any = true;
+        }
+        if (!improved_any) return {};
+        return partition_utils::buildResult(input, assignment, num_threads);
+    };
+
+    PartitionResult current_seed_result = improveFromCurrentAssignment();
+    if (!current_seed_result.unit_to_thread.empty() &&
+        current_seed_result.estimated_max_thread_time_ns <
+            result.estimated_max_thread_time_ns - 0.01) {
+        result = std::move(current_seed_result);
+    }
+
+    std::vector<size_t> cluster_sample_count(num_clusters, 0);
+    std::vector<size_t> cluster_active_sample_count(num_clusters, 0);
+    for (size_t t = 0; t < thread_units_.size(); ++t) {
+        const auto& state = thread_sampling_[t];
+        for (size_t u_idx = 0; u_idx < thread_units_[t].size(); ++u_idx) {
+            size_t u = thread_units_[t][u_idx];
+            if (u >= unit_to_cluster_.size()) continue;
+            size_t cluster = unit_to_cluster_[u];
+            if (cluster >= num_clusters) continue;
+            if (u_idx >= state.unit_sample_count.size() || state.unit_sample_count[u_idx] == 0) {
+                continue;
+            }
+            size_t base = u_idx * ThreadSamplingState::RING_SIZE;
+            size_t count = std::min(state.unit_sample_count[u_idx], ThreadSamplingState::RING_SIZE);
+            size_t ring_end = std::min(base + count, state.active_samples.size());
+            cluster_sample_count[cluster] += ring_end - base;
+            for (size_t i = base; i < ring_end; ++i) {
+                cluster_active_sample_count[cluster] += state.active_samples[i] != 0 ? 1 : 0;
+            }
+        }
+    }
+
+    std::vector<size_t> old_thread_cluster_count(num_threads, 0);
+    std::vector<size_t> old_thread_single_cluster(num_threads, SIZE_MAX);
+    for (size_t c = 0; c < num_clusters; ++c) {
+        size_t thread = old_assignment[c];
+        if (thread >= num_threads) continue;
+        old_thread_cluster_count[thread]++;
+        old_thread_single_cluster[thread] = c;
+    }
+    constexpr size_t kMinSingletonSamples = 4;
+    constexpr size_t kLowActivityDenominator = 4;  // active/sample <= 25%.
+    std::vector<std::string> protected_repair_logs;
+
+    auto protectedSingletonReason = [&](size_t c) -> const char* {
+        if (c >= num_clusters) return nullptr;
+        if (clusters_.clusters[c].size() == 1) {
+            size_t u = clusters_.clusters[c].front();
+            if (u < unit_ptrs_.size() &&
+                (unit_ptrs_[u]->tickInterval() > 1 || unit_ptrs_[u]->usesActivityScheduling())) {
+                return "activity-scheduled";
+            }
+        }
+        if (cluster_sample_count[c] >= kMinSingletonSamples &&
+            cluster_active_sample_count[c] * kLowActivityDenominator <= cluster_sample_count[c]) {
+            return "low-activity";
+        }
+        return nullptr;
+    };
+
+    auto repairProtectedSingletons = [&]() {
+        bool changed = false;
+        bool changed_this_pass = true;
+        while (changed_this_pass) {
+            changed_this_pass = false;
+            std::vector<size_t> result_thread_cluster_count(num_threads, 0);
+            std::vector<size_t> result_thread_single_cluster(num_threads, SIZE_MAX);
+            for (size_t c = 0; c < num_clusters; ++c) {
+                size_t thread = result.unit_to_thread[c];
+                if (thread >= num_threads) continue;
+                result_thread_cluster_count[thread]++;
+                result_thread_single_cluster[thread] = c;
+            }
+
+            for (size_t t = 0; t < num_threads; ++t) {
+                if (result_thread_cluster_count[t] != 1) continue;
+                size_t c = result_thread_single_cluster[t];
+                if (c >= num_clusters) continue;
+                bool was_same_singleton =
+                    old_thread_cluster_count[t] == 1 && old_thread_single_cluster[t] == c;
+                if (was_same_singleton) continue;
+                const char* reason = protectedSingletonReason(c);
+                if (!reason) continue;
+                size_t best_thread = SIZE_MAX;
+                double best_cost = std::numeric_limits<double>::infinity();
+                for (size_t target = 0; target < num_threads; ++target) {
+                    if (target == t || result_thread_cluster_count[target] == 0) continue;
+                    auto candidate = result.unit_to_thread;
+                    candidate[c] = target;
+                    double candidate_cost =
+                        WeightedPartitioner::evaluatePartition(input, candidate);
+                    if (candidate_cost < best_cost) {
+                        best_cost = candidate_cost;
+                        best_thread = target;
+                    }
+                }
+                if (best_thread == SIZE_MAX) {
+                    if (observe_ctx_) {
+                        std::string names = buildUnitNameList_(clusters_.clusters[c]);
+                        observe::log_info<
+                            "Dynamic rebalance SKIPPED (would isolate {} cluster {} [{}], no "
+                            "merge target)">(observe_ctx_, reason, c, names.c_str());
+                    }
+                    return false;
+                }
+                std::ostringstream repair_log;
+                repair_log << "  Repaired protected singleton: merged " << reason << " cluster "
+                           << c << " [" << buildUnitNameList_(clusters_.clusters[c]) << "] T" << t
+                           << " -> T" << best_thread;
+                protected_repair_logs.push_back(repair_log.str());
+                result.unit_to_thread[c] = best_thread;
+                result.estimated_max_thread_time_ns = best_cost;
+                changed = true;
+                changed_this_pass = true;
+                break;
+            }
+        }
+        if (changed) {
+            result.estimated_max_thread_time_ns =
+                WeightedPartitioner::evaluatePartition(input, result.unit_to_thread);
+        }
+        return true;
+    };
+
+    if (!repairProtectedSingletons()) {
+        return false;
+    }
 
     double gain = 0.0;
     if (old_max_time > 0.0) {
         gain = (old_max_time - result.estimated_max_thread_time_ns) / old_max_time;
     }
 
+    auto new_thread_costs_for_gate =
+        WeightedPartitioner::evaluatePerThread(input, result.unit_to_thread);
+    new_thread_costs_for_gate.resize(num_threads, 0.0);
+    double balance_gain = 0.0;
+    const double old_balance_score = balanceScore(old_thread_costs);
+    if (old_balance_score > 0.0) {
+        balance_gain =
+            (old_balance_score - balanceScore(new_thread_costs_for_gate)) / old_balance_score;
+    }
+    const double logged_balance_gain = std::max(0.0, balance_gain);
+
     if (config_.rebalance_min_gain > 0.0 && gain < config_.rebalance_min_gain) {
         if (observe_ctx_) {
-            observe::log_info<"Dynamic rebalance SKIPPED (gain={}% < min_gain={}%)">(
+            observe::log_info<
+                "Dynamic rebalance SKIPPED (gain={}%, balance_gain={}%, min_gain={}%)">(
                 observe_ctx_, static_cast<uint64_t>(gain * 100),
+                static_cast<uint64_t>(logged_balance_gain * 100),
                 static_cast<uint64_t>(config_.rebalance_min_gain * 100));
         }
         return false;
@@ -503,7 +752,8 @@ bool TickSimulation::performRebalance_() {
 
     std::ostringstream rebalance_detail;
     rebalance_detail << "rebalance=" << (rebalance_count_ + 1)
-                     << " imbalance=" << result.imbalance_ratio << " predicted_gain=" << gain;
+                     << " imbalance=" << result.imbalance_ratio << " predicted_gain=" << gain
+                     << " balance_gain=" << logged_balance_gain;
     size_t migration_count = 0;
     for (size_t c = 0; c < num_clusters; ++c) {
         if (old_assignment[c] == result.unit_to_thread[c]) continue;
@@ -519,9 +769,14 @@ bool TickSimulation::performRebalance_() {
     last_rebalance_detail_ = rebalance_detail.str();
 
     if (observe_ctx_) {
-        observe::log_info<"Dynamic rebalance #{}: imbalance={}%, predicted_gain={}%">(
+        observe::log_info<
+            "Dynamic rebalance #{}: imbalance={}%, predicted_gain={}%, balance_gain={}%">(
             observe_ctx_, rebalance_count_ + 1, static_cast<uint64_t>(result.imbalance_ratio * 100),
-            static_cast<uint64_t>(gain * 100));
+            static_cast<uint64_t>(gain * 100), static_cast<uint64_t>(logged_balance_gain * 100));
+
+        for (const auto& repair_log : protected_repair_logs) {
+            observe::log_info<"{}">(observe_ctx_, repair_log.c_str());
+        }
 
         observe::log_info<"  OLD assignment:">(observe_ctx_);
         for (size_t t = 0; t < num_threads; ++t) {
@@ -560,15 +815,16 @@ bool TickSimulation::performRebalance_() {
     for (size_t t = 0; t < num_threads; ++t) {
         auto& state = thread_sampling_[t];
         state.tick_times.assign(thread_units_[t].size() * ThreadSamplingState::RING_SIZE, 0);
-        state.write_idx = 0;
+        state.active_samples.assign(thread_units_[t].size() * ThreadSamplingState::RING_SIZE, 0);
+        state.unit_write_idx.assign(thread_units_[t].size(), 0);
+        state.unit_sample_count.assign(thread_units_[t].size(), 0);
         state.sample_count = 0;
     }
 
     rebalance_count_++;
 
     if (observe_ctx_) {
-        auto new_thread_costs =
-            WeightedPartitioner::evaluatePerThread(input, result.unit_to_thread);
+        auto new_thread_costs = std::move(new_thread_costs_for_gate);
         new_thread_costs.resize(num_threads, 0.0);
 
         observe::log_info<"  NEW assignment:">(observe_ctx_);
@@ -591,15 +847,29 @@ bool TickSimulation::performRebalance_() {
     return true;
 }
 
-void TickSimulation::recordTickSample_(size_t thread_idx, size_t unit_local_idx, uint64_t ticks) {
+void TickSimulation::recordTickSample_(size_t thread_idx, size_t unit_local_idx, uint64_t ticks,
+                                       bool active) {
     if (thread_idx >= thread_sampling_.size()) return;
     auto& state = thread_sampling_[thread_idx];
+    if (unit_local_idx >= state.unit_write_idx.size()) {
+        state.unit_write_idx.resize(unit_local_idx + 1, 0);
+    }
+    if (unit_local_idx >= state.unit_sample_count.size()) {
+        state.unit_sample_count.resize(unit_local_idx + 1, 0);
+    }
+    if (state.active_samples.size() < state.tick_times.size()) {
+        state.active_samples.resize(state.tick_times.size(), 0);
+    }
     size_t slot = unit_local_idx * ThreadSamplingState::RING_SIZE +
-                  (state.write_idx % ThreadSamplingState::RING_SIZE);
+                  (state.unit_write_idx[unit_local_idx] % ThreadSamplingState::RING_SIZE);
     if (slot < state.tick_times.size()) {
         state.tick_times[slot] = ticks;
     }
-    state.write_idx++;
+    if (slot < state.active_samples.size()) {
+        state.active_samples[slot] = active ? 1 : 0;
+    }
+    state.unit_write_idx[unit_local_idx]++;
+    state.unit_sample_count[unit_local_idx]++;
     state.sample_count++;
 }
 

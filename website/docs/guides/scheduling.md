@@ -416,10 +416,11 @@ These settings can be configured via YAML (`enable_parallel`, `enable_lookahead`
 Dynamic rebalance is opt-in. It samples unit tick cost periodically, computes
 per-stream total sampled work, and migrates whole tight clusters at epoch
 boundaries when the heaviest stream is more than
-`rebalance_imbalance_threshold` above the active-stream average. Set
-`enable_dynamic_rebalance: true` when runtime migration is more important than
-dependency/lookahead-paced epoch-free execution; doing so vetoes the epoch-free
-path and keeps the explicit epoch boundary driver.
+`rebalance_imbalance_threshold` above the assigned-stream average. Leave
+`enable_dynamic_rebalance: false` when a fixed initial layout or
+dependency/lookahead-paced epoch-free execution is more important; dynamic
+rebalance vetoes the epoch-free path and keeps the explicit epoch boundary
+driver.
 `rebalance_min_gain` can suppress migrations with too little predicted speedup,
 and `rebalance_cooldown_cycles` can enforce a minimum cycle gap between applied
 rebalances.

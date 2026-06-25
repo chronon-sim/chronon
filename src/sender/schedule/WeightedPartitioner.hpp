@@ -45,6 +45,7 @@ public:
 
         pairwiseSwap_(input, assignment, num_threads);
         multiUnitRelocate_(input, assignment, num_threads);
+        balanceUnderutilizedThreads_(input, assignment, num_threads);
 
         return partition_utils::buildResult(input, assignment, num_threads);
     }
@@ -268,6 +269,93 @@ private:
                 partition_utils::computeThreadTimes(input, assignment, thread_times);
                 improved = true;
             }
+        }
+    }
+
+    static double balanceScore_(const std::vector<double>& thread_times) {
+        double score = 0.0;
+        for (double time : thread_times) {
+            score += time * time;
+        }
+        return score;
+    }
+
+    static bool moveWouldSplitZeroDelay_(const PartitionInput& input,
+                                         const std::vector<size_t>& assignment, size_t unit_idx,
+                                         size_t to_thread) {
+        for (const auto& edge : input.adjacency[unit_idx]) {
+            if (edge.min_delay == 0 && assignment[edge.neighbor] != to_thread) {
+                return true;
+            }
+        }
+        for (size_t u = 0; u < input.num_units; ++u) {
+            if (u == unit_idx) continue;
+            for (const auto& edge : input.adjacency[u]) {
+                if (edge.neighbor == unit_idx && edge.min_delay == 0 &&
+                    assignment[u] != to_thread) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Phase 5: secondary balance. When a dominant unsplittable unit fixes the
+    /// max thread time, the min-max objective can leave other streams nearly
+    /// empty. Move positive-cost work to lighter threads only when the max cost
+    /// does not increase and the all-thread balance score improves.
+    static void balanceUnderutilizedThreads_(const PartitionInput& input,
+                                             std::vector<size_t>& assignment, size_t num_threads) {
+        if (num_threads < 2) return;
+
+        std::vector<double> thread_times(num_threads, 0.0);
+        partition_utils::computeThreadTimes(input, assignment, thread_times);
+
+        const size_t max_iterations = input.num_units * num_threads;
+        for (size_t iter = 0; iter < max_iterations; ++iter) {
+            bool improved = false;
+            const double current_max = *std::max_element(thread_times.begin(), thread_times.end());
+            const double current_score = balanceScore_(thread_times);
+
+            double best_score = current_score;
+            size_t best_unit = SIZE_MAX;
+            size_t best_target = SIZE_MAX;
+            std::vector<double> best_times;
+
+            for (size_t u = 0; u < input.num_units; ++u) {
+                const size_t from_thread = assignment[u];
+                if (input.unit_cost_ns[u] <= 0.0) continue;
+
+                for (size_t target = 0; target < num_threads; ++target) {
+                    if (target == from_thread) continue;
+                    if (thread_times[target] >= thread_times[from_thread]) continue;
+                    if (moveWouldSplitZeroDelay_(input, assignment, u, target)) continue;
+
+                    assignment[u] = target;
+                    std::vector<double> new_times(num_threads, 0.0);
+                    partition_utils::computeThreadTimes(input, assignment, new_times);
+                    assignment[u] = from_thread;
+
+                    const double new_max = *std::max_element(new_times.begin(), new_times.end());
+                    if (new_max > current_max + 0.01) continue;
+
+                    const double new_score = balanceScore_(new_times);
+                    if (new_score < best_score - 0.01) {
+                        best_score = new_score;
+                        best_unit = u;
+                        best_target = target;
+                        best_times = std::move(new_times);
+                    }
+                }
+            }
+
+            if (best_unit != SIZE_MAX) {
+                assignment[best_unit] = best_target;
+                thread_times = std::move(best_times);
+                improved = true;
+            }
+
+            if (!improved) break;
         }
     }
 };
