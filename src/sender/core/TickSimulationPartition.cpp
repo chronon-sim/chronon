@@ -556,6 +556,54 @@ bool TickSimulation::performRebalance_() {
     }
 
     auto result = runRebalanceSolver_(input);
+    auto improveFromCurrentAssignment = [&]() -> PartitionResult {
+        std::vector<size_t> assignment = old_assignment;
+        double current_max = old_max_time;
+        bool improved_any = false;
+        const size_t max_iterations = num_clusters * std::max<size_t>(1, num_threads);
+        for (size_t iter = 0; iter < max_iterations; ++iter) {
+            auto thread_costs = WeightedPartitioner::evaluatePerThread(input, assignment);
+            thread_costs.resize(num_threads, 0.0);
+            size_t heaviest = 0;
+            for (size_t t = 1; t < num_threads; ++t) {
+                if (thread_costs[t] > thread_costs[heaviest]) {
+                    heaviest = t;
+                }
+            }
+
+            double best_cost = current_max - 0.01;
+            size_t best_cluster = SIZE_MAX;
+            size_t best_target = SIZE_MAX;
+            for (size_t c = 0; c < num_clusters; ++c) {
+                if (assignment[c] != heaviest) continue;
+                for (size_t target = 0; target < num_threads; ++target) {
+                    if (target == heaviest) continue;
+                    auto candidate = assignment;
+                    candidate[c] = target;
+                    double candidate_cost =
+                        WeightedPartitioner::evaluatePartition(input, candidate);
+                    if (candidate_cost < best_cost) {
+                        best_cost = candidate_cost;
+                        best_cluster = c;
+                        best_target = target;
+                    }
+                }
+            }
+            if (best_cluster == SIZE_MAX) break;
+            assignment[best_cluster] = best_target;
+            current_max = best_cost;
+            improved_any = true;
+        }
+        if (!improved_any) return {};
+        return partition_utils::buildResult(input, assignment, num_threads);
+    };
+
+    PartitionResult current_seed_result = improveFromCurrentAssignment();
+    if (!current_seed_result.unit_to_thread.empty() &&
+        current_seed_result.estimated_max_thread_time_ns <
+            result.estimated_max_thread_time_ns - 0.01) {
+        result = std::move(current_seed_result);
+    }
 
     std::vector<size_t> cluster_sample_count(num_clusters, 0);
     std::vector<size_t> cluster_active_sample_count(num_clusters, 0);
