@@ -412,6 +412,30 @@ void test_simulation_parallel_termination() {
     std::cout << "PASSED\n";
 }
 
+void test_parallel_barrier_termination_respects_epoch_chunks() {
+    std::cout << "Testing parallel barrier termination chunking... ";
+
+    TickSimulationConfig config;
+    config.enable_parallel = true;
+    config.enable_lookahead = false;
+    config.num_threads = 2;
+    config.epoch_size = 8;
+
+    TickSimulation sim(config);
+    [[maybe_unused]] auto* counter = sim.createUnit<CountingUnit>("counter", 3);
+    sim.createUnit<InfiniteUnit>("infinite");
+
+    [[maybe_unused]] uint64_t executed = sim.runUntilTermination(100000);
+
+    assert(sim.wasTerminationRequested());
+    assert(sim.terminationRequest().reason == TerminationReason::Completed);
+    assert(counter->count() >= 3);
+    assert(counter->count() <= config.epoch_size);
+    assert(executed <= config.epoch_size);
+
+    std::cout << "PASSED\n";
+}
+
 void test_stop_token_reflects_termination() {
     std::cout << "Testing stop_token reflects termination... ";
 
@@ -535,6 +559,7 @@ int main() {
     test_simulation_reset_termination();
     test_simulation_multiple_units_first_wins();
     test_simulation_parallel_termination();
+    test_parallel_barrier_termination_respects_epoch_chunks();
 
     std::cout << "\n";
 

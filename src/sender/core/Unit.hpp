@@ -12,11 +12,14 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -83,6 +86,113 @@ public:
     /// TickSimulation::unit_progress_ atomics, not this counter.
     uint64_t localCycle() const noexcept { return local_cycle_; }
 
+    static constexpr uint64_t NEVER_ACTIVE = std::numeric_limits<uint64_t>::max();
+
+    /// Opt in to scheduler-controlled activity before the first tick.
+    ///
+    /// Units that may sleep after their first poll but need future port arrivals
+    /// sent earlier in the same cycle to wake them should call this from their
+    /// constructor. sleepUntil(), sleepForever(), and setTickInterval(N > 1)
+    /// enable it automatically once they are used.
+    void enableActivityScheduling() noexcept {
+        activity_scheduling_enabled_ = true;
+        port_wake_enabled_.store(true, std::memory_order_release);
+        wake_tracking_enabled_.store(true, std::memory_order_release);
+        setNextActiveCycleMin_(local_cycle_);
+    }
+
+    /// Request that the unit's tick body next runs no earlier than @p cycle.
+    /// This is expressed in the global simulation cycle domain.
+    void sleepUntil(uint64_t cycle) noexcept {
+        enableActivityScheduling_();
+        wake_tracking_enabled_.store(true, std::memory_order_release);
+        activity_control_used_.store(true, std::memory_order_relaxed);
+        setSleepTarget_(cycle);
+    }
+
+    /// Disable the tick body until an external wakeAt() or port arrival wakes it.
+    void sleepForever() noexcept {
+        enableActivityScheduling_();
+        wake_tracking_enabled_.store(true, std::memory_order_release);
+        activity_control_used_.store(true, std::memory_order_relaxed);
+        setSleepTarget_(NEVER_ACTIVE);
+    }
+
+    /// Wake the unit no later than @p cycle. Safe for cross-thread producers.
+    void wakeAt(uint64_t cycle) noexcept {
+        std::lock_guard lock(pending_wake_mutex_);
+        pending_wake_cycles_.insert(cycle);
+        setNextActiveCycleMin_(cycle);
+    }
+
+    uint64_t nextActiveCycle() const noexcept {
+        return next_active_cycle_.load(std::memory_order_acquire);
+    }
+
+    bool acceptsPortWakeups() const noexcept {
+        return port_wake_enabled_.load(std::memory_order_acquire);
+    }
+
+    bool usesActivityScheduling() const noexcept { return activity_scheduling_enabled_; }
+
+    void setTickInterval(uint32_t interval) noexcept {
+        const uint32_t normalized = interval == 0 ? 1 : interval;
+        tick_interval_.store(normalized, std::memory_order_release);
+        if (normalized > 1) {
+            // Only a sleepUntil()/sleepForever() target should defer interval
+            // ticking. An explicit future wakeAt() lowers next_active_cycle_
+            // too, but it is an additional wake hint and must not suppress the
+            // normal interval cadence.
+            const bool has_sleep_target = activity_control_used_.load(std::memory_order_relaxed);
+            wake_tracking_enabled_.store(true, std::memory_order_release);
+            enableActivityScheduling_();
+            if (!has_sleep_target) {
+                setNextActiveCycleMin_(local_cycle_);
+            }
+        }
+    }
+
+    uint32_t tickInterval() const noexcept {
+        return tick_interval_.load(std::memory_order_acquire);
+    }
+
+    bool shouldRunTickAt(uint64_t cycle) const noexcept {
+        if (!activity_scheduling_enabled_) {
+            return true;
+        }
+        const uint64_t next = next_active_cycle_.load(std::memory_order_acquire);
+        if (cycle < next) {
+            return false;
+        }
+        const uint32_t interval = tick_interval_.load(std::memory_order_acquire);
+        return interval <= 1 || (cycle % interval) == 0;
+    }
+
+    uint64_t nextRunnableCycleAtOrAfter(uint64_t cycle) const noexcept {
+        if (!activity_scheduling_enabled_) {
+            return cycle;
+        }
+        uint64_t base = std::max(cycle, next_active_cycle_.load(std::memory_order_acquire));
+        if (base == NEVER_ACTIVE) {
+            return NEVER_ACTIVE;
+        }
+
+        const uint32_t interval = tick_interval_.load(std::memory_order_acquire);
+        if (interval <= 1) {
+            return base;
+        }
+
+        uint64_t rem = base % interval;
+        if (rem == 0) {
+            return base;
+        }
+        uint64_t delta = interval - rem;
+        if (base > NEVER_ACTIVE - delta) {
+            return NEVER_ACTIVE;
+        }
+        return base + delta;
+    }
+
     /// Default mode. Eliminates atomic overhead (~80% of tight-loop time).
     void useFastCycleCounter() noexcept { use_atomic_cycle_ = false; }
 
@@ -138,7 +248,80 @@ protected:
         return local_cycle_atomic_.load(std::memory_order_acquire);
     }
 
+    void beginActiveTick_() noexcept {
+        if (!activity_scheduling_enabled_) {
+            return;
+        }
+        activity_control_used_.store(false, std::memory_order_relaxed);
+        consumeCyclesThrough_(next_active_cycle_, local_cycle_);
+        if (wake_tracking_enabled_.load(std::memory_order_relaxed)) {
+            consumePendingWakesThrough_(local_cycle_);
+        }
+    }
+
+    void finishActiveTick_() noexcept {
+        if (!activity_scheduling_enabled_) {
+            return;
+        }
+        if (!activity_control_used_.load(std::memory_order_relaxed)) {
+            setNextActiveCycleMin_(local_cycle_ + 1);
+        }
+    }
+
 private:
+    void enableActivityScheduling_() noexcept {
+        activity_scheduling_enabled_ = true;
+        port_wake_enabled_.store(true, std::memory_order_release);
+    }
+
+    void setSleepTarget_(uint64_t cycle) noexcept {
+        std::lock_guard lock(pending_wake_mutex_);
+        uint64_t target = std::min(cycle, earliestPendingWakeLocked_());
+        target = std::min(target, earliestPortArrival_());
+        next_active_cycle_.store(target, std::memory_order_release);
+    }
+
+    void setNextActiveCycleMin_(uint64_t cycle) noexcept {
+        setCycleMin_(next_active_cycle_, cycle);
+    }
+
+    static void setCycleMin_(std::atomic<uint64_t>& value, uint64_t cycle) noexcept {
+        uint64_t current = value.load(std::memory_order_relaxed);
+        while (cycle < current &&
+               !value.compare_exchange_weak(current, cycle, std::memory_order_release,
+                                            std::memory_order_relaxed)) {
+        }
+    }
+
+    static void consumeCyclesThrough_(std::atomic<uint64_t>& value, uint64_t cycle) noexcept {
+        uint64_t current = value.load(std::memory_order_relaxed);
+        while (current <= cycle &&
+               !value.compare_exchange_weak(current, NEVER_ACTIVE, std::memory_order_release,
+                                            std::memory_order_relaxed)) {
+        }
+    }
+
+    uint64_t earliestPendingWakeLocked_() const noexcept {
+        return pending_wake_cycles_.empty() ? NEVER_ACTIVE : *pending_wake_cycles_.begin();
+    }
+
+    uint64_t earliestPortArrival_() const {
+        uint64_t earliest = NEVER_ACTIVE;
+        for (const auto* port : ports_) {
+            if (auto arrival = port->minArrivalCycle()) {
+                earliest = std::min(earliest, *arrival);
+            }
+        }
+        return earliest;
+    }
+
+    void consumePendingWakesThrough_(uint64_t cycle) noexcept {
+        std::lock_guard lock(pending_wake_mutex_);
+        while (!pending_wake_cycles_.empty() && *pending_wake_cycles_.begin() <= cycle) {
+            pending_wake_cycles_.erase(pending_wake_cycles_.begin());
+        }
+    }
+
     void registerAllPendingPorts() {
         std::string prefix = fullPath();
         for (auto& reg : pending_port_registrations_) {
@@ -154,6 +337,14 @@ private:
     uint64_t local_cycle_ = 0;
     std::atomic<uint64_t> local_cycle_atomic_{0};  ///< mirror used only when use_atomic_cycle_
     bool use_atomic_cycle_ = false;
+    std::atomic<uint64_t> next_active_cycle_{NEVER_ACTIVE};
+    std::mutex pending_wake_mutex_;
+    std::multiset<uint64_t> pending_wake_cycles_;
+    std::atomic<uint32_t> tick_interval_{1};
+    std::atomic<bool> activity_control_used_{false};
+    bool activity_scheduling_enabled_ = false;
+    std::atomic<bool> port_wake_enabled_{false};
+    std::atomic<bool> wake_tracking_enabled_{false};
     uint32_t id_;
     std::vector<PortBase*> ports_;
     tree::TreeNode* tree_node_ = nullptr;
@@ -207,6 +398,12 @@ inline void addPortRegistrationToUnit(Unit* unit,
 inline void recordPortOnOwnerUnit(Unit* unit, PortBase* port) {
     if (unit && port) {
         unit->registerPort(port);
+    }
+}
+
+inline void wakeUnitAt(Unit* unit, uint64_t cycle) {
+    if (unit && unit->acceptsPortWakeups()) {
+        unit->wakeAt(cycle);
     }
 }
 

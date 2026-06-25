@@ -442,7 +442,7 @@ public:
         last_arbitrated_cycle_.store(s, std::memory_order_relaxed);
     }
 
-    bool hasMPSCConnections() const noexcept { return !mpsc_connections_.empty(); }
+    bool hasMPSCConnections() const noexcept override { return !mpsc_connections_.empty(); }
 
     /**
      * Install the set of `completed_cycle` atomics for the predecessor
@@ -553,8 +553,18 @@ public:
     /// True if messages are ready at the owning Unit's current local cycle.
     bool hasMessages() const { return hasData(getCurrentCycle()); }
 
-    /// Earliest arrival cycle of pending messages, used for lookahead.
-    std::optional<uint64_t> minArrivalCycle() const { return queue_->minArrivalCycle(); }
+    /// Earliest arrival cycle of pending or staged messages, used for lookahead.
+    std::optional<uint64_t> minArrivalCycle() const override {
+        std::optional<uint64_t> earliest = queue_->minArrivalCycle();
+        for (const auto* conn : mpsc_connections_) {
+            if (auto staged = conn->minStagedArrivalCycle()) {
+                if (!earliest || *staged < *earliest) {
+                    earliest = staged;
+                }
+            }
+        }
+        return earliest;
+    }
 
     size_t queuedMessageCount() const { return queue_->size(); }
 

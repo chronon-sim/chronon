@@ -160,6 +160,9 @@ private:
             if (!unit) {
                 throw BuildError("CONFIGURING", "Factory returned null for unit '" + name + "'");
             }
+            if (unit_config.has_tick_interval) {
+                unit->setTickInterval(unit_config.tick_interval);
+            }
 
             auto unit_node = std::make_unique<tree::TreeNode>(name, result.root_node.get());
             tree::TreeNode* unit_node_ptr = unit_node.get();

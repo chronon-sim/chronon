@@ -545,6 +545,15 @@ private:
             unit_config.params_yaml = unit_node["params"];
         }
 
+        if (unit_node["tick_interval"]) {
+            unit_config.tick_interval = unit_node["tick_interval"].as<uint32_t>();
+            unit_config.has_tick_interval = true;
+            if (unit_config.tick_interval == 0) {
+                throw ConfigLoadError(source,
+                                      "Unit '" + unit_name + "' tick_interval must be >= 1");
+            }
+        }
+
         if (!config.hasUnit(unit_name)) {
             config.unit_order.push_back(unit_name);
         }

@@ -81,6 +81,45 @@ private:
     uint32_t work_;
 };
 
+class TerminatorNode : public TickableUnit {
+public:
+    explicit TerminatorNode(uint64_t stop_cycle)
+        : TickableUnit("terminator"), stop_cycle_(stop_cycle) {}
+
+    void tick() override {
+        if (localCycle() >= stop_cycle_) {
+            requestTermination(TerminationReason::Completed, 0, "done");
+        }
+    }
+
+private:
+    uint64_t stop_cycle_;
+};
+
+class LaggingUnit : public TickableUnit {
+public:
+    explicit LaggingUnit(uint32_t work) : TickableUnit("lagging"), work_(work) {}
+
+    void tick() override {
+        uint64_t v = localCycle() + 1;
+        for (uint32_t i = 0; i < work_; ++i) {
+            v = v * 6364136223846793005ULL + 1442695040888963407ULL;
+        }
+        sink_ ^= v;
+    }
+
+private:
+    uint32_t work_;
+    uint64_t sink_ = 0;
+};
+
+class EmptyUnit : public TickableUnit {
+public:
+    explicit EmptyUnit(std::string name) : TickableUnit(std::move(name)) {}
+
+    void tick() override {}
+};
+
 struct RunResult {
     uint64_t checksum;
     uint64_t epoch_free_runs;
@@ -89,15 +128,18 @@ struct RunResult {
 // A and B fan in to C with delays (dA, dB); C -> D -> {A, B} closes a feedback
 // loop so producer rates are coupled.
 RunResult runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, bool epoch_free,
-                  uint32_t max_lookahead, uint64_t cycles, size_t out_rate = 1) {
+                  uint32_t max_lookahead, uint64_t cycles, size_t out_rate = 1,
+                  bool scheduler_timeline = false, bool dynamic_rebalance = false) {
     TickSimulationConfig cfg;
     cfg.num_threads = num_threads;
     cfg.enable_parallel = (num_threads > 1);
     cfg.enable_lookahead = lookahead;
-    cfg.enable_dynamic_rebalance = false;  // required for the persistent path
+    cfg.enable_dynamic_rebalance = dynamic_rebalance;
     cfg.enable_epoch_free_lookahead = epoch_free;
     cfg.max_lookahead_cycles = max_lookahead;
     cfg.epoch_size = 64;
+    cfg.timeline_trace.enabled = scheduler_timeline;
+    cfg.timeline_trace.end_cycle = cycles;
 
     TickSimulation sim(cfg);
     constexpr uint32_t kWork = 1500;  // spread the 4 units across workers
@@ -113,6 +155,121 @@ RunResult runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, 
     sim.initialize();
     sim.run(cycles);
     return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount()};
+}
+
+void verify_scheduler_timeline_does_not_veto_epoch_free(uint64_t cycles, unsigned hw) {
+    if (hw < 2) return;
+    const uint64_t ref = runOnce(2, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
+                                 /*max_lookahead=*/100, cycles)
+                             .checksum;
+
+    RunResult traced = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                               /*max_lookahead=*/64, cycles, /*out_rate=*/1,
+                               /*scheduler_timeline=*/true);
+    check(traced.checksum == ref, "scheduler timeline epoch-free == ref");
+    check(traced.epoch_free_runs > 0, "scheduler timeline does not veto epoch-free");
+}
+
+void verify_run_until_termination_uses_epoch_free(unsigned hw) {
+    if (hw < 2) return;
+    TickSimulationConfig cfg;
+    cfg.num_threads = 2;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_dynamic_rebalance = false;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.max_lookahead_cycles = 64;
+    cfg.timeline_trace.enabled = true;
+    cfg.timeline_trace.end_cycle = 256;
+
+    TickSimulation sim(cfg);
+    sim.createUnit<TerminatorNode>(100);
+    constexpr uint32_t kWork = 1500;
+    auto* A = sim.createUnit<Node>("A", 11, kWork);
+    auto* B = sim.createUnit<Node>("B", 22, kWork);
+    auto* C = sim.createUnit<Node>("C", 33, kWork);
+    auto* D = sim.createUnit<Node>("D", 44, kWork);
+    sim.connect(A->out, B->in, 1);
+    sim.connect(B->out, C->in, 1);
+    sim.connect(C->out, D->in, 1);
+    sim.connect(D->out, A->in, 1);
+    sim.initialize();
+
+    uint64_t executed = sim.runUntilTermination(1000);
+    check(sim.wasTerminationRequested(), "runUntilTermination receives unit termination");
+    check(executed < 1000, "runUntilTermination stops before max cycles");
+    check(sim.epochFreeRunCount() > 0, "runUntilTermination uses epoch-free with timeline");
+}
+
+void verify_run_until_termination_default_max_after_warmup(unsigned hw) {
+    if (hw < 2) return;
+    TickSimulationConfig cfg;
+    cfg.num_threads = 2;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_dynamic_rebalance = false;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.max_lookahead_cycles = 64;
+    cfg.epoch_size = 16;
+
+    TickSimulation sim(cfg);
+    sim.createUnit<TerminatorNode>(20);
+    constexpr uint32_t kWork = 1500;
+    auto* A = sim.createUnit<Node>("A", 11, kWork);
+    auto* B = sim.createUnit<Node>("B", 22, kWork);
+    auto* C = sim.createUnit<Node>("C", 33, kWork);
+    auto* D = sim.createUnit<Node>("D", 44, kWork);
+    sim.connect(A->out, B->in, 1);
+    sim.connect(B->out, C->in, 1);
+    sim.connect(C->out, D->in, 1);
+    sim.connect(D->out, A->in, 1);
+    sim.initialize();
+
+    sim.run(10);
+    const uint64_t warm_cycle = sim.currentCycle();
+    const uint64_t warm_epoch_free_runs = sim.epochFreeRunCount();
+    uint64_t executed = sim.runUntilTermination();
+
+    check(executed > 0, "default-max runUntilTermination advances after warmup");
+    check(executed < 1000, "default-max runUntilTermination stops at unit termination");
+    check(sim.currentCycle() > warm_cycle, "default-max runUntilTermination updates current cycle");
+    check(sim.wasTerminationRequested(), "default-max runUntilTermination receives termination");
+    check(sim.epochFreeRunCount() > warm_epoch_free_runs,
+          "default-max runUntilTermination uses epoch-free after warmup");
+}
+
+void verify_run_until_termination_accounts_nonzero_worker(unsigned hw) {
+    if (hw < 2) return;
+    TickSimulationConfig cfg;
+    cfg.num_threads = 2;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_weighted_partitioning = false;
+    cfg.enable_dynamic_rebalance = false;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.max_lookahead_cycles = 64;
+    cfg.epoch_size = 16;
+
+    TickSimulation sim(cfg);
+    auto* lagging = sim.createUnit<LaggingUnit>(200000);
+    auto* terminator = sim.createUnit<TerminatorNode>(100);
+    sim.createUnit<EmptyUnit>("empty0");
+    sim.createUnit<EmptyUnit>("empty1");
+    sim.createUnit<EmptyUnit>("empty2");
+    sim.createUnit<EmptyUnit>("empty3");
+    sim.initialize();
+
+    check(sim.assignedThread(lagging) != sim.assignedThread(terminator),
+          "termination regression places lagging and terminating units on different streams");
+
+    const uint64_t executed = sim.runUntilTermination(1000);
+
+    check(sim.wasTerminationRequested(), "nonzero-worker termination requested");
+    const auto& request = sim.terminationRequest();
+    const uint64_t covered_cycle = request.cycle + 1;
+    check(sim.epochFreeRunCount() > 0, "nonzero-worker termination uses epoch-free");
+    check(executed >= covered_cycle, "epoch-free return covers nonzero-worker stop cycle");
+    check(sim.currentCycle() >= covered_cycle, "currentCycle covers nonzero-worker stop cycle");
 }
 
 void verify(uint32_t dA, uint32_t dB, uint64_t cycles, unsigned hw) {
@@ -225,6 +382,19 @@ void verify_spsc_gate(uint64_t cycles, unsigned hw) {
     check(veto.epoch_free_runs == 0, "spsc-gate vetoes epoch-free past SPSC ring");
 }
 
+void verify_dynamic_rebalance_vetoes_epoch_free(uint64_t cycles, unsigned hw) {
+    if (hw < 2) return;
+    const uint64_t ref = runOnce(2, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
+                                 /*max_lookahead=*/100, cycles)
+                             .checksum;
+
+    RunResult dynamic = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                                /*max_lookahead=*/64, cycles, /*out_rate=*/1,
+                                /*scheduler_timeline=*/false, /*dynamic_rebalance=*/true);
+    check(dynamic.checksum == ref, "dynamic-rebalance veto epoch-free == ref");
+    check(dynamic.epoch_free_runs == 0, "dynamic rebalance vetoes epoch-free");
+}
+
 }  // namespace
 
 int main() {
@@ -242,6 +412,11 @@ int main() {
 
     verify_staging_veto(cycles, hw);
     verify_spsc_gate(cycles, hw);
+    verify_dynamic_rebalance_vetoes_epoch_free(cycles, hw);
+    verify_scheduler_timeline_does_not_veto_epoch_free(cycles, hw);
+    verify_run_until_termination_uses_epoch_free(hw);
+    verify_run_until_termination_default_max_after_warmup(hw);
+    verify_run_until_termination_accounts_nonzero_worker(hw);
 
     std::cout << "\n=== Results: " << g_pass << " passed, " << g_fail << " failed ===\n";
     return g_fail == 0 ? 0 : 1;

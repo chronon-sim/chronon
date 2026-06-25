@@ -229,11 +229,11 @@ YAML and CLI equivalents:
 simulation:
   epoch_size: 1024
   max_lookahead_cycles: 256              # uint32_t
-  enable_epoch_free_lookahead: false     # Opt-in: drop the per-epoch barrier
+  enable_epoch_free_lookahead: true      # Drop the per-epoch barrier when safe
   enable_weighted_partitioning: true     # Cost-aware thread assignment (default)
   profiling_warmup_cycles: 512           # Warmup ticks before measuring
   profiling_measurement_cycles: 1024     # Measurement window for tick costs
-  enable_dynamic_rebalance: true         # Runtime cluster migration (default)
+  enable_dynamic_rebalance: false        # Runtime cluster migration (opt-in)
   rebalance_check_interval_cycles: 8192  # Epoch-boundary imbalance checks
   rebalance_min_gain: 0.05               # Skip if predicted gain is too small
   rebalance_cooldown_cycles: 0           # Minimum cycles between rebalances
@@ -250,12 +250,12 @@ frequent migrations.
 ./examples/cpu_pipeline_yaml_example config.yaml --epoch-size=1024
 ```
 
-For imbalanced, high-worker-count topologies where the per-epoch barrier's
-straggler wait dominates, `enable_epoch_free_lookahead` (default off) removes the
-barrier entirely instead of just widening it — run-ahead is then bounded only by
-`max_lookahead_cycles`. It is an opt-in A/B knob (neutral or slightly negative on
-balanced or chain-like workloads) and engages only when the staging-capacity gate
-is satisfied; see [Epoch-Free Lookahead](scheduling.md) for the conditions and the
+When the staging-capacity gate is satisfied, `enable_epoch_free_lookahead`
+(default on) removes the per-epoch barrier entirely instead of just widening it:
+run-ahead is then bounded only by dependency progress and
+`max_lookahead_cycles`. If the gate rejects the topology, Chronon falls back to
+the per-epoch path, where dynamic rebalance can still operate at epoch
+boundaries; see [Epoch-Free Lookahead](scheduling.md) for the conditions and the
 MPSC headroom requirement.
 
 Notes:

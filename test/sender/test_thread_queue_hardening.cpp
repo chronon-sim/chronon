@@ -80,6 +80,15 @@ public:
     void setCycle(uint64_t cycle) { setLocalCycle(cycle); }
 };
 
+class IdleMPSCReceiverUnit : public TickableUnit {
+public:
+    explicit IdleMPSCReceiverUnit(std::string name) : TickableUnit(std::move(name)) {}
+
+    InPort<int> in{this, "in", 8};
+
+    void tick() override {}
+};
+
 void require(bool condition, const char* message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -173,6 +182,36 @@ void test_mpsc_staging_tracks_large_user_capacity() {
     }
     require(received == kUserCapacity,
             "downstream MPSC queue did not admit all same-cycle entries");
+
+    std::cout << "PASSED\n";
+}
+
+void test_idle_advance_drains_mpsc_staging() {
+    std::cout << "Testing idle advance drains MPSC staging... ";
+
+    ManualUnit prod("prod");
+    IdleMPSCReceiverUnit cons("cons");
+
+    OutPort<int> out{&prod, "out"};
+    auto* conn = out.connect(&cons.in, 1);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    prod.setCycle(0);
+    require(out.send(42), "MPSC send failed before idle drain");
+    require(cons.in.queuedMessageCount() == 0, "message bypassed MPSC staging unexpectedly");
+
+    cons.advanceIdleTick(3);
+
+    require(cons.localCycle() == 3, "idle advance did not update receiver cycle");
+    require(cons.in.queuedMessageCount() == 1, "idle advance did not drain MPSC staging");
+    auto value = cons.in.tryReceive(3);
+    require(value.has_value(), "drained MPSC message was not visible after idle advance");
+    require(*value == 42, "drained MPSC message payload changed");
 
     std::cout << "PASSED\n";
 }
@@ -283,6 +322,7 @@ int main() {
 
     test_tick_simulation_mpsc_delivery();
     test_mpsc_staging_tracks_large_user_capacity();
+    test_idle_advance_drains_mpsc_staging();
     test_lockfree_backpressure_contract();
     test_small_non_tight_graph_parallel_fallback();
 

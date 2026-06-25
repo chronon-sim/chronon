@@ -25,8 +25,10 @@ namespace chronon::sender::config {
 /** @brief Parsed YAML config for one unit instance — type, name, and raw params. */
 struct UnitConfig {
     std::string instance_name;
-    std::string type_name;   ///< Factory type name, e.g. "FetchUnit".
-    YAML::Node params_yaml;  ///< Raw YAML node for parameter deserialization.
+    std::string type_name;       ///< Factory type name, e.g. "FetchUnit".
+    YAML::Node params_yaml;      ///< Raw YAML node for parameter deserialization.
+    uint32_t tick_interval = 1;  ///< Execute tick() only on global cycles divisible by this.
+    bool has_tick_interval = false;
 
     bool isValid() const { return !instance_name.empty() && !type_name.empty(); }
 };
@@ -66,14 +68,14 @@ struct SimulationYAMLConfig {
     bool enable_lookahead = true;
     bool trace_execution = false;  ///< Print execution policy details.
     uint32_t max_lookahead_cycles = 100;
-    uint64_t epoch_size = 64;                  ///< Synchronization period in cycles.
-    bool enable_epoch_free_lookahead = false;  ///< Drop the per-epoch barrier (A/B knob).
-    uint64_t run_cycles = 0;                   ///< 0 = run until completion.
+    uint64_t epoch_size = 64;                 ///< Synchronization period in cycles.
+    bool enable_epoch_free_lookahead = true;  ///< Drop the per-epoch barrier when safe.
+    uint64_t run_cycles = 0;                  ///< 0 = run until completion.
     std::string name = "simulation";
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< Default 1 GHz.
 
     bool enable_weighted_partitioning = true;
-    bool enable_dynamic_rebalance = true;
+    bool enable_dynamic_rebalance = false;
     double rebalance_imbalance_threshold = 1.3;
     uint64_t rebalance_check_interval_cycles = 8192;
     double rebalance_min_gain = 0.05;

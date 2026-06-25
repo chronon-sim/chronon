@@ -133,7 +133,7 @@ simulation:
   num_workers: 4
   enable_parallel: true    # Enable parallel execution (requires num_workers > 1)
   enable_lookahead: true   # Enable lookahead scheduling for parallel epochs
-  enable_epoch_free_lookahead: false  # Opt-in: drop the per-epoch barrier (see Scheduling guide)
+  enable_epoch_free_lookahead: true   # Drop the per-epoch barrier when safe
   run_cycles: 1000000
 
   unit:
@@ -150,7 +150,21 @@ simulation:
       type: DecodeUnit
       params:
         decode_width: 4
+
+    uart:
+      type: UART
+      tick_interval: 1000  # Optional: run tick() only on every 1000th global cycle
+      params:
+        poll_interval: 1
 ```
+
+`tick_interval` is a unit-level scheduler hint, not a constructor parameter. It
+defaults to `1`. Off-edge cycles skip the unit's `tick()` body but still advance
+the unit's local cycle and scheduler progress. Port arrivals and explicit
+`wakeAt()` calls can make a sleeping unit active again; the tick body still runs
+only on an allowed interval edge. Applying `tick_interval` from YAML preserves
+any constructor-established `sleepUntil()` or `sleepForever()` target; it only
+seeds cycle 0 activity when the unit has not already deferred itself.
 
 ### Observation Configuration
 
@@ -233,7 +247,8 @@ with a warning. Categories still control enable/disable and temporal filters.
 ### Scheduler Timeline Trace
 
 The scheduler timeline records Chronon scheduler streams, unit tick slices,
-cross-thread spin waits, epoch spans, and MPSC arbitration slices. It is part
+lazy idle fast-path slices, cross-thread spin waits, epoch spans, and MPSC
+arbitration slices. It is part
 of the unified Perfetto timeline: when the observation backend runs with a
 timeline sink, the scheduler slices merge into `timeline.pftrace` under a
 "Chronon Scheduler" process group, with one lane per worker stream (`stream 0`,

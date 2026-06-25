@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -27,6 +28,7 @@ template <typename T>
 class OutPort;
 class Unit;
 class IArbitratablePort;
+void wakeUnitAt(Unit* unit, uint64_t cycle);
 
 /**
  * ConnectionBase - Type-erased base class for connections.
@@ -148,6 +150,9 @@ public:
      */
     virtual size_t arbitrateAdmitBoundedErased(size_t budget, uint64_t max_send_cycle) = 0;
 
+    /// Earliest arrival currently staged on this MPSC connection, if any.
+    virtual std::optional<uint64_t> minStagedArrivalCycle() const { return std::nullopt; }
+
     /**
      * Register this MPSC connection on its destination InPort and return
      * the InPort's type-erased IArbitratablePort interface so the
@@ -218,6 +223,7 @@ public:
                 return false;
             }
             ++pushes_this_cycle_;
+            wakeUnitAt(destination(), arrive_cycle);
             return true;
         }
         // SPSC/SingleThread mode: enforce the per-cycle admission bound
@@ -230,7 +236,10 @@ public:
         }
         const bool ok = to_->enqueueCancelable(std::move(data), arrive_cycle, &cancel_epoch_,
                                                epoch_snapshot, send_cycle);
-        if (ok) ++pushes_this_cycle_;
+        if (ok) {
+            ++pushes_this_cycle_;
+            wakeUnitAt(destination(), arrive_cycle);
+        }
         return ok;
     }
 
@@ -297,6 +306,17 @@ public:
             ++admitted;
         }
         return admitted;
+    }
+
+    std::optional<uint64_t> minStagedArrivalCycle() const override {
+        if (thread_queue_id_ == SIZE_MAX) {
+            return std::nullopt;
+        }
+        const size_t head = staging_head_.load(std::memory_order_relaxed);
+        if (head == staging_tail_.load(std::memory_order_acquire)) {
+            return std::nullopt;
+        }
+        return staging_buf_[head].arrive_cycle;
     }
 
     /// True if the destination can accept data (back-pressure preflight).

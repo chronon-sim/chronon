@@ -42,8 +42,8 @@ struct TickSimulationConfig {
     uint32_t max_lookahead_cycles = 100;
     uint64_t epoch_size = 64;  ///< Cycles per epoch before sync.
 
-    /// Epoch-free lookahead (A/B knob, default off): in the persistent-worker
-    /// lookahead path, collapse the per-epoch std::barrier into a single
+    /// Epoch-free lookahead: in the persistent-worker lookahead path, collapse
+    /// the per-epoch std::barrier into a single
     /// run-spanning window. Run-ahead is then bounded solely by
     /// lookahead_floor_ + max_lookahead_cycles (refreshed lazily on the slow
     /// path) and per-connection MPSC arbitration, with a single MPSC flush at
@@ -52,7 +52,7 @@ struct TickSimulationConfig {
     /// resolved per-connection progress; otherwise it falls back to the
     /// barrier path. Results are identical to the barrier path — it trades
     /// per-epoch straggler idle for lookahead-window slack.
-    bool enable_epoch_free_lookahead = false;
+    bool enable_epoch_free_lookahead = true;
 
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< 1 GHz default.
 
@@ -61,7 +61,7 @@ struct TickSimulationConfig {
 
     bool enable_weighted_partitioning = true;
 
-    bool enable_dynamic_rebalance = true;
+    bool enable_dynamic_rebalance = false;
     double rebalance_imbalance_threshold = 1.3;
     uint64_t rebalance_check_interval_cycles = 8192;
     double rebalance_min_gain = 0.05;  ///< Skip rebalance if predicted gain below this fraction.

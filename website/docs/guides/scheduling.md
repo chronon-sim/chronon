@@ -203,34 +203,107 @@ TickSimulation selects execution mode based on topology:
 | Lookahead | No tight connections | Units run ahead within safe boundaries |
 | Cluster-aware | Tight intra-cluster only | Groups on same thread, lookahead between |
 
+### Lazy Wakeup And Multi-Rate Ticks
+
+Chronon can skip a unit's user `tick()` body on cycles where the unit is known to
+be inactive while still advancing its local cycle and scheduler progress. This
+keeps the runtime tick-driven: there is no global event queue and no callback is
+executed on the producer thread.
+
+Units can use activity controls from their own `tick()` body:
+
+```cpp
+class TimerDevice : public TickableUnit {
+public:
+    TimerDevice() : TickableUnit("timer") {
+        setTickInterval(1000);  // only run tick() on global cycles divisible by 1000
+    }
+
+    void tick() override {
+        if (!has_work) {
+            sleepUntil(localCycle() + 500);
+            return;
+        }
+        process();
+        sleepForever();  // wait for a port arrival or explicit wakeAt()
+    }
+};
+```
+
+The scheduler evaluates a unit as active when both conditions are true:
+
+```text
+global_cycle >= unit.nextActiveCycle()
+global_cycle % unit.tickInterval() == 0
+```
+
+When the unit is inactive, Chronon runs a cheap idle path that only advances the
+unit's local cycle. The cluster's completed-cycle progress still advances, so
+downstream lookahead dependencies do not stall behind idle units.
+
+In the progress-based lookahead scheduler, if every unit in a cluster is
+inactive, Chronon advances the whole cluster in one batch to the next active
+unit cycle, dependency boundary, or epoch end. The scheduler timeline still
+records this fast path because dependency progress is advancing, but it uses the
+`unit idle` category instead of `unit`. The slice detail includes `cycles=N` for
+batched idle advances.
+
+Port delivery is an input-driven wakeup source. When a connection successfully
+enqueues a message with arrival cycle `A` for a scheduler-controlled destination,
+Chronon wakes that destination unit at `A`; the destination still receives the
+message through its `InPort` during its own later `tick()` context. This gives
+event-like behavior without executing target-unit code from the producer thread.
+
+For always-active units, port delivery avoids the wakeup atomic entirely. A unit
+starts accepting port wakeups after it uses `sleepUntil()`, `sleepForever()`, or
+`setTickInterval(N > 1)`. If delayed port messages were already queued before
+the unit first goes to sleep, the sleep target is seeded from the pending input
+arrival cycles, so those messages still wake the unit at their arrival cycle.
+Explicit `wakeAt()` requests are tracked independently and multiple future
+requests are preserved even if they are issued before the unit first sleeps.
+
+`wakeAt()` is intentionally only a scheduler hint. If a model communicates
+through shared memory or another side channel outside Chronon ports, the model
+must still expose the causal relationship to the scheduler, for example by
+converting the side-channel write into a port message or an explicit wake source
+with a conservative dependency. Otherwise an isolated sleeping unit may have
+already advanced past the event's nominal cycle under lookahead and will process
+the wake at its next scheduled opportunity.
+
 ### Epoch-Free Lookahead
 
-By default the persistent-worker lookahead path synchronizes all worker threads
-at a `std::barrier` every `epoch_size` cycles. Within an epoch, clusters advance
-out of order on their own predecessor dependencies, but the per-epoch barrier
-still makes every thread wait for the slowest one at each boundary — a straggler
-tax that hurts most when load is imbalanced.
+The persistent-worker lookahead path can either synchronize all worker threads
+at a `std::barrier` every `epoch_size` cycles, or use epoch-free lookahead. The
+per-epoch barrier is a conservative fallback: within an epoch, clusters advance
+out of order on their own predecessor dependencies, but every thread still waits
+for the slowest one at each boundary.
 
-`enable_epoch_free_lookahead` (default **off**) removes that barrier: the whole
-run becomes a single window in which run-ahead is bounded solely by
+`enable_epoch_free_lookahead` (default **on**) removes that barrier when the
+runtime can prove it is safe: the whole run becomes a single window in which
+run-ahead is bounded solely by
 `lookahead_floor_ + max_lookahead_cycles` (refreshed lazily as the global-minimum
 cluster advances) and per-connection MPSC arbitration, with one MPSC flush at the
 end of the run instead of one per epoch. Results stay bit-identical to every other
 mode; only wall-clock changes.
 
-It is an opt-in A/B knob, not a universal default — it wins on imbalanced,
-high-worker-count topologies (where the straggler tax is real) and is neutral or
-slightly negative on balanced or dependency-bound chains (where the lazy floor
-refresh costs more than the barrier it removes). Measure on your own model.
+If the safety gate rejects epoch-free execution, Chronon transparently falls
+back to the per-epoch path. Scheduler timeline tracing does not veto epoch-free
+lookahead; idle fast paths are then paced by dependency progress and
+`max_lookahead_cycles`, not by `epoch_size`.
+
+Dynamic rebalance vetoes epoch-free lookahead. Rebalance decisions are made at
+epoch boundaries, so `enable_dynamic_rebalance: true` keeps the per-epoch driver
+even when the dependency and buffer-headroom gates would otherwise allow
+epoch-free execution.
 
 **When it engages.** The dispatch gate keeps the per-epoch barrier path unless
 *all* of the following hold; otherwise it transparently falls back (no result
 change):
 
 - `enable_epoch_free_lookahead` is set and `max_lookahead_cycles > 0`;
-- the run uses the persistent path — reached via `TickSimulation::run()`;
-  `runUntilTermination()` (periodic dumps / termination polling) deliberately
-  keeps the per-epoch path for its boundaries, so epoch-free is a no-op there;
+- `enable_dynamic_rebalance` is not set;
+- the run uses the persistent path — reached via `TickSimulation::run()` or
+  `runUntilTermination()`;
 - every MPSC input port has fully-resolved per-connection producer progress;
 - **cross-thread buffer headroom suffices for every connection** (see below).
 
@@ -319,7 +392,7 @@ struct TickSimulationConfig {
     // Lookahead configuration
     uint32_t max_lookahead_cycles = 100;    // Max cycles a unit can run ahead
     uint64_t epoch_size = 64;               // Cycles per epoch before sync
-    bool enable_epoch_free_lookahead = false; // Drop the per-epoch barrier (see below)
+    bool enable_epoch_free_lookahead = true;  // Drop the per-epoch barrier when safe
 
     // Debug options
     bool trace_execution = false;           // Log execution mode selection
@@ -330,7 +403,7 @@ struct TickSimulationConfig {
     uint64_t profiling_measurement_cycles = 1024; // Measurement window
 
     // Dynamic rebalancing
-    bool enable_dynamic_rebalance = true;
+    bool enable_dynamic_rebalance = false;
     double rebalance_imbalance_threshold = 1.3;
     uint64_t rebalance_check_interval_cycles = 8192;
     double rebalance_min_gain = 0.05;
@@ -340,12 +413,13 @@ struct TickSimulationConfig {
 
 These settings can be configured via YAML (`enable_parallel`, `enable_lookahead`) or set directly in code. All scheduling modes produce identical cycle-accurate results — they differ only in wall-clock performance.
 
-Dynamic rebalance is enabled by default for throughput-oriented runs. It samples
-unit tick cost periodically, computes per-stream total sampled work, and
-migrates whole tight clusters at epoch boundaries when the heaviest stream is
-more than `rebalance_imbalance_threshold` above the active-stream average. Set
-`enable_dynamic_rebalance: false` for deterministic partitioning studies or
-A/B runs that must preserve a fixed initial assignment.
+Dynamic rebalance is opt-in. It samples unit tick cost periodically, computes
+per-stream total sampled work, and migrates whole tight clusters at epoch
+boundaries when the heaviest stream is more than
+`rebalance_imbalance_threshold` above the active-stream average. Set
+`enable_dynamic_rebalance: true` when runtime migration is more important than
+dependency/lookahead-paced epoch-free execution; doing so vetoes the epoch-free
+path and keeps the explicit epoch boundary driver.
 `rebalance_min_gain` can suppress migrations with too little predicted speedup,
 and `rebalance_cooldown_cycles` can enforce a minimum cycle gap between applied
 rebalances.
