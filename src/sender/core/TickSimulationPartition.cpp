@@ -591,7 +591,23 @@ bool TickSimulation::performRebalance_() {
     for (size_t t = 0; t < num_threads; ++t) {
         if (result_thread_cluster_count[t] != 1) continue;
         size_t c = result_thread_single_cluster[t];
-        if (c >= num_clusters || cluster_sample_count[c] < kMinSingletonSamples) continue;
+        if (c >= num_clusters) continue;
+
+        if (clusters_.clusters[c].size() == 1) {
+            size_t u = clusters_.clusters[c].front();
+            if (u < unit_ptrs_.size() && unit_ptrs_[u]->tickInterval() > 1) {
+                if (observe_ctx_) {
+                    std::string names = buildUnitNameList_(clusters_.clusters[c]);
+                    observe::log_info<
+                        "Dynamic rebalance SKIPPED (would isolate interval-ticked cluster {} "
+                        "[{}], tick_interval={})">(observe_ctx_, c, names.c_str(),
+                                                   unit_ptrs_[u]->tickInterval());
+                }
+                return false;
+            }
+        }
+
+        if (cluster_sample_count[c] < kMinSingletonSamples) continue;
         if (cluster_active_sample_count[c] * kLowActivityDenominator > cluster_sample_count[c]) {
             continue;
         }
