@@ -442,7 +442,7 @@ private:
     bool shouldRebalance_() const;
     bool performRebalance_();
     void maybeRebalanceAfterEpoch_(uint64_t epoch_executed);
-    void recordTickSample_(size_t thread_idx, size_t unit_local_idx, uint64_t ticks);
+    void recordTickSample_(size_t thread_idx, size_t unit_local_idx, uint64_t ticks, bool active);
 
     /**
      * Topology-only cluster-aware placement (no cost profiling). Used as
@@ -653,6 +653,7 @@ private:
         std::vector<uint64_t> tick_times;
         std::vector<size_t> unit_write_idx;
         std::vector<size_t> unit_sample_count;
+        std::vector<size_t> unit_active_sample_count;
         size_t sample_count = 0;
         static constexpr size_t RING_SIZE = 128;
     };

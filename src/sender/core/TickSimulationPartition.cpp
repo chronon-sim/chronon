@@ -263,6 +263,7 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
                                                   0);
             thread_sampling_[t].unit_write_idx.assign(units_on_thread, 0);
             thread_sampling_[t].unit_sample_count.assign(units_on_thread, 0);
+            thread_sampling_[t].unit_active_sample_count.assign(units_on_thread, 0);
             thread_sampling_[t].sample_count = 0;
         }
     }
@@ -559,6 +560,52 @@ bool TickSimulation::performRebalance_() {
     }
     const double logged_balance_gain = std::max(0.0, balance_gain);
 
+    std::vector<size_t> cluster_sample_count(num_clusters, 0);
+    std::vector<size_t> cluster_active_sample_count(num_clusters, 0);
+    for (size_t t = 0; t < thread_units_.size(); ++t) {
+        const auto& state = thread_sampling_[t];
+        for (size_t u_idx = 0; u_idx < thread_units_[t].size(); ++u_idx) {
+            size_t u = thread_units_[t][u_idx];
+            if (u >= unit_to_cluster_.size()) continue;
+            size_t cluster = unit_to_cluster_[u];
+            if (cluster >= num_clusters) continue;
+            if (u_idx < state.unit_sample_count.size()) {
+                cluster_sample_count[cluster] += state.unit_sample_count[u_idx];
+            }
+            if (u_idx < state.unit_active_sample_count.size()) {
+                cluster_active_sample_count[cluster] += state.unit_active_sample_count[u_idx];
+            }
+        }
+    }
+
+    std::vector<size_t> result_thread_cluster_count(num_threads, 0);
+    std::vector<size_t> result_thread_single_cluster(num_threads, SIZE_MAX);
+    for (size_t c = 0; c < num_clusters; ++c) {
+        size_t thread = result.unit_to_thread[c];
+        if (thread >= num_threads) continue;
+        result_thread_cluster_count[thread]++;
+        result_thread_single_cluster[thread] = c;
+    }
+    constexpr size_t kMinSingletonSamples = 4;
+    constexpr size_t kLowActivityDenominator = 4;  // active/sample <= 25%.
+    for (size_t t = 0; t < num_threads; ++t) {
+        if (result_thread_cluster_count[t] != 1) continue;
+        size_t c = result_thread_single_cluster[t];
+        if (c >= num_clusters || cluster_sample_count[c] < kMinSingletonSamples) continue;
+        if (cluster_active_sample_count[c] * kLowActivityDenominator > cluster_sample_count[c]) {
+            continue;
+        }
+        if (observe_ctx_) {
+            std::string names = buildUnitNameList_(clusters_.clusters[c]);
+            observe::log_info<
+                "Dynamic rebalance SKIPPED (would isolate low-activity cluster {} [{}], "
+                "active_samples={}, samples={})">(observe_ctx_, c, names.c_str(),
+                                                  cluster_active_sample_count[c],
+                                                  cluster_sample_count[c]);
+        }
+        return false;
+    }
+
     if (config_.rebalance_min_gain > 0.0 && gain < config_.rebalance_min_gain) {
         if (observe_ctx_) {
             observe::log_info<
@@ -633,6 +680,7 @@ bool TickSimulation::performRebalance_() {
         state.tick_times.assign(thread_units_[t].size() * ThreadSamplingState::RING_SIZE, 0);
         state.unit_write_idx.assign(thread_units_[t].size(), 0);
         state.unit_sample_count.assign(thread_units_[t].size(), 0);
+        state.unit_active_sample_count.assign(thread_units_[t].size(), 0);
         state.sample_count = 0;
     }
 
@@ -662,7 +710,8 @@ bool TickSimulation::performRebalance_() {
     return true;
 }
 
-void TickSimulation::recordTickSample_(size_t thread_idx, size_t unit_local_idx, uint64_t ticks) {
+void TickSimulation::recordTickSample_(size_t thread_idx, size_t unit_local_idx, uint64_t ticks,
+                                       bool active) {
     if (thread_idx >= thread_sampling_.size()) return;
     auto& state = thread_sampling_[thread_idx];
     if (unit_local_idx >= state.unit_write_idx.size()) {
@@ -671,6 +720,9 @@ void TickSimulation::recordTickSample_(size_t thread_idx, size_t unit_local_idx,
     if (unit_local_idx >= state.unit_sample_count.size()) {
         state.unit_sample_count.resize(unit_local_idx + 1, 0);
     }
+    if (unit_local_idx >= state.unit_active_sample_count.size()) {
+        state.unit_active_sample_count.resize(unit_local_idx + 1, 0);
+    }
     size_t slot = unit_local_idx * ThreadSamplingState::RING_SIZE +
                   (state.unit_write_idx[unit_local_idx] % ThreadSamplingState::RING_SIZE);
     if (slot < state.tick_times.size()) {
@@ -678,6 +730,9 @@ void TickSimulation::recordTickSample_(size_t thread_idx, size_t unit_local_idx,
     }
     state.unit_write_idx[unit_local_idx]++;
     state.unit_sample_count[unit_local_idx]++;
+    if (active) {
+        state.unit_active_sample_count[unit_local_idx]++;
+    }
     state.sample_count++;
 }
 

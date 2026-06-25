@@ -729,7 +729,8 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
                     thread_idx, cluster_thread_unit_positions_[cluster][u],
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                               points[u + 1] - points[u])
-                                              .count()));
+                                              .count()),
+                    active[u]);
             }
         }
         for (size_t u = 0; u < num_units; ++u) {
@@ -740,11 +741,12 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
     } else if (__builtin_expect(config_.enable_dynamic_rebalance && (cycle & 1023u) == 0, 0)) {
         for (size_t u = 0; u < num_units; ++u) {
             auto tp0 = std::chrono::steady_clock::now();
-            executeUnitCycle_(units[u], cycle);
+            bool active = executeUnitCycle_(units[u], cycle);
             auto tp1 = std::chrono::steady_clock::now();
             uint64_t elapsed_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(tp1 - tp0).count());
-            recordTickSample_(thread_idx, cluster_thread_unit_positions_[cluster][u], elapsed_ns);
+            recordTickSample_(thread_idx, cluster_thread_unit_positions_[cluster][u], elapsed_ns,
+                              active);
         }
     } else {
         for (size_t u = 0; u < num_units; ++u) {
