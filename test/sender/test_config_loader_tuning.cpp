@@ -81,7 +81,7 @@ simulation:
     assert(!config.trace_execution);
     assert(config.max_lookahead_cycles == 100);
     assert(config.epoch_size == 64);
-    assert(!config.enable_dynamic_rebalance);
+    assert(config.enable_dynamic_rebalance);
     assert(config.rebalance_check_interval_cycles == 8192);
     assert(config.rebalance_min_gain == 0.05);
     assert(config.rebalance_cooldown_cycles == 0);

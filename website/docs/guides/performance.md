@@ -233,7 +233,7 @@ simulation:
   enable_weighted_partitioning: true     # Cost-aware thread assignment (default)
   profiling_warmup_cycles: 512           # Warmup ticks before measuring
   profiling_measurement_cycles: 1024     # Measurement window for tick costs
-  enable_dynamic_rebalance: false        # Runtime cluster migration (opt-in)
+  enable_dynamic_rebalance: true         # Runtime cluster migration
   rebalance_check_interval_cycles: 8192  # Epoch-boundary imbalance checks
   rebalance_min_gain: 0.05               # Skip if predicted gain is too small
   rebalance_cooldown_cycles: 0           # Minimum cycles between rebalances

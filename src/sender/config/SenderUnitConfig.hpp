@@ -75,7 +75,7 @@ struct SimulationYAMLConfig {
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< Default 1 GHz.
 
     bool enable_weighted_partitioning = true;
-    bool enable_dynamic_rebalance = false;
+    bool enable_dynamic_rebalance = true;
     double rebalance_imbalance_threshold = 1.3;
     uint64_t rebalance_check_interval_cycles = 8192;
     double rebalance_min_gain = 0.05;

@@ -66,8 +66,9 @@ public:
 
 }  // namespace
 
-int main() {
-    std::cout << "=== Rebalance Calibration Test ===\n";
+int run_rebalance_calibration(bool use_run_until_termination) {
+    std::cout << (use_run_until_termination ? "Testing runUntilTermination rebalance... "
+                                            : "Testing run() rebalance... ");
 
     TickSimulationConfig cfg;
     cfg.num_threads = 3;
@@ -102,10 +103,14 @@ int main() {
 
     sim.initialize();
 
-    sim.runUntilTermination(16384);
+    if (use_run_until_termination) {
+        sim.runUntilTermination(16384);
+    } else {
+        sim.run(16384);
+    }
 
     const auto& post = sim.getPlatformMetrics();
-    std::cout << "Post-run atomic_roundtrip_ns: " << post.atomic_roundtrip_ns << "\n";
+    std::cout << "\nPost-run atomic_roundtrip_ns: " << post.atomic_roundtrip_ns << "\n";
     std::cout << "Rebalance count: " << sim.rebalanceCount() << "\n";
 
     const auto& costs = sim.getUnitCosts();
@@ -142,5 +147,18 @@ int main() {
     }
 
     std::cout << "\n=== Rebalance calibration: PASSED ===\n";
+    return 0;
+}
+
+int main() {
+    std::cout << "=== Rebalance Calibration Test ===\n";
+
+    if (run_rebalance_calibration(true) != 0) {
+        return 1;
+    }
+    if (run_rebalance_calibration(false) != 0) {
+        return 1;
+    }
+
     return 0;
 }

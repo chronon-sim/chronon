@@ -441,6 +441,7 @@ private:
 
     bool shouldRebalance_() const;
     bool performRebalance_();
+    void maybeRebalanceAfterEpoch_(uint64_t epoch_executed);
     void recordTickSample_(size_t thread_idx, size_t unit_local_idx, uint64_t ticks);
 
     /**

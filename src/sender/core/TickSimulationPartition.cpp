@@ -35,6 +35,14 @@ struct PairHash {
         return k.u ^ (k.v * 0x9e3779b97f4a7c15ULL + (k.u << 6) + (k.u >> 2));
     }
 };
+
+double balanceScore(const std::vector<double>& thread_times) {
+    double score = 0.0;
+    for (double time : thread_times) {
+        score += time * time;
+    }
+    return score;
+}
 }  // namespace
 
 void TickSimulation::buildPartitionAdjacency_(
@@ -359,7 +367,12 @@ bool TickSimulation::shouldRebalance_() const {
     // thread hides imbalance when one stream owns more active units; sum
     // per-unit averages instead.
     std::vector<double> thread_times(thread_units_.size(), 0.0);
-    size_t active_threads = 0;
+    size_t candidate_threads = 0;
+    for (const auto& units : thread_units_) {
+        if (!units.empty()) {
+            candidate_threads++;
+        }
+    }
 
     for (size_t t = 0; t < thread_units_.size(); ++t) {
         const auto& state = thread_sampling_[t];
@@ -387,24 +400,57 @@ bool TickSimulation::shouldRebalance_() const {
         }
         if (sampled_units == 0) continue;
 
-        active_threads++;
         thread_times[t] = total;
     }
 
-    if (active_threads < 2) return false;
+    if (candidate_threads < 2) return false;
 
     double max_time = *std::max_element(thread_times.begin(), thread_times.end());
     double total_time = 0.0;
     for (double t : thread_times) {
         total_time += t;
     }
-    double avg_time = total_time / static_cast<double>(active_threads);
+    double avg_time = total_time / static_cast<double>(candidate_threads);
 
     return avg_time > 0 && (max_time / avg_time) > config_.rebalance_imbalance_threshold;
 }
 
+void TickSimulation::maybeRebalanceAfterEpoch_(uint64_t epoch_executed) {
+    cycles_since_last_rebalance_ += epoch_executed;
+    cycles_since_last_actual_rebalance_ += epoch_executed;
+    if (cycles_since_last_rebalance_ < config_.rebalance_check_interval_cycles) {
+        return;
+    }
+
+    cycles_since_last_rebalance_ = 0;
+    bool cooldown_ok = (config_.rebalance_cooldown_cycles == 0) ||
+                       (cycles_since_last_actual_rebalance_ >= config_.rebalance_cooldown_cycles);
+    if (!cooldown_ok || !shouldRebalance_()) {
+        return;
+    }
+
+    SchedulerTimelineTrace::TimePoint rebalance_begin{};
+    if (timeline_trace_.enabled()) {
+        rebalance_begin = SchedulerTimelineTrace::Clock::now();
+    }
+    if (!performRebalance_()) {
+        return;
+    }
+
+    cycles_since_last_actual_rebalance_ = 0;
+    if (timeline_trace_.enabled()) {
+        auto rebalance_end = SchedulerTimelineTrace::Clock::now();
+        timeline_trace_.recordDuration(timeline_trace_.schedulerStream(), "scheduler",
+                                       "dynamic rebalance", current_cycle_, rebalance_begin,
+                                       rebalance_end, last_rebalance_detail_);
+    }
+}
+
 bool TickSimulation::performRebalance_() {
     if (!thread_sampling_.empty()) {
+        std::vector<double> sampled_unit_costs(unit_ptrs_.size(), 0.0);
+        bool has_window_sample = false;
+
         for (size_t t = 0; t < thread_units_.size(); ++t) {
             const auto& state = thread_sampling_[t];
             if (state.sample_count == 0) continue;
@@ -424,10 +470,15 @@ bool TickSimulation::performRebalance_() {
                         count++;
                     }
                 }
-                if (count > 0 && u < unit_costs_.size()) {
-                    unit_costs_[u] = sum / static_cast<double>(count);
+                if (count > 0 && u < sampled_unit_costs.size()) {
+                    sampled_unit_costs[u] = sum / static_cast<double>(count);
+                    has_window_sample = true;
                 }
             }
+        }
+
+        if (has_window_sample) {
+            unit_costs_ = std::move(sampled_unit_costs);
         }
     }
 
@@ -492,10 +543,24 @@ bool TickSimulation::performRebalance_() {
         gain = (old_max_time - result.estimated_max_thread_time_ns) / old_max_time;
     }
 
-    if (config_.rebalance_min_gain > 0.0 && gain < config_.rebalance_min_gain) {
+    auto new_thread_costs_for_gate =
+        WeightedPartitioner::evaluatePerThread(input, result.unit_to_thread);
+    new_thread_costs_for_gate.resize(num_threads, 0.0);
+    double balance_gain = 0.0;
+    const double old_balance_score = balanceScore(old_thread_costs);
+    if (old_balance_score > 0.0) {
+        balance_gain =
+            (old_balance_score - balanceScore(new_thread_costs_for_gate)) / old_balance_score;
+    }
+    const double logged_balance_gain = std::max(0.0, balance_gain);
+
+    if (config_.rebalance_min_gain > 0.0 && gain < config_.rebalance_min_gain &&
+        balance_gain < config_.rebalance_min_gain) {
         if (observe_ctx_) {
-            observe::log_info<"Dynamic rebalance SKIPPED (gain={}% < min_gain={}%)">(
+            observe::log_info<
+                "Dynamic rebalance SKIPPED (gain={}%, balance_gain={}% < min_gain={}%)">(
                 observe_ctx_, static_cast<uint64_t>(gain * 100),
+                static_cast<uint64_t>(logged_balance_gain * 100),
                 static_cast<uint64_t>(config_.rebalance_min_gain * 100));
         }
         return false;
@@ -503,7 +568,8 @@ bool TickSimulation::performRebalance_() {
 
     std::ostringstream rebalance_detail;
     rebalance_detail << "rebalance=" << (rebalance_count_ + 1)
-                     << " imbalance=" << result.imbalance_ratio << " predicted_gain=" << gain;
+                     << " imbalance=" << result.imbalance_ratio << " predicted_gain=" << gain
+                     << " balance_gain=" << logged_balance_gain;
     size_t migration_count = 0;
     for (size_t c = 0; c < num_clusters; ++c) {
         if (old_assignment[c] == result.unit_to_thread[c]) continue;
@@ -519,9 +585,10 @@ bool TickSimulation::performRebalance_() {
     last_rebalance_detail_ = rebalance_detail.str();
 
     if (observe_ctx_) {
-        observe::log_info<"Dynamic rebalance #{}: imbalance={}%, predicted_gain={}%">(
+        observe::log_info<
+            "Dynamic rebalance #{}: imbalance={}%, predicted_gain={}%, balance_gain={}%">(
             observe_ctx_, rebalance_count_ + 1, static_cast<uint64_t>(result.imbalance_ratio * 100),
-            static_cast<uint64_t>(gain * 100));
+            static_cast<uint64_t>(gain * 100), static_cast<uint64_t>(logged_balance_gain * 100));
 
         observe::log_info<"  OLD assignment:">(observe_ctx_);
         for (size_t t = 0; t < num_threads; ++t) {
@@ -567,8 +634,7 @@ bool TickSimulation::performRebalance_() {
     rebalance_count_++;
 
     if (observe_ctx_) {
-        auto new_thread_costs =
-            WeightedPartitioner::evaluatePerThread(input, result.unit_to_thread);
+        auto new_thread_costs = std::move(new_thread_costs_for_gate);
         new_thread_costs.resize(num_threads, 0.0);
 
         observe::log_info<"  NEW assignment:">(observe_ctx_);
