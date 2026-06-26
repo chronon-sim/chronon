@@ -518,14 +518,19 @@ private:
     /// Precondition for executeRunEpochFree_ (see enable_epoch_free_lookahead).
     bool allMPSCPortsHaveConnProgress_() const noexcept;
 
-    /// True iff every cross-thread connection (MPSC staging ring or SPSC lock-free
-    /// ring) can absorb @p max_lookahead cycles of producer run-ahead without
-    /// overflowing. Without the per-epoch barrier the producer can lead the
-    /// consumer by up to max_lookahead_cycles; back-pressured (bounded-capacity)
-    /// ports would diverge from the barrier flush and an unlimited-capacity port
-    /// would silently drop once its ring fills. Vetoing the epoch-free path here
-    /// (fall back to the per-epoch barrier, which drains every epoch) keeps
-    /// long-delay / large-lookahead topologies lossless.
+    /// Grow lock-free queues with no positive headroom, or switch the port to
+    /// thread-safe queueing if bounded capacity makes that impossible.
+    size_t demoteUnsafeEpochFreeQueues_();
+
+    /// Minimum cross-thread queue headroom over all connections. SIZE_MAX means
+    /// no bounded cross-thread ring constrains epoch-free run-ahead.
+    size_t crossThreadHeadroomLimit_() const noexcept;
+
+    /// True when every remaining finite cross-thread queue has at least one
+    /// cycle of safe run-ahead after unsafe ports have been demoted.
+    bool crossThreadHeadroomAllowsEpochFree_() const noexcept;
+
+    /// Compatibility helper used by logs/tests.
     bool crossThreadHeadroomFits_(uint64_t max_lookahead) const noexcept;
 
     /// Per-thread epoch body. Spin-waits on cross-thread progress atomics

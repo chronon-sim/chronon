@@ -151,10 +151,11 @@ public:
      * there is only ONE source thread writing to this port.
      * Uses atomic operations instead of mutex.
      */
-    void useLockFreeQueue() {
+    void useLockFreeQueue(size_t min_usable_capacity = 0) {
         multi_producer_queue_raw_ = nullptr;
         lock_free_queue_ = true;
-        queue_ = std::make_unique<LockFreeQueueAdapter<StoredMessage>>(capacity_);
+        queue_ =
+            std::make_unique<LockFreeQueueAdapter<StoredMessage>>(capacity_, min_usable_capacity);
     }
 
     /**
@@ -325,6 +326,8 @@ public:
     }
 
     size_t capacity() const { return queue_->capacity(); }
+    size_t storageCapacity() const noexcept { return queue_->storageCapacity(); }
+    size_t configuredCapacity() const noexcept { return capacity_; }
     size_t available() const { return queue_->available(); }
 
     void setCapacity(size_t capacity) {
