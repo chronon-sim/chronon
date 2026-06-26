@@ -35,6 +35,7 @@ struct TimelineStreamData {
         uint64_t cycle = 0;
         uint64_t ts_ns = 0;
         uint64_t dur_ns = 0;
+        bool instant = false;
     };
 
     std::string process_name = "Chronon Scheduler";

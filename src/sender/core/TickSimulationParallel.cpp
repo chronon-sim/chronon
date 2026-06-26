@@ -22,6 +22,7 @@
 
 #include "../../chronon/CpuPause.hpp"
 #include "TickSimulation.hpp"
+#include "sender/schedule/SchedulerTimelineStyle.hpp"
 
 namespace chronon::sender {
 
@@ -594,8 +595,9 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
             const char* stall_name = blocker.cluster == SIZE_MAX        ? "stall: no-ready-cluster"
                                      : blocker.pred_cluster == SIZE_MAX ? "stall: lookahead-floor"
                                                                         : "stall: cluster-dep";
+            const auto stall_style = schedulerStallStyle(stall_name);
             timeline_trace_.recordDuration(
-                thread_idx, "wait", stall_name,
+                thread_idx, stall_style.category, stall_style.name,
                 blocker.cluster == SIZE_MAX
                     ? current_cycle_
                     : thread_progress_array_[blocker.cluster].completed_cycle.load(

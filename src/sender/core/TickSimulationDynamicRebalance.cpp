@@ -21,6 +21,7 @@
 #include "../../chronon/CpuPause.hpp"
 #include "TickSimulation.hpp"
 #include "sender/schedule/EpochFreeTopologyCost.hpp"
+#include "sender/schedule/SchedulerTimelineStyle.hpp"
 
 namespace chronon::sender {
 
@@ -229,18 +230,16 @@ void TickSimulation::flushDynamicSchedulerMarkers_() {
     for (size_t i = 0; i < count; ++i) {
         const auto& marker = dynamic_scheduler_markers_[i];
         if (marker.name.empty()) continue;
-        timeline_trace_.recordDuration(timeline_trace_.schedulerStream(), "scheduler rebalance",
-                                       marker.name, marker.cycle, marker.time,
-                                       marker.time + std::chrono::nanoseconds(1), marker.detail);
+        timeline_trace_.recordInstant(timeline_trace_.schedulerStream(), "scheduler rebalance",
+                                      marker.name, marker.cycle, marker.time, marker.detail);
     }
 
     const uint64_t drops = dynamic_scheduler_marker_drops_.load(std::memory_order_relaxed);
     if (drops > 0) {
         const auto now = SchedulerTimelineTrace::Clock::now();
-        timeline_trace_.recordDuration(timeline_trace_.schedulerStream(), "scheduler rebalance",
-                                       "Chronon epoch-free rebalance markers dropped",
-                                       current_cycle_, now, now + std::chrono::nanoseconds(1),
-                                       "drops=" + std::to_string(drops));
+        timeline_trace_.recordInstant(timeline_trace_.schedulerStream(), "scheduler rebalance",
+                                      "Chronon epoch-free rebalance markers dropped",
+                                      current_cycle_, now, "drops=" + std::to_string(drops));
     }
 
     resetDynamicSchedulerMarkers_();
@@ -977,8 +976,9 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
             const char* stall_name = blocker.cluster == SIZE_MAX        ? "stall: no-ready-cluster"
                                      : blocker.pred_cluster == SIZE_MAX ? "stall: lookahead-floor"
                                                                         : "stall: cluster-dep";
+            const auto stall_style = schedulerStallStyle(stall_name);
             timeline_trace_.recordDuration(
-                thread_idx, "wait", stall_name,
+                thread_idx, stall_style.category, stall_style.name,
                 blocker.cluster == SIZE_MAX
                     ? current_cycle_
                     : thread_progress_array_[blocker.cluster].completed_cycle.load(

@@ -96,7 +96,9 @@ Chronon stream assignment.
 
 The `scheduler` lane appears as its own row after the worker streams. It is
 not an extra simulation worker; it contains scheduler-side spans such as epoch
-and MPSC arbitration work. Perfetto assigns slice colors automatically.
+and MPSC arbitration work. Chronon uses a stable dark-red color seed for
+scheduler stall slices so waits are visually distinct from normal unit work
+without using bright warning colors.
 
 ## Event Types
 
@@ -104,16 +106,18 @@ and MPSC arbitration work. Perfetto assigns slice colors automatically.
 |----------|------------|---------|
 | `unit` | Unit name | Wall time spent executing one unit tick on that stream. |
 | `unit idle` | Unit name | Lazy wakeup fast path that advances local cycle/progress without running the unit's `tick()` body. Detail includes `cycles=N` when multiple inactive cycles were batched. |
-| `wait` | `cluster dependency` | Time spent spinning because no local cluster is ready. Detail names the blocking predecessor cluster. |
+| color-stable wait category | `stall: cluster-dep` | Time spent spinning on a predecessor cluster. Detail names the blocked and blocking clusters. |
+| color-stable wait category | `stall: lookahead-floor` | Time spent throttled by the epoch-free lookahead floor. |
+| color-stable wait category | `stall: no-ready-cluster` | Time spent with no locally assigned cluster ready to run. |
 | `scheduler` | `progress epoch` | Wall time for one progress-based lookahead epoch. |
 | `scheduler` | `mpsc arbitration` | Per-cycle MPSC arbitration in barrier mode. |
 | `scheduler` | `epoch-end mpsc arbitration` | End-of-epoch MPSC flush in progress-based mode. |
 | `summary` | `dropped events` | Instant event emitted when `max_events` is exceeded. |
 
 Every duration slice carries `cycle` and `detail` debug annotations (visible in
-the Perfetto slice details panel). For wait events, `detail` names the blocking
-predecessor cluster and includes fields such as `cluster`, `pred_cluster`,
-`needed`, `observed`, and `delay`.
+the Perfetto slice details panel). For wait events, the exported name identifies
+the stall reason and `detail` names the blocking predecessor cluster with fields
+such as `cluster`, `pred_cluster`, `needed`, `observed`, and `delay`.
 
 ## Reading The Trace
 

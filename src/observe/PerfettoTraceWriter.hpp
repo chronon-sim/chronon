@@ -120,6 +120,8 @@ public:
     /// Emit an instant event at @p ts_ns on the wall-clock sequence.
     void wallInstant(uint64_t track_uuid, std::string_view category, std::string_view name,
                      uint64_t ts_ns);
+    void wallInstant(uint64_t track_uuid, std::string_view category, std::string_view name,
+                     uint64_t ts_ns, uint64_t cycle, std::string_view detail = {});
 
     /// Emit an instant event at @p cycle on the simulation cycle clock.
     void instant(uint64_t track_uuid, std::string_view category, std::string_view name,
