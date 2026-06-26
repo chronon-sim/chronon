@@ -555,6 +555,8 @@ private:
     bool maybeRequestEpochFreeMigration_(uint64_t cycle);
     void serviceEpochFreeMigration_();
     void clearDynamicMigrationRequest_();
+    void recordDynamicWaitSample_(size_t thread_idx, const BlockedClusterInfo& blocker,
+                                  uint64_t wait_ns);
     void resetDynamicSchedulerMarkers_();
     void recordDynamicSchedulerMarker_(std::string name, uint64_t cycle, std::string detail);
     void flushDynamicSchedulerMarkers_();
@@ -665,8 +667,12 @@ private:
     std::unique_ptr<std::atomic<uint64_t>[]> cluster_sample_time_ns_;
     std::unique_ptr<std::atomic<uint64_t>[]> cluster_sample_count_;
     std::unique_ptr<std::atomic<uint64_t>[]> cluster_active_sample_count_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_floor_wait_ns_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_dep_wait_ns_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_no_ready_wait_ns_;
     std::atomic<uint64_t> cluster_assignment_generation_{0};
     size_t dynamic_runtime_cluster_count_ = 0;
+    size_t dynamic_runtime_thread_count_ = 0;
     alignas(64) std::atomic<uint64_t> next_dynamic_rebalance_check_cycle_{0};
     alignas(64) std::atomic<bool> epoch_free_dynamic_runtime_active_{false};
 

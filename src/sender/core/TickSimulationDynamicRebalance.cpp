@@ -25,6 +25,7 @@ namespace chronon::sender {
 
 namespace {
 constexpr uint64_t kFloorRefreshSpinMask = 0xFF;
+constexpr uint64_t kDynamicClusterMinSamples = 4;
 
 uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
     const uint64_t max = std::numeric_limits<uint64_t>::max();
@@ -41,6 +42,20 @@ bool clusterHasMPSCConnections(const std::vector<TickableUnit*>& units) noexcept
     }
     return false;
 }
+
+double waitAdjustedTargetScore(double active_cost, uint64_t floor_wait_ns,
+                               uint64_t dep_wait_ns) noexcept {
+    const double floor_wait = static_cast<double>(floor_wait_ns);
+    const double dep_wait = static_cast<double>(dep_wait_ns);
+    const double total_wait = floor_wait + dep_wait;
+    if (total_wait <= 0.0) {
+        return active_cost;
+    }
+
+    const double floor_slack_ratio = floor_wait / total_wait;
+    const double dep_pressure_ratio = dep_wait / total_wait;
+    return active_cost * (1.0 + 0.75 * dep_pressure_ratio - 0.20 * floor_slack_ratio);
+}
 }  // namespace
 
 void TickSimulation::clearDynamicMigrationRequest_() {
@@ -55,6 +70,7 @@ void TickSimulation::clearDynamicMigrationRequest_() {
 void TickSimulation::initDynamicMigrationRuntime_() {
     const size_t num_clusters = clusters_.numClusters();
     if (num_clusters == 0 || thread_units_.empty()) return;
+    const size_t num_threads = thread_units_.size();
 
     if (dynamic_runtime_cluster_count_ != num_clusters || !cluster_runtime_owner_) {
         cluster_runtime_owner_ = std::make_unique<std::atomic<size_t>[]>(num_clusters);
@@ -65,6 +81,12 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         cluster_active_sample_count_ = std::make_unique<std::atomic<uint64_t>[]>(num_clusters);
         dynamic_runtime_cluster_count_ = num_clusters;
     }
+    if (dynamic_runtime_thread_count_ != num_threads || !dynamic_thread_floor_wait_ns_) {
+        dynamic_thread_floor_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_threads);
+        dynamic_thread_dep_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_threads);
+        dynamic_thread_no_ready_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_threads);
+        dynamic_runtime_thread_count_ = num_threads;
+    }
 
     for (size_t c = 0; c < num_clusters; ++c) {
         const size_t owner = c < cluster_to_thread_.size() ? cluster_to_thread_[c] : 0;
@@ -74,6 +96,11 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         cluster_sample_time_ns_[c].store(0, std::memory_order_relaxed);
         cluster_sample_count_[c].store(0, std::memory_order_relaxed);
         cluster_active_sample_count_[c].store(0, std::memory_order_relaxed);
+    }
+    for (size_t t = 0; t < num_threads; ++t) {
+        dynamic_thread_floor_wait_ns_[t].store(0, std::memory_order_relaxed);
+        dynamic_thread_dep_wait_ns_[t].store(0, std::memory_order_relaxed);
+        dynamic_thread_no_ready_wait_ns_[t].store(0, std::memory_order_relaxed);
     }
     cluster_assignment_generation_.store(1, std::memory_order_release);
     clearDynamicMigrationRequest_();
@@ -139,6 +166,18 @@ void TickSimulation::recordClusterTickSample_(size_t cluster, uint64_t ticks, bo
     cluster_sample_count_[cluster].fetch_add(1, std::memory_order_relaxed);
     if (active) {
         cluster_active_sample_count_[cluster].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void TickSimulation::recordDynamicWaitSample_(size_t thread_idx, const BlockedClusterInfo& blocker,
+                                              uint64_t wait_ns) {
+    if (thread_idx >= dynamic_runtime_thread_count_ || !dynamic_thread_floor_wait_ns_) return;
+    if (blocker.cluster == SIZE_MAX) {
+        dynamic_thread_no_ready_wait_ns_[thread_idx].fetch_add(wait_ns, std::memory_order_relaxed);
+    } else if (blocker.pred_cluster == SIZE_MAX) {
+        dynamic_thread_floor_wait_ns_[thread_idx].fetch_add(wait_ns, std::memory_order_relaxed);
+    } else {
+        dynamic_thread_dep_wait_ns_[thread_idx].fetch_add(wait_ns, std::memory_order_relaxed);
     }
 }
 
@@ -218,10 +257,15 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
         return false;
     }
 
-    const size_t num_threads = config_.num_threads;
+    const size_t num_threads = thread_units_.size();
     const size_t num_clusters = dynamic_runtime_cluster_count_;
     std::vector<double> cluster_cost(num_clusters, 0.0);
+    std::vector<uint64_t> cluster_samples(num_clusters, 0);
     std::vector<double> thread_cost(num_threads, 0.0);
+    std::vector<size_t> thread_active_clusters(num_threads, 0);
+    std::vector<uint64_t> thread_floor_wait(num_threads, 0);
+    std::vector<uint64_t> thread_dep_wait(num_threads, 0);
+    std::vector<double> target_score(num_threads, 0.0);
 
     for (size_t c = 0; c < num_clusters; ++c) {
         double fallback = 0.0;
@@ -234,13 +278,24 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
 
         const uint64_t samples = cluster_sample_count_[c].load(std::memory_order_relaxed);
         const uint64_t total = cluster_sample_time_ns_[c].load(std::memory_order_relaxed);
-        cluster_cost[c] =
-            samples > 0 ? static_cast<double>(total) / static_cast<double>(samples) : fallback;
+        cluster_samples[c] = samples;
+        cluster_cost[c] = samples >= kDynamicClusterMinSamples
+                              ? static_cast<double>(total) / static_cast<double>(samples)
+                              : fallback;
 
         size_t owner = cluster_runtime_owner_[c].load(std::memory_order_acquire);
         if (owner < num_threads) {
             thread_cost[owner] += cluster_cost[c];
+            if (cluster_cost[c] > 0.0) {
+                ++thread_active_clusters[owner];
+            }
         }
+    }
+    for (size_t t = 0; t < num_threads && t < dynamic_runtime_thread_count_; ++t) {
+        thread_floor_wait[t] = dynamic_thread_floor_wait_ns_[t].load(std::memory_order_relaxed);
+        thread_dep_wait[t] = dynamic_thread_dep_wait_ns_[t].load(std::memory_order_relaxed);
+        target_score[t] =
+            waitAdjustedTargetScore(thread_cost[t], thread_floor_wait[t], thread_dep_wait[t]);
     }
 
     double total_cost = 0.0;
@@ -250,34 +305,80 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
         return false;
     }
 
-    size_t source = 0;
-    size_t target = 0;
-    for (size_t t = 1; t < num_threads; ++t) {
-        if (thread_cost[t] > thread_cost[source]) source = t;
-        if (thread_cost[t] < thread_cost[target]) target = t;
-    }
-    if (source == target) {
-        clearDynamicMigrationRequest_();
-        return false;
-    }
-
     const double avg = total_cost / static_cast<double>(num_threads);
-    if (avg <= 0.0 || (thread_cost[source] / avg) <= config_.rebalance_imbalance_threshold) {
+    if (avg <= 0.0) {
         clearDynamicMigrationRequest_();
         return false;
     }
 
-    size_t cluster = SIZE_MAX;
-    double best_cluster_cost = 0.0;
-    for (size_t c = 0; c < num_clusters; ++c) {
-        if (cluster_runtime_owner_[c].load(std::memory_order_acquire) != source) continue;
-        if (cluster_migration_pending_[c].load(std::memory_order_acquire) != 0) continue;
-        if (cluster_cost[c] > best_cluster_cost) {
-            best_cluster_cost = cluster_cost[c];
-            cluster = c;
+    std::vector<size_t> source_threads;
+    for (size_t t = 0; t < num_threads; ++t) {
+        if ((thread_cost[t] / avg) > config_.rebalance_imbalance_threshold) {
+            source_threads.push_back(t);
         }
     }
-    if (cluster == SIZE_MAX || best_cluster_cost <= 0.0) {
+    if (source_threads.empty()) {
+        clearDynamicMigrationRequest_();
+        return false;
+    }
+
+    size_t source = SIZE_MAX;
+    size_t cluster = SIZE_MAX;
+    size_t target = SIZE_MAX;
+    double best_cluster_cost = 0.0;
+    double best_candidate_score = std::numeric_limits<double>::infinity();
+    double best_target_score = std::numeric_limits<double>::infinity();
+    const double old_max = *std::max_element(thread_cost.begin(), thread_cost.end());
+    for (size_t candidate_source : source_threads) {
+        for (size_t c = 0; c < num_clusters; ++c) {
+            if (cluster_runtime_owner_[c].load(std::memory_order_acquire) != candidate_source) {
+                continue;
+            }
+            if (cluster_migration_pending_[c].load(std::memory_order_acquire) != 0) continue;
+            if (cluster_samples[c] > 0 && cluster_samples[c] < kDynamicClusterMinSamples) continue;
+            if (cluster_cost[c] <= 0.0) continue;
+
+            for (size_t candidate_target = 0; candidate_target < num_threads; ++candidate_target) {
+                if (candidate_target == candidate_source) continue;
+
+                std::vector<double> candidate_cost = thread_cost;
+                candidate_cost[candidate_source] -= cluster_cost[c];
+                candidate_cost[candidate_target] += cluster_cost[c];
+                const double new_max =
+                    *std::max_element(candidate_cost.begin(), candidate_cost.end());
+                const double global_gain = old_max > 0.0 ? (old_max - new_max) / old_max : 0.0;
+                const double local_gain = thread_cost[candidate_source] > 0.0
+                                              ? cluster_cost[c] / thread_cost[candidate_source]
+                                              : 0.0;
+                const bool improves_global =
+                    config_.rebalance_min_gain <= 0.0 || global_gain >= config_.rebalance_min_gain;
+                const bool improves_overloaded_source =
+                    new_max <= old_max &&
+                    (config_.rebalance_min_gain <= 0.0 || local_gain >= config_.rebalance_min_gain);
+                if (!improves_global && !improves_overloaded_source) {
+                    continue;
+                }
+
+                const double target_cluster_penalty =
+                    1.0 + 0.20 * static_cast<double>(thread_active_clusters[candidate_target] + 1);
+                const double score = new_max + target_score[candidate_target] * 0.25 +
+                                     candidate_cost[candidate_target] * target_cluster_penalty -
+                                     global_gain * old_max;
+                if (score < best_candidate_score ||
+                    (score == best_candidate_score &&
+                     target_score[candidate_target] < best_target_score)) {
+                    best_candidate_score = score;
+                    best_target_score = target_score[candidate_target];
+                    best_cluster_cost = cluster_cost[c];
+                    source = candidate_source;
+                    cluster = c;
+                    target = candidate_target;
+                }
+            }
+        }
+    }
+    if (source == SIZE_MAX || cluster == SIZE_MAX || target == SIZE_MAX ||
+        best_cluster_cost <= 0.0) {
         clearDynamicMigrationRequest_();
         return false;
     }
@@ -285,10 +386,12 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     std::vector<double> candidate_cost = thread_cost;
     candidate_cost[source] -= best_cluster_cost;
     candidate_cost[target] += best_cluster_cost;
-    const double old_max = *std::max_element(thread_cost.begin(), thread_cost.end());
     const double new_max = *std::max_element(candidate_cost.begin(), candidate_cost.end());
-    const double gain = old_max > 0.0 ? (old_max - new_max) / old_max : 0.0;
-    if (config_.rebalance_min_gain > 0.0 && gain < config_.rebalance_min_gain) {
+    const double global_gain = old_max > 0.0 ? (old_max - new_max) / old_max : 0.0;
+    const double local_gain =
+        thread_cost[source] > 0.0 ? best_cluster_cost / thread_cost[source] : 0.0;
+    if (config_.rebalance_min_gain > 0.0 && global_gain < config_.rebalance_min_gain &&
+        !(new_max <= old_max && local_gain >= config_.rebalance_min_gain)) {
         clearDynamicMigrationRequest_();
         return false;
     }
@@ -309,10 +412,15 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     if (cluster < clusters_.clusters.size()) {
         names = buildUnitNameList_(clusters_.clusters[cluster]);
     }
-    last_rebalance_detail_ = "rebalance=" + std::to_string(rebalance_count_ + 1) + " C" +
-                             std::to_string(cluster) + "(" + names + ") T" +
-                             std::to_string(source) + "->T" + std::to_string(target) +
-                             " fence=" + std::to_string(fence);
+    last_rebalance_detail_ =
+        "rebalance=" + std::to_string(rebalance_count_ + 1) + " C" + std::to_string(cluster) + "(" +
+        names + ") T" + std::to_string(source) + "->T" + std::to_string(target) +
+        " fence=" + std::to_string(fence) + " src_active=" + std::to_string(thread_cost[source]) +
+        " dst_active=" + std::to_string(thread_cost[target]) +
+        " dst_score=" + std::to_string(target_score[target]) +
+        " dst_clusters=" + std::to_string(thread_active_clusters[target]) +
+        " dst_floor_wait_ns=" + std::to_string(thread_floor_wait[target]) +
+        " dst_dep_wait_ns=" + std::to_string(thread_dep_wait[target]);
 
     if (observe_ctx_) {
         observe::log_info<"Dynamic rebalance requested: cluster {} [{}] T{} -> T{} fence={}">(
@@ -370,7 +478,8 @@ void TickSimulation::serviceEpochFreeMigration_() {
     for (size_t c = 0; c < dynamic_runtime_cluster_count_; ++c) {
         const uint64_t samples = cluster_sample_count_[c].load(std::memory_order_relaxed);
         const uint64_t total = cluster_sample_time_ns_[c].load(std::memory_order_relaxed);
-        if (samples > 0 && c < clusters_.clusters.size() && !clusters_.clusters[c].empty()) {
+        if (samples >= kDynamicClusterMinSamples && c < clusters_.clusters.size() &&
+            !clusters_.clusters[c].empty()) {
             const double avg = static_cast<double>(total) / static_cast<double>(samples);
             const double per_unit =
                 std::max(0.001, avg / static_cast<double>(clusters_.clusters[c].size()));
@@ -386,6 +495,11 @@ void TickSimulation::serviceEpochFreeMigration_() {
         cluster_sample_time_ns_[c].store(0, std::memory_order_relaxed);
         cluster_sample_count_[c].store(0, std::memory_order_relaxed);
         cluster_active_sample_count_[c].store(0, std::memory_order_relaxed);
+    }
+    for (size_t t = 0; t < dynamic_runtime_thread_count_; ++t) {
+        dynamic_thread_floor_wait_ns_[t].store(0, std::memory_order_relaxed);
+        dynamic_thread_dep_wait_ns_[t].store(0, std::memory_order_relaxed);
+        dynamic_thread_no_ready_wait_ns_[t].store(0, std::memory_order_relaxed);
     }
 
     ++rebalance_count_;
@@ -618,10 +732,7 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
             }
         }
 
-        SchedulerTimelineTrace::TimePoint wait_begin{};
-        if (trace_waits) {
-            wait_begin = SchedulerTimelineTrace::Clock::now();
-        }
+        SchedulerTimelineTrace::TimePoint wait_begin = SchedulerTimelineTrace::Clock::now();
 
         uint64_t spin = 0;
         while (!token.stop_requested()) {
@@ -663,8 +774,14 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
             cpuPause();
         }
 
-        if (trace_waits && !token.stop_requested()) {
+        if (!token.stop_requested()) {
             auto wait_end = SchedulerTimelineTrace::Clock::now();
+            const uint64_t wait_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_begin)
+                    .count());
+            recordDynamicWaitSample_(thread_idx, blocker, wait_ns);
+            if (!trace_waits) continue;
+
             const char* stall_name = blocker.cluster == SIZE_MAX        ? "stall: no-ready-cluster"
                                      : blocker.pred_cluster == SIZE_MAX ? "stall: lookahead-floor"
                                                                         : "stall: cluster-dep";
