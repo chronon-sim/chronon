@@ -130,7 +130,8 @@ uint64_t TickSimulation::run(uint64_t num_cycles) {
 
     uint64_t executed = 0;
 
-    if (shouldUseParallelExecution_() && config_.enable_dynamic_rebalance) {
+    if (shouldUseParallelExecution_() && config_.enable_dynamic_rebalance &&
+        !epochFreeLookaheadEligible_()) {
         while (executed < num_cycles) {
             uint64_t step_cycles = std::min(config_.epoch_size, num_cycles - executed);
             uint64_t epoch_executed = runParallelEpoch(step_cycles, executed);
@@ -194,8 +195,8 @@ uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
 
         if (use_parallel) {
             if (config_.enable_dynamic_rebalance && !use_epoch_free_chunk) {
-                // Dynamic rebalance is epoch-boundary based, so keep the
-                // explicit epoch driver when it is enabled.
+                // Dynamic rebalance on the non-epoch-free fallback commits at
+                // explicit epoch boundaries.
                 epoch_executed = runParallelEpoch(step_cycles, 0);
             } else {
                 epoch_executed = runParallel(step_cycles);
@@ -350,33 +351,29 @@ bool TickSimulation::persistentLookaheadEligible_() const {
 
 bool TickSimulation::epochFreeLookaheadEligible_() const {
     return persistentLookaheadEligible_() && config_.enable_epoch_free_lookahead &&
-           !config_.enable_dynamic_rebalance && config_.max_lookahead_cycles > 0 &&
-           allMPSCPortsHaveConnProgress_() &&
-           crossThreadHeadroomFits_(config_.max_lookahead_cycles);
+           config_.max_lookahead_cycles > 0 && allMPSCPortsHaveConnProgress_() &&
+           crossThreadHeadroomAllowsEpochFree_();
 }
 
 uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
-    // Persistent-worker fast path (see executeRunProgressBased): only safe with a
-    // fixed thread layout. runUntilTermination() reaches this path for chunks
-    // that do not need dynamic-rebalance epoch boundaries.
+    // Persistent-worker fast path (see executeRunProgressBased). The
+    // epoch-free driver is the default when its dependency/queue safety gate
+    // holds; otherwise fixed-layout lookahead falls back to reusable epochs.
     const bool can_persist = persistentLookaheadEligible_();
     if (can_persist) {
-        // Epoch-free (A/B): drop the per-epoch barrier when the lookahead floor
-        // can be the sole run-ahead cap (max_lookahead_cycles > 0) and every
-        // MPSC port is fully covered by per-connection progress (so no port
-        // needs the per-epoch central flush). Otherwise keep the barrier path.
         const bool epoch_free = epochFreeLookaheadEligible_();
         if (config_.enable_epoch_free_lookahead && !epoch_free && observe_ctx_) {
             observe::log_info<
-                "epoch-free lookahead requested but vetoed (max_lookahead={}, "
-                "dynamic_rebalance={}, mpsc_progress_full={}, headroom_fits={}); "
-                "using barrier path">(observe_ctx_, config_.max_lookahead_cycles,
-                                      config_.enable_dynamic_rebalance,
-                                      allMPSCPortsHaveConnProgress_(),
-                                      crossThreadHeadroomFits_(config_.max_lookahead_cycles));
+                "epoch-free lookahead requested but vetoed "
+                "(max_lookahead={}, mpsc_progress_full={}, headroom={}); using barrier path">(
+                observe_ctx_, config_.max_lookahead_cycles, allMPSCPortsHaveConnProgress_(),
+                crossThreadHeadroomLimit_());
         }
         if (epoch_free) {
             ++epoch_free_run_count_;
+            if (config_.enable_dynamic_rebalance) {
+                return executeRunEpochFreeDynamic_(num_cycles);
+            }
             return executeRunEpochFree_(num_cycles);
         }
         if (!config_.enable_dynamic_rebalance) {
@@ -668,9 +665,7 @@ void TickSimulation::optimizeConnectionQueuesForThreads() {
         port_to_connections[key].push_back(conn);
     }
 
-    size_t same_thread_count = 0;
-    size_t spsc_count = 0;
-    size_t mpsc_count = 0;
+    size_t same_thread_count = 0, spsc_count = 0, mpsc_count = 0;
 
     for (auto& [dst_port_key, conns] : port_to_connections) {
         (void)dst_port_key;
@@ -753,9 +748,12 @@ void TickSimulation::optimizeConnectionQueuesForThreads() {
         }
     }
 
+    const size_t fallback_count = demoteUnsafeEpochFreeQueues_();
+
     if (observe_ctx_) {
-        observe::log_info<"Queue optimization: {} same-thread, {} SPSC, {} MPSC connections">(
-            observe_ctx_, same_thread_count, spsc_count, mpsc_count);
+        observe::log_info<
+            "Queue optimization: {} same-thread, {} SPSC, {} MPSC, {} thread-safe fallbacks">(
+            observe_ctx_, same_thread_count, spsc_count, mpsc_count, fallback_count);
     }
 }
 
@@ -766,35 +764,44 @@ void TickSimulation::optimizeConnectionQueuesForDynamicRebalance_() {
         port_to_connections[key].push_back(conn);
     }
 
-    size_t spsc_count = 0;
-    size_t mpsc_count = 0;
+    size_t spsc_count = 0, mpsc_count = 0;
 
     for (auto& [dst_port_key, conns] : port_to_connections) {
         (void)dst_port_key;
         if (conns.empty()) continue;
 
         if (conns.size() == 1) {
+            // Dynamic rebalance cannot use same-thread queues; migration can
+            // turn an initially local edge into a cross-thread edge with
+            // future-cycle messages still pending.
             conns[0]->optimizeForSPSC();
-            spsc_count += 1;
-            continue;
-        }
-
-        for (auto* conn : conns) {
-            conn->optimizeForMPSC();
-        }
-        for (auto* conn : conns) {
-            const size_t pseudo_thread_id = static_cast<size_t>(conn->connId()) + 1;
-            const size_t queue_id = conn->registerProducerThread(pseudo_thread_id);
-            if (queue_id != SIZE_MAX) {
-                conn->setThreadQueueId(queue_id);
+        } else {
+            // Multi-producer fan-in remains topology-keyed: one staging ring
+            // per Connection, ordered by stable conn_id.
+            for (auto* conn : conns) {
+                conn->optimizeForMPSC();
+            }
+            for (auto* conn : conns) {
+                const size_t pseudo_thread_id = static_cast<size_t>(conn->connId()) + 1;
+                const size_t queue_id = conn->registerProducerThread(pseudo_thread_id);
+                if (queue_id != SIZE_MAX) {
+                    conn->setThreadQueueId(queue_id);
+                }
             }
         }
-        mpsc_count += conns.size();
+        if (conns.size() == 1) {
+            spsc_count += 1;
+        } else {
+            mpsc_count += conns.size();
+        }
     }
 
+    const size_t fallback_count = demoteUnsafeEpochFreeQueues_();
+
     if (observe_ctx_) {
-        observe::log_info<"Queue optimization: dynamic-stable, {} SPSC, {} MPSC connections">(
-            observe_ctx_, spsc_count, mpsc_count);
+        observe::log_info<
+            "Queue optimization: dynamic-stable, {} SPSC, {} MPSC, {} thread-safe fallback, "
+            "no same-thread queues">(observe_ctx_, spsc_count, mpsc_count, fallback_count);
     }
 }
 
@@ -947,6 +954,12 @@ void TickSimulation::buildCrossThreadDependencies() {
     }
 
     std::vector<std::unordered_map<size_t, uint32_t>> min_delay(num_clusters);
+    auto add_dep = [&](size_t cluster, size_t pred_cluster, uint32_t delay) {
+        auto [it, inserted] = min_delay[cluster].try_emplace(pred_cluster, delay);
+        if (!inserted && delay < it->second) {
+            it->second = delay;
+        }
+    };
 
     for (auto* conn : connections_) {
         Unit* src = conn->source();
@@ -962,11 +975,13 @@ void TickSimulation::buildCrossThreadDependencies() {
 
         if (src_cluster == dst_cluster) continue;
 
-        uint32_t delay = conn->delay();
-        auto& dm = min_delay[dst_cluster];
-        auto it = dm.find(src_cluster);
-        if (it == dm.end() || delay < it->second) {
-            dm[src_cluster] = delay;
+        add_dep(dst_cluster, src_cluster, conn->delay());
+
+        const size_t headroom = conn->crossThreadHeadroom();
+        if (headroom != std::numeric_limits<size_t>::max() && headroom > 1) {
+            const uint64_t safe_cap = static_cast<uint64_t>(headroom - 1);
+            const auto delay = static_cast<uint32_t>(std::min<uint64_t>(safe_cap, UINT32_MAX));
+            add_dep(src_cluster, dst_cluster, delay);
         }
     }
 

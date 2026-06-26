@@ -148,6 +148,31 @@ public:
                                          detail_len, cycle, relNs(begin), duration_ns});
     }
 
+    /// Record a point event in a stream.
+    void recordInstant(size_t stream, std::string_view category, std::string_view name,
+                       uint64_t cycle, TimePoint time, std::string_view detail = {}) {
+        if (!started_ || stream >= data_.streams.size()) return;
+        if (cycle < config_.start_cycle || cycle >= config_.end_cycle) return;
+
+        const uint64_t slot = event_count_.fetch_add(1, std::memory_order_relaxed);
+        if (slot >= config_.max_events) {
+            dropped_events_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        std::string& arena = data_.arenas[stream];
+        const auto intern = [&arena](std::string_view s) -> std::pair<uint32_t, uint32_t> {
+            const uint32_t off = static_cast<uint32_t>(arena.size());
+            arena.append(s.data(), s.size());
+            return {off, static_cast<uint32_t>(s.size())};
+        };
+        const auto [cat_off, cat_len] = intern(category);
+        const auto [name_off, name_len] = intern(name);
+        const auto [detail_off, detail_len] = intern(detail);
+        data_.streams[stream].push_back({cat_off, cat_len, name_off, name_len, detail_off,
+                                         detail_len, cycle, relNs(time), 0, true});
+    }
+
     size_t schedulerStream() const noexcept { return scheduler_stream_; }
     const std::string& file() const noexcept { return config_.file; }
 

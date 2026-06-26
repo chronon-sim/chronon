@@ -26,7 +26,7 @@ namespace {
 class HeavyUnit : public TickableUnit {
 public:
     explicit HeavyUnit(const std::string& name) : TickableUnit(name) {}
-    OutPort<uint64_t> out{this, "out"};
+    OutPort<uint64_t> out{this, "out", 1};
 
     void tick() override {
         uint64_t v = localCycle();
@@ -62,6 +62,31 @@ public:
         while (in.tryReceive(localCycle())) {
         }
     }
+};
+
+class TightProducer : public TickableUnit {
+public:
+    TightProducer() : TickableUnit("tight_producer") {}
+    OutPort<uint64_t> out{this, "out", 1};
+
+    void tick() override { (void)out.send(localCycle()); }
+};
+
+class TightConsumer : public TickableUnit {
+public:
+    TightConsumer() : TickableUnit("tight_consumer") {}
+    InPort<uint64_t> in{this, "in"};
+
+    void tick() override {
+        if (auto v = in.tryReceive(localCycle())) {
+            checksum_ ^= *v + localCycle();
+        }
+    }
+
+    uint64_t checksum() const { return checksum_; }
+
+private:
+    uint64_t checksum_ = 0;
 };
 
 }  // namespace
@@ -112,6 +137,7 @@ int run_rebalance_calibration(bool use_run_until_termination) {
     const auto& post = sim.getPlatformMetrics();
     std::cout << "\nPost-run atomic_roundtrip_ns: " << post.atomic_roundtrip_ns << "\n";
     std::cout << "Rebalance count: " << sim.rebalanceCount() << "\n";
+    std::cout << "Epoch-free runs: " << sim.epochFreeRunCount() << "\n";
 
     const auto& costs = sim.getUnitCosts();
     std::cout << "Unit costs:";
@@ -122,6 +148,11 @@ int run_rebalance_calibration(bool use_run_until_termination) {
 
     if (sim.rebalanceCount() == 0) {
         std::cerr << "FAIL: no rebalance occurred (imbalance may not have been detected)\n";
+        return 1;
+    }
+
+    if (sim.epochFreeRunCount() == 0) {
+        std::cerr << "FAIL: dynamic rebalance did not use epoch-free lookahead\n";
         return 1;
     }
 
@@ -150,6 +181,52 @@ int run_rebalance_calibration(bool use_run_until_termination) {
     return 0;
 }
 
+int run_tight_cluster_migration_guard() {
+    std::cout << "Testing delay=0 cluster migration guard... ";
+
+    TickSimulationConfig cfg;
+    cfg.num_threads = 3;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.epoch_size = 64;
+    cfg.enable_dynamic_rebalance = true;
+    cfg.rebalance_check_interval_cycles = 64;
+    cfg.rebalance_imbalance_threshold = 1.05;
+    cfg.rebalance_min_gain = 0.0;
+    cfg.initial_partition_sync_cost_ns = 0.0;
+
+    TickSimulation sim(cfg);
+    auto* tight_src = sim.createUnit<TightProducer>();
+    auto* tight_dst = sim.createUnit<TightConsumer>();
+    auto* h0 = sim.createUnit<HeavyUnit>("guard_heavy0");
+    auto* h1 = sim.createUnit<HeavyUnit>("guard_heavy1");
+    auto* h2 = sim.createUnit<HeavyUnit>("guard_heavy2");
+    auto* h3 = sim.createUnit<HeavyUnit>("guard_heavy3");
+    auto* sink = sim.createUnit<Sink>();
+
+    sim.connect(tight_src->out, tight_dst->in, 0);
+    sim.connect(h0->out, sink->in, 1);
+    sim.connect(h1->out, sink->in, 1);
+    sim.connect(h2->out, sink->in, 1);
+    sim.connect(h3->out, sink->in, 1);
+
+    sim.initialize();
+    sim.run(4096);
+
+    if (sim.assignedThread(tight_src) != sim.assignedThread(tight_dst)) {
+        std::cerr << "FAIL: delay=0 tight cluster was split by migration\n";
+        return 1;
+    }
+    if (sim.rebalanceCount() == 0 || sim.epochFreeRunCount() == 0) {
+        std::cerr << "FAIL: guard did not exercise epoch-free dynamic migration\n";
+        return 1;
+    }
+
+    std::cout << "PASSED (checksum=" << tight_dst->checksum()
+              << ", rebalances=" << sim.rebalanceCount() << ")\n";
+    return 0;
+}
+
 int main() {
     std::cout << "=== Rebalance Calibration Test ===\n";
 
@@ -157,6 +234,9 @@ int main() {
         return 1;
     }
     if (run_rebalance_calibration(false) != 0) {
+        return 1;
+    }
+    if (run_tight_cluster_migration_guard() != 0) {
         return 1;
     }
 

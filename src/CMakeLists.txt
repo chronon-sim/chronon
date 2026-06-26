@@ -19,6 +19,7 @@ add_library(chronon STATIC
     sender/core/TickSimulation.cpp
     sender/core/TickSimulationPartition.cpp
     sender/core/TickSimulationParallel.cpp
+    sender/core/TickSimulationDynamicRebalance.cpp
     sender/core/TickSimulationValidation.cpp
 
     # SimulationApp - unified entry point for simulations

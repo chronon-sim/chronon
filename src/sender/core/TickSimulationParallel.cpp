@@ -22,6 +22,7 @@
 
 #include "../../chronon/CpuPause.hpp"
 #include "TickSimulation.hpp"
+#include "sender/schedule/SchedulerTimelineStyle.hpp"
 
 namespace chronon::sender {
 
@@ -211,6 +212,10 @@ void TickSimulation::initProgressSync() {
         observe::log_info<"  Initialized cluster progress sync for {} clusters on {} threads">(
             observe_ctx_, num_clusters, num_threads);
     }
+
+    if (config_.enable_dynamic_rebalance) {
+        initDynamicMigrationRuntime_();
+    }
 }
 
 void TickSimulation::initTimelineTraceScratch_() {
@@ -381,17 +386,49 @@ uint64_t TickSimulation::completedCyclesForRun_(uint64_t run_start,
 }
 
 bool TickSimulation::crossThreadHeadroomFits_(uint64_t max_lookahead) const noexcept {
-    // crossThreadHeadroom() folds in the source's per-cycle send rate and the edge
-    // delay, so it is the max producer run-ahead (in cycles) a connection's
-    // cross-thread buffer (MPSC staging ring or SPSC lock-free ring) can absorb
-    // without overflow (unlimited port) or back-pressure divergence (bounded port).
-    // The producer can lead the consumer by up to max_lookahead cycles, so every
-    // connection's headroom must exceed it. Connections with no bounded cross-thread
-    // ring report SIZE_MAX; an uncapped source reports 0 and always vetoes.
+    return crossThreadHeadroomLimit_() > max_lookahead;
+}
+
+bool TickSimulation::crossThreadHeadroomAllowsEpochFree_() const noexcept {
     for (const ConnectionBase* c : connections_) {
-        if (c->crossThreadHeadroom() <= max_lookahead) return false;
+        if (c->crossThreadHeadroom() <= 1) return false;
     }
     return true;
+}
+
+size_t TickSimulation::demoteUnsafeEpochFreeQueues_() {
+    if (!config_.enable_epoch_free_lookahead) return 0;
+    std::unordered_map<void*, std::vector<ConnectionBase*>> by_port;
+    for (auto* conn : connections_) {
+        by_port[conn->destPortPtr()].push_back(conn);
+    }
+
+    size_t demoted = 0;
+    for (auto& [port, conns] : by_port) {
+        (void)port;
+        bool unsafe = false;
+        for (auto* conn : conns) {
+            if (conn->crossThreadHeadroom() <= 1 &&
+                !conn->ensureEpochFreeHeadroom(config_.max_lookahead_cycles)) {
+                unsafe = true;
+                break;
+            }
+        }
+        if (!unsafe) continue;
+        for (auto* conn : conns) {
+            conn->optimizeForThreadSafe();
+        }
+        demoted += conns.size();
+    }
+    return demoted;
+}
+
+size_t TickSimulation::crossThreadHeadroomLimit_() const noexcept {
+    size_t limit = std::numeric_limits<size_t>::max();
+    for (const ConnectionBase* c : connections_) {
+        limit = std::min(limit, c->crossThreadHeadroom());
+    }
+    return limit;
 }
 
 uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
@@ -590,8 +627,9 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
             const char* stall_name = blocker.cluster == SIZE_MAX        ? "stall: no-ready-cluster"
                                      : blocker.pred_cluster == SIZE_MAX ? "stall: lookahead-floor"
                                                                         : "stall: cluster-dep";
+            const auto stall_style = schedulerStallStyle(stall_name);
             timeline_trace_.recordDuration(
-                thread_idx, "wait", stall_name,
+                thread_idx, stall_style.category, stall_style.name,
                 blocker.cluster == SIZE_MAX
                     ? current_cycle_
                     : thread_progress_array_[blocker.cluster].completed_cycle.load(
@@ -717,10 +755,16 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
 
     if (trace_units) {
         auto& points = thread_trace_points_[thread_idx];
+        if (points.size() < num_units + 1) {
+            points.resize(num_units + 1);
+        }
         std::vector<char> active(num_units, 0);
         points[0] = SchedulerTimelineTrace::Clock::now();
         for (size_t u = 0; u < num_units; ++u) {
-            const bool sample_tick = config_.enable_dynamic_rebalance && (cycle & 1023u) == 0;
+            const bool sample_tick =
+                config_.enable_dynamic_rebalance &&
+                !epoch_free_dynamic_runtime_active_.load(std::memory_order_relaxed) &&
+                (cycle & 1023u) == 0;
             active[u] = executeUnitCycle_(units[u], cycle);
             points[u + 1] = SchedulerTimelineTrace::Clock::now();
 
@@ -737,7 +781,11 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
                                            units[u]->name(), cycle, points[u], points[u + 1],
                                            active[u] ? "" : "cycles=1");
         }
-    } else if (__builtin_expect(config_.enable_dynamic_rebalance && (cycle & 1023u) == 0, 0)) {
+    } else if (__builtin_expect(
+                   config_.enable_dynamic_rebalance &&
+                       !epoch_free_dynamic_runtime_active_.load(std::memory_order_relaxed) &&
+                       (cycle & 1023u) == 0,
+                   0)) {
         for (size_t u = 0; u < num_units; ++u) {
             auto tp0 = std::chrono::steady_clock::now();
             bool active = executeUnitCycle_(units[u], cycle);

@@ -22,6 +22,7 @@
 
 #include "PftraceTestDecoder.hpp"
 #include "observe/PerfettoTraceWriter.hpp"
+#include "observe/PipelineTraceFormat.hpp"
 #include "observe/TimelineData.hpp"
 
 using namespace chronon::observe;
@@ -360,7 +361,7 @@ void test_timeline_stream_export() {
     data.arenas.resize(2);
 
     auto record = [&](size_t stream, std::string_view cat, std::string_view name, uint64_t cycle,
-                      uint64_t ts, uint64_t dur, std::string_view detail) {
+                      uint64_t ts, uint64_t dur, std::string_view detail, bool instant = false) {
         std::string& arena = data.arenas[stream];
         auto intern = [&arena](std::string_view s) -> std::pair<uint32_t, uint32_t> {
             uint32_t off = static_cast<uint32_t>(arena.size());
@@ -370,12 +371,18 @@ void test_timeline_stream_export() {
         auto [co, cl] = intern(cat);
         auto [no, nl] = intern(name);
         auto [dto, dtl] = intern(detail);
-        data.streams[stream].push_back({co, cl, no, nl, dto, dtl, cycle, ts, dur});
+        data.streams[stream].push_back({co, cl, no, nl, dto, dtl, cycle, ts, dur, instant});
     };
 
+    const uint64_t dep_color = 0x2bcd8b204bcc2742ULL;
+    const std::string dep_category = pipelineColorCategory(dep_color);
+    const std::string dep_name = pipelineColoredEventName("stall: cluster-dep", dep_color);
+
     record(0, "unit", "fetch", 10, 1000, 300, "");
-    record(0, "wait", "cross-cluster stall", 11, 1300, 700, "iq0");
+    record(0, dep_category, dep_name, 11, 1300, 700, "iq0");
     record(1, "scheduler", "epoch", 10, 900, 1500, "");
+    record(1, "scheduler rebalance", "Chronon epoch-free rebalance committed", 12, 2500, 0,
+           "rebalance=3 C17(ieu) T5->T3", true);
     data.dropped_events = 5;
 
     // Default options → exercises the compressed path end-to-end.
@@ -396,16 +403,25 @@ void test_timeline_stream_export() {
     CHECK(trace.tracks[2].name == "scheduler");
     CHECK(trace.tracks[1].parent_uuid == trace.tracks[0].uuid);
 
-    // 3 slices = 6 begin/end events, plus the dropped-events instant.
-    CHECK(trace.events.size() == 7);
+    // 3 slices = 6 begin/end events, plus one scheduler instant and the
+    // dropped-events instant.
+    CHECK(trace.events.size() == 8);
 
     const auto& stall_begin = trace.events[2];
-    CHECK(stall_begin.type == 1 && stall_begin.name == "cross-cluster stall");
-    CHECK(stall_begin.category == "wait" && stall_begin.timestamp == 1300);
+    CHECK(stall_begin.type == 1);
+    CHECK(stall_begin.name.rfind("stall: cluster-dep", 0) == 0);
+    CHECK(stall_begin.category == dep_category && stall_begin.timestamp == 1300);
     CHECK(stall_begin.uint_annotations.at("cycle") == 11);
     CHECK(stall_begin.string_annotations.at("detail") == "iq0");
     const auto& stall_end = trace.events[3];
     CHECK(stall_end.type == 2 && stall_end.timestamp == 2000);
+
+    const auto& rebalance = trace.events[6];
+    CHECK(rebalance.type == 3);
+    CHECK(rebalance.name == "Chronon epoch-free rebalance committed");
+    CHECK(rebalance.category == "scheduler rebalance" && rebalance.timestamp == 2500);
+    CHECK(rebalance.uint_annotations.at("cycle") == 12);
+    CHECK(rebalance.string_annotations.at("detail") == "rebalance=3 C17(ieu) T5->T3");
 
     const auto& dropped = trace.events.back();
     CHECK(dropped.type == 3 && dropped.name == "dropped events: 5");

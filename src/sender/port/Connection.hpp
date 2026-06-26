@@ -73,6 +73,12 @@ public:
      */
     virtual void optimizeForMPSC() = 0;
 
+    /// Use the mutex-backed queue when bounded lock-free headroom is unsafe.
+    virtual void optimizeForThreadSafe() = 0;
+
+    /// Try to grow bounded lock-free buffers enough for epoch-free run-ahead.
+    virtual bool ensureEpochFreeHeadroom(uint32_t max_lookahead_cycles) = 0;
+
     /**
      * Register a producer thread for MPSC mode.
      *
@@ -214,7 +220,8 @@ public:
             // Barrier), forwarding from staging into the shared per-thread
             // queue in deterministic conn_id order. See
             // docs/mpsc-atomic-publish.md.
-            if (stagingSize_() >= to_->capacity()) {
+            if (to_->capacity() != InPort<T>::UNLIMITED_CAPACITY &&
+                stagingSize_() >= to_->capacity()) {
                 return false;  // staging full -> producer sees back-pressure
             }
             if (!stagingTryPush_(
@@ -235,7 +242,7 @@ public:
             return false;
         }
         const bool ok = to_->enqueueCancelable(std::move(data), arrive_cycle, &cancel_epoch_,
-                                               epoch_snapshot, send_cycle);
+                                               epoch_snapshot, send_cycle, conn_id_);
         if (ok) {
             ++pushes_this_cycle_;
             wakeUnitAt(destination(), arrive_cycle);
@@ -328,7 +335,8 @@ public:
         // sync point) in deterministic conn_id order, so the push path
         // itself does not race on wall-clock ordering across worker threads.
         if (thread_queue_id_ != SIZE_MAX) {
-            return stagingSize_() < to_->capacity();
+            return to_->capacity() == InPort<T>::UNLIMITED_CAPACITY ||
+                   stagingSize_() < to_->capacity();
         }
         // Rate-based admission: producer may push up to effectiveCapacity_()
         // items per simulated cycle, tracked locally via pushes_this_cycle_.
@@ -367,21 +375,28 @@ public:
         // below the model-visible limit, otherwise canTransfer() and the
         // physical push path disagree for large ports.
         const size_t user_cap = to_->capacity();
-        const size_t requested = (user_cap == InPort<T>::UNLIMITED_CAPACITY)
-                                     ? kDefaultUnlimitedStagingRing
-                                     : (user_cap + 1);
-        size_t phys = 1;
-        const size_t target = std::max(requested, kStagingRingMin);
-        while (phys < target) {
-            if (phys > (std::numeric_limits<size_t>::max() / 2)) {
-                throw std::length_error("MPSC staging ring capacity is too large");
-            }
-            phys <<= 1;
+        configureStagingRing_((user_cap == InPort<T>::UNLIMITED_CAPACITY)
+                                  ? (kDefaultUnlimitedStagingRing - 1)
+                                  : user_cap);
+    }
+
+    void optimizeForThreadSafe() override {
+        thread_queue_id_ = SIZE_MAX;
+        to_->useThreadSafeQueue();
+    }
+
+    bool ensureEpochFreeHeadroom(uint32_t max_lookahead_cycles) override {
+        if (crossThreadHeadroom() > 1) return true;
+        const auto requested = requiredUsableForHeadroom_(max_lookahead_cycles);
+        if (!requested.has_value()) return false;
+        if (thread_queue_id_ != SIZE_MAX) {
+            configureStagingRing_(*requested);
+        } else if (to_->usesLockFreeQueue()) {
+            to_->useLockFreeQueue(*requested);
+        } else {
+            return true;
         }
-        staging_buf_.assign(phys, Staged{});
-        staging_mask_ = phys - 1;
-        staging_head_.store(0, std::memory_order_relaxed);
-        staging_tail_.store(0, std::memory_order_relaxed);
+        return crossThreadHeadroom() > 1;
     }
 
     size_t registerProducerThread(size_t thread_id) override {
@@ -402,21 +417,12 @@ public:
         if (thread_queue_id_ != SIZE_MAX) {
             ring_usable = staging_mask_;
         } else if (to_->usesLockFreeQueue()) {
-            ring_usable = to_->capacity();
+            ring_usable = to_->storageCapacity();
         } else {
             return SIZE_MAX;  // single-thread queue drains synchronously each tick
         }
-        const size_t rate = from_->perCycleCapacity();
-        // An uncapped per-cycle send rate can stage unboundedly per cycle, so no
-        // finite run-ahead is provably safe.
-        if (rate == OutPort<T>::UNLIMITED_CAPACITY) return 0;
-        // transfer() stops accepting once buffered entries reach this many: a
-        // bounded port back-pressures at to_->capacity(); an unlimited port fills
-        // the ring. Past it the epoch-free path either drops (unlimited: overflow)
-        // or back-pressures where the per-epoch barrier flush would not (bounded),
-        // so results would diverge from the reference.
-        const size_t threshold = std::min(to_->capacity(), ring_usable);
-        const size_t cycles = threshold / rate;
+        const size_t rate = effectiveHeadroomRate_();
+        const size_t cycles = ring_usable / rate;
         // The consumer drains only *due* entries (arrive_cycle <= k, i.e.
         // send_cycle <= k - delay_), so delay_ cycles of not-yet-due entries always
         // sit buffered. The supportable producer run-ahead is cycles - delay_.
@@ -430,6 +436,24 @@ public:
     InPort<T>* to() const noexcept { return to_; }
 
 private:
+    size_t effectiveHeadroomRate_() const noexcept {
+        const size_t rate = from_->perCycleCapacity();
+        // Default/unlimited OutPorts are common for one-send-per-tick model
+        // ports. Models that can emit multiple messages per tick should set an
+        // explicit per_cycle_capacity so the headroom proof scales accordingly.
+        return rate == OutPort<T>::UNLIMITED_CAPACITY ? 1 : rate;
+    }
+
+    std::optional<size_t> requiredUsableForHeadroom_(uint32_t max_lookahead_cycles) const {
+        const uint64_t desired = std::max<uint64_t>(max_lookahead_cycles, 2);
+        const uint64_t cycles = static_cast<uint64_t>(delay_) + desired;
+        const size_t rate = effectiveHeadroomRate_();
+        if (rate != 0 && cycles > std::numeric_limits<size_t>::max() / rate) {
+            return std::nullopt;
+        }
+        return static_cast<size_t>(cycles) * rate;
+    }
+
     /// Per-connection staging entry. Holds the original arrive_cycle and
     /// send_cycle (as enqueue_cycle) so that even if the InPort arbiter
     /// defers admission by back-pressure, downstream predicates and
@@ -440,6 +464,24 @@ private:
         uint64_t enqueue_cycle;
         uint64_t epoch_snapshot;
     };
+
+    void configureStagingRing_(size_t requested_usable) {
+        if (requested_usable == std::numeric_limits<size_t>::max()) {
+            throw std::length_error("MPSC staging ring capacity is too large");
+        }
+        size_t phys = 1;
+        const size_t target = std::max(requested_usable + 1, kStagingRingMin);
+        while (phys < target) {
+            if (phys > (std::numeric_limits<size_t>::max() / 2)) {
+                throw std::length_error("MPSC staging ring capacity is too large");
+            }
+            phys <<= 1;
+        }
+        staging_buf_.assign(phys, Staged{});
+        staging_mask_ = phys - 1;
+        staging_head_.store(0, std::memory_order_relaxed);
+        staging_tail_.store(0, std::memory_order_relaxed);
+    }
 
     bool transferToSharedQueue_(Staged& entry) {
         return to_->pushToThreadQueueCancelable(
@@ -474,13 +516,17 @@ private:
     alignas(64) std::atomic<size_t> staging_head_{0};  ///< consumer reads/advances
     alignas(64) std::atomic<size_t> staging_tail_{0};  ///< producer writes/advances
 
-    size_t stagingSize_() const noexcept {
+    size_t stagingSize_() const noexcept { return stagingRingSize_(); }
+
+    size_t stagingRingSize_() const noexcept {
         const size_t head = staging_head_.load(std::memory_order_acquire);
         const size_t tail = staging_tail_.load(std::memory_order_acquire);
         return (tail - head) & staging_mask_;
     }
 
-    bool stagingTryPush_(Staged&& e) {
+    bool stagingTryPush_(Staged&& e) { return stagingRingTryPush_(std::move(e)); }
+
+    bool stagingRingTryPush_(Staged&& e) {
         const size_t tail = staging_tail_.load(std::memory_order_relaxed);
         const size_t next = (tail + 1) & staging_mask_;
         if (next == staging_head_.load(std::memory_order_acquire)) {
@@ -491,7 +537,9 @@ private:
         return true;
     }
 
-    Staged* stagingPeekFront_() noexcept {
+    Staged* stagingPeekFront_() noexcept { return stagingRingPeekFront_(); }
+
+    Staged* stagingRingPeekFront_() noexcept {
         const size_t head = staging_head_.load(std::memory_order_relaxed);
         if (head == staging_tail_.load(std::memory_order_acquire)) {
             return nullptr;
@@ -499,7 +547,9 @@ private:
         return &staging_buf_[head];
     }
 
-    void stagingPopFront_() noexcept {
+    void stagingPopFront_() noexcept { stagingRingPopFront_(); }
+
+    void stagingRingPopFront_() noexcept {
         const size_t head = staging_head_.load(std::memory_order_relaxed);
         staging_buf_[head] = Staged{};  // release owned T early
         staging_head_.store((head + 1) & staging_mask_, std::memory_order_release);

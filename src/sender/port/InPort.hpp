@@ -113,6 +113,19 @@ private:
 
 public:
     /**
+     * Switch to the mutex-backed priority queue.
+     *
+     * Used during initialization when a connection cannot prove enough
+     * lock-free ring headroom for epoch-free lookahead. This queue is safe
+     * across runtime migration and reports unbounded cross-thread headroom.
+     */
+    void useThreadSafeQueue() {
+        multi_producer_queue_raw_ = nullptr;
+        lock_free_queue_ = false;
+        queue_ = std::make_unique<MessageQueueAdapter<StoredMessage>>(capacity_);
+    }
+
+    /**
      * Switch to single-thread queue (no mutex overhead).
      *
      * Call this during initialization when both producer and consumer
@@ -138,10 +151,11 @@ public:
      * there is only ONE source thread writing to this port.
      * Uses atomic operations instead of mutex.
      */
-    void useLockFreeQueue() {
+    void useLockFreeQueue(size_t min_usable_capacity = 0) {
         multi_producer_queue_raw_ = nullptr;
         lock_free_queue_ = true;
-        queue_ = std::make_unique<LockFreeQueueAdapter<StoredMessage>>(capacity_);
+        queue_ =
+            std::make_unique<LockFreeQueueAdapter<StoredMessage>>(capacity_, min_usable_capacity);
     }
 
     /**
@@ -262,11 +276,12 @@ public:
      * Used by Connection to support OutPort::cancelInFlight().
      */
     bool enqueueCancelable(T data, uint64_t arrive_cycle, const std::atomic<uint64_t>* cancel_epoch,
-                           uint64_t epoch_snapshot) {
+                           uint64_t epoch_snapshot, uint32_t sender_id = 0) {
         StoredMessage msg{.data = std::move(data),
                           .cancel_epoch = cancel_epoch,
                           .epoch_snapshot = epoch_snapshot};
         msg.enqueue_cycle = 0;
+        msg.sender_id = sender_id;
         return enqueueStored_(std::move(msg), arrive_cycle);
     }
 
@@ -278,11 +293,13 @@ public:
      * decide whether the message predates the most recent flush.
      */
     bool enqueueCancelable(T data, uint64_t arrive_cycle, const std::atomic<uint64_t>* cancel_epoch,
-                           uint64_t epoch_snapshot, uint64_t enqueue_cycle) {
+                           uint64_t epoch_snapshot, uint64_t enqueue_cycle,
+                           uint32_t sender_id = 0) {
         StoredMessage msg{.data = std::move(data),
                           .cancel_epoch = cancel_epoch,
                           .epoch_snapshot = epoch_snapshot};
         msg.enqueue_cycle = enqueue_cycle;
+        msg.sender_id = sender_id;
         return enqueueStored_(std::move(msg), arrive_cycle);
     }
 
@@ -309,6 +326,8 @@ public:
     }
 
     size_t capacity() const { return queue_->capacity(); }
+    size_t storageCapacity() const noexcept { return queue_->storageCapacity(); }
+    size_t configuredCapacity() const noexcept { return capacity_; }
     size_t available() const { return queue_->available(); }
 
     void setCapacity(size_t capacity) {

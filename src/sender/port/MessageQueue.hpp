@@ -211,12 +211,26 @@ private:
             if (arrive_cycle != other.arrive_cycle) {
                 return arrive_cycle > other.arrive_cycle;
             }
+            const uint32_t sid = stableSenderId_(data);
+            const uint32_t other_sid = stableSenderId_(other.data);
+            if (sid != other_sid) {
+                return sid > other_sid;
+            }
             return sequence > other.sequence;  // FIFO: earlier sequence = higher priority
         }
     };
 
     using InternalQueue = std::priority_queue<InternalMessage, std::vector<InternalMessage>,
                                               std::greater<InternalMessage>>;
+
+    template <typename Msg>
+    static uint32_t stableSenderId_(const Msg& msg) noexcept {
+        if constexpr (requires { msg.sender_id; }) {
+            return msg.sender_id;
+        } else {
+            return 0;
+        }
+    }
 
     mutable std::mutex mutex_;
     InternalQueue messages_;
@@ -566,6 +580,7 @@ public:
     virtual bool full() const = 0;
     virtual size_t size() const = 0;
     virtual size_t capacity() const noexcept = 0;
+    virtual size_t storageCapacity() const noexcept { return capacity(); }
     virtual size_t available() const = 0;
     virtual void setCapacity(size_t capacity) = 0;
     virtual void clear() = 0;
@@ -576,7 +591,7 @@ public:
  *
  * Works for any queue type that exposes: push(), tryPop(), popAll(),
  * hasReady(), minArrivalCycle(), empty(), full(), size(), capacity(),
- * available(), setCapacity(), clear().  Both MessageQueue and
+ * storageCapacity(), available(), setCapacity(), clear(). Both MessageQueue and
  * SingleThreadMessageQueue satisfy this contract.
  */
 template <typename T, typename QueueImpl>
@@ -607,6 +622,7 @@ public:
     bool full() const override { return queue_.full(); }
     size_t size() const override { return queue_.size(); }
     size_t capacity() const noexcept override { return queue_.capacity(); }
+    size_t storageCapacity() const noexcept override { return queue_.capacity(); }
     size_t available() const override { return queue_.available(); }
     void setCapacity(size_t capacity) override { queue_.setCapacity(capacity); }
     void clear() override { queue_.clear(); }
@@ -633,9 +649,15 @@ using SingleThreadQueueAdapter = QueueAdapterImpl<T, SingleThreadMessageQueue<T>
 template <typename T>
 class LockFreeQueueAdapter : public IMessageQueue<T> {
 public:
-    explicit LockFreeQueueAdapter(size_t capacity = LockFreeMessageQueue<T>::USABLE_CAPACITY)
-        : queue_(LockFreeMessageQueue<T>::physicalCapacityForUserCapacity(capacity)),
-          user_capacity_(std::min(capacity, queue_.usableCapacity())) {}
+    explicit LockFreeQueueAdapter(size_t capacity = LockFreeMessageQueue<T>::USABLE_CAPACITY,
+                                  size_t min_usable_capacity = 0)
+        : queue_(LockFreeMessageQueue<T>::physicalCapacityForUserCapacity(
+              capacity == std::numeric_limits<size_t>::max()
+                  ? min_usable_capacity
+                  : std::max(capacity, min_usable_capacity))),
+          user_capacity_(capacity == std::numeric_limits<size_t>::max()
+                             ? queue_.usableCapacity()
+                             : std::min(capacity, queue_.usableCapacity())) {}
 
     bool push(T data, uint64_t arrive_cycle) override {
         // Model-side admission is enforced upstream (Connection::transfer
@@ -677,6 +699,7 @@ public:
     bool full() const override { return queue_.size() >= user_capacity_; }
     size_t size() const override { return queue_.size(); }
     size_t capacity() const noexcept override { return user_capacity_; }
+    size_t storageCapacity() const noexcept override { return queue_.usableCapacity(); }
     size_t available() const override {
         const size_t sz = queue_.size();
         return sz < user_capacity_ ? user_capacity_ - sz : 0;

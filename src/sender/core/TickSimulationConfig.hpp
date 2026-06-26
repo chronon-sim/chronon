@@ -44,14 +44,14 @@ struct TickSimulationConfig {
 
     /// Epoch-free lookahead: in the persistent-worker lookahead path, collapse
     /// the per-epoch std::barrier into a single
-    /// run-spanning window. Run-ahead is then bounded solely by
-    /// lookahead_floor_ + max_lookahead_cycles (refreshed lazily on the slow
-    /// path) and per-connection MPSC arbitration, with a single MPSC flush at
-    /// run end. Engaged by runParallel() only when the persistent path is
-    /// eligible AND max_lookahead_cycles > 0 AND every MPSC port has fully
-    /// resolved per-connection progress; otherwise it falls back to the
-    /// barrier path. Results are identical to the barrier path — it trades
-    /// per-epoch straggler idle for lookahead-window slack.
+    /// run-spanning window. Run-ahead is then bounded by lookahead_floor_ +
+    /// max_lookahead_cycles plus per-edge queue-headroom dependencies, with
+    /// per-connection MPSC arbitration and a single MPSC flush at run end.
+    /// Engaged by runParallel() only when the persistent path is eligible,
+    /// max_lookahead_cycles is positive, and every MPSC port has fully resolved
+    /// per-connection progress; otherwise it falls back to the barrier path.
+    /// Results are identical to the barrier path — it trades per-epoch straggler
+    /// idle for lookahead-window slack.
     bool enable_epoch_free_lookahead = true;
 
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< 1 GHz default.

@@ -462,13 +462,23 @@ void PerfettoTraceWriter::sliceComplete(uint64_t track_uuid, std::string_view ca
 
 void PerfettoTraceWriter::wallInstant(uint64_t track_uuid, std::string_view category,
                                       std::string_view name, uint64_t ts_ns) {
+    wallInstant(track_uuid, category, name, ts_ns, 0, {});
+}
+
+void PerfettoTraceWriter::wallInstant(uint64_t track_uuid, std::string_view category,
+                                      std::string_view name, uint64_t ts_ns, uint64_t cycle,
+                                      std::string_view detail) {
     if (!isOpen()) {
         return;
     }
 
     auto* pkt = impl_->newPacket(impl_->wall, /*needs_incremental_state=*/true);
     pkt->set_timestamp(ts_ns);
-    auto strings = impl_->internEventStrings(impl_->wall, pkt, category, name, nullptr, 0, nullptr);
+    uint64_t annotation_iids[2] = {0, 0};
+    static constexpr std::string_view kInstantAnnotations[2] = {"cycle", "detail"};
+    const size_t annotation_count = cycle == 0 && detail.empty() ? 0 : (detail.empty() ? 1 : 2);
+    auto strings = impl_->internEventStrings(impl_->wall, pkt, category, name, kInstantAnnotations,
+                                             annotation_count, annotation_iids);
     auto* event = pkt->set_track_event();
     event->set_type(pbz::TrackEvent::TYPE_INSTANT);
     event->set_track_uuid(track_uuid);
@@ -476,6 +486,16 @@ void PerfettoTraceWriter::wallInstant(uint64_t track_uuid, std::string_view cate
         event->add_category_iids(strings.category_iid);
     }
     event->set_name_iid(strings.name_iid);
+    if (annotation_count > 0) {
+        auto* cycle_ann = event->add_debug_annotations();
+        cycle_ann->set_name_iid(annotation_iids[0]);
+        cycle_ann->set_uint_value(cycle);
+    }
+    if (annotation_count > 1) {
+        auto* detail_ann = event->add_debug_annotations();
+        detail_ann->set_name_iid(annotation_iids[1]);
+        detail_ann->set_string_value(chars(detail));
+    }
 
     ++events_written_;
     if (impl_->packets_buffered >= FLUSH_PACKET_COUNT) {
@@ -717,9 +737,16 @@ void writeTimeline(PerfettoTraceWriter& writer, const TimelineStreamData& data) 
             return std::string_view(arena.data() + off, len);
         };
         for (const auto& event : data.streams[sid]) {
-            writer.sliceComplete(stream_tracks[sid], slice(event.cat_off, event.cat_len),
-                                 slice(event.name_off, event.name_len), event.ts_ns, event.dur_ns,
-                                 event.cycle, slice(event.detail_off, event.detail_len));
+            const auto category = slice(event.cat_off, event.cat_len);
+            const auto name = slice(event.name_off, event.name_len);
+            const auto detail = slice(event.detail_off, event.detail_len);
+            if (event.instant) {
+                writer.wallInstant(stream_tracks[sid], category, name, event.ts_ns, event.cycle,
+                                   detail);
+            } else {
+                writer.sliceComplete(stream_tracks[sid], category, name, event.ts_ns, event.dur_ns,
+                                     event.cycle, detail);
+            }
         }
     }
 
