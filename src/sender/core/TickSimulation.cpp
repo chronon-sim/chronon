@@ -130,7 +130,8 @@ uint64_t TickSimulation::run(uint64_t num_cycles) {
 
     uint64_t executed = 0;
 
-    if (shouldUseParallelExecution_() && config_.enable_dynamic_rebalance) {
+    if (shouldUseParallelExecution_() && config_.enable_dynamic_rebalance &&
+        !epochFreeLookaheadEligible_()) {
         while (executed < num_cycles) {
             uint64_t step_cycles = std::min(config_.epoch_size, num_cycles - executed);
             uint64_t epoch_executed = runParallelEpoch(step_cycles, executed);
@@ -350,9 +351,9 @@ bool TickSimulation::persistentLookaheadEligible_() const {
 
 bool TickSimulation::epochFreeLookaheadEligible_() const {
     return persistentLookaheadEligible_() && config_.enable_epoch_free_lookahead &&
-           !config_.enable_dynamic_rebalance && config_.max_lookahead_cycles > 0 &&
-           allMPSCPortsHaveConnProgress_() &&
-           crossThreadHeadroomFits_(config_.max_lookahead_cycles);
+           config_.max_lookahead_cycles > 0 && allMPSCPortsHaveConnProgress_() &&
+           (config_.enable_dynamic_rebalance ||
+            crossThreadHeadroomFits_(config_.max_lookahead_cycles));
 }
 
 uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
@@ -369,14 +370,16 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
         if (config_.enable_epoch_free_lookahead && !epoch_free && observe_ctx_) {
             observe::log_info<
                 "epoch-free lookahead requested but vetoed (max_lookahead={}, "
-                "dynamic_rebalance={}, mpsc_progress_full={}, headroom_fits={}); "
+                "mpsc_progress_full={}, headroom_fits={}); "
                 "using barrier path">(observe_ctx_, config_.max_lookahead_cycles,
-                                      config_.enable_dynamic_rebalance,
                                       allMPSCPortsHaveConnProgress_(),
                                       crossThreadHeadroomFits_(config_.max_lookahead_cycles));
         }
         if (epoch_free) {
             ++epoch_free_run_count_;
+            if (config_.enable_dynamic_rebalance) {
+                return executeRunEpochFreeDynamic_(num_cycles);
+            }
             return executeRunEpochFree_(num_cycles);
         }
         if (!config_.enable_dynamic_rebalance) {
@@ -774,27 +777,42 @@ void TickSimulation::optimizeConnectionQueuesForDynamicRebalance_() {
         if (conns.empty()) continue;
 
         if (conns.size() == 1) {
+            // Dynamic rebalance cannot use SingleThreadMessageQueue: a local
+            // migration can turn an initially same-thread edge into a
+            // cross-thread edge while future-cycle messages are still pending.
+            // SPSC stays valid across migration because the topology still has
+            // exactly one producer connection and one consumer port; thread
+            // identity is irrelevant to the ring's single-writer/single-reader
+            // contract.
             conns[0]->optimizeForSPSC();
-            spsc_count += 1;
-            continue;
-        }
-
-        for (auto* conn : conns) {
-            conn->optimizeForMPSC();
-        }
-        for (auto* conn : conns) {
-            const size_t pseudo_thread_id = static_cast<size_t>(conn->connId()) + 1;
-            const size_t queue_id = conn->registerProducerThread(pseudo_thread_id);
-            if (queue_id != SIZE_MAX) {
-                conn->setThreadQueueId(queue_id);
+        } else {
+            // Multi-producer fan-in remains topology-keyed rather than
+            // thread-keyed: one staging ring per Connection, ordered by stable
+            // conn_id. This stays valid when a cluster moves because a
+            // Connection's producer is still single-threaded at any instant and
+            // the queue_id does not encode the old worker id.
+            for (auto* conn : conns) {
+                conn->optimizeForMPSC();
+            }
+            for (auto* conn : conns) {
+                const size_t pseudo_thread_id = static_cast<size_t>(conn->connId()) + 1;
+                const size_t queue_id = conn->registerProducerThread(pseudo_thread_id);
+                if (queue_id != SIZE_MAX) {
+                    conn->setThreadQueueId(queue_id);
+                }
             }
         }
-        mpsc_count += conns.size();
+        if (conns.size() == 1) {
+            spsc_count += 1;
+        } else {
+            mpsc_count += conns.size();
+        }
     }
 
     if (observe_ctx_) {
-        observe::log_info<"Queue optimization: dynamic-stable, {} SPSC, {} MPSC connections">(
-            observe_ctx_, spsc_count, mpsc_count);
+        observe::log_info<
+            "Queue optimization: dynamic-stable, {} SPSC, {} MPSC, no same-thread "
+            "queues">(observe_ctx_, spsc_count, mpsc_count);
     }
 }
 

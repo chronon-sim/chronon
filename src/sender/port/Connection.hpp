@@ -214,7 +214,8 @@ public:
             // Barrier), forwarding from staging into the shared per-thread
             // queue in deterministic conn_id order. See
             // docs/mpsc-atomic-publish.md.
-            if (stagingSize_() >= to_->capacity()) {
+            if (to_->capacity() != InPort<T>::UNLIMITED_CAPACITY &&
+                stagingSize_() >= to_->capacity()) {
                 return false;  // staging full -> producer sees back-pressure
             }
             if (!stagingTryPush_(
@@ -235,7 +236,7 @@ public:
             return false;
         }
         const bool ok = to_->enqueueCancelable(std::move(data), arrive_cycle, &cancel_epoch_,
-                                               epoch_snapshot, send_cycle);
+                                               epoch_snapshot, send_cycle, conn_id_);
         if (ok) {
             ++pushes_this_cycle_;
             wakeUnitAt(destination(), arrive_cycle);
@@ -328,7 +329,8 @@ public:
         // sync point) in deterministic conn_id order, so the push path
         // itself does not race on wall-clock ordering across worker threads.
         if (thread_queue_id_ != SIZE_MAX) {
-            return stagingSize_() < to_->capacity();
+            return to_->capacity() == InPort<T>::UNLIMITED_CAPACITY ||
+                   stagingSize_() < to_->capacity();
         }
         // Rate-based admission: producer may push up to effectiveCapacity_()
         // items per simulated cycle, tracked locally via pushes_this_cycle_.
@@ -474,13 +476,17 @@ private:
     alignas(64) std::atomic<size_t> staging_head_{0};  ///< consumer reads/advances
     alignas(64) std::atomic<size_t> staging_tail_{0};  ///< producer writes/advances
 
-    size_t stagingSize_() const noexcept {
+    size_t stagingSize_() const noexcept { return stagingRingSize_(); }
+
+    size_t stagingRingSize_() const noexcept {
         const size_t head = staging_head_.load(std::memory_order_acquire);
         const size_t tail = staging_tail_.load(std::memory_order_acquire);
         return (tail - head) & staging_mask_;
     }
 
-    bool stagingTryPush_(Staged&& e) {
+    bool stagingTryPush_(Staged&& e) { return stagingRingTryPush_(std::move(e)); }
+
+    bool stagingRingTryPush_(Staged&& e) {
         const size_t tail = staging_tail_.load(std::memory_order_relaxed);
         const size_t next = (tail + 1) & staging_mask_;
         if (next == staging_head_.load(std::memory_order_acquire)) {
@@ -491,7 +497,9 @@ private:
         return true;
     }
 
-    Staged* stagingPeekFront_() noexcept {
+    Staged* stagingPeekFront_() noexcept { return stagingRingPeekFront_(); }
+
+    Staged* stagingRingPeekFront_() noexcept {
         const size_t head = staging_head_.load(std::memory_order_relaxed);
         if (head == staging_tail_.load(std::memory_order_acquire)) {
             return nullptr;
@@ -499,7 +507,9 @@ private:
         return &staging_buf_[head];
     }
 
-    void stagingPopFront_() noexcept {
+    void stagingPopFront_() noexcept { stagingRingPopFront_(); }
+
+    void stagingRingPopFront_() noexcept {
         const size_t head = staging_head_.load(std::memory_order_relaxed);
         staging_buf_[head] = Staged{};  // release owned T early
         staging_head_.store((head + 1) & staging_mask_, std::memory_order_release);

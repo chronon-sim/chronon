@@ -34,6 +34,7 @@
 #pragma GCC diagnostic pop
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -443,6 +444,7 @@ private:
     bool performRebalance_();
     void maybeRebalanceAfterEpoch_(uint64_t epoch_executed);
     void recordTickSample_(size_t thread_idx, size_t unit_local_idx, uint64_t ticks, bool active);
+    void recordClusterTickSample_(size_t cluster, uint64_t ticks, bool active);
 
     /**
      * Topology-only cluster-aware placement (no cost profiling). Used as
@@ -501,6 +503,7 @@ private:
      * max_lookahead_cycles > 0. Returns cycles actually executed.
      */
     uint64_t executeRunEpochFree_(uint64_t total_cycles);
+    uint64_t executeRunEpochFreeDynamic_(uint64_t total_cycles);
 
     /// Completed cycles reported by a run-spanning worker launch. When a unit
     /// requests termination on a nonzero cluster, cluster 0 may lag behind the
@@ -527,6 +530,8 @@ private:
     /// and exits via stop_token on termination or exception.
     void executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
                              stdexec::inplace_stop_token token);
+    void executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_cycle,
+                                    stdexec::inplace_stop_token token);
 
     /// Monotonically raise lookahead_floor_ to the global-min completed cycle.
     /// Slow-path only (a stalled worker); see lookahead_floor_ for the contract.
@@ -544,6 +549,15 @@ private:
     std::string formatBlockerDetail_(const BlockedClusterInfo& blocker) const;
     void executeClusterOneCycle_(size_t thread_idx, size_t cluster, uint64_t cycle,
                                  bool trace_units);
+
+    void initDynamicMigrationRuntime_();
+    void rebuildThreadUnitsFromClusterOwners_();
+    bool maybeRequestEpochFreeMigration_(uint64_t cycle);
+    void serviceEpochFreeMigration_();
+    void clearDynamicMigrationRequest_();
+    void resetDynamicSchedulerMarkers_();
+    void recordDynamicSchedulerMarker_(std::string name, uint64_t cycle, std::string detail);
+    void flushDynamicSchedulerMarkers_();
 
     /**
      * Drive cycle-boundary MPSC arbitration on every registered InPort.
@@ -627,6 +641,45 @@ private:
     std::vector<std::vector<TickableUnit*>> cluster_unit_ptrs_;
     std::vector<std::vector<size_t>> cluster_thread_unit_positions_;
     std::vector<std::vector<SchedulerTimelineTrace::TimePoint>> thread_trace_points_;
+
+    enum class MigrationRequestState : uint8_t {
+        None = 0,
+        Requested,
+        Quiescing,
+        ReadyToCommit,
+        Committed,
+    };
+
+    struct RuntimeMigrationRequest {
+        std::atomic<uint8_t> state{static_cast<uint8_t>(MigrationRequestState::None)};
+        std::atomic<size_t> cluster{SIZE_MAX};
+        std::atomic<size_t> source_thread{SIZE_MAX};
+        std::atomic<size_t> target_thread{SIZE_MAX};
+        std::atomic<uint64_t> fence_cycle{0};
+    };
+
+    RuntimeMigrationRequest migration_request_;
+    std::unique_ptr<std::atomic<size_t>[]> cluster_runtime_owner_;
+    std::unique_ptr<std::atomic<size_t>[]> cluster_execution_owner_;
+    std::unique_ptr<std::atomic<uint8_t>[]> cluster_migration_pending_;
+    std::unique_ptr<std::atomic<uint64_t>[]> cluster_sample_time_ns_;
+    std::unique_ptr<std::atomic<uint64_t>[]> cluster_sample_count_;
+    std::unique_ptr<std::atomic<uint64_t>[]> cluster_active_sample_count_;
+    std::atomic<uint64_t> cluster_assignment_generation_{0};
+    size_t dynamic_runtime_cluster_count_ = 0;
+    alignas(64) std::atomic<uint64_t> next_dynamic_rebalance_check_cycle_{0};
+    alignas(64) std::atomic<bool> epoch_free_dynamic_runtime_active_{false};
+
+    struct DynamicSchedulerMarker {
+        SchedulerTimelineTrace::TimePoint time{};
+        uint64_t cycle = 0;
+        std::string name;
+        std::string detail;
+    };
+    static constexpr size_t kDynamicSchedulerMarkerCapacity = 1024;
+    std::array<DynamicSchedulerMarker, kDynamicSchedulerMarkerCapacity> dynamic_scheduler_markers_;
+    std::atomic<size_t> dynamic_scheduler_marker_count_{0};
+    std::atomic<uint64_t> dynamic_scheduler_marker_drops_{0};
 
     /// Unified stop source: prevents spin-wait deadlock AND propagates
     /// unit-initiated termination into worker threads. Wrapped in optional

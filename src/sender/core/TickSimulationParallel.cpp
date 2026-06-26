@@ -211,6 +211,10 @@ void TickSimulation::initProgressSync() {
         observe::log_info<"  Initialized cluster progress sync for {} clusters on {} threads">(
             observe_ctx_, num_clusters, num_threads);
     }
+
+    if (config_.enable_dynamic_rebalance) {
+        initDynamicMigrationRuntime_();
+    }
 }
 
 void TickSimulation::initTimelineTraceScratch_() {
@@ -717,10 +721,16 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
 
     if (trace_units) {
         auto& points = thread_trace_points_[thread_idx];
+        if (points.size() < num_units + 1) {
+            points.resize(num_units + 1);
+        }
         std::vector<char> active(num_units, 0);
         points[0] = SchedulerTimelineTrace::Clock::now();
         for (size_t u = 0; u < num_units; ++u) {
-            const bool sample_tick = config_.enable_dynamic_rebalance && (cycle & 1023u) == 0;
+            const bool sample_tick =
+                config_.enable_dynamic_rebalance &&
+                !epoch_free_dynamic_runtime_active_.load(std::memory_order_relaxed) &&
+                (cycle & 1023u) == 0;
             active[u] = executeUnitCycle_(units[u], cycle);
             points[u + 1] = SchedulerTimelineTrace::Clock::now();
 
@@ -737,7 +747,11 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
                                            units[u]->name(), cycle, points[u], points[u + 1],
                                            active[u] ? "" : "cycles=1");
         }
-    } else if (__builtin_expect(config_.enable_dynamic_rebalance && (cycle & 1023u) == 0, 0)) {
+    } else if (__builtin_expect(
+                   config_.enable_dynamic_rebalance &&
+                       !epoch_free_dynamic_runtime_active_.load(std::memory_order_relaxed) &&
+                       (cycle & 1023u) == 0,
+                   0)) {
         for (size_t u = 0; u < num_units; ++u) {
             auto tp0 = std::chrono::steady_clock::now();
             bool active = executeUnitCycle_(units[u], cycle);

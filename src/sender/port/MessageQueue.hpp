@@ -211,12 +211,26 @@ private:
             if (arrive_cycle != other.arrive_cycle) {
                 return arrive_cycle > other.arrive_cycle;
             }
+            const uint32_t sid = stableSenderId_(data);
+            const uint32_t other_sid = stableSenderId_(other.data);
+            if (sid != other_sid) {
+                return sid > other_sid;
+            }
             return sequence > other.sequence;  // FIFO: earlier sequence = higher priority
         }
     };
 
     using InternalQueue = std::priority_queue<InternalMessage, std::vector<InternalMessage>,
                                               std::greater<InternalMessage>>;
+
+    template <typename Msg>
+    static uint32_t stableSenderId_(const Msg& msg) noexcept {
+        if constexpr (requires { msg.sender_id; }) {
+            return msg.sender_id;
+        } else {
+            return 0;
+        }
+    }
 
     mutable std::mutex mutex_;
     InternalQueue messages_;

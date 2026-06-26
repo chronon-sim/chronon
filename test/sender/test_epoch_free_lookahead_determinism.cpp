@@ -123,6 +123,7 @@ public:
 struct RunResult {
     uint64_t checksum;
     uint64_t epoch_free_runs;
+    uint64_t rebalances;
 };
 
 // A and B fan in to C with delays (dA, dB); C -> D -> {A, B} closes a feedback
@@ -154,7 +155,8 @@ RunResult runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, 
     sim.connect(D->out, B->in, 1);
     sim.initialize();
     sim.run(cycles);
-    return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount()};
+    return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount(),
+            sim.rebalanceCount()};
 }
 
 void verify_scheduler_timeline_does_not_veto_epoch_free(uint64_t cycles, unsigned hw) {
@@ -361,7 +363,8 @@ RunResult runCycle(size_t num_threads, bool epoch_free, uint32_t max_lookahead, 
     sim.connect(D->out, A->in, 1);  // close the cycle; one producer per port -> SPSC
     sim.initialize();
     sim.run(cycles);
-    return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount()};
+    return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount(),
+            sim.rebalanceCount()};
 }
 
 // The SPSC lock-free ring (USABLE_CAPACITY, ~4095) is bounded even for unlimited
@@ -382,7 +385,7 @@ void verify_spsc_gate(uint64_t cycles, unsigned hw) {
     check(veto.epoch_free_runs == 0, "spsc-gate vetoes epoch-free past SPSC ring");
 }
 
-void verify_dynamic_rebalance_vetoes_epoch_free(uint64_t cycles, unsigned hw) {
+void verify_dynamic_rebalance_uses_epoch_free(uint64_t cycles, unsigned hw) {
     if (hw < 2) return;
     const uint64_t ref = runOnce(2, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
                                  /*max_lookahead=*/100, cycles)
@@ -391,8 +394,8 @@ void verify_dynamic_rebalance_vetoes_epoch_free(uint64_t cycles, unsigned hw) {
     RunResult dynamic = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
                                 /*max_lookahead=*/64, cycles, /*out_rate=*/1,
                                 /*scheduler_timeline=*/false, /*dynamic_rebalance=*/true);
-    check(dynamic.checksum == ref, "dynamic-rebalance veto epoch-free == ref");
-    check(dynamic.epoch_free_runs == 0, "dynamic rebalance vetoes epoch-free");
+    check(dynamic.checksum == ref, "dynamic-rebalance epoch-free == ref");
+    check(dynamic.epoch_free_runs > 0, "dynamic rebalance keeps epoch-free enabled");
 }
 
 }  // namespace
@@ -412,7 +415,7 @@ int main() {
 
     verify_staging_veto(cycles, hw);
     verify_spsc_gate(cycles, hw);
-    verify_dynamic_rebalance_vetoes_epoch_free(cycles, hw);
+    verify_dynamic_rebalance_uses_epoch_free(cycles, hw);
     verify_scheduler_timeline_does_not_veto_epoch_free(cycles, hw);
     verify_run_until_termination_uses_epoch_free(hw);
     verify_run_until_termination_default_max_after_warmup(hw);
