@@ -142,8 +142,9 @@ protected:
     }
 
     /**
-     * Request simulation termination. First request wins; the simulation
-     * stops at the next epoch boundary.
+     * Request simulation termination. First request wins; the simulation stops
+     * at the next scheduler boundary, and parallel lookahead workers are
+     * signaled through the shared stop token.
      */
     void requestTermination(TerminationReason reason, int32_t exit_code = 0,
                             std::string_view message = "") {

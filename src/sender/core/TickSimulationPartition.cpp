@@ -19,6 +19,7 @@
 #include <unordered_map>
 
 #include "TickSimulation.hpp"
+#include "sender/schedule/EpochFreeTopologyCost.hpp"
 
 namespace chronon::sender {
 
@@ -59,21 +60,13 @@ void TickSimulation::buildPartitionAdjacency_(
         if (si == unit_ptr_to_idx.end() || di == unit_ptr_to_idx.end()) continue;
 
         size_t s = si->second, d = di->second;
-        // Store directed edge only. Bidirectional communication naturally
-        // produces edges in both directions because separate Connection
-        // objects exist for each. Adding a synthetic reverse entry would
-        // double-count bus connections (wakeup/flush buses expand to N*M
-        // Connections, each of which would otherwise create 2 adjacency
-        // entries instead of 1).
+        // Directed edge only; reciprocal traffic has its own Connection.
         auto& fwd = pair_info[{s, d}];
         fwd.first++;
         fwd.second = (fwd.second == 0) ? conn->delay() : std::min(fwd.second, conn->delay());
     }
 
-    // Drain the hash map in a deterministic (u, v) order: unordered_map iteration
-    // order is implementation-defined, and the resulting adjacency ordering feeds
-    // floating-point sync-cost sums in the solver, so leaving it stdlib-dependent
-    // would make the partition diverge across standard libraries.
+    // Deterministic edge order keeps solver floating-point sums repeatable.
     std::vector<PairKey> keys;
     keys.reserve(pair_info.size());
     for (const auto& [key, info] : pair_info) keys.push_back(key);
@@ -217,8 +210,7 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
     cluster_input.critical_path_weight = config_.sa_critical_path_weight;
     cluster_input.adjacency.resize(num_clusters);
 
-    // Deterministic (u, v) drain order — see buildPartitionAdjacency_ for why the
-    // unordered_map's iteration order must not leak into the adjacency layout.
+    // Deterministic (u, v) drain order; the adjacency feeds floating-point sums.
     std::vector<PairKey> cluster_keys;
     cluster_keys.reserve(cluster_pair_info.size());
     for (const auto& [key, info] : cluster_pair_info) cluster_keys.push_back(key);
@@ -231,6 +223,15 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
     }
 
     auto result = runPartitionSolver_(cluster_input);
+    if (config_.enable_lookahead && config_.enable_epoch_free_lookahead && num_threads > 1) {
+        auto improved = epoch_free_cost::improveInitialPlacement(
+            cluster_input, result.unit_to_thread, num_threads);
+        if (improved != result.unit_to_thread) {
+            auto stats = result.stats;
+            result = partition_utils::buildResult(cluster_input, improved, num_threads);
+            result.stats = std::move(stats);
+        }
+    }
 
     cluster_to_thread_.resize(num_clusters);
     for (size_t c = 0; c < num_clusters; ++c) {

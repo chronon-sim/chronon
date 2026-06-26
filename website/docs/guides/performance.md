@@ -234,16 +234,16 @@ simulation:
   profiling_warmup_cycles: 512           # Warmup ticks before measuring
   profiling_measurement_cycles: 1024     # Measurement window for tick costs
   enable_dynamic_rebalance: false        # Runtime cluster migration (opt-in)
-  rebalance_check_interval_cycles: 8192  # Epoch-boundary imbalance checks
+  rebalance_check_interval_cycles: 8192  # Scheduler-fence imbalance checks
   rebalance_min_gain: 0.05               # Skip if predicted gain is too small
   rebalance_cooldown_cycles: 0           # Minimum cycles between rebalances
 ```
 
-Dynamic rebalance is an opt-in epoch-boundary migration path. It is most useful
-when timeline traces show one stream doing
-most unit work while others spend time in dependency waits. The rebalancer
-samples unit tick cost, sums sampled work per stream, and migrates whole
-tight clusters at epoch boundaries; it never splits a delay=0 cluster. Use
+Dynamic rebalance is an opt-in whole-cluster migration path. It is most useful
+when timeline traces show one stream doing most unit work while others spend
+time in dependency waits. The rebalancer samples unit tick cost, combines it
+with dependency topology and wait attribution, and migrates whole tight clusters
+at scheduler fence points; it never splits a delay=0 cluster. Use
 `rebalance_min_gain` and `rebalance_cooldown_cycles` to avoid low-value or too
 frequent migrations.
 
@@ -255,9 +255,10 @@ When the staging-capacity gate is satisfied, `enable_epoch_free_lookahead`
 (default on) removes the per-epoch barrier entirely instead of just widening it:
 run-ahead is then bounded only by dependency progress and
 `max_lookahead_cycles`. If the gate rejects the topology, Chronon falls back to
-the per-epoch path, where dynamic rebalance can still operate at epoch
-boundaries; see [Epoch-Free Lookahead](scheduling.md) for the conditions and the
-MPSC headroom requirement.
+the per-epoch path. Dynamic rebalance remains opt-in and can run on the
+epoch-free dynamic driver when its gate holds, or on the per-epoch fallback when
+epoch-free is vetoed; see [Epoch-Free Lookahead](scheduling.md) for the
+conditions and MPSC requirements.
 
 Notes:
 - In single-thread mode, Chronon uses a per-cycle fast path to avoid lookahead bookkeeping overhead.

@@ -49,9 +49,10 @@ namespace chronon::sender {
 /**
  * High-performance simulation using stdexec.
  *
- * Execution model: for each epoch, compute safe boundaries (lookahead),
- * dispatch parallel work via stdexec::bulk + starts_on, then sync_wait at
- * the epoch boundary. No per-cycle sync overhead.
+ * Execution model: Chronon selects sequential, barrier, per-epoch lookahead,
+ * or epoch-free lookahead at runtime. In lookahead mode, tight clusters advance
+ * on dependency progress atomics; the epoch-free path is the default when the
+ * safety gate can prove that no per-epoch flush is required.
  *
  * @code
  * TickSimulation sim;
@@ -180,9 +181,10 @@ public:
     /**
      * Run until termination is requested or max_cycles is reached.
      *
-     * Termination is checked at epoch boundaries (~64 cycles) with very low
-     * overhead. If max_cycles is reached without a request, the controller
-     * is updated with MaxCyclesReached.
+     * Termination is observed at scheduler boundaries with very low overhead;
+     * parallel lookahead paths also propagate the stop token into spin waits.
+     * If max_cycles is reached without a request, the controller is updated
+     * with MaxCyclesReached.
      */
     uint64_t runUntilTermination(uint64_t max_cycles = UINT64_MAX);
 
@@ -459,7 +461,7 @@ private:
 
     /**
      * Pick queue adapters that remain valid after runtime cluster
-     * migration. Dynamic rebalance can move endpoints at epoch boundaries,
+     * migration. Dynamic rebalance can move endpoints at scheduler fence points,
      * so queue type cannot depend on initial thread placement, and
      * reconfiguring adapters mid-run would drop future-cycle messages.
      */
@@ -487,8 +489,8 @@ private:
      * Persistent-worker variant of executeEpochProgressBased: one bulk launch for
      * the whole run, epoch boundaries crossed via a reusable std::barrier, so the
      * stdexec thread pool no longer heap-allocates a bulk op-state per epoch. Used
-     * by runParallel() only when lookahead is on, rebalance is off, and tracing is
-     * disabled (the per-epoch path handles the rest). Returns cycles executed.
+     * by runParallel() as the fixed-layout fallback when the epoch-free gate is
+     * unavailable. Returns cycles executed.
      */
     uint64_t executeRunProgressBased(uint64_t total_cycles);
 
@@ -670,6 +672,11 @@ private:
     std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_floor_wait_ns_;
     std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_dep_wait_ns_;
     std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_no_ready_wait_ns_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_cluster_blocked_wait_ns_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_cluster_blocker_wait_ns_;
+    std::vector<uint64_t> dynamic_cluster_last_migration_cycle_;
+    std::vector<size_t> dynamic_cluster_last_source_thread_;
+    std::vector<size_t> dynamic_cluster_last_target_thread_;
     std::atomic<uint64_t> cluster_assignment_generation_{0};
     size_t dynamic_runtime_cluster_count_ = 0;
     size_t dynamic_runtime_thread_count_ = 0;

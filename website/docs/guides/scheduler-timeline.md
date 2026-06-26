@@ -167,13 +167,14 @@ execution is dependency-aware rather than strictly list-ordered: if one cluster
 is blocked, another ready cluster on the same stream may advance.
 
 Stream lanes are logical worker lanes, not fixed unit ownership labels. Dynamic
-rebalance is enabled by default and migrates whole clusters at epoch boundaries
-when sampled per-stream work is imbalanced. A later unit event can therefore
-appear on a different stream than it used at initialization.
+rebalance is opt-in and migrates whole clusters at scheduler fence points when
+sampled per-stream work and dependency pressure predict a useful improvement. A
+later unit event can therefore appear on a different stream than it used at
+initialization.
 
 The scheduler lane records a `dynamic rebalance` event whenever a new assignment
 is applied. Its `detail` field lists the migrated clusters and the old/new
 stream ids.
 
 It does not move individual units independently and does not migrate work in the
-middle of an epoch.
+middle of a scheduler window.

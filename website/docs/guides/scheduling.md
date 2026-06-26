@@ -291,31 +291,33 @@ back to the per-epoch path. Scheduler timeline tracing does not veto epoch-free
 lookahead; idle fast paths are then paced by dependency progress and
 `max_lookahead_cycles`, not by `epoch_size`.
 
-Dynamic rebalance vetoes epoch-free lookahead. Rebalance decisions are made at
-epoch boundaries, so `enable_dynamic_rebalance: true` keeps the per-epoch driver
-even when the dependency and buffer-headroom gates would otherwise allow
-epoch-free execution.
+Dynamic rebalance does not veto epoch-free lookahead. Rebalance remains opt-in,
+but when `enable_dynamic_rebalance: true` and the epoch-free dependency gate
+holds, Chronon uses the epoch-free dynamic driver and commits whole-cluster
+migrations only at scheduler fence points. If the epoch-free gate is rejected,
+the dynamic path falls back to the explicit per-epoch driver.
 
 **When it engages.** The dispatch gate keeps the per-epoch barrier path unless
 *all* of the following hold; otherwise it transparently falls back (no result
 change):
 
 - `enable_epoch_free_lookahead` is set and `max_lookahead_cycles > 0`;
-- `enable_dynamic_rebalance` is not set;
 - the run uses the persistent path — reached via `TickSimulation::run()` or
   `runUntilTermination()`;
 - every MPSC input port has fully-resolved per-connection producer progress;
-- **cross-thread buffer headroom suffices for every connection** (see below).
+- when dynamic rebalance is disabled, **cross-thread buffer headroom suffices
+  for every connection** (see below).
 
-**Cross-thread buffer headroom.** Without the per-epoch drain, a producer can run
-ahead of a consumer and leave entries buffered in the connection's cross-thread
-ring — the per-connection MPSC staging ring for a multi-producer port, or the
-SPSC lock-free ring for a single-producer cross-thread edge. For bounded
-`InPort`s, lock-free rings are sized at initialization so the declared capacity
-fits. For unlimited-capacity `InPort`s, the physical lock-free rings remain
-bounded by the default ring size, and the port never model-side back-pressures,
-so a producer could silently overflow the physical ring. The gate therefore
-vetoes epoch-free unless each connection can absorb the configured run-ahead.
+**Cross-thread buffer headroom.** In fixed-layout epoch-free lookahead, without
+the per-epoch drain, a producer can run ahead of a consumer and leave entries
+buffered in the connection's cross-thread ring — the per-connection MPSC staging
+ring for a multi-producer port, or the SPSC lock-free ring for a single-producer
+cross-thread edge. For bounded `InPort`s, lock-free rings are sized at
+initialization so the declared capacity fits. For unlimited-capacity `InPort`s,
+the physical lock-free rings remain bounded by the default ring size, and the
+port never model-side back-pressures, so a producer could silently overflow the
+physical ring. The fixed-layout gate therefore vetoes epoch-free unless each
+connection can absorb the configured run-ahead.
 The headroom (in cycles) a connection supports is roughly:
 
 ```
@@ -326,11 +328,12 @@ where `per_cycle_send_rate` is the source `OutPort`'s per-cycle send cap (an
 uncapped source forces a veto), `ring slots` is the usable physical ring
 capacity, and `edge_delay` accounts for not-yet-due entries the consumer cannot
 drain. Same-thread connections drain synchronously and impose no bound. If any
-cross-thread connection's headroom is `<= max_lookahead_cycles`, the run falls
-back to the barrier path. To use epoch-free with unlimited-capacity cross-thread
-edges, give the producing `OutPort` a per-cycle send cap and keep
-`max_lookahead_cycles + edge_delay` within the default physical ring, or use an
-explicit bounded `InPort` capacity large enough for the desired run-ahead.
+cross-thread connection's headroom is `<= max_lookahead_cycles`, the
+fixed-layout run falls back to the barrier path. To use fixed-layout epoch-free
+with unlimited-capacity cross-thread edges, give the producing `OutPort` a
+per-cycle send cap and keep `max_lookahead_cycles + edge_delay` within the
+default physical ring, or use an explicit bounded `InPort` capacity large enough
+for the desired run-ahead.
 
 ## Scheduler Timeline Diagnostics
 
@@ -344,8 +347,8 @@ the event detail.
 
 This keeps delay=0 groups atomic while allowing independent clusters assigned
 to the same stream to advance out of order. Dynamic rebalance, when enabled,
-migrates whole clusters at epoch boundaries; it does not split delay=0 clusters
-or migrate units in the middle of an epoch.
+migrates whole clusters at scheduler fence points; it does not split delay=0
+clusters or migrate individual units.
 
 Typical investigation workflow:
 
@@ -413,14 +416,12 @@ struct TickSimulationConfig {
 
 These settings can be configured via YAML (`enable_parallel`, `enable_lookahead`) or set directly in code. All scheduling modes produce identical cycle-accurate results — they differ only in wall-clock performance.
 
-Dynamic rebalance is opt-in. It samples unit tick cost periodically, computes
-per-stream total sampled work, and migrates whole tight clusters at epoch
-boundaries when the heaviest stream is more than
-`rebalance_imbalance_threshold` above the assigned-stream average. Leave
-`enable_dynamic_rebalance: false` when a fixed initial layout or
-dependency/lookahead-paced epoch-free execution is more important; dynamic
-rebalance vetoes the epoch-free path and keeps the explicit epoch boundary
-driver.
+Dynamic rebalance is opt-in. It samples unit tick cost periodically, combines
+measured active cost with dependency topology and wait attribution, and migrates
+whole tight clusters at scheduler fence points when the predicted objective gain
+clears the configured thresholds. Leave `enable_dynamic_rebalance: false` when a
+fixed initial layout is more important; epoch-free lookahead itself remains the
+default path when the safety gate holds.
 `rebalance_min_gain` can suppress migrations with too little predicted speedup,
 and `rebalance_cooldown_cycles` can enforce a minimum cycle gap between applied
 rebalances.

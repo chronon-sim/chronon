@@ -20,12 +20,25 @@
 
 #include "../../chronon/CpuPause.hpp"
 #include "TickSimulation.hpp"
+#include "sender/schedule/EpochFreeTopologyCost.hpp"
 
 namespace chronon::sender {
 
 namespace {
 constexpr uint64_t kFloorRefreshSpinMask = 0xFF;
 constexpr uint64_t kDynamicClusterMinSamples = 4;
+constexpr uint64_t kNoMigrationCycle = std::numeric_limits<uint64_t>::max();
+
+struct PairKey {
+    size_t u, v;
+    bool operator==(const PairKey& o) const { return u == o.u && v == o.v; }
+};
+
+struct PairHash {
+    size_t operator()(const PairKey& k) const {
+        return k.u ^ (k.v * 0x9e3779b97f4a7c15ULL + (k.u << 6) + (k.u >> 2));
+    }
+};
 
 uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
     const uint64_t max = std::numeric_limits<uint64_t>::max();
@@ -43,19 +56,6 @@ bool clusterHasMPSCConnections(const std::vector<TickableUnit*>& units) noexcept
     return false;
 }
 
-double waitAdjustedTargetScore(double active_cost, uint64_t floor_wait_ns,
-                               uint64_t dep_wait_ns) noexcept {
-    const double floor_wait = static_cast<double>(floor_wait_ns);
-    const double dep_wait = static_cast<double>(dep_wait_ns);
-    const double total_wait = floor_wait + dep_wait;
-    if (total_wait <= 0.0) {
-        return active_cost;
-    }
-
-    const double floor_slack_ratio = floor_wait / total_wait;
-    const double dep_pressure_ratio = dep_wait / total_wait;
-    return active_cost * (1.0 + 0.75 * dep_pressure_ratio - 0.20 * floor_slack_ratio);
-}
 }  // namespace
 
 void TickSimulation::clearDynamicMigrationRequest_() {
@@ -79,6 +79,11 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         cluster_sample_time_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_clusters);
         cluster_sample_count_ = std::make_unique<std::atomic<uint64_t>[]>(num_clusters);
         cluster_active_sample_count_ = std::make_unique<std::atomic<uint64_t>[]>(num_clusters);
+        dynamic_cluster_blocked_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_clusters);
+        dynamic_cluster_blocker_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_clusters);
+        dynamic_cluster_last_migration_cycle_.assign(num_clusters, kNoMigrationCycle);
+        dynamic_cluster_last_source_thread_.assign(num_clusters, SIZE_MAX);
+        dynamic_cluster_last_target_thread_.assign(num_clusters, SIZE_MAX);
         dynamic_runtime_cluster_count_ = num_clusters;
     }
     if (dynamic_runtime_thread_count_ != num_threads || !dynamic_thread_floor_wait_ns_) {
@@ -96,6 +101,8 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         cluster_sample_time_ns_[c].store(0, std::memory_order_relaxed);
         cluster_sample_count_[c].store(0, std::memory_order_relaxed);
         cluster_active_sample_count_[c].store(0, std::memory_order_relaxed);
+        dynamic_cluster_blocked_wait_ns_[c].store(0, std::memory_order_relaxed);
+        dynamic_cluster_blocker_wait_ns_[c].store(0, std::memory_order_relaxed);
     }
     for (size_t t = 0; t < num_threads; ++t) {
         dynamic_thread_floor_wait_ns_[t].store(0, std::memory_order_relaxed);
@@ -178,6 +185,15 @@ void TickSimulation::recordDynamicWaitSample_(size_t thread_idx, const BlockedCl
         dynamic_thread_floor_wait_ns_[thread_idx].fetch_add(wait_ns, std::memory_order_relaxed);
     } else {
         dynamic_thread_dep_wait_ns_[thread_idx].fetch_add(wait_ns, std::memory_order_relaxed);
+        if (dynamic_cluster_blocked_wait_ns_ && blocker.cluster < dynamic_runtime_cluster_count_) {
+            dynamic_cluster_blocked_wait_ns_[blocker.cluster].fetch_add(wait_ns,
+                                                                        std::memory_order_relaxed);
+        }
+        if (dynamic_cluster_blocker_wait_ns_ &&
+            blocker.pred_cluster < dynamic_runtime_cluster_count_) {
+            dynamic_cluster_blocker_wait_ns_[blocker.pred_cluster].fetch_add(
+                wait_ns, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -237,7 +253,8 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     }
 
     const uint64_t interval = std::max<uint64_t>(1, config_.rebalance_check_interval_cycles);
-    const uint64_t gate_cycle = lookahead_floor_.load(std::memory_order_acquire);
+    const uint64_t floor_cycle = lookahead_floor_.load(std::memory_order_acquire);
+    const uint64_t gate_cycle = std::max(floor_cycle, cycle);
     uint64_t next = next_dynamic_rebalance_check_cycle_.load(std::memory_order_relaxed);
     while (gate_cycle >= next) {
         if (next_dynamic_rebalance_check_cycle_.compare_exchange_weak(
@@ -265,13 +282,21 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     std::vector<size_t> thread_active_clusters(num_threads, 0);
     std::vector<uint64_t> thread_floor_wait(num_threads, 0);
     std::vector<uint64_t> thread_dep_wait(num_threads, 0);
-    std::vector<double> target_score(num_threads, 0.0);
+    std::vector<uint64_t> thread_no_ready_wait(num_threads, 0);
+    std::vector<uint64_t> cluster_blocked_wait(num_clusters, 0);
+    std::vector<uint64_t> cluster_blocker_wait(num_clusters, 0);
+    std::vector<size_t> assignment(num_clusters, 0);
+    std::vector<uint8_t> cluster_low_frequency(num_clusters, 0);
 
     for (size_t c = 0; c < num_clusters; ++c) {
         double fallback = 0.0;
         if (c < clusters_.clusters.size()) {
             for (size_t u : clusters_.clusters[c]) {
                 fallback += u < unit_costs_.size() ? unit_costs_[u] : 1.0;
+                if (u < unit_ptrs_.size() && (unit_ptrs_[u]->tickInterval() > 1 ||
+                                              unit_ptrs_[u]->usesActivityScheduling())) {
+                    cluster_low_frequency[c] = 1;
+                }
             }
         }
         if (fallback <= 0.0) fallback = 1.0;
@@ -279,11 +304,14 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
         const uint64_t samples = cluster_sample_count_[c].load(std::memory_order_relaxed);
         const uint64_t total = cluster_sample_time_ns_[c].load(std::memory_order_relaxed);
         cluster_samples[c] = samples;
-        cluster_cost[c] = samples >= kDynamicClusterMinSamples
-                              ? static_cast<double>(total) / static_cast<double>(samples)
-                              : fallback;
+        cluster_cost[c] =
+            samples > 0 && (!cluster_low_frequency[c] || samples >= kDynamicClusterMinSamples)
+                ? static_cast<double>(total) / static_cast<double>(samples)
+                : fallback;
 
         size_t owner = cluster_runtime_owner_[c].load(std::memory_order_acquire);
+        if (owner >= num_threads) owner = 0;
+        assignment[c] = owner;
         if (owner < num_threads) {
             thread_cost[owner] += cluster_cost[c];
             if (cluster_cost[c] > 0.0) {
@@ -294,8 +322,14 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     for (size_t t = 0; t < num_threads && t < dynamic_runtime_thread_count_; ++t) {
         thread_floor_wait[t] = dynamic_thread_floor_wait_ns_[t].load(std::memory_order_relaxed);
         thread_dep_wait[t] = dynamic_thread_dep_wait_ns_[t].load(std::memory_order_relaxed);
-        target_score[t] =
-            waitAdjustedTargetScore(thread_cost[t], thread_floor_wait[t], thread_dep_wait[t]);
+        thread_no_ready_wait[t] =
+            dynamic_thread_no_ready_wait_ns_[t].load(std::memory_order_relaxed);
+    }
+    for (size_t c = 0; c < num_clusters; ++c) {
+        cluster_blocked_wait[c] =
+            dynamic_cluster_blocked_wait_ns_[c].load(std::memory_order_relaxed);
+        cluster_blocker_wait[c] =
+            dynamic_cluster_blocker_wait_ns_[c].load(std::memory_order_relaxed);
     }
 
     double total_cost = 0.0;
@@ -312,8 +346,18 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     }
 
     std::vector<size_t> source_threads;
+    uint64_t total_dep_wait = 0;
+    for (uint64_t wait : thread_dep_wait) total_dep_wait += wait;
+    const double avg_dep_wait =
+        num_threads > 0 ? static_cast<double>(total_dep_wait) / static_cast<double>(num_threads)
+                        : 0.0;
     for (size_t t = 0; t < num_threads; ++t) {
-        if ((thread_cost[t] / avg) > config_.rebalance_imbalance_threshold) {
+        const bool active_overloaded =
+            (thread_cost[t] / avg) > config_.rebalance_imbalance_threshold;
+        const bool dep_overloaded = avg_dep_wait > 0.0 &&
+                                    static_cast<double>(thread_dep_wait[t]) > avg_dep_wait * 1.25 &&
+                                    thread_cost[t] > avg * 0.90;
+        if (active_overloaded || dep_overloaded) {
             source_threads.push_back(t);
         }
     }
@@ -322,53 +366,92 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
         return false;
     }
 
+    PartitionInput input;
+    input.num_units = num_clusters;
+    input.num_threads = num_threads;
+    input.unit_cost_ns = cluster_cost;
+    input.sync_cost_ns =
+        std::max(platform_metrics_.atomic_roundtrip_ns, config_.initial_partition_sync_cost_ns);
+    input.critical_path_weight = config_.sa_critical_path_weight;
+    input.adjacency.resize(num_clusters);
+
+    std::unordered_map<Unit*, size_t> unit_ptr_to_idx;
+    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
+        unit_ptr_to_idx[static_cast<Unit*>(unit_ptrs_[i])] = i;
+    }
+    std::unordered_map<PairKey, std::pair<size_t, uint32_t>, PairHash> cluster_pair_info;
+    for (auto* conn : connections_) {
+        Unit* src = conn->source();
+        Unit* dst = conn->destination();
+        if (!src || !dst) continue;
+        auto si = unit_ptr_to_idx.find(src);
+        auto di = unit_ptr_to_idx.find(dst);
+        if (si == unit_ptr_to_idx.end() || di == unit_ptr_to_idx.end()) continue;
+        size_t sc = unit_to_cluster_[si->second];
+        size_t dc = unit_to_cluster_[di->second];
+        if (sc == dc) continue;
+        auto& fwd = cluster_pair_info[{sc, dc}];
+        fwd.first++;
+        fwd.second = (fwd.second == 0) ? conn->delay() : std::min(fwd.second, conn->delay());
+    }
+    std::vector<PairKey> keys;
+    keys.reserve(cluster_pair_info.size());
+    for (const auto& [key, info] : cluster_pair_info) keys.push_back(key);
+    std::sort(keys.begin(), keys.end(), [](const PairKey& a, const PairKey& b) {
+        return a.u != b.u ? a.u < b.u : a.v < b.v;
+    });
+    for (const PairKey& key : keys) {
+        const auto& info = cluster_pair_info[key];
+        input.adjacency[key.u].push_back({key.v, info.first, info.second});
+    }
+
+    epoch_free_cost::RuntimeWaits waits{&thread_floor_wait, &thread_dep_wait, &thread_no_ready_wait,
+                                        &cluster_blocked_wait, &cluster_blocker_wait};
+    const uint64_t history_cooldown = std::max(config_.rebalance_cooldown_cycles, interval * 2);
+    const uint64_t pingpong_cooldown = std::max(history_cooldown, interval * 4);
     size_t source = SIZE_MAX;
     size_t cluster = SIZE_MAX;
     size_t target = SIZE_MAX;
     double best_cluster_cost = 0.0;
-    double best_candidate_score = std::numeric_limits<double>::infinity();
-    double best_target_score = std::numeric_limits<double>::infinity();
-    const double old_max = *std::max_element(thread_cost.begin(), thread_cost.end());
+    epoch_free_cost::MoveBreakdown best_breakdown;
     for (size_t candidate_source : source_threads) {
         for (size_t c = 0; c < num_clusters; ++c) {
             if (cluster_runtime_owner_[c].load(std::memory_order_acquire) != candidate_source) {
                 continue;
             }
             if (cluster_migration_pending_[c].load(std::memory_order_acquire) != 0) continue;
-            if (cluster_samples[c] > 0 && cluster_samples[c] < kDynamicClusterMinSamples) continue;
+            if (cluster_samples[c] == 0) continue;
+            if (cluster_low_frequency[c] && cluster_samples[c] < kDynamicClusterMinSamples) {
+                continue;
+            }
             if (cluster_cost[c] <= 0.0) continue;
+            const uint64_t last_cycle = c < dynamic_cluster_last_migration_cycle_.size()
+                                            ? dynamic_cluster_last_migration_cycle_[c]
+                                            : kNoMigrationCycle;
+            if (last_cycle != kNoMigrationCycle &&
+                cycle < saturatingCycleAdd(last_cycle, history_cooldown)) {
+                continue;
+            }
 
             for (size_t candidate_target = 0; candidate_target < num_threads; ++candidate_target) {
                 if (candidate_target == candidate_source) continue;
-
-                std::vector<double> candidate_cost = thread_cost;
-                candidate_cost[candidate_source] -= cluster_cost[c];
-                candidate_cost[candidate_target] += cluster_cost[c];
-                const double new_max =
-                    *std::max_element(candidate_cost.begin(), candidate_cost.end());
-                const double global_gain = old_max > 0.0 ? (old_max - new_max) / old_max : 0.0;
-                const double local_gain = thread_cost[candidate_source] > 0.0
-                                              ? cluster_cost[c] / thread_cost[candidate_source]
-                                              : 0.0;
-                const bool improves_global =
-                    config_.rebalance_min_gain <= 0.0 || global_gain >= config_.rebalance_min_gain;
-                const bool improves_overloaded_source =
-                    new_max <= old_max &&
-                    (config_.rebalance_min_gain <= 0.0 || local_gain >= config_.rebalance_min_gain);
-                if (!improves_global && !improves_overloaded_source) {
+                if (last_cycle != kNoMigrationCycle &&
+                    c < dynamic_cluster_last_source_thread_.size() &&
+                    dynamic_cluster_last_source_thread_[c] == candidate_target &&
+                    dynamic_cluster_last_target_thread_[c] == candidate_source &&
+                    cycle < saturatingCycleAdd(last_cycle, pingpong_cooldown)) {
                     continue;
                 }
 
-                const double target_cluster_penalty =
-                    1.0 + 0.20 * static_cast<double>(thread_active_clusters[candidate_target] + 1);
-                const double score = new_max + target_score[candidate_target] * 0.25 +
-                                     candidate_cost[candidate_target] * target_cluster_penalty -
-                                     global_gain * old_max;
-                if (score < best_candidate_score ||
-                    (score == best_candidate_score &&
-                     target_score[candidate_target] < best_target_score)) {
-                    best_candidate_score = score;
-                    best_target_score = target_score[candidate_target];
+                const double churn =
+                    last_cycle == kNoMigrationCycle ? 0.0 : std::max(0.001, cluster_cost[c] * 0.05);
+                auto breakdown =
+                    epoch_free_cost::scoreMove(input, assignment, c, candidate_target, waits,
+                                               config_.rebalance_min_gain, churn);
+                if (!breakdown.valid) continue;
+                if (breakdown.score > best_breakdown.score ||
+                    (breakdown.score == best_breakdown.score && c < cluster)) {
+                    best_breakdown = breakdown;
                     best_cluster_cost = cluster_cost[c];
                     source = candidate_source;
                     cluster = c;
@@ -377,21 +460,60 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
             }
         }
     }
+    if (source == SIZE_MAX) {
+        size_t fallback_source = source_threads.front();
+        for (size_t t : source_threads) {
+            if (thread_cost[t] > thread_cost[fallback_source]) fallback_source = t;
+        }
+        size_t fallback_target = SIZE_MAX;
+        for (size_t t = 0; t < num_threads; ++t) {
+            if (t == fallback_source) continue;
+            if (fallback_target == SIZE_MAX || thread_cost[t] < thread_cost[fallback_target]) {
+                fallback_target = t;
+            }
+        }
+        if (fallback_target != SIZE_MAX) {
+            for (size_t c = 0; c < num_clusters; ++c) {
+                if (cluster_runtime_owner_[c].load(std::memory_order_acquire) != fallback_source) {
+                    continue;
+                }
+                if (cluster_migration_pending_[c].load(std::memory_order_acquire) != 0) continue;
+                if (cluster_samples[c] == 0) continue;
+                if (cluster_low_frequency[c] && cluster_samples[c] < kDynamicClusterMinSamples) {
+                    continue;
+                }
+                const double target_after = thread_cost[fallback_target] + cluster_cost[c];
+                if (target_after > thread_cost[fallback_source] * 1.02) continue;
+                if (cluster == SIZE_MAX || cluster_cost[c] > best_cluster_cost) {
+                    source = fallback_source;
+                    target = fallback_target;
+                    cluster = c;
+                    best_cluster_cost = cluster_cost[c];
+                }
+            }
+        }
+        if (cluster != SIZE_MAX) {
+            auto old_summary = epoch_free_cost::summarize(input, assignment, num_threads);
+            auto candidate_assignment = assignment;
+            candidate_assignment[cluster] = target;
+            auto new_summary = epoch_free_cost::summarize(input, candidate_assignment, num_threads);
+            best_breakdown.valid = true;
+            best_breakdown.objective_gain = old_summary.objective - new_summary.objective;
+            best_breakdown.active_gain = old_summary.max_active - new_summary.max_active;
+            best_breakdown.topology_delta =
+                (old_summary.cross_pressure + old_summary.max_incoming_pressure) -
+                (new_summary.cross_pressure + new_summary.max_incoming_pressure);
+            best_breakdown.score = std::max(0.0, best_breakdown.active_gain);
+            best_breakdown.old_max_active = old_summary.max_active;
+            best_breakdown.new_max_active = new_summary.max_active;
+            best_breakdown.target_active_after = thread_cost[target] + best_cluster_cost;
+            best_breakdown.active_budget = std::max(avg * 1.15, old_summary.max_active * 0.72);
+            best_breakdown.target_heavy_before = old_summary.heavy_count[target];
+            best_breakdown.target_heavy_after = new_summary.heavy_count[target];
+        }
+    }
     if (source == SIZE_MAX || cluster == SIZE_MAX || target == SIZE_MAX ||
         best_cluster_cost <= 0.0) {
-        clearDynamicMigrationRequest_();
-        return false;
-    }
-
-    std::vector<double> candidate_cost = thread_cost;
-    candidate_cost[source] -= best_cluster_cost;
-    candidate_cost[target] += best_cluster_cost;
-    const double new_max = *std::max_element(candidate_cost.begin(), candidate_cost.end());
-    const double global_gain = old_max > 0.0 ? (old_max - new_max) / old_max : 0.0;
-    const double local_gain =
-        thread_cost[source] > 0.0 ? best_cluster_cost / thread_cost[source] : 0.0;
-    if (config_.rebalance_min_gain > 0.0 && global_gain < config_.rebalance_min_gain &&
-        !(new_max <= old_max && local_gain >= config_.rebalance_min_gain)) {
         clearDynamicMigrationRequest_();
         return false;
     }
@@ -417,10 +539,26 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
         names + ") T" + std::to_string(source) + "->T" + std::to_string(target) +
         " fence=" + std::to_string(fence) + " src_active=" + std::to_string(thread_cost[source]) +
         " dst_active=" + std::to_string(thread_cost[target]) +
-        " dst_score=" + std::to_string(target_score[target]) +
+        " score=" + std::to_string(best_breakdown.score) +
+        " obj_gain=" + std::to_string(best_breakdown.objective_gain) +
+        " active_gain=" + std::to_string(best_breakdown.active_gain) +
+        " topology_delta=" + std::to_string(best_breakdown.topology_delta) +
+        " dep_bonus=" + std::to_string(best_breakdown.measured_dep_bonus) +
+        " floor_bonus=" + std::to_string(best_breakdown.floor_slack_bonus) +
+        " dep_penalty=" + std::to_string(best_breakdown.target_dep_penalty) +
+        " stack_penalty=" + std::to_string(best_breakdown.active_stack_penalty) +
+        " churn_penalty=" + std::to_string(best_breakdown.churn_penalty) +
+        " new_max_active=" + std::to_string(best_breakdown.new_max_active) +
+        " target_active_after=" + std::to_string(best_breakdown.target_active_after) +
+        " active_budget=" + std::to_string(best_breakdown.active_budget) +
+        " target_heavy_before=" + std::to_string(best_breakdown.target_heavy_before) +
+        " target_heavy_after=" + std::to_string(best_breakdown.target_heavy_after) +
         " dst_clusters=" + std::to_string(thread_active_clusters[target]) +
         " dst_floor_wait_ns=" + std::to_string(thread_floor_wait[target]) +
-        " dst_dep_wait_ns=" + std::to_string(thread_dep_wait[target]);
+        " dst_dep_wait_ns=" + std::to_string(thread_dep_wait[target]) +
+        " dst_no_ready_wait_ns=" + std::to_string(thread_no_ready_wait[target]) +
+        " cluster_blocked_wait_ns=" + std::to_string(cluster_blocked_wait[cluster]) +
+        " cluster_blocker_wait_ns=" + std::to_string(cluster_blocker_wait[cluster]);
 
     if (observe_ctx_) {
         observe::log_info<"Dynamic rebalance requested: cluster {} [{}] T{} -> T{} fence={}">(
@@ -441,6 +579,7 @@ void TickSimulation::serviceEpochFreeMigration_() {
     }
 
     const size_t cluster = migration_request_.cluster.load(std::memory_order_relaxed);
+    const size_t source = migration_request_.source_thread.load(std::memory_order_relaxed);
     const size_t target = migration_request_.target_thread.load(std::memory_order_relaxed);
     const uint64_t fence = migration_request_.fence_cycle.load(std::memory_order_acquire);
     if (cluster >= dynamic_runtime_cluster_count_ || target >= config_.num_threads) {
@@ -462,6 +601,11 @@ void TickSimulation::serviceEpochFreeMigration_() {
 
     cluster_runtime_owner_[cluster].store(target, std::memory_order_release);
     cluster_migration_pending_[cluster].store(0, std::memory_order_release);
+    if (cluster < dynamic_cluster_last_migration_cycle_.size()) {
+        dynamic_cluster_last_migration_cycle_[cluster] = fence;
+        dynamic_cluster_last_source_thread_[cluster] = source;
+        dynamic_cluster_last_target_thread_[cluster] = target;
+    }
     rebuildThreadUnitsFromClusterOwners_();
     cluster_assignment_generation_.fetch_add(1, std::memory_order_acq_rel);
 
@@ -478,8 +622,19 @@ void TickSimulation::serviceEpochFreeMigration_() {
     for (size_t c = 0; c < dynamic_runtime_cluster_count_; ++c) {
         const uint64_t samples = cluster_sample_count_[c].load(std::memory_order_relaxed);
         const uint64_t total = cluster_sample_time_ns_[c].load(std::memory_order_relaxed);
-        if (samples >= kDynamicClusterMinSamples && c < clusters_.clusters.size() &&
-            !clusters_.clusters[c].empty()) {
+        bool low_frequency = false;
+        if (c < clusters_.clusters.size()) {
+            for (size_t unit_idx : clusters_.clusters[c]) {
+                if (unit_idx < unit_ptrs_.size() &&
+                    (unit_ptrs_[unit_idx]->tickInterval() > 1 ||
+                     unit_ptrs_[unit_idx]->usesActivityScheduling())) {
+                    low_frequency = true;
+                    break;
+                }
+            }
+        }
+        if (samples > 0 && (!low_frequency || samples >= kDynamicClusterMinSamples) &&
+            c < clusters_.clusters.size() && !clusters_.clusters[c].empty()) {
             const double avg = static_cast<double>(total) / static_cast<double>(samples);
             const double per_unit =
                 std::max(0.001, avg / static_cast<double>(clusters_.clusters[c].size()));
@@ -495,6 +650,8 @@ void TickSimulation::serviceEpochFreeMigration_() {
         cluster_sample_time_ns_[c].store(0, std::memory_order_relaxed);
         cluster_sample_count_[c].store(0, std::memory_order_relaxed);
         cluster_active_sample_count_[c].store(0, std::memory_order_relaxed);
+        dynamic_cluster_blocked_wait_ns_[c].store(0, std::memory_order_relaxed);
+        dynamic_cluster_blocker_wait_ns_[c].store(0, std::memory_order_relaxed);
     }
     for (size_t t = 0; t < dynamic_runtime_thread_count_; ++t) {
         dynamic_thread_floor_wait_ns_[t].store(0, std::memory_order_relaxed);
@@ -590,6 +747,7 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
     const size_t num_clusters = dynamic_runtime_cluster_count_;
     std::vector<size_t> owned_clusters;
     uint64_t seen_generation = 0;
+    uint64_t priority_refresh = 0;
 
     auto refresh_owned_clusters = [&]() {
         owned_clusters.clear();
@@ -613,11 +771,45 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
         return true;
     };
 
+    auto prioritize_owned_clusters = [&]() {
+        if (owned_clusters.size() < 2) return;
+        std::sort(owned_clusters.begin(), owned_clusters.end(), [&](size_t a, size_t b) {
+            const uint64_t a_blocker =
+                dynamic_cluster_blocker_wait_ns_
+                    ? dynamic_cluster_blocker_wait_ns_[a].load(std::memory_order_relaxed)
+                    : 0;
+            const uint64_t b_blocker =
+                dynamic_cluster_blocker_wait_ns_
+                    ? dynamic_cluster_blocker_wait_ns_[b].load(std::memory_order_relaxed)
+                    : 0;
+            if (a_blocker != b_blocker) return a_blocker > b_blocker;
+
+            const uint64_t a_samples = cluster_sample_count_[a].load(std::memory_order_relaxed);
+            const uint64_t b_samples = cluster_sample_count_[b].load(std::memory_order_relaxed);
+            const double a_cost =
+                a_samples > 0 ? static_cast<double>(
+                                    cluster_sample_time_ns_[a].load(std::memory_order_relaxed)) /
+                                    static_cast<double>(a_samples)
+                              : 0.0;
+            const double b_cost =
+                b_samples > 0 ? static_cast<double>(
+                                    cluster_sample_time_ns_[b].load(std::memory_order_relaxed)) /
+                                    static_cast<double>(b_samples)
+                              : 0.0;
+            if (a_cost != b_cost) return a_cost > b_cost;
+            return a < b;
+        });
+    };
+
     while (!token.stop_requested()) {
         serviceEpochFreeMigration_();
         const uint64_t generation = cluster_assignment_generation_.load(std::memory_order_acquire);
         if (generation != seen_generation) {
             refresh_owned_clusters();
+            prioritize_owned_clusters();
+            priority_refresh = 0;
+        } else if ((priority_refresh++ & 0xFFu) == 0) {
+            prioritize_owned_clusters();
         }
 
         bool made_progress = false;

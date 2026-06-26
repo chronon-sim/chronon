@@ -195,8 +195,8 @@ uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
 
         if (use_parallel) {
             if (config_.enable_dynamic_rebalance && !use_epoch_free_chunk) {
-                // Dynamic rebalance is epoch-boundary based, so keep the
-                // explicit epoch driver when it is enabled.
+                // Dynamic rebalance on the non-epoch-free fallback commits at
+                // explicit epoch boundaries.
                 epoch_executed = runParallelEpoch(step_cycles, 0);
             } else {
                 epoch_executed = runParallel(step_cycles);
@@ -357,9 +357,9 @@ bool TickSimulation::epochFreeLookaheadEligible_() const {
 }
 
 uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
-    // Persistent-worker fast path (see executeRunProgressBased): only safe with a
-    // fixed thread layout. runUntilTermination() reaches this path for chunks
-    // that do not need dynamic-rebalance epoch boundaries.
+    // Persistent-worker fast path (see executeRunProgressBased). The
+    // epoch-free driver is the default when its dependency/queue safety gate
+    // holds; otherwise fixed-layout lookahead falls back to reusable epochs.
     const bool can_persist = persistentLookaheadEligible_();
     if (can_persist) {
         // Epoch-free (A/B): drop the per-epoch barrier when the lookahead floor
