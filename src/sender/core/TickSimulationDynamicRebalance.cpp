@@ -521,14 +521,6 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
         thread_progress_array_[cluster].completed_cycle.load(std::memory_order_acquire);
     const uint64_t fence = saturatingCycleAdd(progress, 1);
 
-    migration_request_.cluster.store(cluster, std::memory_order_relaxed);
-    migration_request_.source_thread.store(source, std::memory_order_relaxed);
-    migration_request_.target_thread.store(target, std::memory_order_relaxed);
-    migration_request_.fence_cycle.store(fence, std::memory_order_release);
-    cluster_migration_pending_[cluster].store(1, std::memory_order_release);
-    migration_request_.state.store(static_cast<uint8_t>(MigrationRequestState::Quiescing),
-                                   std::memory_order_release);
-
     std::string names;
     if (cluster < clusters_.clusters.size()) {
         names = buildUnitNameList_(clusters_.clusters[cluster]);
@@ -566,6 +558,14 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     recordDynamicSchedulerMarker_("Chronon epoch-free rebalance requested", cycle,
                                   last_rebalance_detail_);
 
+    migration_request_.cluster.store(cluster, std::memory_order_relaxed);
+    migration_request_.source_thread.store(source, std::memory_order_relaxed);
+    migration_request_.target_thread.store(target, std::memory_order_relaxed);
+    migration_request_.fence_cycle.store(fence, std::memory_order_release);
+    cluster_migration_pending_[cluster].store(1, std::memory_order_release);
+    migration_request_.state.store(static_cast<uint8_t>(MigrationRequestState::Quiescing),
+                                   std::memory_order_release);
+
     return true;
 }
 
@@ -582,6 +582,9 @@ void TickSimulation::serviceEpochFreeMigration_() {
     const size_t target = migration_request_.target_thread.load(std::memory_order_relaxed);
     const uint64_t fence = migration_request_.fence_cycle.load(std::memory_order_acquire);
     if (cluster >= dynamic_runtime_cluster_count_ || target >= config_.num_threads) {
+        if (cluster < dynamic_runtime_cluster_count_) {
+            cluster_migration_pending_[cluster].store(0, std::memory_order_release);
+        }
         clearDynamicMigrationRequest_();
         return;
     }
@@ -605,7 +608,6 @@ void TickSimulation::serviceEpochFreeMigration_() {
         dynamic_cluster_last_source_thread_[cluster] = source;
         dynamic_cluster_last_target_thread_[cluster] = target;
     }
-    rebuildThreadUnitsFromClusterOwners_();
     cluster_assignment_generation_.fetch_add(1, std::memory_order_acq_rel);
 
     const uint64_t delay =
@@ -745,6 +747,8 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
     const bool trace_waits = timeline_trace_.traceWaits();
     const size_t num_clusters = dynamic_runtime_cluster_count_;
     std::vector<size_t> owned_clusters;
+    std::vector<uint64_t> priority_blocker_ns(num_clusters, 0);
+    std::vector<double> priority_cost_ns(num_clusters, 0.0);
     uint64_t seen_generation = 0;
     uint64_t priority_refresh = 0;
 
@@ -772,32 +776,41 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
 
     auto prioritize_owned_clusters = [&]() {
         if (owned_clusters.size() < 2) return;
+        for (size_t cluster : owned_clusters) {
+            priority_blocker_ns[cluster] =
+                dynamic_cluster_blocker_wait_ns_
+                    ? dynamic_cluster_blocker_wait_ns_[cluster].load(std::memory_order_relaxed)
+                    : 0;
+            const uint64_t samples = cluster_sample_count_[cluster].load(std::memory_order_relaxed);
+            priority_cost_ns[cluster] =
+                samples > 0 ? static_cast<double>(cluster_sample_time_ns_[cluster].load(
+                                  std::memory_order_relaxed)) /
+                                  static_cast<double>(samples)
+                            : 0.0;
+        }
         std::sort(owned_clusters.begin(), owned_clusters.end(), [&](size_t a, size_t b) {
-            const uint64_t a_blocker =
-                dynamic_cluster_blocker_wait_ns_
-                    ? dynamic_cluster_blocker_wait_ns_[a].load(std::memory_order_relaxed)
-                    : 0;
-            const uint64_t b_blocker =
-                dynamic_cluster_blocker_wait_ns_
-                    ? dynamic_cluster_blocker_wait_ns_[b].load(std::memory_order_relaxed)
-                    : 0;
+            const uint64_t a_blocker = priority_blocker_ns[a];
+            const uint64_t b_blocker = priority_blocker_ns[b];
             if (a_blocker != b_blocker) return a_blocker > b_blocker;
 
-            const uint64_t a_samples = cluster_sample_count_[a].load(std::memory_order_relaxed);
-            const uint64_t b_samples = cluster_sample_count_[b].load(std::memory_order_relaxed);
-            const double a_cost =
-                a_samples > 0 ? static_cast<double>(
-                                    cluster_sample_time_ns_[a].load(std::memory_order_relaxed)) /
-                                    static_cast<double>(a_samples)
-                              : 0.0;
-            const double b_cost =
-                b_samples > 0 ? static_cast<double>(
-                                    cluster_sample_time_ns_[b].load(std::memory_order_relaxed)) /
-                                    static_cast<double>(b_samples)
-                              : 0.0;
+            const double a_cost = priority_cost_ns[a];
+            const double b_cost = priority_cost_ns[b];
             if (a_cost != b_cost) return a_cost > b_cost;
             return a < b;
         });
+    };
+
+    auto migration_blocks_cluster = [&](size_t cluster, uint64_t cycle) {
+        if (cluster_migration_pending_[cluster].load(std::memory_order_acquire) == 0) {
+            return false;
+        }
+        const uint8_t state = migration_request_.state.load(std::memory_order_acquire);
+        const bool committing = state == static_cast<uint8_t>(MigrationRequestState::Quiescing) ||
+                                state == static_cast<uint8_t>(MigrationRequestState::ReadyToCommit);
+        if (!committing || migration_request_.cluster.load(std::memory_order_relaxed) != cluster) {
+            return false;
+        }
+        return cycle >= migration_request_.fence_cycle.load(std::memory_order_acquire);
     };
 
     while (!token.stop_requested()) {
@@ -825,6 +838,8 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
             if (cycle >= end_cycle) continue;
             local_done = false;
 
+            if (migration_blocks_cluster(cluster, cycle)) continue;
+
             cluster_execution_owner_[cluster].store(thread_idx, std::memory_order_release);
 
             auto release_cluster = [&]() noexcept {
@@ -836,16 +851,9 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
                 continue;
             }
 
-            const uint8_t state = migration_request_.state.load(std::memory_order_acquire);
-            if (cluster_migration_pending_[cluster].load(std::memory_order_acquire) != 0 &&
-                state == static_cast<uint8_t>(MigrationRequestState::Quiescing) &&
-                migration_request_.cluster.load(std::memory_order_relaxed) == cluster) {
-                const uint64_t fence =
-                    migration_request_.fence_cycle.load(std::memory_order_acquire);
-                if (cycle >= fence) {
-                    release_cluster();
-                    continue;
-                }
+            if (migration_blocks_cluster(cluster, cycle)) {
+                release_cluster();
+                continue;
             }
 
             BlockedClusterInfo candidate{};
@@ -950,11 +958,7 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
                 }
                 BlockedClusterInfo ignored{};
                 if (clusterCanAdvance_(cluster, cycle, ignored)) {
-                    const uint8_t state = migration_request_.state.load(std::memory_order_acquire);
-                    if (cluster_migration_pending_[cluster].load(std::memory_order_acquire) != 0 &&
-                        state == static_cast<uint8_t>(MigrationRequestState::Quiescing) &&
-                        migration_request_.cluster.load(std::memory_order_relaxed) == cluster &&
-                        cycle >= migration_request_.fence_cycle.load(std::memory_order_acquire)) {
+                    if (migration_blocks_cluster(cluster, cycle)) {
                         continue;
                     }
                     any_ready = true;
