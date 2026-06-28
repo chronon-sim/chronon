@@ -319,13 +319,14 @@ void verify_staging_headroom(uint64_t cycles, unsigned hw) {
     check(far.checksum == ref, "staging-clamp(lookahead) epoch-free == ref");
     check(far.epoch_free_runs > 0, "staging-clamp keeps epoch-free past configured ring capacity");
 
-    // (2) Default/unlimited source rate: scheduler estimates one admission slot
-    //     per producer tick unless the model sets an explicit per-cycle cap.
+    // (2) Default/unlimited source rate is not provable for bounded lock-free
+    //     headroom, so epoch-free must use the thread-safe queue fallback.
     const size_t kUnlimited = OutPort<uint64_t>::UNLIMITED_CAPACITY;
     RunResult uncapped = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
                                  /*max_lookahead=*/64, cycles, /*out_rate=*/kUnlimited);
-    check(uncapped.checksum == ref, "staging-clamp(default-rate) epoch-free == ref");
-    check(uncapped.epoch_free_runs > 0, "staging-clamp keeps epoch-free for default-rate source");
+    check(uncapped.checksum == ref, "staging-threadsafe(default-rate) epoch-free == ref");
+    check(uncapped.epoch_free_runs > 0,
+          "staging-threadsafe keeps epoch-free for default-rate source");
 
     // (3) Long edge delay: the consumer can't drain not-yet-due entries, so even a
     //     small max_lookahead exceeds the default ring headroom. The scheduler
@@ -422,6 +423,13 @@ void verify_dynamic_rebalance_clamps_headroom(uint64_t cycles, unsigned hw) {
                                /*scheduler_timeline=*/false, /*dynamic_rebalance=*/true);
     check(unsafe.checksum == ref_d, "dynamic-rebalance headroom resize == ref");
     check(unsafe.epoch_free_runs > 0, "dynamic rebalance avoids epoch fallback for long delay");
+
+    const size_t kUnlimited = OutPort<uint64_t>::UNLIMITED_CAPACITY;
+    RunResult uncapped = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                                 /*max_lookahead=*/64, cycles, /*out_rate=*/kUnlimited,
+                                 /*scheduler_timeline=*/false, /*dynamic_rebalance=*/true);
+    check(uncapped.checksum == ref, "dynamic-rebalance unsafe-rate fallback == ref");
+    check(uncapped.epoch_free_runs > 0, "dynamic rebalance avoids epoch fallback for unsafe rate");
 }
 
 }  // namespace

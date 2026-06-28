@@ -421,8 +421,9 @@ public:
         } else {
             return SIZE_MAX;  // single-thread queue drains synchronously each tick
         }
-        const size_t rate = effectiveHeadroomRate_();
-        const size_t cycles = ring_usable / rate;
+        const auto rate = effectiveHeadroomRate_();
+        if (!rate.has_value()) return 0;
+        const size_t cycles = ring_usable / *rate;
         // The consumer drains only *due* entries (arrive_cycle <= k, i.e.
         // send_cycle <= k - delay_), so delay_ cycles of not-yet-due entries always
         // sit buffered. The supportable producer run-ahead is cycles - delay_.
@@ -436,22 +437,23 @@ public:
     InPort<T>* to() const noexcept { return to_; }
 
 private:
-    size_t effectiveHeadroomRate_() const noexcept {
+    std::optional<size_t> effectiveHeadroomRate_() const noexcept {
         const size_t rate = from_->perCycleCapacity();
-        // Default/unlimited OutPorts are common for one-send-per-tick model
-        // ports. Models that can emit multiple messages per tick should set an
-        // explicit per_cycle_capacity so the headroom proof scales accordingly.
-        return rate == OutPort<T>::UNLIMITED_CAPACITY ? 1 : rate;
+        if (rate == OutPort<T>::UNLIMITED_CAPACITY) {
+            return std::nullopt;
+        }
+        return rate;
     }
 
     std::optional<size_t> requiredUsableForHeadroom_(uint32_t max_lookahead_cycles) const {
         const uint64_t desired = std::max<uint64_t>(max_lookahead_cycles, 2);
         const uint64_t cycles = static_cast<uint64_t>(delay_) + desired;
-        const size_t rate = effectiveHeadroomRate_();
-        if (rate != 0 && cycles > std::numeric_limits<size_t>::max() / rate) {
+        const auto rate = effectiveHeadroomRate_();
+        if (!rate.has_value()) return std::nullopt;
+        if (*rate != 0 && cycles > std::numeric_limits<size_t>::max() / *rate) {
             return std::nullopt;
         }
-        return static_cast<size_t>(cycles) * rate;
+        return static_cast<size_t>(cycles) * *rate;
     }
 
     /// Per-connection staging entry. Holds the original arrive_cycle and
