@@ -843,8 +843,9 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
             local_done = false;
 
             if (migration_blocks_cluster(cluster, cycle)) continue;
-
-            cluster_execution_owner_[cluster].store(thread_idx, std::memory_order_release);
+            size_t claim = SIZE_MAX;
+            if (!cluster_execution_owner_[cluster].compare_exchange_strong(claim, thread_idx))
+                continue;
 
             auto release_cluster = [&]() noexcept {
                 cluster_execution_owner_[cluster].store(SIZE_MAX, std::memory_order_release);
