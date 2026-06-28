@@ -186,6 +186,30 @@ void test_mpsc_staging_tracks_large_user_capacity() {
     std::cout << "PASSED\n";
 }
 
+void test_mpsc_epoch_free_headroom_respects_user_capacity() {
+    std::cout << "Testing MPSC epoch-free headroom respects user capacity... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", 1};
+    InPort<int> in{&cons, "in", 1};
+    auto* conn = out.connect(&in, 1);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    require(conn->crossThreadHeadroom() == 0,
+            "MPSC headroom ignored the bounded staging admission capacity");
+    require(!conn->ensureEpochFreeHeadroom(8),
+            "MPSC headroom growth bypassed the bounded user capacity");
+
+    std::cout << "PASSED\n";
+}
+
 void test_idle_advance_drains_mpsc_staging() {
     std::cout << "Testing idle advance drains MPSC staging... ";
 
@@ -322,6 +346,7 @@ int main() {
 
     test_tick_simulation_mpsc_delivery();
     test_mpsc_staging_tracks_large_user_capacity();
+    test_mpsc_epoch_free_headroom_respects_user_capacity();
     test_idle_advance_drains_mpsc_staging();
     test_lockfree_backpressure_contract();
     test_small_non_tight_graph_parallel_fallback();

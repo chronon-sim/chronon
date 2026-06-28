@@ -22,6 +22,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <fstream>
 #include <iostream>
@@ -421,10 +422,14 @@ void PerfettoTraceWriter::sliceComplete(uint64_t track_uuid, std::string_view ca
         pkt->set_timestamp(ts_ns);
 
         uint64_t annotation_iids[2] = {0, 0};
-        static constexpr std::string_view kSliceAnnotations[2] = {"cycle", "detail"};
-        auto strings =
-            impl_->internEventStrings(impl_->wall, pkt, category, name, kSliceAnnotations,
-                                      detail.empty() ? 1 : 2, annotation_iids);
+        const std::array<Annotation, 2> annotations = {
+            Annotation{"cycle", Annotation::Kind::Uint, cycle},
+            Annotation{"detail", Annotation::Kind::String, 0, detail},
+        };
+        const size_t annotation_count = detail.empty() ? 1 : annotations.size();
+        auto strings = impl_->internAnnotatedEvent(
+            impl_->wall, pkt, category, name,
+            std::span<const Annotation>(annotations.data(), annotation_count), annotation_iids);
 
         auto* event = pkt->set_track_event();
         event->set_type(pbz::TrackEvent::TYPE_SLICE_BEGIN);
@@ -434,15 +439,9 @@ void PerfettoTraceWriter::sliceComplete(uint64_t track_uuid, std::string_view ca
         }
         event->set_name_iid(strings.name_iid);
 
-        auto* cycle_ann = event->add_debug_annotations();
-        cycle_ann->set_name_iid(annotation_iids[0]);
-        cycle_ann->set_uint_value(cycle);
-
-        if (!detail.empty()) {
-            auto* detail_ann = event->add_debug_annotations();
-            detail_ann->set_name_iid(annotation_iids[1]);
-            detail_ann->set_string_value(chars(detail));
-        }
+        Impl::writeAnnotations(event,
+                               std::span<const Annotation>(annotations.data(), annotation_count),
+                               annotation_iids);
     }
 
     // SLICE_END only needs the track and timestamp.
@@ -475,10 +474,14 @@ void PerfettoTraceWriter::wallInstant(uint64_t track_uuid, std::string_view cate
     auto* pkt = impl_->newPacket(impl_->wall, /*needs_incremental_state=*/true);
     pkt->set_timestamp(ts_ns);
     uint64_t annotation_iids[2] = {0, 0};
-    static constexpr std::string_view kInstantAnnotations[2] = {"cycle", "detail"};
+    const std::array<Annotation, 2> annotations = {
+        Annotation{"cycle", Annotation::Kind::Uint, cycle},
+        Annotation{"detail", Annotation::Kind::String, 0, detail},
+    };
     const size_t annotation_count = cycle == 0 && detail.empty() ? 0 : (detail.empty() ? 1 : 2);
-    auto strings = impl_->internEventStrings(impl_->wall, pkt, category, name, kInstantAnnotations,
-                                             annotation_count, annotation_iids);
+    auto strings = impl_->internAnnotatedEvent(
+        impl_->wall, pkt, category, name,
+        std::span<const Annotation>(annotations.data(), annotation_count), annotation_iids);
     auto* event = pkt->set_track_event();
     event->set_type(pbz::TrackEvent::TYPE_INSTANT);
     event->set_track_uuid(track_uuid);
@@ -486,16 +489,8 @@ void PerfettoTraceWriter::wallInstant(uint64_t track_uuid, std::string_view cate
         event->add_category_iids(strings.category_iid);
     }
     event->set_name_iid(strings.name_iid);
-    if (annotation_count > 0) {
-        auto* cycle_ann = event->add_debug_annotations();
-        cycle_ann->set_name_iid(annotation_iids[0]);
-        cycle_ann->set_uint_value(cycle);
-    }
-    if (annotation_count > 1) {
-        auto* detail_ann = event->add_debug_annotations();
-        detail_ann->set_name_iid(annotation_iids[1]);
-        detail_ann->set_string_value(chars(detail));
-    }
+    Impl::writeAnnotations(event, std::span<const Annotation>(annotations.data(), annotation_count),
+                           annotation_iids);
 
     ++events_written_;
     if (impl_->packets_buffered >= FLUSH_PACKET_COUNT) {

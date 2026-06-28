@@ -668,6 +668,8 @@ private:
     };
 
     RuntimeMigrationRequest migration_request_;
+    // unique_ptr owns variable-size arrays; atomic elements publish runtime
+    // ownership/progress between worker threads during epoch-free rebalance.
     std::unique_ptr<std::atomic<size_t>[]> cluster_runtime_owner_;
     std::unique_ptr<std::atomic<size_t>[]> cluster_execution_owner_;
     std::unique_ptr<std::atomic<uint8_t>[]> cluster_migration_pending_;

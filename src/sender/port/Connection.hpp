@@ -415,7 +415,7 @@ public:
         //   same-thread / unbounded     -> no ring to overflow (SIZE_MAX).
         size_t ring_usable;
         if (thread_queue_id_ != SIZE_MAX) {
-            ring_usable = staging_mask_;
+            ring_usable = mpscLogicalHeadroomCapacity_();
         } else if (to_->usesLockFreeQueue()) {
             ring_usable = to_->storageCapacity();
         } else {
@@ -443,6 +443,14 @@ private:
             return std::nullopt;
         }
         return rate;
+    }
+
+    size_t mpscLogicalHeadroomCapacity_() const noexcept {
+        const size_t user_cap = to_->capacity();
+        if (user_cap == InPort<T>::UNLIMITED_CAPACITY) {
+            return staging_mask_;
+        }
+        return std::min(staging_mask_, user_cap);
     }
 
     std::optional<size_t> requiredUsableForHeadroom_(uint32_t max_lookahead_cycles) const {
