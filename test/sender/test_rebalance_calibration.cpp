@@ -10,6 +10,7 @@
 // is set low (64) to ensure a rebalance occurs within the test's run
 // budget.
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <iostream>
@@ -91,7 +92,8 @@ private:
 
 }  // namespace
 
-int run_rebalance_calibration(bool use_run_until_termination) {
+int run_rebalance_calibration(bool use_run_until_termination, uint64_t chunk_cycles = 0,
+                              uint64_t check_interval = 64, uint64_t total_cycles = 16384) {
     std::cout << (use_run_until_termination ? "Testing runUntilTermination rebalance... "
                                             : "Testing run() rebalance... ");
 
@@ -101,7 +103,7 @@ int run_rebalance_calibration(bool use_run_until_termination) {
     cfg.enable_lookahead = true;
     cfg.epoch_size = 64;
     cfg.enable_dynamic_rebalance = true;
-    cfg.rebalance_check_interval_cycles = 64;
+    cfg.rebalance_check_interval_cycles = check_interval;
     cfg.rebalance_imbalance_threshold = 1.05;
     cfg.rebalance_min_gain = 0.0;
     cfg.rebalance_cooldown_cycles = 0;
@@ -129,9 +131,13 @@ int run_rebalance_calibration(bool use_run_until_termination) {
     sim.initialize();
 
     if (use_run_until_termination) {
-        sim.runUntilTermination(16384);
+        sim.runUntilTermination(total_cycles);
+    } else if (chunk_cycles > 0) {
+        for (uint64_t done = 0; done < total_cycles; done += chunk_cycles) {
+            sim.run(std::min<uint64_t>(chunk_cycles, total_cycles - done));
+        }
     } else {
-        sim.run(16384);
+        sim.run(total_cycles);
     }
 
     const auto& post = sim.getPlatformMetrics();
@@ -234,6 +240,9 @@ int main() {
         return 1;
     }
     if (run_rebalance_calibration(false) != 0) {
+        return 1;
+    }
+    if (run_rebalance_calibration(false, 1024, 2048, 8192) != 0) {
         return 1;
     }
     if (run_tight_cluster_migration_guard() != 0) {

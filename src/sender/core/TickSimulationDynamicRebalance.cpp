@@ -690,9 +690,13 @@ uint64_t TickSimulation::executeRunEpochFreeDynamic_(uint64_t total_cycles) {
     const uint64_t run_target = saturatingCycleAdd(run_start, total_cycles);
 
     lookahead_floor_.store(run_start, std::memory_order_relaxed);
-    next_dynamic_rebalance_check_cycle_.store(
-        saturatingCycleAdd(run_start, config_.rebalance_check_interval_cycles),
-        std::memory_order_relaxed);
+    const uint64_t first_check =
+        saturatingCycleAdd(run_start, config_.rebalance_check_interval_cycles);
+    uint64_t next_check = next_dynamic_rebalance_check_cycle_.load(std::memory_order_relaxed);
+    while ((next_check == 0 || next_check < run_start) &&
+           !next_dynamic_rebalance_check_cycle_.compare_exchange_weak(
+               next_check, first_check, std::memory_order_release, std::memory_order_relaxed)) {
+    }
     epoch_free_dynamic_runtime_active_.store(true, std::memory_order_release);
 
     SchedulerTimelineTrace::TimePoint run_begin{};
