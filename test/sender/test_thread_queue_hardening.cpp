@@ -80,6 +80,16 @@ public:
     void setCycle(uint64_t cycle) { setLocalCycle(cycle); }
 };
 
+struct AllocationProbe {
+    static inline bool fail_on_default = false;
+
+    AllocationProbe() {
+        if (fail_on_default) {
+            throw std::runtime_error("unexpected staging ring allocation");
+        }
+    }
+};
+
 class IdleMPSCReceiverUnit : public TickableUnit {
 public:
     explicit IdleMPSCReceiverUnit(std::string name) : TickableUnit(std::move(name)) {}
@@ -206,6 +216,35 @@ void test_mpsc_epoch_free_headroom_respects_user_capacity() {
             "MPSC headroom ignored the bounded staging admission capacity");
     require(!conn->ensureEpochFreeHeadroom(8),
             "MPSC headroom growth bypassed the bounded user capacity");
+
+    std::cout << "PASSED\n";
+}
+
+void test_bounded_mpsc_epoch_free_headroom_skips_resize() {
+    std::cout << "Testing bounded MPSC headroom skips impossible resize... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<AllocationProbe> out{&prod, "out", 1};
+    InPort<AllocationProbe> in{&cons, "in", 1};
+    auto* conn = out.connect(&in, 1);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    AllocationProbe::fail_on_default = true;
+    try {
+        require(!conn->ensureEpochFreeHeadroom(4096),
+                "bounded MPSC headroom should demote without resizing");
+    } catch (...) {
+        AllocationProbe::fail_on_default = false;
+        throw;
+    }
+    AllocationProbe::fail_on_default = false;
 
     std::cout << "PASSED\n";
 }
@@ -347,6 +386,7 @@ int main() {
     test_tick_simulation_mpsc_delivery();
     test_mpsc_staging_tracks_large_user_capacity();
     test_mpsc_epoch_free_headroom_respects_user_capacity();
+    test_bounded_mpsc_epoch_free_headroom_skips_resize();
     test_idle_advance_drains_mpsc_staging();
     test_lockfree_backpressure_contract();
     test_small_non_tight_graph_parallel_fallback();

@@ -387,6 +387,9 @@ public:
 
     bool ensureEpochFreeHeadroom(uint32_t max_lookahead_cycles) override {
         if (crossThreadHeadroom() > 1) return true;
+        if (thread_queue_id_ != SIZE_MAX && to_->capacity() != InPort<T>::UNLIMITED_CAPACITY) {
+            return false;
+        }
         const auto requested = requiredUsableForHeadroom_(max_lookahead_cycles);
         if (!requested.has_value()) return false;
         if (thread_queue_id_ != SIZE_MAX) {
