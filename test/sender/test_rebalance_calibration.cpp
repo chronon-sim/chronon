@@ -26,12 +26,13 @@ namespace {
 
 class HeavyUnit : public TickableUnit {
 public:
-    explicit HeavyUnit(const std::string& name) : TickableUnit(name) {}
+    explicit HeavyUnit(const std::string& name, int iterations = 5000)
+        : TickableUnit(name), iterations_(iterations) {}
     OutPort<uint64_t> out{this, "out", 1};
 
     void tick() override {
         uint64_t v = localCycle();
-        for (int i = 0; i < 5000; ++i) {
+        for (int i = 0; i < iterations_; ++i) {
             v = v * 6364136223846793005ULL + 1442695040888963407ULL;
         }
         sink_ += v;
@@ -39,6 +40,9 @@ public:
     }
 
     uint64_t sink_ = 0;
+
+private:
+    int iterations_ = 5000;
 };
 
 class LightUnit : public TickableUnit {
@@ -117,10 +121,14 @@ int run_rebalance_calibration(bool use_run_until_termination, uint64_t chunk_cyc
     // one thread starts with fewer units than the others. Real tick costs are
     // still imbalanced (heavy >> sink), so sampled costs should replace the
     // initial 1.0 placeholders on the first successful rebalance.
-    auto* h0 = sim.createUnit<HeavyUnit>("heavy0");
-    auto* h1 = sim.createUnit<HeavyUnit>("heavy1");
-    auto* h2 = sim.createUnit<HeavyUnit>("heavy2");
-    auto* h3 = sim.createUnit<HeavyUnit>("heavy3");
+    // Uniform initial costs place unit indices 0 and 3 on the same thread.
+    // Make those two runtime-heavy so dynamic rebalance has a deterministic
+    // migration that lowers max active cost instead of relying on timing noise
+    // between otherwise identical units.
+    auto* h0 = sim.createUnit<HeavyUnit>("heavy0", 12000);
+    auto* h1 = sim.createUnit<HeavyUnit>("heavy1", 300);
+    auto* h2 = sim.createUnit<HeavyUnit>("heavy2", 300);
+    auto* h3 = sim.createUnit<HeavyUnit>("heavy3", 8000);
     auto* sink = sim.createUnit<Sink>();
 
     sim.connect(h0->out, sink->in, 1);
@@ -204,10 +212,14 @@ int run_tight_cluster_migration_guard() {
     TickSimulation sim(cfg);
     auto* tight_src = sim.createUnit<TightProducer>();
     auto* tight_dst = sim.createUnit<TightConsumer>();
-    auto* h0 = sim.createUnit<HeavyUnit>("guard_heavy0");
-    auto* h1 = sim.createUnit<HeavyUnit>("guard_heavy1");
-    auto* h2 = sim.createUnit<HeavyUnit>("guard_heavy2");
-    auto* h3 = sim.createUnit<HeavyUnit>("guard_heavy3");
+    // With the tight producer/consumer forming one delay=0 cluster, uniform
+    // initial cluster costs place guard_heavy0 and guard_heavy2 together.
+    // Make that pair runtime-heavy so the guard exercises a real migration
+    // while still verifying the tight cluster remains atomic.
+    auto* h0 = sim.createUnit<HeavyUnit>("guard_heavy0", 12000);
+    auto* h1 = sim.createUnit<HeavyUnit>("guard_heavy1", 300);
+    auto* h2 = sim.createUnit<HeavyUnit>("guard_heavy2", 8000);
+    auto* h3 = sim.createUnit<HeavyUnit>("guard_heavy3", 300);
     auto* sink = sim.createUnit<Sink>();
 
     sim.connect(tight_src->out, tight_dst->in, 0);
