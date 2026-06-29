@@ -94,6 +94,28 @@ private:
     uint64_t checksum_ = 0;
 };
 
+#ifdef CHRONON_SANITIZER_BUILD
+constexpr int kPrimaryHeavy0Iterations = 6000;
+constexpr int kPrimaryHeavy3Iterations = 4000;
+constexpr int kGuardHeavy0Iterations = 6000;
+constexpr int kGuardHeavy2Iterations = 4000;
+constexpr uint64_t kRunUntilCycles = 8192;
+constexpr uint64_t kLongRunCycles = 8192;
+constexpr uint64_t kChunkedCooldownCycles = 4096;
+constexpr uint64_t kChunkBoundaryCycles = 1024;
+constexpr uint64_t kGuardCycles = 2048;
+#else
+constexpr int kPrimaryHeavy0Iterations = 12000;
+constexpr int kPrimaryHeavy3Iterations = 8000;
+constexpr int kGuardHeavy0Iterations = 12000;
+constexpr int kGuardHeavy2Iterations = 8000;
+constexpr uint64_t kRunUntilCycles = 16384;
+constexpr uint64_t kLongRunCycles = 65536;
+constexpr uint64_t kChunkedCooldownCycles = 8192;
+constexpr uint64_t kChunkBoundaryCycles = 2048;
+constexpr uint64_t kGuardCycles = 4096;
+#endif
+
 }  // namespace
 
 int run_rebalance_calibration(bool use_run_until_termination, uint64_t chunk_cycles = 0,
@@ -125,10 +147,10 @@ int run_rebalance_calibration(bool use_run_until_termination, uint64_t chunk_cyc
     // Make those two runtime-heavy so dynamic rebalance has a deterministic
     // migration that lowers max active cost instead of relying on timing noise
     // between otherwise identical units.
-    auto* h0 = sim.createUnit<HeavyUnit>("heavy0", 12000);
+    auto* h0 = sim.createUnit<HeavyUnit>("heavy0", kPrimaryHeavy0Iterations);
     auto* h1 = sim.createUnit<HeavyUnit>("heavy1", 300);
     auto* h2 = sim.createUnit<HeavyUnit>("heavy2", 300);
-    auto* h3 = sim.createUnit<HeavyUnit>("heavy3", 8000);
+    auto* h3 = sim.createUnit<HeavyUnit>("heavy3", kPrimaryHeavy3Iterations);
     auto* sink = sim.createUnit<Sink>();
 
     sim.connect(h0->out, sink->in, 1);
@@ -216,9 +238,9 @@ int run_tight_cluster_migration_guard() {
     // initial cluster costs place guard_heavy0 and guard_heavy2 together.
     // Make that pair runtime-heavy so the guard exercises a real migration
     // while still verifying the tight cluster remains atomic.
-    auto* h0 = sim.createUnit<HeavyUnit>("guard_heavy0", 12000);
+    auto* h0 = sim.createUnit<HeavyUnit>("guard_heavy0", kGuardHeavy0Iterations);
     auto* h1 = sim.createUnit<HeavyUnit>("guard_heavy1", 300);
-    auto* h2 = sim.createUnit<HeavyUnit>("guard_heavy2", 8000);
+    auto* h2 = sim.createUnit<HeavyUnit>("guard_heavy2", kGuardHeavy2Iterations);
     auto* h3 = sim.createUnit<HeavyUnit>("guard_heavy3", 300);
     auto* sink = sim.createUnit<Sink>();
 
@@ -229,7 +251,7 @@ int run_tight_cluster_migration_guard() {
     sim.connect(h3->out, sink->in, 1);
 
     sim.initialize();
-    sim.run(4096);
+    sim.run(kGuardCycles);
 
     if (sim.assignedThread(tight_src) != sim.assignedThread(tight_dst)) {
         std::cerr << "FAIL: delay=0 tight cluster was split by migration\n";
@@ -248,16 +270,16 @@ int run_tight_cluster_migration_guard() {
 int main() {
     std::cout << "=== Rebalance Calibration Test ===\n";
 
-    if (run_rebalance_calibration(true) != 0) {
+    if (run_rebalance_calibration(true, 0, 64, kRunUntilCycles) != 0) {
         return 1;
     }
-    if (run_rebalance_calibration(false, 0, 64, 65536) != 0) {
+    if (run_rebalance_calibration(false, 0, 64, kLongRunCycles) != 0) {
         return 1;
     }
-    if (run_rebalance_calibration(false, 1024, 2048, 8192) != 0) {
+    if (run_rebalance_calibration(false, 1024, 2048, kChunkedCooldownCycles) != 0) {
         return 1;
     }
-    if (run_rebalance_calibration(false, 64, 64, 2048) != 0) {
+    if (run_rebalance_calibration(false, 64, 64, kChunkBoundaryCycles) != 0) {
         return 1;
     }
     if (run_tight_cluster_migration_guard() != 0) {
