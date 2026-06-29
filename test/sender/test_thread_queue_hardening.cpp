@@ -100,6 +100,28 @@ public:
     void tick() override {}
 };
 
+class ZeroSlackFeedbackUnit : public TickableUnit {
+public:
+    explicit ZeroSlackFeedbackUnit(std::string name) : TickableUnit(std::move(name)) {}
+
+    InPort<int> peer_in{this, "peer_in", 1};
+    OutPort<int> peer_out{this, "peer_out", 1};
+    OutPort<int> local_out{this, "local_out"};
+
+    void tick() override {
+        while (peer_in.tryReceive(localCycle()).has_value()) {
+        }
+        [[maybe_unused]] bool peer_sent = peer_out.send(static_cast<int>(localCycle()));
+        [[maybe_unused]] bool local_sent = local_out.send(static_cast<int>(localCycle()));
+        ++ticks_;
+    }
+
+    uint64_t ticks() const noexcept { return ticks_; }
+
+private:
+    uint64_t ticks_ = 0;
+};
+
 void require(bool condition, const char* message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -256,6 +278,49 @@ void test_mpsc_epoch_free_headroom_respects_user_capacity() {
     require(conn->crossThreadHeadroom() == 1,
             "MPSC headroom ignored the bounded staging admission capacity");
     require(conn->ensureEpochFreeHeadroom(8), "MPSC headroom rejected bounded zero-slack capacity");
+
+    std::cout << "PASSED\n";
+}
+
+void test_zero_slack_feedback_falls_back_to_barrier() {
+    std::cout << "Testing zero-slack feedback falls back to barrier... ";
+
+    TickSimulationConfig config;
+    config.num_threads = 2;
+    config.enable_parallel = true;
+    config.enable_lookahead = true;
+    config.enable_epoch_free_lookahead = true;
+    config.enable_weighted_partitioning = false;
+    config.max_lookahead_cycles = 16;
+    config.epoch_size = 4;
+
+    TickSimulation sim(config);
+
+    auto* a = sim.createUnit<ZeroSlackFeedbackUnit>("a");
+    auto* a1 = sim.createUnit<RelayUnit>("a1");
+    auto* a2 = sim.createUnit<RelayUnit>("a2");
+    auto* b = sim.createUnit<ZeroSlackFeedbackUnit>("b");
+    auto* b1 = sim.createUnit<RelayUnit>("b1");
+    auto* b2 = sim.createUnit<RelayUnit>("b2");
+
+    // Two tight intra-cluster chains force two size-3 clusters. With two
+    // threads, the bidirectional delay-1/capacity-1 links must cross threads.
+    sim.connect(a->local_out, a1->in, 0);
+    sim.connect(a1->out, a2->in, 0);
+    sim.connect(b->local_out, b1->in, 0);
+    sim.connect(b1->out, b2->in, 0);
+    sim.connect(a->peer_out, b->peer_in, 1);
+    sim.connect(b->peer_out, a->peer_in, 1);
+
+    sim.initialize();
+    require(sim.useParallelExecution(), "zero-slack feedback test did not enter parallel mode");
+
+    sim.run(8);
+
+    require(sim.epochFreeRunCount() == 0,
+            "zero-slack feedback cycle should veto epoch-free lookahead");
+    require(a->ticks() == 8 && b->ticks() == 8,
+            "barrier fallback did not execute zero-slack feedback units");
 
     std::cout << "PASSED\n";
 }
@@ -571,6 +636,7 @@ int main() {
     test_mpsc_staging_tracks_large_user_capacity();
     test_registered_mpsc_capacity_sizes_destination_queue();
     test_mpsc_epoch_free_headroom_respects_user_capacity();
+    test_zero_slack_feedback_falls_back_to_barrier();
     test_registered_capacity_only_uses_source_rate_for_headroom();
     test_registered_capacity_only_does_not_throttle_rate();
     test_registered_edge_rate_throttles_mpsc_pushes();

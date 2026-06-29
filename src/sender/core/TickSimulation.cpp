@@ -331,7 +331,8 @@ uint64_t TickSimulation::runParallelEpoch(uint64_t epoch_cycles, uint64_t /*exec
     // Lookahead is usable as long as no tight edges cross cluster
     // boundaries. Intra-cluster tight edges are safe because units inside
     // a cluster run sequentially on the same thread.
-    const bool use_lookahead = config_.enable_lookahead && !has_tight_inter_cluster_;
+    const bool use_lookahead = config_.enable_lookahead && !has_tight_inter_cluster_ &&
+                               !has_zero_delay_cross_thread_cycle_;
 
     if (use_lookahead && thread_progress_count_ > 0) {
         executeEpochProgressBased(epoch_cycles);
@@ -344,7 +345,8 @@ uint64_t TickSimulation::runParallelEpoch(uint64_t epoch_cycles, uint64_t /*exec
 }
 
 bool TickSimulation::persistentLookaheadEligible_() const {
-    const bool use_lookahead = config_.enable_lookahead && !has_tight_inter_cluster_;
+    const bool use_lookahead = config_.enable_lookahead && !has_tight_inter_cluster_ &&
+                               !has_zero_delay_cross_thread_cycle_;
     return use_lookahead && thread_progress_count_ > 0 &&
            thread_units_.size() <= pool_.available_parallelism();
 }
@@ -938,60 +940,6 @@ void TickSimulation::buildThreadAssignment() {
             observe::log_info<"    {} -> {} (delay={}, C{}:T{} -> C{}:T{})">(
                 observe_ctx_, src->name().c_str(), dst->name().c_str(), conn->delay(), src_cluster,
                 src_thread, dst_cluster, dst_thread);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Cross-thread dependency analysis
-// ---------------------------------------------------------------------------
-
-void TickSimulation::buildCrossThreadDependencies() {
-    const size_t num_clusters = clusters_.numClusters();
-    thread_cross_deps_temp_.clear();
-    thread_cross_deps_temp_.resize(num_clusters);
-    if (num_clusters == 0) return;
-
-    std::unordered_map<Unit*, size_t> unit_ptr_to_idx;
-    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-        unit_ptr_to_idx[static_cast<Unit*>(unit_ptrs_[i])] = i;
-    }
-
-    std::vector<std::unordered_map<size_t, uint32_t>> min_delay(num_clusters);
-    auto add_dep = [&](size_t cluster, size_t pred_cluster, uint32_t delay) {
-        auto [it, inserted] = min_delay[cluster].try_emplace(pred_cluster, delay);
-        if (!inserted && delay < it->second) {
-            it->second = delay;
-        }
-    };
-
-    for (auto* conn : connections_) {
-        Unit* src = conn->source();
-        Unit* dst = conn->destination();
-        if (!src || !dst) continue;
-
-        auto src_it = unit_ptr_to_idx.find(src);
-        auto dst_it = unit_ptr_to_idx.find(dst);
-        if (src_it == unit_ptr_to_idx.end() || dst_it == unit_ptr_to_idx.end()) continue;
-
-        size_t src_cluster = unit_to_cluster_[src_it->second];
-        size_t dst_cluster = unit_to_cluster_[dst_it->second];
-
-        if (src_cluster == dst_cluster) continue;
-
-        add_dep(dst_cluster, src_cluster, conn->delay());
-
-        const size_t headroom = conn->crossThreadHeadroom();
-        if (headroom != std::numeric_limits<size_t>::max() && headroom > 0) {
-            const uint64_t safe_cap = static_cast<uint64_t>(headroom - 1);
-            const auto delay = static_cast<uint32_t>(std::min<uint64_t>(safe_cap, UINT32_MAX));
-            add_dep(src_cluster, dst_cluster, delay);
-        }
-    }
-
-    for (size_t c = 0; c < num_clusters; ++c) {
-        for (auto& [src_cluster, delay] : min_delay[c]) {
-            thread_cross_deps_temp_[c].push_back({src_cluster, delay});
         }
     }
 }

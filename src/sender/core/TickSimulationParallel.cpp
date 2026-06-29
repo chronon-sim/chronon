@@ -390,6 +390,7 @@ bool TickSimulation::crossThreadHeadroomFits_(uint64_t max_lookahead) const noex
 }
 
 bool TickSimulation::crossThreadHeadroomAllowsEpochFree_() const noexcept {
+    if (has_zero_delay_cross_thread_cycle_) return false;
     for (const ConnectionBase* c : connections_) {
         if (c->crossThreadHeadroom() == 0) return false;
     }

@@ -530,9 +530,10 @@ private:
     size_t crossThreadHeadroomLimit_() const noexcept;
 
     /// True when every finite cross-thread queue has a provable capacity
-    /// dependency after headroom preparation. A headroom of one is valid: it
-    /// maps to a delay-0 reverse dependency, so the producer cannot run ahead of
-    /// the consumer but still avoids per-epoch barriers.
+    /// dependency after headroom preparation, and those dependencies do not
+    /// introduce a zero-delay cluster cycle. Zero-slack cycles fall back to the
+    /// per-cycle barrier path because progress-based lookahead has no cluster
+    /// that can legally make the first tick.
     bool crossThreadHeadroomAllowsEpochFree_() const noexcept;
 
     /// Compatibility helper used by logs/tests.
@@ -605,6 +606,7 @@ private:
     ExecutionMode execution_mode_ = ExecutionMode::Sequential;
     bool has_tight_connections_ = false;
     bool has_tight_inter_cluster_ = false;
+    bool has_zero_delay_cross_thread_cycle_ = false;
     bool parallel_beneficial_ = false;
 
     /// Count of runParallel() invocations dispatched to executeRunEpochFree_.
