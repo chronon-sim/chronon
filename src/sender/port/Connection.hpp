@@ -223,6 +223,9 @@ public:
             // lookahead scheduler) or at scheduler sync points (Sequential /
             // Barrier), forwarding from staging into the destination MPSC
             // adapter in deterministic conn_id order. See docs/mpsc-atomic-publish.md.
+            if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
+                return false;
+            }
             const size_t edge_cap = edgeAdmissionCapacity_();
             if (edge_cap != InPort<T>::UNLIMITED_CAPACITY && stagingSize_() >= edge_cap) {
                 return false;  // staging full -> producer sees back-pressure
@@ -241,7 +244,7 @@ public:
         // never exceed the model-side capacity. This keeps push() and
         // canAccept() agreeing on the same rate limit without reading
         // the live queue size (which races with the consumer thread).
-        if (pushes_this_cycle_ >= to_->admissionCapacity()) {
+        if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
             return false;
         }
         const bool ok = to_->enqueueCancelable(std::move(data), arrive_cycle, &cancel_epoch_,
@@ -338,6 +341,9 @@ public:
         // sync point) in deterministic conn_id order, so the push path
         // itself does not race on wall-clock ordering across worker threads.
         if (thread_queue_id_ != SIZE_MAX) {
+            if (currentPendingPushes_() >= edgeCycleRateLimit_()) {
+                return false;
+            }
             const size_t edge_cap = edgeAdmissionCapacity_();
             return edge_cap == InPort<T>::UNLIMITED_CAPACITY || stagingSize_() < edge_cap;
         }
@@ -347,7 +353,7 @@ public:
         // which matches a hardware pipeline register whose per-edge admission
         // is bounded by width rather than downstream FIFO depth.
         const size_t pending = currentPendingPushes_();
-        return to_->canAccept(pending);
+        return pending < edgeCycleRateLimit_();
     }
 
     bool isDestinationFull() const { return !canTransfer(); }
@@ -477,6 +483,20 @@ private:
 
     size_t edgeAdmissionCapacity_() const noexcept {
         return registered_capacity_.value_or(to_->capacity());
+    }
+
+    static constexpr size_t minCapacity_(size_t lhs, size_t rhs) noexcept {
+        if (lhs == InPort<T>::UNLIMITED_CAPACITY) return rhs;
+        if (rhs == InPort<T>::UNLIMITED_CAPACITY) return lhs;
+        return std::min(lhs, rhs);
+    }
+
+    size_t edgeCycleRateLimit_() const noexcept {
+        size_t limit = from_->perCycleCapacity();
+        if (registered_rate_.has_value()) {
+            limit = *registered_rate_;
+        }
+        return minCapacity_(limit, edgeAdmissionCapacity_());
     }
 
     size_t mpscLogicalHeadroomCapacity_() const noexcept {

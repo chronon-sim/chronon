@@ -245,6 +245,106 @@ void test_registered_capacity_only_uses_source_rate_for_headroom() {
     std::cout << "PASSED\n";
 }
 
+void test_registered_capacity_only_does_not_throttle_rate() {
+    std::cout << "Testing registered capacity-only does not throttle rate... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", 4};
+    InPort<int> in{&cons, "in", 8};
+    auto* conn = out.connect(&in, 1);
+    conn->configureRegisteredEdge(/*capacity=*/8, /*rate=*/std::nullopt);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    prod.setCycle(0);
+    for (int value = 0; value < 4; ++value) {
+        require(out.canSend(), "capacity-only edge throttled below source rate");
+        require(out.send(value), "capacity-only edge blocked below source rate");
+    }
+    require(!out.canSend(), "source rate did not cap capacity-only edge");
+    require(!out.send(4), "source rate allowed extra capacity-only send");
+
+    in.arbitrateMPSC();
+    for (int value = 0; value < 4; ++value) {
+        auto received = in.tryReceive(1);
+        require(received.has_value() && *received == value, "capacity-only edge delivery changed");
+    }
+    require(!in.tryReceive(1).has_value(), "capacity-only edge delivered extra data");
+
+    std::cout << "PASSED\n";
+}
+
+void test_registered_edge_rate_throttles_mpsc_pushes() {
+    std::cout << "Testing registered edge rate throttles MPSC pushes... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", 4};
+    InPort<int> in{&cons, "in", 8};
+    auto* conn = out.connect(&in, 1);
+    conn->configureRegisteredEdge(/*capacity=*/8, /*rate=*/1);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    prod.setCycle(0);
+    require(out.canSend(), "registered rate rejected first MPSC send");
+    require(out.send(1), "registered rate blocked first MPSC send");
+    require(!out.canSend(), "registered rate allowed second same-cycle MPSC preflight");
+    require(!out.send(2), "registered rate allowed second same-cycle MPSC send");
+
+    in.arbitrateMPSC();
+    auto first = in.tryReceive(1);
+    require(first.has_value() && *first == 1, "MPSC registered-rate delivery changed");
+    require(!in.tryReceive(1).has_value(), "MPSC registered-rate throttle delivered extra data");
+
+    prod.setCycle(1);
+    require(out.canSend(), "registered rate did not reset on producer cycle advance");
+    require(out.send(3), "registered rate blocked next-cycle MPSC send");
+
+    std::cout << "PASSED\n";
+}
+
+void test_registered_edge_rate_throttles_spsc_pushes() {
+    std::cout << "Testing registered edge rate throttles SPSC pushes... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", 4};
+    InPort<int> in{&cons, "in", 8};
+    auto* conn = out.connect(&in, 1);
+    conn->configureRegisteredEdge(/*capacity=*/8, /*rate=*/1);
+
+    conn->optimizeForSPSC();
+
+    prod.setCycle(0);
+    require(out.canSend(), "registered rate rejected first SPSC send");
+    require(out.send(1), "registered rate blocked first SPSC send");
+    require(!out.canSend(), "registered rate allowed second same-cycle SPSC preflight");
+    require(!out.send(2), "registered rate allowed second same-cycle SPSC send");
+
+    auto first = in.tryReceive(1);
+    require(first.has_value() && *first == 1, "SPSC registered-rate delivery changed");
+    require(!in.tryReceive(1).has_value(), "SPSC registered-rate throttle delivered extra data");
+
+    prod.setCycle(1);
+    require(out.canSend(), "registered rate did not reset on producer cycle advance");
+    require(out.send(3), "registered rate blocked next-cycle SPSC send");
+
+    std::cout << "PASSED\n";
+}
+
 void test_bounded_mpsc_epoch_free_headroom_skips_resize() {
     std::cout << "Testing bounded MPSC headroom skips impossible resize... ";
 
@@ -431,6 +531,9 @@ int main() {
     test_mpsc_staging_tracks_large_user_capacity();
     test_mpsc_epoch_free_headroom_respects_user_capacity();
     test_registered_capacity_only_uses_source_rate_for_headroom();
+    test_registered_capacity_only_does_not_throttle_rate();
+    test_registered_edge_rate_throttles_mpsc_pushes();
+    test_registered_edge_rate_throttles_spsc_pushes();
     test_bounded_mpsc_epoch_free_headroom_skips_resize();
     test_spsc_epoch_free_headroom_respects_registered_capacity();
     test_idle_advance_drains_mpsc_staging();
