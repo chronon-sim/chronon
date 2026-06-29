@@ -36,8 +36,6 @@ class DependencyGraph;
 class CycleAnalyzer;
 
 template <typename T>
-class MessageQueue;
-template <typename T>
 class LockFreeMessageQueue;
 
 }  // namespace chronon::sender

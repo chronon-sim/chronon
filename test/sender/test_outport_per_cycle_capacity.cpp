@@ -38,8 +38,8 @@ void require(bool condition, const char* message) {
     }
 }
 
-void test_default_unlimited() {
-    std::cout << "Testing default unlimited capacity... ";
+void test_default_single_entry() {
+    std::cout << "Testing default single-entry capacity... ";
 
     TestUnit prod("prod");
     TestUnit cons("cons");
@@ -49,8 +49,32 @@ void test_default_unlimited() {
 
     prod.setCycle(0);
 
-    // Default capacity should allow unlimited sends per cycle.
-    // InPort capacity is 256, so 100 sends should all succeed without backpressure.
+    // Default output rate models one registered-edge entry per cycle.
+    assert(out.canSend());
+    assert(out.send(1));
+    assert(!out.canSend());
+    assert(!out.send(2));
+
+    prod.setCycle(1);
+    assert(out.canSend());
+    assert(out.send(3));
+
+    std::cout << "PASSED\n";
+}
+
+void test_explicit_unlimited() {
+    std::cout << "Testing explicit unlimited capacity... ";
+
+    TestUnit prod("prod");
+    TestUnit cons("cons");
+    OutPort<int> out{&prod, "out", OutPort<int>::UNLIMITED_CAPACITY};
+    InPort<int> in{&cons, "in", 256};
+    out.connect(&in, 0);
+
+    prod.setCycle(0);
+
+    // Explicit unlimited capacity should allow all sends until downstream
+    // backpressure applies.
     for (int i = 0; i < 100; ++i) {
         assert(out.canSend());
         assert(out.send(i));
@@ -149,7 +173,7 @@ void test_fanout_send_is_all_or_none_for_const_payload() {
     TestUnit prod("prod");
     TestUnit cons0("cons0");
     TestUnit cons1("cons1");
-    OutPort<int> out{&prod, "out"};
+    OutPort<int> out{&prod, "out", 2};
     InPort<int> in0{&cons0, "in0", 2};
     InPort<int> in1{&cons1, "in1", 1};
     out.connect(&in0, 0);
@@ -182,7 +206,7 @@ void test_fanout_send_is_all_or_none_for_rvalue_payload() {
     TestUnit prod("prod");
     TestUnit cons0("cons0");
     TestUnit cons1("cons1");
-    OutPort<int> out{&prod, "out"};
+    OutPort<int> out{&prod, "out", 2};
     InPort<int> in0{&cons0, "in0", 2};
     InPort<int> in1{&cons1, "in1", 1};
     out.connect(&in0, 0);
@@ -299,7 +323,7 @@ void test_query_methods() {
     // Test unlimited query behavior.
     TestUnit prod2("prod2");
     TestUnit cons2("cons2");
-    OutPort<int> out2{&prod2, "out2"};
+    OutPort<int> out2{&prod2, "out2", OutPort<int>::UNLIMITED_CAPACITY};
     InPort<int> in2{&cons2, "in2", 64};
     out2.connect(&in2, 0);
 
@@ -320,7 +344,7 @@ void test_connection_and_receive_convenience_methods() {
 
     TestUnit prod("prod");
     TestUnit cons("cons");
-    OutPort<int> out{&prod, "out"};
+    OutPort<int> out{&prod, "out", 2};
     InPort<int> in{&cons, "in", 64};
     InPort<int> other{&cons, "other", 64};
     [[maybe_unused]] auto* conn = out.connect(&in, 0);
@@ -350,7 +374,8 @@ void test_connection_and_receive_convenience_methods() {
 int main() {
     std::cout << "=== OutPort Per-Cycle Capacity Tests ===\n\n";
 
-    test_default_unlimited();
+    test_default_single_entry();
+    test_explicit_unlimited();
     test_cap_limits_sends();
     test_counter_resets_on_new_cycle();
     test_failed_send_no_slot_consumed();

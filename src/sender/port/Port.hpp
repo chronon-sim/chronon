@@ -20,7 +20,6 @@
 #include <functional>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -98,9 +97,9 @@ struct PortEnvelope {
     /// StageSelective predicates to decide whether a message was in-flight
     /// at the time of a flush.
     uint64_t enqueue_cycle = 0;
-    /// Stable producer tiebreaker for mutex-backed multi-producer queues.
+    /// Stable producer tiebreaker for topology-keyed multi-producer queues.
     /// Connection::conn_id is deterministic for a fixed topology, so same-cycle
-    /// fan-in does not depend on wall-clock mutex acquisition order.
+    /// fan-in does not depend on runtime thread placement.
     uint32_t sender_id = 0;
 };
 

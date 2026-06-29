@@ -239,7 +239,7 @@ int main() {
     if (run_rebalance_calibration(true) != 0) {
         return 1;
     }
-    if (run_rebalance_calibration(false) != 0) {
+    if (run_rebalance_calibration(false, 0, 64, 65536) != 0) {
         return 1;
     }
     if (run_rebalance_calibration(false, 1024, 2048, 8192) != 0) {

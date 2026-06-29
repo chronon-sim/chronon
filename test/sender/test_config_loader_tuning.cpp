@@ -168,6 +168,50 @@ simulation:
     std::cout << "PASSED\n";
 }
 
+void test_registered_edge_fields_parse() {
+    std::cout << "Testing registered edge capacity/rate parse... ";
+
+    SenderConfigLoader loader;
+    auto config = loader.loadFromString(R"yaml(
+simulation:
+  bus:
+    wakeup:
+      delay: 1
+      capacity: 32
+      rate: 4
+      inputs: [exe0.out_wakeup]
+      outputs: [iq0.in_wakeup, iq1.in_wakeup]
+  unit:
+    fetch:
+      type: FetchUnit
+      port:
+        out_fetch:
+          to: decode.in_fetch
+          delay: 2
+          capacity: 16
+          rate: 2
+    decode:
+      type: DecodeUnit
+)yaml");
+
+    assert(config.connections.size() == 3);
+    const auto& direct = config.connections[2];
+    assert(direct.source_path == "fetch.out_fetch");
+    assert(direct.dest_path == "decode.in_fetch");
+    assert(direct.delay == 2);
+    assert(direct.capacity.has_value() && *direct.capacity == 16);
+    assert(direct.rate.has_value() && *direct.rate == 2);
+
+    for (size_t i = 0; i < 2; ++i) {
+        assert(config.connections[i].capacity.has_value());
+        assert(*config.connections[i].capacity == 32);
+        assert(config.connections[i].rate.has_value());
+        assert(*config.connections[i].rate == 4);
+    }
+
+    std::cout << "PASSED\n";
+}
+
 void test_builder_preserves_constructor_tick_interval_when_yaml_omits_override() {
     std::cout << "Testing builder preserves constructor tick_interval defaults... ";
 
@@ -205,6 +249,7 @@ int main() {
     test_unit_names_include_programmatic_additions();
     test_unit_names_skip_programmatic_deletions();
     test_unit_tick_interval_parse();
+    test_registered_edge_fields_parse();
     test_builder_preserves_constructor_tick_interval_when_yaml_omits_override();
 
     std::cout << "\n=== Config loader tuning tests PASSED ===\n";

@@ -43,6 +43,8 @@ struct PortConnectionSpec {
     std::string source_path;
     std::string dest_path;
     uint32_t delay = 1;
+    std::optional<size_t> capacity;
+    std::optional<size_t> rate;
 
     bool isValid() const { return !source_path.empty() && !dest_path.empty(); }
 };

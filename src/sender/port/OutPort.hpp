@@ -48,12 +48,12 @@ public:
      *
      * @param owner The unit that owns this port
      * @param name The port name (for debugging)
-     * @param per_cycle_capacity Max sends per cycle (UNLIMITED_CAPACITY = unlimited, default).
-     *                           Passing 0 is accepted as the legacy unlimited spelling.
+     * @param per_cycle_capacity Max sends per cycle. Defaults to one registered-edge entry per
+     *                           cycle. UNLIMITED_CAPACITY or 0 explicitly opts out.
      */
     static constexpr size_t UNLIMITED_CAPACITY = std::numeric_limits<size_t>::max();
 
-    OutPort(Unit* owner, std::string name, size_t per_cycle_capacity = UNLIMITED_CAPACITY)
+    OutPort(Unit* owner, std::string name, size_t per_cycle_capacity = 1)
         : PortBase(owner, std::move(name)),
           per_cycle_capacity_(normalizeCapacity_(per_cycle_capacity)) {
         if (owner_) {
@@ -280,7 +280,7 @@ private:
     }
 
     std::vector<std::unique_ptr<Connection<T>>> connections_;
-    size_t per_cycle_capacity_ = UNLIMITED_CAPACITY;
+    size_t per_cycle_capacity_ = 1;
     mutable size_t sent_this_cycle_ = 0;
     mutable uint64_t last_counted_cycle_ = 0;
 };

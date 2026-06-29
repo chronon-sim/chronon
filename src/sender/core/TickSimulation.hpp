@@ -124,10 +124,11 @@ public:
     }
 
     template <typename T>
-    void connect(OutPort<T>& from, InPort<T>& to, uint32_t delay = 1) {
+    Connection<T>* connect(OutPort<T>& from, InPort<T>& to, uint32_t delay = 1) {
         auto* conn = from.connect(&to, delay);
         conn->setConnId(static_cast<uint32_t>(connections_.size()));
         connections_.push_back(conn);
+        return conn;
     }
 
     /// For YAML-driven builders that create connections via type-erased port
@@ -518,16 +519,20 @@ private:
     /// Precondition for executeRunEpochFree_ (see enable_epoch_free_lookahead).
     bool allMPSCPortsHaveConnProgress_() const noexcept;
 
-    /// Grow lock-free queues with no positive headroom, or switch the port to
-    /// thread-safe queueing if bounded capacity makes that impossible.
-    size_t demoteUnsafeEpochFreeQueues_();
+    /// Grow registered lock-free buffers where the model declares enough edge
+    /// rate to prove epoch-free headroom. Returns the number of connections
+    /// whose reverse space dependency cannot be proven, which vetoes
+    /// epoch-free instead of changing queue semantics.
+    size_t prepareEpochFreeHeadroom_();
 
     /// Minimum cross-thread queue headroom over all connections. SIZE_MAX means
     /// no bounded cross-thread ring constrains epoch-free run-ahead.
     size_t crossThreadHeadroomLimit_() const noexcept;
 
-    /// True when every remaining finite cross-thread queue has at least one
-    /// cycle of safe run-ahead after unsafe ports have been demoted.
+    /// True when every finite cross-thread queue has a provable capacity
+    /// dependency after headroom preparation. A headroom of one is valid: it
+    /// maps to a delay-0 reverse dependency, so the producer cannot run ahead of
+    /// the consumer but still avoids per-epoch barriers.
     bool crossThreadHeadroomAllowsEpochFree_() const noexcept;
 
     /// Compatibility helper used by logs/tests.
@@ -605,6 +610,7 @@ private:
     /// Count of runParallel() invocations dispatched to executeRunEpochFree_.
     /// Introspection only (see epochFreeRunCount()).
     uint64_t epoch_free_run_count_ = 0;
+    bool epoch_free_veto_logged_ = false;
 
     TerminationController termination_ctrl_;
 

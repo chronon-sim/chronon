@@ -391,36 +391,33 @@ bool TickSimulation::crossThreadHeadroomFits_(uint64_t max_lookahead) const noex
 
 bool TickSimulation::crossThreadHeadroomAllowsEpochFree_() const noexcept {
     for (const ConnectionBase* c : connections_) {
-        if (c->crossThreadHeadroom() <= 1) return false;
+        if (c->crossThreadHeadroom() == 0) return false;
     }
     return true;
 }
 
-size_t TickSimulation::demoteUnsafeEpochFreeQueues_() {
+size_t TickSimulation::prepareEpochFreeHeadroom_() {
     if (!config_.enable_epoch_free_lookahead) return 0;
     std::unordered_map<void*, std::vector<ConnectionBase*>> by_port;
     for (auto* conn : connections_) {
         by_port[conn->destPortPtr()].push_back(conn);
     }
 
-    size_t demoted = 0;
+    size_t unproven_count = 0;
     for (auto& [port, conns] : by_port) {
         (void)port;
         bool unsafe = false;
         for (auto* conn : conns) {
-            if (conn->crossThreadHeadroom() <= 1 &&
+            if (conn->crossThreadHeadroom() == 0 &&
                 !conn->ensureEpochFreeHeadroom(config_.max_lookahead_cycles)) {
                 unsafe = true;
                 break;
             }
         }
         if (!unsafe) continue;
-        for (auto* conn : conns) {
-            conn->optimizeForThreadSafe();
-        }
-        demoted += conns.size();
+        unproven_count += conns.size();
     }
-    return demoted;
+    return unproven_count;
 }
 
 size_t TickSimulation::crossThreadHeadroomLimit_() const noexcept {

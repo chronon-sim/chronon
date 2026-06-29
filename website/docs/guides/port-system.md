@@ -21,9 +21,10 @@ template<typename T>
 class OutPort {
 public:
     // Construction (auto-registers with owner)
-    // per_cycle_capacity: max sends per cycle (UNLIMITED_CAPACITY = unlimited, default)
+    // per_cycle_capacity: max source sends per cycle
+    // (default = 1 registered-edge entry; use UNLIMITED_CAPACITY to opt out).
     OutPort(Unit* owner, std::string name,
-            size_t per_cycle_capacity = UNLIMITED_CAPACITY);
+            size_t per_cycle_capacity = 1);
 
     // Connect to input port
     Connection<T>* connect(InPort<T>* to, uint32_t delay);
@@ -307,8 +308,8 @@ In real hardware, a 4-wide decode stage can produce at most 4 micro-ops per cycl
 
 Per-cycle capacity on OutPort is:
 - **Thread-safe without atomics**: Only the owning unit's thread calls `canSend()`/`send()`
-- **Backward compatible**: Passing 0 still means unlimited
-- **Zero overhead when unused**: No cycle tracking when capacity is UNLIMITED_CAPACITY
+- **Explicitly unbounded when needed**: Passing 0 or `UNLIMITED_CAPACITY` opts out of the rate cap
+- **Low overhead**: No atomics; only the producing unit tracks its per-cycle sends
 
 ### Usage
 
@@ -324,7 +325,7 @@ OutPort<InstData> out_iq0{this, "out_iq0", 1};
 **Runtime parameterized** (for configurable pipeline widths):
 ```cpp
 // In constructor:
-OutPort<InstData> out_uop_queue{this, "out_uop_queue"};  // unlimited initially
+OutPort<InstData> out_uop_queue{this, "out_uop_queue", 1};
 
 // In initialize():
 out_uop_queue.setPerCycleCapacity(num_to_decode_);  // set from YAML param

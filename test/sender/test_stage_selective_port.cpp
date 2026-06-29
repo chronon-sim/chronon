@@ -66,7 +66,7 @@ void test_basic_flush_semantic() {
     TestUnit prod("prod");
     TestUnit cons("cons");
 
-    OutPort<TaggedMsg> out{&prod, "out"};
+    OutPort<TaggedMsg> out{&prod, "out", 16};
     InPort<TaggedMsg> in{&cons, "in", InPort<TaggedMsg>::UNLIMITED_CAPACITY,
                          PortPolicy::StageSelective};
     out.connect(&in, /*delay=*/1);
@@ -110,7 +110,7 @@ void test_overlapping_flush_predicates() {
     TestUnit prod("prod");
     TestUnit cons("cons");
 
-    OutPort<TaggedMsg> out{&prod, "out"};
+    OutPort<TaggedMsg> out{&prod, "out", 16};
     InPort<TaggedMsg> in{&cons, "in", 64, PortPolicy::StageSelective};
     out.connect(&in, /*delay=*/1);
 
@@ -147,7 +147,7 @@ void test_retirement_boundary() {
     TestUnit prod("prod");
     TestUnit cons("cons");
 
-    OutPort<TaggedMsg> out{&prod, "out"};
+    OutPort<TaggedMsg> out{&prod, "out", 16};
     InPort<TaggedMsg> in{&cons, "in", 64, PortPolicy::StageSelective};
     out.connect(&in, /*delay=*/2);
 
@@ -195,7 +195,7 @@ void test_sender_filter_removal() {
     TestUnit prod("prod");
     TestUnit cons("cons");
 
-    OutPort<TaggedMsg> out{&prod, "out"};
+    OutPort<TaggedMsg> out{&prod, "out", kN};
     InPort<TaggedMsg> in{&cons, "in", /*capacity=*/kN * 2, PortPolicy::StageSelective};
     out.connect(&in, /*delay=*/1);
 

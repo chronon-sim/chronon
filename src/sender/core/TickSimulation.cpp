@@ -362,14 +362,17 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
     const bool can_persist = persistentLookaheadEligible_();
     if (can_persist) {
         const bool epoch_free = epochFreeLookaheadEligible_();
-        if (config_.enable_epoch_free_lookahead && !epoch_free && observe_ctx_) {
+        if (config_.enable_epoch_free_lookahead && !epoch_free && observe_ctx_ &&
+            !epoch_free_veto_logged_) {
             observe::log_info<
                 "epoch-free lookahead requested but vetoed "
                 "(max_lookahead={}, mpsc_progress_full={}, headroom={}); using barrier path">(
                 observe_ctx_, config_.max_lookahead_cycles, allMPSCPortsHaveConnProgress_(),
                 crossThreadHeadroomLimit_());
+            epoch_free_veto_logged_ = true;
         }
         if (epoch_free) {
+            epoch_free_veto_logged_ = false;
             ++epoch_free_run_count_;
             if (config_.enable_dynamic_rebalance) {
                 return executeRunEpochFreeDynamic_(num_cycles);
@@ -610,9 +613,8 @@ void TickSimulation::optimizeAllQueuesForSingleThread() {
         for (auto* conn : conns) {
             conn->optimizeForMPSC();
         }
-        // Synthesize a pseudo thread_id per connection (its conn_id + 1)
-        // so each connection gets its own per-thread ring, matching the
-        // multi-thread case.
+        // Synthesize a producer key per connection (conn_id + 1), so each
+        // registered edge gets its own MPSC staging ring.
         for (auto* conn : conns) {
             const size_t pseudo_thread_id = static_cast<size_t>(conn->connId()) + 1;
             const size_t queue_id = conn->registerProducerThread(pseudo_thread_id);
@@ -715,9 +717,9 @@ void TickSimulation::optimizeConnectionQueuesForThreads() {
                 conns[0]->optimizeForSPSC();
                 spsc_count += 1;
             } else {
-                // Cross-thread, single producer thread, multiple
-                // Connections: producer units race for the queue, so use
-                // MPSC + one queue per Connection.
+                // Cross-thread, single producer thread, multiple Connections:
+                // use MPSC + one queue per Connection so admission order is
+                // topology-stable.
                 for (auto* conn : conns) {
                     conn->optimizeForMPSC();
                 }
@@ -748,12 +750,13 @@ void TickSimulation::optimizeConnectionQueuesForThreads() {
         }
     }
 
-    const size_t fallback_count = demoteUnsafeEpochFreeQueues_();
+    const size_t unproven_headroom_count = prepareEpochFreeHeadroom_();
 
     if (observe_ctx_) {
         observe::log_info<
-            "Queue optimization: {} same-thread, {} SPSC, {} MPSC, {} thread-safe fallbacks">(
-            observe_ctx_, same_thread_count, spsc_count, mpsc_count, fallback_count);
+            "Queue optimization: {} same-thread, {} SPSC, {} MPSC, {} unproven registered "
+            "headroom connections">(observe_ctx_, same_thread_count, spsc_count, mpsc_count,
+                                    unproven_headroom_count);
     }
 }
 
@@ -796,12 +799,13 @@ void TickSimulation::optimizeConnectionQueuesForDynamicRebalance_() {
         }
     }
 
-    const size_t fallback_count = demoteUnsafeEpochFreeQueues_();
+    const size_t unproven_headroom_count = prepareEpochFreeHeadroom_();
 
     if (observe_ctx_) {
         observe::log_info<
-            "Queue optimization: dynamic-stable, {} SPSC, {} MPSC, {} thread-safe fallback, "
-            "no same-thread queues">(observe_ctx_, spsc_count, mpsc_count, fallback_count);
+            "Queue optimization: dynamic-stable, {} SPSC, {} MPSC, {} unproven registered "
+            "headroom connections, no same-thread queues">(observe_ctx_, spsc_count, mpsc_count,
+                                                           unproven_headroom_count);
     }
 }
 
@@ -978,7 +982,7 @@ void TickSimulation::buildCrossThreadDependencies() {
         add_dep(dst_cluster, src_cluster, conn->delay());
 
         const size_t headroom = conn->crossThreadHeadroom();
-        if (headroom != std::numeric_limits<size_t>::max() && headroom > 1) {
+        if (headroom != std::numeric_limits<size_t>::max() && headroom > 0) {
             const uint64_t safe_cap = static_cast<uint64_t>(headroom - 1);
             const auto delay = static_cast<uint32_t>(std::min<uint64_t>(safe_cap, UINT32_MAX));
             add_dep(src_cluster, dst_cluster, delay);

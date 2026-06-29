@@ -40,7 +40,7 @@ void test_delayed_cancel_drops_message() {
 
     TestUnit prod("prod");
     TestUnit cons("cons");
-    OutPort<int> out{&prod, "out"};
+    OutPort<int> out{&prod, "out", 16};
     InPort<int> in{&cons, "in", 64};
     out.connect(&in, 5);
 
@@ -61,7 +61,7 @@ void test_delayed_cancel_only_affects_prior_epoch() {
 
     TestUnit prod("prod");
     TestUnit cons("cons");
-    OutPort<int> out{&prod, "out"};
+    OutPort<int> out{&prod, "out", 16};
     InPort<int> in{&cons, "in", 64};
     out.connect(&in, 3);
 
@@ -91,7 +91,7 @@ void test_fanout_cancel_drops_all() {
     TestUnit cons0("cons0");
     TestUnit cons1("cons1");
 
-    OutPort<int> out{&prod, "out"};
+    OutPort<int> out{&prod, "out", 16};
     InPort<int> in0{&cons0, "in0", 64};
     InPort<int> in1{&cons1, "in1", 64};
 
@@ -113,7 +113,7 @@ void test_delay0_cancel_before_receive() {
 
     TestUnit prod("prod");
     TestUnit cons("cons");
-    OutPort<int> out{&prod, "out"};
+    OutPort<int> out{&prod, "out", 16};
     InPort<int> in{&cons, "in", 64};
     out.connect(&in, 0);
 
@@ -132,7 +132,7 @@ void test_inport_flush_drops_future_messages() {
 
     TestUnit prod("prod");
     TestUnit cons("cons");
-    OutPort<int> out{&prod, "out"};
+    OutPort<int> out{&prod, "out", 16};
     InPort<int> in{&cons, "in", 64};
     out.connect(&in, 10);
 
@@ -154,7 +154,7 @@ void test_inport_selective_cancel_basic() {
 
     TestUnit prod("prod");
     TestUnit cons("cons");
-    OutPort<TaggedMsg> out{&prod, "out"};
+    OutPort<TaggedMsg> out{&prod, "out", 16};
     InPort<TaggedMsg> in{&cons, "in", 64};
     out.connect(&in, 5);
 
@@ -187,7 +187,7 @@ void test_inport_selective_cancel_monotonic_watermark() {
 
     TestUnit prod("prod");
     TestUnit cons("cons");
-    OutPort<TaggedMsg> out{&prod, "out"};
+    OutPort<TaggedMsg> out{&prod, "out", 16};
     InPort<TaggedMsg> in{&cons, "in", 64};
     out.connect(&in, 5);
 
@@ -222,7 +222,7 @@ void test_inport_selective_cancel_younger_than() {
 
     TestUnit prod("prod");
     TestUnit cons("cons");
-    OutPort<TaggedMsg> out{&prod, "out"};
+    OutPort<TaggedMsg> out{&prod, "out", 16};
     InPort<TaggedMsg> in{&cons, "in", 64};
     out.connect(&in, 4);
 
@@ -252,7 +252,7 @@ void test_inport_selective_cancel_reset() {
 
     TestUnit prod("prod");
     TestUnit cons("cons");
-    OutPort<TaggedMsg> out{&prod, "out"};
+    OutPort<TaggedMsg> out{&prod, "out", 16};
     InPort<TaggedMsg> in{&cons, "in", 64};
     out.connect(&in, 4);
 
@@ -289,7 +289,7 @@ void test_inport_selective_cancel_with_epoch_cancel() {
 
     TestUnit prod("prod");
     TestUnit cons("cons");
-    OutPort<TaggedMsg> out{&prod, "out"};
+    OutPort<TaggedMsg> out{&prod, "out", 16};
     InPort<TaggedMsg> in{&cons, "in", 64};
     out.connect(&in, 5);
 
@@ -332,7 +332,7 @@ void test_inport_selective_cancel_scoped_to_inflight() {
 
     TestUnit prod("prod");
     TestUnit cons("cons");
-    OutPort<TaggedMsg> out{&prod, "out"};
+    OutPort<TaggedMsg> out{&prod, "out", 16};
     InPort<TaggedMsg> in{&cons, "in", 64};
     out.connect(&in, 5);
 
@@ -372,7 +372,7 @@ void test_inport_selective_cancel_mismatched_keyfn_is_noop() {
 
     TestUnit prod("prod");
     TestUnit cons("cons");
-    OutPort<TaggedMsg> out{&prod, "out"};
+    OutPort<TaggedMsg> out{&prod, "out", 16};
     InPort<TaggedMsg> in{&cons, "in", 64};
     out.connect(&in, 4);
 

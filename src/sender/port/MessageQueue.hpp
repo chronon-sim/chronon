@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <queue>
 #include <stdexcept>
@@ -21,223 +20,6 @@
 #include <vector>
 
 namespace chronon::sender {
-
-/**
- * MessageQueue - Thread-safe priority queue ordered by arrival cycle.
- *
- * This queue ensures deterministic message delivery:
- * - Messages are delivered in cycle order
- * - Messages within the same cycle are delivered in FIFO order
- * - Thread-safe for concurrent push/pop operations
- *
- * Usage:
- *   MessageQueue<int> queue;
- *   queue.push(42, current_cycle + delay);  // Will arrive after delay
- *   if (auto msg = queue.tryPop(current_cycle)) {
- *       process(*msg);
- *   }
- */
-template <typename T>
-class MessageQueue {
-public:
-    static constexpr size_t UNLIMITED_CAPACITY = std::numeric_limits<size_t>::max();
-
-    /**
-     * Create a message queue.
-     *
-     * @param capacity Maximum number of messages (default unlimited)
-     */
-    explicit MessageQueue(size_t capacity = UNLIMITED_CAPACITY) : capacity_(capacity) {}
-
-    // Non-copyable, movable
-    MessageQueue(const MessageQueue&) = delete;
-    MessageQueue& operator=(const MessageQueue&) = delete;
-    MessageQueue(MessageQueue&&) = default;
-    MessageQueue& operator=(MessageQueue&&) = default;
-
-    /**
-     * Push a message to arrive at a specific cycle.
-     *
-     * @param data The message data
-     * @param arrive_cycle The cycle at which the message should be delivered
-     * @return true if push succeeded, false if queue is full (back pressure)
-     */
-    bool push(T data, uint64_t arrive_cycle) {
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        // Model-side admission (user-visible capacity) is enforced at the
-        // InPort/Connection layer via a per-cycle push counter. The queue
-        // itself does not reject on user_capacity_ here — doing so would
-        // race with the consumer thread's mid-cycle pops under num_workers>=2
-        // and spuriously back-pressure the producer under num_workers=1
-        // where the consumer always runs after the producer within the
-        // same simulated cycle.
-        messages_.push({std::move(data), arrive_cycle, sequence_++});
-        size_.store(messages_.size(), std::memory_order_release);
-        return true;
-    }
-
-    /**
-     * Try to pop a message if one is ready.
-     *
-     * @param current_cycle The current simulation cycle
-     * @return The message data if available, std::nullopt otherwise
-     */
-    std::optional<T> tryPop(uint64_t current_cycle) {
-        // Fast-path: check if queue is empty using atomic size
-        if (size_.load(std::memory_order_relaxed) == 0) {
-            return std::nullopt;
-        }
-
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        if (messages_.empty()) {
-            return std::nullopt;
-        }
-
-        const auto& top = messages_.top();
-        if (top.arrive_cycle > current_cycle) {
-            return std::nullopt;
-        }
-
-        T data = std::move(const_cast<InternalMessage&>(top).data);
-        messages_.pop();
-        size_.store(messages_.size(), std::memory_order_release);
-        return data;
-    }
-
-    /**
-     * Pop all messages ready at the current cycle.
-     *
-     * @param current_cycle The current simulation cycle
-     * @return Vector of all ready messages in order
-     */
-    std::vector<T> popAll(uint64_t current_cycle) {
-        std::vector<T> result;
-        popAllInto(result, current_cycle);
-        return result;
-    }
-
-    void popAllInto(std::vector<T>& out, uint64_t current_cycle) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        out.clear();
-        while (!messages_.empty() && messages_.top().arrive_cycle <= current_cycle) {
-            out.push_back(std::move(const_cast<InternalMessage&>(messages_.top()).data));
-            messages_.pop();
-        }
-        size_.store(messages_.size(), std::memory_order_release);
-    }
-
-    /**
-     * Check if any messages are ready.
-     *
-     * @param current_cycle The current simulation cycle
-     * @return true if at least one message is ready
-     */
-    bool hasReady(uint64_t current_cycle) const {
-        // Fast-path: check if queue is empty using atomic size
-        if (size_.load(std::memory_order_relaxed) == 0) {
-            return false;
-        }
-        std::lock_guard<std::mutex> lock(mutex_);
-        return !messages_.empty() && messages_.top().arrive_cycle <= current_cycle;
-    }
-
-    /**
-     * Get the minimum arrival cycle of all pending messages.
-     *
-     * Used for lookahead computation.
-     *
-     * @return Minimum arrival cycle, or std::nullopt if queue is empty
-     */
-    std::optional<uint64_t> minArrivalCycle() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (messages_.empty()) {
-            return std::nullopt;
-        }
-        return messages_.top().arrive_cycle;
-    }
-
-    bool empty() const { return size_.load(std::memory_order_relaxed) == 0; }
-
-    bool full() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return messages_.size() >= capacity_;
-    }
-
-    size_t size() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return messages_.size();
-    }
-
-    size_t capacity() const noexcept { return capacity_; }
-
-    size_t available() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (capacity_ == UNLIMITED_CAPACITY) {
-            return UNLIMITED_CAPACITY;
-        }
-        return capacity_ - messages_.size();
-    }
-
-    /**
-     * Set the queue capacity.
-     *
-     * @param capacity New capacity (does not drop existing messages)
-     */
-    void setCapacity(size_t capacity) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        capacity_ = capacity;
-    }
-
-    /**
-     * Clear all pending messages.
-     */
-    void clear() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        messages_ = InternalQueue{};
-        sequence_ = 0;
-        size_.store(0, std::memory_order_release);
-    }
-
-private:
-    // Internal message with sequence number for FIFO within same cycle
-    struct InternalMessage {
-        T data;
-        uint64_t arrive_cycle;
-        uint64_t sequence;
-
-        bool operator>(const InternalMessage& other) const {
-            if (arrive_cycle != other.arrive_cycle) {
-                return arrive_cycle > other.arrive_cycle;
-            }
-            const uint32_t sid = stableSenderId_(data);
-            const uint32_t other_sid = stableSenderId_(other.data);
-            if (sid != other_sid) {
-                return sid > other_sid;
-            }
-            return sequence > other.sequence;  // FIFO: earlier sequence = higher priority
-        }
-    };
-
-    using InternalQueue = std::priority_queue<InternalMessage, std::vector<InternalMessage>,
-                                              std::greater<InternalMessage>>;
-
-    template <typename Msg>
-    static uint32_t stableSenderId_(const Msg& msg) noexcept {
-        if constexpr (requires { msg.sender_id; }) {
-            return msg.sender_id;
-        } else {
-            return 0;
-        }
-    }
-
-    mutable std::mutex mutex_;
-    InternalQueue messages_;
-    uint64_t sequence_ = 0;
-    size_t capacity_ = UNLIMITED_CAPACITY;
-    mutable std::atomic<size_t> size_{0};  // Cached size for fast-path checks
-};
 
 /**
  * LockFreeMessageQueue - Single-producer single-consumer message queue.
@@ -420,12 +202,10 @@ private:
 /**
  * SingleThreadMessageQueue - Non-thread-safe priority queue for single-thread access.
  *
- * This queue provides the same interface as MessageQueue but with zero
- * synchronization overhead. Use when both producer and consumer are guaranteed
- * to be on the same thread (e.g., units in the same tight-coupling cluster).
+ * This queue provides the registered-edge interface for single-thread
+ * producer/consumer pairs.
  *
  * Features:
- * - Same API as MessageQueue for easy switching
  * - No mutex, no atomic operations
  * - Priority ordering by arrival cycle with FIFO within same cycle
  *
@@ -463,7 +243,7 @@ public:
      * @return true if push succeeded, false if queue is full (back pressure)
      */
     bool push(T data, uint64_t arrive_cycle) {
-        // Capacity admission is enforced upstream (see MessageQueue::push).
+        // Capacity admission is enforced upstream by Connection/InPort.
         messages_.push({std::move(data), arrive_cycle, sequence_++});
         return true;
     }
@@ -562,7 +342,7 @@ private:
 /**
  * IMessageQueue - Type-erased interface for message queues.
  *
- * Allows switching between MessageQueue and SingleThreadMessageQueue at runtime.
+ * Allows InPort to hold the selected registered-edge storage at runtime.
  */
 template <typename T>
 class IMessageQueue {
@@ -591,8 +371,7 @@ public:
  *
  * Works for any queue type that exposes: push(), tryPop(), popAll(),
  * hasReady(), minArrivalCycle(), empty(), full(), size(), capacity(),
- * storageCapacity(), available(), setCapacity(), clear(). Both MessageQueue and
- * SingleThreadMessageQueue satisfy this contract.
+ * storageCapacity(), available(), setCapacity(), clear().
  */
 template <typename T, typename QueueImpl>
 class QueueAdapterImpl : public IMessageQueue<T> {
@@ -630,10 +409,6 @@ public:
 private:
     QueueImpl queue_;
 };
-
-/** Adapts MessageQueue (mutex-protected) to IMessageQueue. */
-template <typename T>
-using MessageQueueAdapter = QueueAdapterImpl<T, MessageQueue<T>>;
 
 /** Adapts SingleThreadMessageQueue (no synchronization) to IMessageQueue. */
 template <typename T>
@@ -715,14 +490,13 @@ private:
 };
 
 /**
- * MultiProducerQueueAdapter - Lock-free MPSC via per-thread SPSC queues.
+ * MultiProducerQueueAdapter - Lock-free MPSC via independent SPSC queues.
  *
- * Each source thread gets its own LockFreeMessageQueue to the consumer.
- * This is thread-safe because:
- * - Each thread has its own dedicated queue (no concurrent push to same queue)
- * - Units on the same thread share a queue but execute sequentially
- * - Consumer pops via a k-way merge keyed on (arrive_cycle, queue_id) for
- *   deterministic, simulated-time-ordered delivery.
+ * Chronon's scheduler registers one producer key per Connection, so each
+ * registered edge has a dedicated staging queue into the consumer. This is
+ * thread-safe because no two producers push the same physical queue, and the
+ * consumer pops via a k-way merge keyed on (arrive_cycle, sender_id) for
+ * deterministic, simulated-time-ordered delivery.
  *
  * Use when multiple threads write to the same InPort.
  *
@@ -732,14 +506,12 @@ private:
  *   MultiProducerQueueAdapter::addProducerThread in the order producer
  *   threads are discovered during TickSimulation::optimizeConnectionQueuesForThreads,
  *   which iterates a std::set<size_t>. This makes ordering reproducible run-to-run
- *   for a fixed num_workers, but NOT num_workers-invariant: same-cycle cross-thread
- *   ties may resolve differently between single-threaded (priority_queue sequence)
- *   and multi-threaded (queue_id) modes. For full num_workers-invariant replay, use
- *   PortPolicy::LegacyFastPath with MessageQueueAdapter (priority_queue), at the cost of
- *   a mutex on push.
+ *   for a fixed num_workers. Chronon's scheduler registers one queue per
+ *   Connection and passes the stable conn_id as sender_id, so same-cycle ties
+ *   remain topology-stable across thread placements.
  *
  * Correctness prerequisite:
- * - Each per-thread LockFreeMessageQueue must be pushed with non-decreasing
+ * - Each per-connection LockFreeMessageQueue must be pushed with non-decreasing
  *   arrive_cycle (i.e., producer pushes arrive_cycle = X + const_delay where X
  *   is monotonically advancing). This holds for any TickableUnit whose push
  *   site is `OutPort::send(data)` with fixed delay — the standard pattern.
@@ -751,13 +523,13 @@ public:
     /**
      * Construct an MPSC adapter with an initial user-visible capacity.
      *
-     * The per-thread physical LockFreeMessageQueue ring capacity is chosen
+     * The per-connection physical LockFreeMessageQueue ring capacity is chosen
      * at construction from the bounded user capacity. user_capacity_ is a
      * *soft* aggregate gate consulted by capacity()/full(); it is only
      * honored by the arbiter/canAccept layer before admitting a push. The
      * push path itself (pushFromThread) does NOT enforce user_capacity_ —
      * enforcing it there would reintroduce a wall-clock race where two
-     * producer threads racing against each other could both see size < cap
+     * producer queues racing against each other could both see size < cap
      * and both succeed even though their joint push exceeds the soft cap.
      *
      * If the user does not override capacity explicitly, we still want
@@ -771,10 +543,10 @@ public:
           user_capacity_(capacity) {}
 
     /**
-     * Register a new source thread and create its queue.
+     * Register a stable producer key and create its queue.
      *
-     * @param thread_id The thread ID (from cluster assignment)
-     * @return Queue ID for this thread (used in pushFromThread)
+     * @param thread_id Stable producer key. Chronon passes conn_id + 1 here.
+     * @return Queue ID for this producer key (used in pushFromThread)
      */
     size_t addProducerThread(size_t thread_id) {
         auto existing = thread_to_queue_id_.find(thread_id);
@@ -822,8 +594,8 @@ public:
             // Physical SPSC ring full: the entry is dropped, which corrupts the
             // run. Under epoch-free lookahead a producer can run up to
             // max_lookahead_cycles ahead of a lagging consumer, so this counter
-            // is the staging-overflow watchdog (each producer thread writes its
-            // own queue_id, hence atomic). Relaxed: rare path, read after join.
+            // is the staging-overflow watchdog (each connection writes its own
+            // queue_id, hence atomic). Relaxed: rare path, read after join.
             staging_overflow_events_.fetch_add(1, std::memory_order_relaxed);
         }
         return ok;
@@ -836,7 +608,7 @@ public:
         return staging_overflow_events_.load(std::memory_order_relaxed);
     }
 
-    // IMessageQueue interface - consumer polls all thread queues
+    // IMessageQueue interface - consumer polls all producer queues.
 
     bool push(T data, uint64_t arrive_cycle) override {
         // Default push to first queue (should use pushFromThread for MPSC)
@@ -946,9 +718,9 @@ public:
     /**
      * Set the soft user-visible capacity.
      *
-     * Per-thread physical ring capacity is unchanged. Only the soft
+     * Per-producer physical ring capacity is unchanged. Only the soft
      * aggregate gate is updated. pushFromThread() still does NOT enforce
-     * this cap — per-thread ring fullness (fullForThread()) continues to
+     * this cap — per-producer ring fullness (fullForThread()) continues to
      * govern push failure on the push path to avoid wall-clock races
      * between producer threads. The MPSC arbiter consults full() before
      * admitting a message.
@@ -956,7 +728,7 @@ public:
     void setCapacity(size_t cap) override {
         if (cap != std::numeric_limits<size_t>::max() && cap > perThreadUsableCapacity_()) {
             throw std::length_error(
-                "MultiProducerQueueAdapter capacity exceeds its fixed per-thread queue capacity");
+                "MultiProducerQueueAdapter capacity exceeds its fixed producer queue capacity");
         }
         user_capacity_ = cap;
     }

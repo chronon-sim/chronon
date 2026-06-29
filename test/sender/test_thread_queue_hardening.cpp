@@ -161,7 +161,7 @@ void test_mpsc_staging_tracks_large_user_capacity() {
     ManualUnit prod("prod");
     ManualUnit cons("cons");
 
-    OutPort<int> out{&prod, "out"};
+    OutPort<int> out{&prod, "out", kUserCapacity};
     InPort<int> in{&cons, "in", kUserCapacity};
     auto* conn = out.connect(&in, 1);
 
@@ -212,10 +212,9 @@ void test_mpsc_epoch_free_headroom_respects_user_capacity() {
     conn->setThreadQueueId(queue_id);
     require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
 
-    require(conn->crossThreadHeadroom() == 0,
+    require(conn->crossThreadHeadroom() == 1,
             "MPSC headroom ignored the bounded staging admission capacity");
-    require(!conn->ensureEpochFreeHeadroom(8),
-            "MPSC headroom growth bypassed the bounded user capacity");
+    require(conn->ensureEpochFreeHeadroom(8), "MPSC headroom rejected bounded zero-slack capacity");
 
     std::cout << "PASSED\n";
 }
@@ -238,13 +237,32 @@ void test_bounded_mpsc_epoch_free_headroom_skips_resize() {
 
     AllocationProbe::fail_on_default = true;
     try {
-        require(!conn->ensureEpochFreeHeadroom(4096),
-                "bounded MPSC headroom should demote without resizing");
+        require(conn->ensureEpochFreeHeadroom(4096),
+                "bounded MPSC headroom should not resize zero-slack capacity");
     } catch (...) {
         AllocationProbe::fail_on_default = false;
         throw;
     }
     AllocationProbe::fail_on_default = false;
+
+    std::cout << "PASSED\n";
+}
+
+void test_spsc_epoch_free_headroom_respects_registered_capacity() {
+    std::cout << "Testing SPSC epoch-free headroom respects registered capacity... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", 1};
+    InPort<int> in{&cons, "in", 1};
+    auto* conn = out.connect(&in, 1);
+
+    conn->optimizeForSPSC();
+
+    require(conn->crossThreadHeadroom() == 1,
+            "SPSC headroom ignored the bounded registered edge capacity");
+    require(conn->ensureEpochFreeHeadroom(8), "SPSC headroom rejected bounded zero-slack capacity");
 
     std::cout << "PASSED\n";
 }
@@ -387,6 +405,7 @@ int main() {
     test_mpsc_staging_tracks_large_user_capacity();
     test_mpsc_epoch_free_headroom_respects_user_capacity();
     test_bounded_mpsc_epoch_free_headroom_skips_resize();
+    test_spsc_epoch_free_headroom_respects_registered_capacity();
     test_idle_advance_drains_mpsc_staging();
     test_lockfree_backpressure_contract();
     test_small_non_tight_graph_parallel_fallback();
