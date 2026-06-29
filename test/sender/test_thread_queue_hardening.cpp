@@ -197,6 +197,46 @@ void test_mpsc_staging_tracks_large_user_capacity() {
     std::cout << "PASSED\n";
 }
 
+void test_registered_mpsc_capacity_sizes_destination_queue() {
+    std::cout << "Testing registered MPSC capacity sizes destination queue... ";
+
+    constexpr size_t kRegisteredCapacity = 8192;
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", kRegisteredCapacity};
+    InPort<int> in{&cons, "in"};
+    auto* conn = out.connect(&in, 1);
+    conn->configureRegisteredEdge(kRegisteredCapacity, std::nullopt);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    prod.setCycle(0);
+
+    for (size_t i = 0; i < kRegisteredCapacity; ++i) {
+        require(out.canSend(), "registered MPSC capacity rejected before edge capacity");
+        require(out.send(static_cast<int>(i)), "registered MPSC send failed before edge capacity");
+    }
+    require(!out.canSend(), "registered MPSC capacity accepted beyond edge capacity");
+    require(!out.send(99999), "registered MPSC send accepted beyond edge capacity");
+
+    in.arbitrateMPSC();
+    size_t received = 0;
+    while (auto value = in.tryReceive(1)) {
+        require(*value == static_cast<int>(received), "registered MPSC delivery order changed");
+        ++received;
+    }
+    require(received == kRegisteredCapacity,
+            "registered MPSC destination queue did not admit declared capacity");
+
+    std::cout << "PASSED\n";
+}
+
 void test_mpsc_epoch_free_headroom_respects_user_capacity() {
     std::cout << "Testing MPSC epoch-free headroom respects user capacity... ";
 
@@ -529,6 +569,7 @@ int main() {
 
     test_tick_simulation_mpsc_delivery();
     test_mpsc_staging_tracks_large_user_capacity();
+    test_registered_mpsc_capacity_sizes_destination_queue();
     test_mpsc_epoch_free_headroom_respects_user_capacity();
     test_registered_capacity_only_uses_source_rate_for_headroom();
     test_registered_capacity_only_does_not_throttle_rate();

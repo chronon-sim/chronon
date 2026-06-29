@@ -153,12 +153,15 @@ public:
      * Creates independent SPSC queues polled by the consumer. TickSimulation
      * uses stable connection ids as the producer keys.
      */
-    void useMultiProducerQueue() {
+    void useMultiProducerQueue(size_t min_per_thread_usable_capacity = 0) {
         if (multi_producer_queue_raw_) {
+            multi_producer_queue_raw_->ensurePerThreadUsableCapacity(
+                min_per_thread_usable_capacity);
             return;
         }
         lock_free_queue_ = false;
-        auto mpq = std::make_unique<MultiProducerQueueAdapter<StoredMessage>>(capacity_);
+        auto mpq = std::make_unique<MultiProducerQueueAdapter<StoredMessage>>(
+            capacity_, min_per_thread_usable_capacity);
         multi_producer_queue_raw_ = mpq.get();
         queue_ = std::move(mpq);
     }
@@ -311,6 +314,10 @@ public:
         // Per-producer ring physical limit; ensures one hot producer doesn't
         // exhaust its own ring.
         return !multi_producer_queue_raw_->fullForThread(queue_id);
+    }
+
+    bool canPushToThreadQueue(size_t queue_id) const {
+        return multi_producer_queue_raw_ && !multi_producer_queue_raw_->fullForThread(queue_id);
     }
 
     size_t capacity() const { return queue_->capacity(); }

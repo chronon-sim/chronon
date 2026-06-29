@@ -537,10 +537,29 @@ public:
      * behaves like the legacy physical aggregate (effectively unlimited
      * for typical configurations).
      */
-    explicit MultiProducerQueueAdapter(size_t capacity = std::numeric_limits<size_t>::max())
-        : per_thread_queue_capacity_(
-              LockFreeMessageQueue<T>::physicalCapacityForUserCapacity(capacity)),
+    explicit MultiProducerQueueAdapter(size_t capacity = std::numeric_limits<size_t>::max(),
+                                       size_t min_per_thread_usable_capacity = 0)
+        : per_thread_queue_capacity_(LockFreeMessageQueue<T>::physicalCapacityForUserCapacity(
+              capacity == std::numeric_limits<size_t>::max()
+                  ? min_per_thread_usable_capacity
+                  : std::max(capacity, min_per_thread_usable_capacity))),
           user_capacity_(capacity) {}
+
+    void ensurePerThreadUsableCapacity(size_t min_usable_capacity) {
+        if (min_usable_capacity == std::numeric_limits<size_t>::max()) {
+            throw std::length_error("MultiProducerQueueAdapter per-thread capacity is too large");
+        }
+        const size_t requested =
+            LockFreeMessageQueue<T>::physicalCapacityForUserCapacity(min_usable_capacity);
+        if (requested <= per_thread_queue_capacity_) {
+            return;
+        }
+        if (!thread_queues_.empty()) {
+            throw std::length_error(
+                "Cannot grow MultiProducerQueueAdapter after producer queues are registered");
+        }
+        per_thread_queue_capacity_ = requested;
+    }
 
     /**
      * Register a stable producer key and create its queue.
@@ -709,6 +728,7 @@ public:
     }
 
     size_t capacity() const noexcept override { return user_capacity_; }
+    size_t storageCapacity() const noexcept override { return perThreadUsableCapacity_(); }
 
     size_t available() const override {
         const size_t sz = size();
@@ -727,8 +747,7 @@ public:
      */
     void setCapacity(size_t cap) override {
         if (cap != std::numeric_limits<size_t>::max() && cap > perThreadUsableCapacity_()) {
-            throw std::length_error(
-                "MultiProducerQueueAdapter capacity exceeds its fixed producer queue capacity");
+            ensurePerThreadUsableCapacity(cap);
         }
         user_capacity_ = cap;
     }

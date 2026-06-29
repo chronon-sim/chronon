@@ -257,6 +257,9 @@ int main() {
     if (run_rebalance_calibration(false, 1024, 2048, 8192) != 0) {
         return 1;
     }
+    if (run_rebalance_calibration(false, 64, 64, 2048) != 0) {
+        return 1;
+    }
     if (run_tight_cluster_migration_guard() != 0) {
         return 1;
     }

@@ -383,7 +383,6 @@ public:
     }
 
     void optimizeForMPSC() override {
-        to_->useMultiProducerQueue();
         // Size the SPSC staging ring now that to_->capacity() is finalized.
         // The producer back-pressures on stagingSize() >= to_->capacity(),
         // so the physical ring only needs room for the user cap plus one
@@ -392,6 +391,7 @@ public:
         // below the model-visible limit, otherwise canTransfer() and the
         // physical push path disagree for large ports.
         const size_t user_cap = edgeAdmissionCapacity_();
+        to_->useMultiProducerQueue(user_cap == InPort<T>::UNLIMITED_CAPACITY ? 0 : user_cap);
         configureStagingRing_((user_cap == InPort<T>::UNLIMITED_CAPACITY)
                                   ? (kDefaultUnlimitedStagingRing - 1)
                                   : user_cap);
@@ -556,6 +556,9 @@ private:
     }
 
     bool transferToSharedQueue_(Staged& entry) {
+        if (!to_->canPushToThreadQueue(thread_queue_id_)) {
+            return false;
+        }
         return to_->pushToThreadQueueCancelable(
             thread_queue_id_, std::move(entry.data), entry.arrive_cycle, &cancel_epoch_,
             entry.epoch_snapshot, entry.enqueue_cycle, conn_id_);
