@@ -397,7 +397,6 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
             auto candidate_assignment = assignment;
             candidate_assignment[cluster] = target;
             auto new_summary = epoch_free_cost::summarize(input, candidate_assignment, num_threads);
-            best_breakdown.valid = true;
             best_breakdown.objective_gain = old_summary.objective - new_summary.objective;
             best_breakdown.active_gain = old_summary.max_active - new_summary.max_active;
             best_breakdown.topology_delta =
@@ -410,9 +409,15 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
             best_breakdown.active_budget = std::max(avg * 1.15, old_summary.max_active * 0.72);
             best_breakdown.target_heavy_before = old_summary.heavy_count[target];
             best_breakdown.target_heavy_after = new_summary.heavy_count[target];
+            const double min_active_gain = std::max(
+                best_cluster_cost * 0.05, old_summary.max_active * config_.rebalance_min_gain);
+            const double min_score =
+                std::max(0.01, config_.rebalance_min_gain * old_summary.objective * 0.25);
+            best_breakdown.valid =
+                best_breakdown.active_gain > min_active_gain && best_breakdown.score >= min_score;
         }
     }
-    if (source == SIZE_MAX || cluster == SIZE_MAX || target == SIZE_MAX ||
+    if (source == SIZE_MAX || cluster == SIZE_MAX || target == SIZE_MAX || !best_breakdown.valid ||
         best_cluster_cost <= 0.0) {
         clearDynamicMigrationRequest_();
         return false;
