@@ -282,6 +282,48 @@ void test_mpsc_epoch_free_headroom_respects_user_capacity() {
     std::cout << "PASSED\n";
 }
 
+void test_mpsc_epoch_free_headroom_sizes_destination_queue() {
+    std::cout << "Testing MPSC headroom sizes destination queue... ";
+
+    constexpr size_t kSourceRate = 5000;
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", kSourceRate};
+    InPort<int> in{&cons, "in"};
+    auto* conn = out.connect(&in, 1);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    require(conn->crossThreadHeadroom() == 0,
+            "high-rate MPSC edge unexpectedly had enough default destination headroom");
+    require(conn->ensureEpochFreeHeadroom(2),
+            "MPSC headroom did not grow destination and staging rings together");
+    require(conn->crossThreadHeadroom() > 1,
+            "MPSC headroom still insufficient after destination ring growth");
+
+    prod.setCycle(0);
+    for (size_t i = 0; i < kSourceRate; ++i) {
+        require(out.canSend(), "high-rate MPSC edge rejected before source rate");
+        require(out.send(static_cast<int>(i)), "high-rate MPSC send failed after headroom growth");
+    }
+
+    in.arbitrateMPSC();
+    size_t received = 0;
+    while (auto value = in.tryReceive(1)) {
+        require(*value == static_cast<int>(received), "grown MPSC destination order changed");
+        ++received;
+    }
+    require(received == kSourceRate, "grown MPSC destination did not admit source-rate burst");
+
+    std::cout << "PASSED\n";
+}
+
 void test_zero_slack_feedback_falls_back_to_barrier() {
     std::cout << "Testing zero-slack feedback falls back to barrier... ";
 
@@ -636,6 +678,7 @@ int main() {
     test_mpsc_staging_tracks_large_user_capacity();
     test_registered_mpsc_capacity_sizes_destination_queue();
     test_mpsc_epoch_free_headroom_respects_user_capacity();
+    test_mpsc_epoch_free_headroom_sizes_destination_queue();
     test_zero_slack_feedback_falls_back_to_barrier();
     test_registered_capacity_only_uses_source_rate_for_headroom();
     test_registered_capacity_only_does_not_throttle_rate();

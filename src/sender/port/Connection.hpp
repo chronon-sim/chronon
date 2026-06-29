@@ -420,12 +420,17 @@ public:
         }
         const auto requested = requiredUsableForHeadroom_(max_lookahead_cycles);
         if (!requested.has_value()) return false;
-        if (thread_queue_id_ != SIZE_MAX) {
-            configureStagingRing_(*requested);
-        } else if (to_->usesLockFreeQueue()) {
-            to_->useLockFreeQueue(*requested);
-        } else {
-            return true;
+        try {
+            if (thread_queue_id_ != SIZE_MAX) {
+                to_->useMultiProducerQueue(*requested);
+                configureStagingRing_(*requested);
+            } else if (to_->usesLockFreeQueue()) {
+                to_->useLockFreeQueue(*requested);
+            } else {
+                return true;
+            }
+        } catch (const std::length_error&) {
+            return false;
         }
         return crossThreadHeadroom() > 1;
     }

@@ -555,8 +555,17 @@ public:
             return;
         }
         if (!thread_queues_.empty()) {
-            throw std::length_error(
-                "Cannot grow MultiProducerQueueAdapter after producer queues are registered");
+            for (const auto& queue : thread_queues_) {
+                if (!queue->empty()) {
+                    throw std::length_error(
+                        "Cannot grow MultiProducerQueueAdapter while producer queues contain data");
+                }
+            }
+            per_thread_queue_capacity_ = requested;
+            for (auto& queue : thread_queues_) {
+                queue = std::make_unique<LockFreeMessageQueue<T>>(per_thread_queue_capacity_);
+            }
+            return;
         }
         per_thread_queue_capacity_ = requested;
     }
