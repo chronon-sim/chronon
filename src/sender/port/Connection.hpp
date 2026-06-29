@@ -487,7 +487,7 @@ private:
     }
 
     size_t edgeAdmissionCapacity_() const noexcept {
-        return registered_capacity_.value_or(to_->capacity());
+        return registered_capacity_.value_or(to_->configuredCapacity());
     }
 
     static constexpr size_t minCapacity_(size_t lhs, size_t rhs) noexcept {
