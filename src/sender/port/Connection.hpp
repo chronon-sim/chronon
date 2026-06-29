@@ -398,9 +398,6 @@ public:
                 throw std::invalid_argument("registered edge capacity must be positive");
             }
             registered_capacity_ = *capacity;
-            if (!rate.has_value()) {
-                registered_rate_ = 1;
-            }
         }
         if (rate.has_value()) {
             if (*rate == 0) {

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -219,6 +220,31 @@ void test_mpsc_epoch_free_headroom_respects_user_capacity() {
     std::cout << "PASSED\n";
 }
 
+void test_registered_capacity_only_uses_source_rate_for_headroom() {
+    std::cout << "Testing registered capacity-only headroom uses source rate... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", 4};
+    InPort<int> in{&cons, "in", 1};
+    auto* conn = out.connect(&in, 1);
+    conn->configureRegisteredEdge(/*capacity=*/1, /*rate=*/std::nullopt);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    require(conn->crossThreadHeadroom() == 0,
+            "capacity-only edge was incorrectly treated as rate-1 headroom");
+    require(!conn->ensureEpochFreeHeadroom(8),
+            "capacity-only bounded edge accepted unproven epoch-free headroom");
+
+    std::cout << "PASSED\n";
+}
+
 void test_bounded_mpsc_epoch_free_headroom_skips_resize() {
     std::cout << "Testing bounded MPSC headroom skips impossible resize... ";
 
@@ -404,6 +430,7 @@ int main() {
     test_tick_simulation_mpsc_delivery();
     test_mpsc_staging_tracks_large_user_capacity();
     test_mpsc_epoch_free_headroom_respects_user_capacity();
+    test_registered_capacity_only_uses_source_rate_for_headroom();
     test_bounded_mpsc_epoch_free_headroom_skips_resize();
     test_spsc_epoch_free_headroom_respects_registered_capacity();
     test_idle_advance_drains_mpsc_staging();

@@ -612,7 +612,7 @@ void TickSimulation::serviceEpochFreeMigration_() {
 
     const uint64_t delay =
         std::max(config_.rebalance_check_interval_cycles, config_.rebalance_cooldown_cycles);
-    const uint64_t base_cycle = lookahead_floor_.load(std::memory_order_acquire);
+    const uint64_t base_cycle = fence;
     const uint64_t next_check = saturatingCycleAdd(base_cycle, delay);
     uint64_t old_next = next_dynamic_rebalance_check_cycle_.load(std::memory_order_relaxed);
     while (next_check > old_next &&
