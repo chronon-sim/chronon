@@ -299,6 +299,23 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                                         &cluster_blocked_wait, &cluster_blocker_wait};
     const uint64_t history_cooldown = std::max(config_.rebalance_cooldown_cycles, interval * 2);
     const uint64_t pingpong_cooldown = std::max(history_cooldown, interval * 4);
+    auto last_migration_cycle = [&](size_t c) -> uint64_t {
+        return c < dynamic_cluster_last_migration_cycle_.size()
+                   ? dynamic_cluster_last_migration_cycle_[c]
+                   : kNoMigrationCycle;
+    };
+    auto in_history_cooldown = [&](uint64_t last_cycle) {
+        return last_cycle != kNoMigrationCycle &&
+               cycle < saturatingCycleAdd(last_cycle, history_cooldown);
+    };
+    auto in_pingpong_cooldown = [&](size_t c, size_t candidate_source, size_t candidate_target,
+                                    uint64_t last_cycle) {
+        return last_cycle != kNoMigrationCycle && c < dynamic_cluster_last_source_thread_.size() &&
+               c < dynamic_cluster_last_target_thread_.size() &&
+               dynamic_cluster_last_source_thread_[c] == candidate_target &&
+               dynamic_cluster_last_target_thread_[c] == candidate_source &&
+               cycle < saturatingCycleAdd(last_cycle, pingpong_cooldown);
+    };
     size_t source = SIZE_MAX;
     size_t cluster = SIZE_MAX;
     size_t target = SIZE_MAX;
@@ -315,23 +332,13 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                 continue;
             }
             if (cluster_cost[c] <= 0.0) continue;
-            const uint64_t last_cycle = c < dynamic_cluster_last_migration_cycle_.size()
-                                            ? dynamic_cluster_last_migration_cycle_[c]
-                                            : kNoMigrationCycle;
-            if (last_cycle != kNoMigrationCycle &&
-                cycle < saturatingCycleAdd(last_cycle, history_cooldown)) {
-                continue;
-            }
+            const uint64_t last_cycle = last_migration_cycle(c);
+            if (in_history_cooldown(last_cycle)) continue;
 
             for (size_t candidate_target = 0; candidate_target < num_threads; ++candidate_target) {
                 if (candidate_target == candidate_source) continue;
-                if (last_cycle != kNoMigrationCycle &&
-                    c < dynamic_cluster_last_source_thread_.size() &&
-                    dynamic_cluster_last_source_thread_[c] == candidate_target &&
-                    dynamic_cluster_last_target_thread_[c] == candidate_source &&
-                    cycle < saturatingCycleAdd(last_cycle, pingpong_cooldown)) {
+                if (in_pingpong_cooldown(c, candidate_source, candidate_target, last_cycle))
                     continue;
-                }
 
                 const double churn =
                     last_cycle == kNoMigrationCycle ? 0.0 : std::max(0.001, cluster_cost[c] * 0.05);
@@ -372,6 +379,9 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                 if (cluster_low_frequency[c] && cluster_samples[c] < kDynamicClusterMinSamples) {
                     continue;
                 }
+                const uint64_t last_cycle = last_migration_cycle(c);
+                if (in_history_cooldown(last_cycle)) continue;
+                if (in_pingpong_cooldown(c, fallback_source, fallback_target, last_cycle)) continue;
                 const double target_after = thread_cost[fallback_target] + cluster_cost[c];
                 if (target_after > thread_cost[fallback_source] * 1.02) continue;
                 if (cluster == SIZE_MAX || cluster_cost[c] > best_cluster_cost) {
