@@ -7,19 +7,13 @@
 // staging.
 
 #include <iostream>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "../TestAssertions.hpp"
 #include "sender/port/MessageQueue.hpp"
 
 using namespace chronon::sender;
-
-void require(bool condition) {
-    if (!condition) {
-        throw std::runtime_error("registered queue test assertion failed");
-    }
-}
 
 void test_basic_push_pop() {
     std::cout << "Testing basic push/pop... ";
@@ -30,25 +24,25 @@ void test_basic_push_pop() {
     queue.push(2, 15);
     queue.push(3, 10);
 
-    require(!queue.tryPop(5).has_value());
-    require(!queue.tryPop(9).has_value());
+    CHECK(!queue.tryPop(5).has_value());
+    CHECK(!queue.tryPop(9).has_value());
 
     auto val1 = queue.tryPop(10);
-    require(val1.has_value());
-    require(*val1 == 1);
+    CHECK(val1.has_value());
+    CHECK(*val1 == 1);
 
     auto val2 = queue.tryPop(10);
-    require(val2.has_value());
-    require(*val2 == 3);
+    CHECK(val2.has_value());
+    CHECK(*val2 == 3);
 
-    require(!queue.tryPop(14).has_value());
+    CHECK(!queue.tryPop(14).has_value());
 
     auto val3 = queue.tryPop(15);
-    require(val3.has_value());
-    require(*val3 == 2);
+    CHECK(val3.has_value());
+    CHECK(*val3 == 2);
 
-    require(!queue.tryPop(100).has_value());
-    require(queue.empty());
+    CHECK(!queue.tryPop(100).has_value());
+    CHECK(queue.empty());
 
     std::cout << "PASSED\n";
 }
@@ -64,17 +58,17 @@ void test_pop_all() {
     queue.push(4, 10);
 
     auto all = queue.popAll(10);
-    require(all.size() == 3);
-    require(all[0] == 1);
-    require(all[1] == 2);
-    require(all[2] == 4);
+    CHECK(all.size() == 3);
+    CHECK(all[0] == 1);
+    CHECK(all[1] == 2);
+    CHECK(all[2] == 4);
 
-    require(queue.size() == 1);
+    CHECK(queue.size() == 1);
 
     auto remaining = queue.popAll(20);
-    require(remaining.size() == 1);
-    require(remaining[0] == 3);
-    require(queue.empty());
+    CHECK(remaining.size() == 1);
+    CHECK(remaining[0] == 3);
+    CHECK(queue.empty());
 
     std::cout << "PASSED\n";
 }
@@ -84,13 +78,13 @@ void test_has_ready() {
 
     SingleThreadMessageQueue<int> queue;
 
-    require(!queue.hasReady(10));
+    CHECK(!queue.hasReady(10));
 
     queue.push(42, 15);
-    require(!queue.hasReady(10));
-    require(!queue.hasReady(14));
-    require(queue.hasReady(15));
-    require(queue.hasReady(20));
+    CHECK(!queue.hasReady(10));
+    CHECK(!queue.hasReady(14));
+    CHECK(queue.hasReady(15));
+    CHECK(queue.hasReady(20));
 
     std::cout << "PASSED\n";
 }
@@ -100,19 +94,19 @@ void test_min_arrival_cycle() {
 
     SingleThreadMessageQueue<int> queue;
 
-    require(!queue.minArrivalCycle().has_value());
+    CHECK(!queue.minArrivalCycle().has_value());
 
     queue.push(1, 20);
-    require(queue.minArrivalCycle().value() == 20);
+    CHECK(queue.minArrivalCycle().value() == 20);
 
     queue.push(2, 10);
-    require(queue.minArrivalCycle().value() == 10);
+    CHECK(queue.minArrivalCycle().value() == 10);
 
     queue.push(3, 15);
-    require(queue.minArrivalCycle().value() == 10);
+    CHECK(queue.minArrivalCycle().value() == 10);
 
     queue.tryPop(10);
-    require(queue.minArrivalCycle().value() == 15);
+    CHECK(queue.minArrivalCycle().value() == 15);
 
     std::cout << "PASSED\n";
 }
@@ -126,14 +120,14 @@ void test_clear() {
     queue.push(2, 20);
     queue.push(3, 30);
 
-    require(queue.size() == 3);
-    require(!queue.empty());
+    CHECK(queue.size() == 3);
+    CHECK(!queue.empty());
 
     queue.clear();
 
-    require(queue.size() == 0);
-    require(queue.empty());
-    require(!queue.tryPop(100).has_value());
+    CHECK(queue.size() == 0);
+    CHECK(queue.empty());
+    CHECK(!queue.tryPop(100).has_value());
 
     std::cout << "PASSED\n";
 }
@@ -153,10 +147,10 @@ void test_complex_types() {
     queue.push({2, "second", {4, 5}}, 15);
 
     auto msg1 = queue.tryPop(10);
-    require(msg1.has_value());
-    require(msg1->id == 1);
-    require(msg1->name == "first");
-    require(msg1->data.size() == 3);
+    CHECK(msg1.has_value());
+    CHECK(msg1->id == 1);
+    CHECK(msg1->name == "first");
+    CHECK(msg1->data.size() == 3);
 
     std::cout << "PASSED\n";
 }
@@ -165,18 +159,18 @@ void test_capacity_tracking() {
     std::cout << "Testing capacity tracking... ";
 
     SingleThreadMessageQueue<int> queue(2);
-    require(queue.capacity() == 2);
-    require(queue.available() == 2);
-    require(!queue.full());
+    CHECK(queue.capacity() == 2);
+    CHECK(queue.available() == 2);
+    CHECK(!queue.full());
 
     queue.push(1, 0);
     queue.push(2, 0);
-    require(queue.full());
-    require(queue.available() == 0);
+    CHECK(queue.full());
+    CHECK(queue.available() == 0);
 
     queue.setCapacity(3);
-    require(queue.capacity() == 3);
-    require(queue.available() == 1);
+    CHECK(queue.capacity() == 3);
+    CHECK(queue.available() == 1);
 
     std::cout << "PASSED\n";
 }
@@ -186,32 +180,32 @@ void test_lock_free_queue_basic() {
 
     LockFreeMessageQueue<int> queue;
 
-    require(queue.empty());
+    CHECK(queue.empty());
 
-    require(queue.tryPush(1, 10));
-    require(queue.tryPush(2, 15));
-    require(queue.tryPush(3, 10));
+    CHECK(queue.tryPush(1, 10));
+    CHECK(queue.tryPush(2, 15));
+    CHECK(queue.tryPush(3, 10));
 
-    require(!queue.empty());
-    require(queue.size() == 3);
-    require(!queue.tryPop(5).has_value());
+    CHECK(!queue.empty());
+    CHECK(queue.size() == 3);
+    CHECK(!queue.tryPop(5).has_value());
 
     auto val1 = queue.tryPop(10);
-    require(val1.has_value());
-    require(*val1 == 1);
+    CHECK(val1.has_value());
+    CHECK(*val1 == 1);
 
     auto val2 = queue.tryPop(10);
-    require(!val2.has_value());
+    CHECK(!val2.has_value());
 
     val2 = queue.tryPop(15);
-    require(val2.has_value());
-    require(*val2 == 2);
+    CHECK(val2.has_value());
+    CHECK(*val2 == 2);
 
     auto val3 = queue.tryPop(15);
-    require(val3.has_value());
-    require(*val3 == 3);
+    CHECK(val3.has_value());
+    CHECK(*val3 == 3);
 
-    require(queue.empty());
+    CHECK(queue.empty());
 
     std::cout << "PASSED\n";
 }
