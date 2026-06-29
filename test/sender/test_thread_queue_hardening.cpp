@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -80,6 +81,16 @@ public:
     void setCycle(uint64_t cycle) { setLocalCycle(cycle); }
 };
 
+struct AllocationProbe {
+    static inline bool fail_on_default = false;
+
+    AllocationProbe() {
+        if (fail_on_default) {
+            throw std::runtime_error("unexpected staging ring allocation");
+        }
+    }
+};
+
 class IdleMPSCReceiverUnit : public TickableUnit {
 public:
     explicit IdleMPSCReceiverUnit(std::string name) : TickableUnit(std::move(name)) {}
@@ -87,6 +98,28 @@ public:
     InPort<int> in{this, "in", 8};
 
     void tick() override {}
+};
+
+class ZeroSlackFeedbackUnit : public TickableUnit {
+public:
+    explicit ZeroSlackFeedbackUnit(std::string name) : TickableUnit(std::move(name)) {}
+
+    InPort<int> peer_in{this, "peer_in", 1};
+    OutPort<int> peer_out{this, "peer_out", 1};
+    OutPort<int> local_out{this, "local_out"};
+
+    void tick() override {
+        while (peer_in.tryReceive(localCycle()).has_value()) {
+        }
+        [[maybe_unused]] bool peer_sent = peer_out.send(static_cast<int>(localCycle()));
+        [[maybe_unused]] bool local_sent = local_out.send(static_cast<int>(localCycle()));
+        ++ticks_;
+    }
+
+    uint64_t ticks() const noexcept { return ticks_; }
+
+private:
+    uint64_t ticks_ = 0;
 };
 
 void require(bool condition, const char* message) {
@@ -151,7 +184,7 @@ void test_mpsc_staging_tracks_large_user_capacity() {
     ManualUnit prod("prod");
     ManualUnit cons("cons");
 
-    OutPort<int> out{&prod, "out"};
+    OutPort<int> out{&prod, "out", kUserCapacity};
     InPort<int> in{&cons, "in", kUserCapacity};
     auto* conn = out.connect(&in, 1);
 
@@ -182,6 +215,327 @@ void test_mpsc_staging_tracks_large_user_capacity() {
     }
     require(received == kUserCapacity,
             "downstream MPSC queue did not admit all same-cycle entries");
+
+    std::cout << "PASSED\n";
+}
+
+void test_registered_mpsc_capacity_sizes_destination_queue() {
+    std::cout << "Testing registered MPSC capacity sizes destination queue... ";
+
+    constexpr size_t kRegisteredCapacity = 8192;
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", kRegisteredCapacity};
+    InPort<int> in{&cons, "in"};
+    auto* conn = out.connect(&in, 1);
+    conn->configureRegisteredEdge(kRegisteredCapacity, std::nullopt);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    prod.setCycle(0);
+
+    for (size_t i = 0; i < kRegisteredCapacity; ++i) {
+        require(out.canSend(), "registered MPSC capacity rejected before edge capacity");
+        require(out.send(static_cast<int>(i)), "registered MPSC send failed before edge capacity");
+    }
+    require(!out.canSend(), "registered MPSC capacity accepted beyond edge capacity");
+    require(!out.send(99999), "registered MPSC send accepted beyond edge capacity");
+
+    in.arbitrateMPSC();
+    size_t received = 0;
+    while (auto value = in.tryReceive(1)) {
+        require(*value == static_cast<int>(received), "registered MPSC delivery order changed");
+        ++received;
+    }
+    require(received == kRegisteredCapacity,
+            "registered MPSC destination queue did not admit declared capacity");
+
+    std::cout << "PASSED\n";
+}
+
+void test_mpsc_epoch_free_headroom_respects_user_capacity() {
+    std::cout << "Testing MPSC epoch-free headroom respects user capacity... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", 1};
+    InPort<int> in{&cons, "in", 1};
+    auto* conn = out.connect(&in, 1);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    require(conn->crossThreadHeadroom() == 1,
+            "MPSC headroom ignored the bounded staging admission capacity");
+    require(conn->ensureEpochFreeHeadroom(8), "MPSC headroom rejected bounded zero-slack capacity");
+
+    std::cout << "PASSED\n";
+}
+
+void test_mpsc_epoch_free_headroom_sizes_destination_queue() {
+    std::cout << "Testing MPSC headroom sizes destination queue... ";
+
+    constexpr size_t kSourceRate = 5000;
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", kSourceRate};
+    InPort<int> in{&cons, "in"};
+    auto* conn = out.connect(&in, 1);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    require(conn->crossThreadHeadroom() == 0,
+            "high-rate MPSC edge unexpectedly had enough default destination headroom");
+    require(conn->ensureEpochFreeHeadroom(2),
+            "MPSC headroom did not grow destination and staging rings together");
+    require(conn->crossThreadHeadroom() > 1,
+            "MPSC headroom still insufficient after destination ring growth");
+
+    prod.setCycle(0);
+    for (size_t i = 0; i < kSourceRate; ++i) {
+        require(out.canSend(), "high-rate MPSC edge rejected before source rate");
+        require(out.send(static_cast<int>(i)), "high-rate MPSC send failed after headroom growth");
+    }
+
+    in.arbitrateMPSC();
+    size_t received = 0;
+    while (auto value = in.tryReceive(1)) {
+        require(*value == static_cast<int>(received), "grown MPSC destination order changed");
+        ++received;
+    }
+    require(received == kSourceRate, "grown MPSC destination did not admit source-rate burst");
+
+    std::cout << "PASSED\n";
+}
+
+void test_zero_slack_feedback_falls_back_to_barrier() {
+    std::cout << "Testing zero-slack feedback falls back to barrier... ";
+
+    TickSimulationConfig config;
+    config.num_threads = 2;
+    config.enable_parallel = true;
+    config.enable_lookahead = true;
+    config.enable_epoch_free_lookahead = true;
+    config.enable_weighted_partitioning = false;
+    config.max_lookahead_cycles = 16;
+    config.epoch_size = 4;
+
+    TickSimulation sim(config);
+
+    auto* a = sim.createUnit<ZeroSlackFeedbackUnit>("a");
+    auto* a1 = sim.createUnit<RelayUnit>("a1");
+    auto* a2 = sim.createUnit<RelayUnit>("a2");
+    auto* b = sim.createUnit<ZeroSlackFeedbackUnit>("b");
+    auto* b1 = sim.createUnit<RelayUnit>("b1");
+    auto* b2 = sim.createUnit<RelayUnit>("b2");
+
+    // Two tight intra-cluster chains force two size-3 clusters. With two
+    // threads, the bidirectional delay-1/capacity-1 links must cross threads.
+    sim.connect(a->local_out, a1->in, 0);
+    sim.connect(a1->out, a2->in, 0);
+    sim.connect(b->local_out, b1->in, 0);
+    sim.connect(b1->out, b2->in, 0);
+    sim.connect(a->peer_out, b->peer_in, 1);
+    sim.connect(b->peer_out, a->peer_in, 1);
+
+    sim.initialize();
+    require(sim.useParallelExecution(), "zero-slack feedback test did not enter parallel mode");
+
+    sim.run(8);
+
+    require(sim.epochFreeRunCount() == 0,
+            "zero-slack feedback cycle should veto epoch-free lookahead");
+    require(a->ticks() == 8 && b->ticks() == 8,
+            "barrier fallback did not execute zero-slack feedback units");
+
+    std::cout << "PASSED\n";
+}
+
+void test_registered_capacity_only_uses_source_rate_for_headroom() {
+    std::cout << "Testing registered capacity-only headroom uses source rate... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", 4};
+    InPort<int> in{&cons, "in", 1};
+    auto* conn = out.connect(&in, 1);
+    conn->configureRegisteredEdge(/*capacity=*/1, /*rate=*/std::nullopt);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    require(conn->crossThreadHeadroom() == 0,
+            "capacity-only edge was incorrectly treated as rate-1 headroom");
+    require(!conn->ensureEpochFreeHeadroom(8),
+            "capacity-only bounded edge accepted unproven epoch-free headroom");
+
+    std::cout << "PASSED\n";
+}
+
+void test_registered_capacity_only_does_not_throttle_rate() {
+    std::cout << "Testing registered capacity-only does not throttle rate... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", 4};
+    InPort<int> in{&cons, "in", 8};
+    auto* conn = out.connect(&in, 1);
+    conn->configureRegisteredEdge(/*capacity=*/8, /*rate=*/std::nullopt);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    prod.setCycle(0);
+    for (int value = 0; value < 4; ++value) {
+        require(out.canSend(), "capacity-only edge throttled below source rate");
+        require(out.send(value), "capacity-only edge blocked below source rate");
+    }
+    require(!out.canSend(), "source rate did not cap capacity-only edge");
+    require(!out.send(4), "source rate allowed extra capacity-only send");
+
+    in.arbitrateMPSC();
+    for (int value = 0; value < 4; ++value) {
+        auto received = in.tryReceive(1);
+        require(received.has_value() && *received == value, "capacity-only edge delivery changed");
+    }
+    require(!in.tryReceive(1).has_value(), "capacity-only edge delivered extra data");
+
+    std::cout << "PASSED\n";
+}
+
+void test_registered_edge_rate_throttles_mpsc_pushes() {
+    std::cout << "Testing registered edge rate throttles MPSC pushes... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", 4};
+    InPort<int> in{&cons, "in", 8};
+    auto* conn = out.connect(&in, 1);
+    conn->configureRegisteredEdge(/*capacity=*/8, /*rate=*/1);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    prod.setCycle(0);
+    require(out.canSend(), "registered rate rejected first MPSC send");
+    require(out.send(1), "registered rate blocked first MPSC send");
+    require(!out.canSend(), "registered rate allowed second same-cycle MPSC preflight");
+    require(!out.send(2), "registered rate allowed second same-cycle MPSC send");
+
+    in.arbitrateMPSC();
+    auto first = in.tryReceive(1);
+    require(first.has_value() && *first == 1, "MPSC registered-rate delivery changed");
+    require(!in.tryReceive(1).has_value(), "MPSC registered-rate throttle delivered extra data");
+
+    prod.setCycle(1);
+    require(out.canSend(), "registered rate did not reset on producer cycle advance");
+    require(out.send(3), "registered rate blocked next-cycle MPSC send");
+
+    std::cout << "PASSED\n";
+}
+
+void test_registered_edge_rate_throttles_spsc_pushes() {
+    std::cout << "Testing registered edge rate throttles SPSC pushes... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", 4};
+    InPort<int> in{&cons, "in", 8};
+    auto* conn = out.connect(&in, 1);
+    conn->configureRegisteredEdge(/*capacity=*/8, /*rate=*/1);
+
+    conn->optimizeForSPSC();
+
+    prod.setCycle(0);
+    require(out.canSend(), "registered rate rejected first SPSC send");
+    require(out.send(1), "registered rate blocked first SPSC send");
+    require(!out.canSend(), "registered rate allowed second same-cycle SPSC preflight");
+    require(!out.send(2), "registered rate allowed second same-cycle SPSC send");
+
+    auto first = in.tryReceive(1);
+    require(first.has_value() && *first == 1, "SPSC registered-rate delivery changed");
+    require(!in.tryReceive(1).has_value(), "SPSC registered-rate throttle delivered extra data");
+
+    prod.setCycle(1);
+    require(out.canSend(), "registered rate did not reset on producer cycle advance");
+    require(out.send(3), "registered rate blocked next-cycle SPSC send");
+
+    std::cout << "PASSED\n";
+}
+
+void test_bounded_mpsc_epoch_free_headroom_skips_resize() {
+    std::cout << "Testing bounded MPSC headroom skips impossible resize... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<AllocationProbe> out{&prod, "out", 1};
+    InPort<AllocationProbe> in{&cons, "in", 1};
+    auto* conn = out.connect(&in, 1);
+
+    conn->optimizeForMPSC();
+    const size_t queue_id = conn->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC producer registration failed");
+    conn->setThreadQueueId(queue_id);
+    require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
+
+    AllocationProbe::fail_on_default = true;
+    try {
+        require(conn->ensureEpochFreeHeadroom(4096),
+                "bounded MPSC headroom should not resize zero-slack capacity");
+    } catch (...) {
+        AllocationProbe::fail_on_default = false;
+        throw;
+    }
+    AllocationProbe::fail_on_default = false;
+
+    std::cout << "PASSED\n";
+}
+
+void test_spsc_epoch_free_headroom_respects_registered_capacity() {
+    std::cout << "Testing SPSC epoch-free headroom respects registered capacity... ";
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", 1};
+    InPort<int> in{&cons, "in", 1};
+    auto* conn = out.connect(&in, 1);
+
+    conn->optimizeForSPSC();
+
+    require(conn->crossThreadHeadroom() == 1,
+            "SPSC headroom ignored the bounded registered edge capacity");
+    require(conn->ensureEpochFreeHeadroom(8), "SPSC headroom rejected bounded zero-slack capacity");
 
     std::cout << "PASSED\n";
 }
@@ -322,6 +676,16 @@ int main() {
 
     test_tick_simulation_mpsc_delivery();
     test_mpsc_staging_tracks_large_user_capacity();
+    test_registered_mpsc_capacity_sizes_destination_queue();
+    test_mpsc_epoch_free_headroom_respects_user_capacity();
+    test_mpsc_epoch_free_headroom_sizes_destination_queue();
+    test_zero_slack_feedback_falls_back_to_barrier();
+    test_registered_capacity_only_uses_source_rate_for_headroom();
+    test_registered_capacity_only_does_not_throttle_rate();
+    test_registered_edge_rate_throttles_mpsc_pushes();
+    test_registered_edge_rate_throttles_spsc_pushes();
+    test_bounded_mpsc_epoch_free_headroom_skips_resize();
+    test_spsc_epoch_free_headroom_respects_registered_capacity();
     test_idle_advance_drains_mpsc_staging();
     test_lockfree_backpressure_contract();
     test_small_non_tight_graph_parallel_fallback();

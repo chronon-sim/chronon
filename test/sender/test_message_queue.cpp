@@ -2,19 +2,15 @@
 // Author: Haomeng Wang <chang_yun@outlook.com>
 // SPDX-License-Identifier: MPL-2.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// Registered queue tests. Chronon ports model clocked edge buffers; the
+// scheduler uses single-thread storage, SPSC rings, or topology-stable MPSC
+// staging.
 
-// test_message_queue.cpp
-//
-// Unit tests for MessageQueue
-
-#include <cassert>
 #include <iostream>
-#include <thread>
+#include <string>
 #include <vector>
 
+#include "../TestAssertions.hpp"
 #include "sender/port/MessageQueue.hpp"
 
 using namespace chronon::sender;
@@ -22,40 +18,31 @@ using namespace chronon::sender;
 void test_basic_push_pop() {
     std::cout << "Testing basic push/pop... ";
 
-    MessageQueue<int> queue;
+    SingleThreadMessageQueue<int> queue;
 
-    // Push some messages
     queue.push(1, 10);
     queue.push(2, 15);
-    queue.push(3, 10);  // Same cycle as first
+    queue.push(3, 10);
 
-    // Should not pop before arrival time
-    assert(!queue.tryPop(5).has_value());
-    assert(!queue.tryPop(9).has_value());
+    CHECK(!queue.tryPop(5).has_value());
+    CHECK(!queue.tryPop(9).has_value());
 
-    // Should pop at arrival time (FIFO within same cycle)
     auto val1 = queue.tryPop(10);
-    assert(val1.has_value());
-    assert(*val1 == 1);
-    (void)val1;  // Suppress unused warning in release
+    CHECK(val1.has_value());
+    CHECK(*val1 == 1);
 
     auto val2 = queue.tryPop(10);
-    assert(val2.has_value());
-    assert(*val2 == 3);  // Second message at cycle 10
-    (void)val2;
+    CHECK(val2.has_value());
+    CHECK(*val2 == 3);
 
-    // Should not pop before cycle 15
-    assert(!queue.tryPop(14).has_value());
+    CHECK(!queue.tryPop(14).has_value());
 
-    // Should pop at cycle 15
     auto val3 = queue.tryPop(15);
-    assert(val3.has_value());
-    assert(*val3 == 2);
-    (void)val3;
+    CHECK(val3.has_value());
+    CHECK(*val3 == 2);
 
-    // Queue should be empty
-    assert(!queue.tryPop(100).has_value());
-    assert(queue.empty());
+    CHECK(!queue.tryPop(100).has_value());
+    CHECK(queue.empty());
 
     std::cout << "PASSED\n";
 }
@@ -63,28 +50,25 @@ void test_basic_push_pop() {
 void test_pop_all() {
     std::cout << "Testing popAll... ";
 
-    MessageQueue<int> queue;
+    SingleThreadMessageQueue<int> queue;
 
     queue.push(1, 10);
     queue.push(2, 10);
     queue.push(3, 15);
     queue.push(4, 10);
 
-    // Pop all at cycle 10
     auto all = queue.popAll(10);
-    assert(all.size() == 3);
-    assert(all[0] == 1);
-    assert(all[1] == 2);
-    assert(all[2] == 4);
+    CHECK(all.size() == 3);
+    CHECK(all[0] == 1);
+    CHECK(all[1] == 2);
+    CHECK(all[2] == 4);
 
-    // One message remaining
-    assert(queue.size() == 1);
+    CHECK(queue.size() == 1);
 
     auto remaining = queue.popAll(20);
-    assert(remaining.size() == 1);
-    assert(remaining[0] == 3);
-
-    assert(queue.empty());
+    CHECK(remaining.size() == 1);
+    CHECK(remaining[0] == 3);
+    CHECK(queue.empty());
 
     std::cout << "PASSED\n";
 }
@@ -92,15 +76,15 @@ void test_pop_all() {
 void test_has_ready() {
     std::cout << "Testing hasReady... ";
 
-    MessageQueue<int> queue;
+    SingleThreadMessageQueue<int> queue;
 
-    assert(!queue.hasReady(10));
+    CHECK(!queue.hasReady(10));
 
     queue.push(42, 15);
-    assert(!queue.hasReady(10));
-    assert(!queue.hasReady(14));
-    assert(queue.hasReady(15));
-    assert(queue.hasReady(20));
+    CHECK(!queue.hasReady(10));
+    CHECK(!queue.hasReady(14));
+    CHECK(queue.hasReady(15));
+    CHECK(queue.hasReady(20));
 
     std::cout << "PASSED\n";
 }
@@ -108,21 +92,21 @@ void test_has_ready() {
 void test_min_arrival_cycle() {
     std::cout << "Testing minArrivalCycle... ";
 
-    MessageQueue<int> queue;
+    SingleThreadMessageQueue<int> queue;
 
-    assert(!queue.minArrivalCycle().has_value());
+    CHECK(!queue.minArrivalCycle().has_value());
 
     queue.push(1, 20);
-    assert(queue.minArrivalCycle().value() == 20);
+    CHECK(queue.minArrivalCycle().value() == 20);
 
-    queue.push(2, 10);  // Earlier arrival
-    assert(queue.minArrivalCycle().value() == 10);
+    queue.push(2, 10);
+    CHECK(queue.minArrivalCycle().value() == 10);
 
     queue.push(3, 15);
-    assert(queue.minArrivalCycle().value() == 10);
+    CHECK(queue.minArrivalCycle().value() == 10);
 
-    queue.tryPop(10);  // Remove earliest
-    assert(queue.minArrivalCycle().value() == 15);
+    queue.tryPop(10);
+    CHECK(queue.minArrivalCycle().value() == 15);
 
     std::cout << "PASSED\n";
 }
@@ -130,20 +114,20 @@ void test_min_arrival_cycle() {
 void test_clear() {
     std::cout << "Testing clear... ";
 
-    MessageQueue<int> queue;
+    SingleThreadMessageQueue<int> queue;
 
     queue.push(1, 10);
     queue.push(2, 20);
     queue.push(3, 30);
 
-    assert(queue.size() == 3);
-    assert(!queue.empty());
+    CHECK(queue.size() == 3);
+    CHECK(!queue.empty());
 
     queue.clear();
 
-    assert(queue.size() == 0);
-    assert(queue.empty());
-    assert(!queue.tryPop(100).has_value());
+    CHECK(queue.size() == 0);
+    CHECK(queue.empty());
+    CHECK(!queue.tryPop(100).has_value());
 
     std::cout << "PASSED\n";
 }
@@ -157,52 +141,36 @@ void test_complex_types() {
         std::vector<int> data;
     };
 
-    MessageQueue<ComplexMessage> queue;
+    SingleThreadMessageQueue<ComplexMessage> queue;
 
     queue.push({1, "first", {1, 2, 3}}, 10);
     queue.push({2, "second", {4, 5}}, 15);
 
     auto msg1 = queue.tryPop(10);
-    assert(msg1.has_value());
-    assert(msg1->id == 1);
-    assert(msg1->name == "first");
-    assert(msg1->data.size() == 3);
+    CHECK(msg1.has_value());
+    CHECK(msg1->id == 1);
+    CHECK(msg1->name == "first");
+    CHECK(msg1->data.size() == 3);
 
     std::cout << "PASSED\n";
 }
 
-void test_thread_safety() {
-    std::cout << "Testing thread safety... ";
+void test_capacity_tracking() {
+    std::cout << "Testing capacity tracking... ";
 
-    MessageQueue<int> queue;
-    const int NUM_PRODUCERS = 4;
-    const int NUM_ITEMS = 1000;
+    SingleThreadMessageQueue<int> queue(2);
+    CHECK(queue.capacity() == 2);
+    CHECK(queue.available() == 2);
+    CHECK(!queue.full());
 
-    std::vector<std::thread> producers;
-    for (int p = 0; p < NUM_PRODUCERS; ++p) {
-        producers.emplace_back([&queue, p]() {
-            for (int i = 0; i < NUM_ITEMS; ++i) {
-                queue.push(p * NUM_ITEMS + i, static_cast<uint64_t>(i));
-            }
-        });
-    }
+    queue.push(1, 0);
+    queue.push(2, 0);
+    CHECK(queue.full());
+    CHECK(queue.available() == 0);
 
-    for (auto& t : producers) {
-        t.join();
-    }
-
-    // All items should be in queue
-    assert(queue.size() == static_cast<size_t>(NUM_PRODUCERS * NUM_ITEMS));
-
-    // Pop all
-    [[maybe_unused]] int count = 0;
-    for (uint64_t cycle = 0; cycle < NUM_ITEMS; ++cycle) {
-        auto all = queue.popAll(cycle);
-        count += static_cast<int>(all.size());
-    }
-
-    assert(count == NUM_PRODUCERS * NUM_ITEMS);
-    assert(queue.empty());
+    queue.setCapacity(3);
+    CHECK(queue.capacity() == 3);
+    CHECK(queue.available() == 1);
 
     std::cout << "PASSED\n";
 }
@@ -212,32 +180,38 @@ void test_lock_free_queue_basic() {
 
     LockFreeMessageQueue<int> queue;
 
-    assert(queue.empty());
+    CHECK(queue.empty());
 
-    // Push some items
-    assert(queue.tryPush(1, 10));
-    assert(queue.tryPush(2, 15));
-    assert(queue.tryPush(3, 10));
+    CHECK(queue.tryPush(1, 10));
+    CHECK(queue.tryPush(2, 15));
+    CHECK(queue.tryPush(3, 10));
 
-    assert(!queue.empty());
+    CHECK(!queue.empty());
+    CHECK(queue.size() == 3);
+    CHECK(!queue.tryPop(5).has_value());
 
-    // Note: LockFree queue is FIFO, not ordered by cycle
-    // Items come out in push order
     auto val1 = queue.tryPop(10);
-    assert(val1.has_value());
-    assert(*val1 == 1);
-    (void)val1;  // Suppress unused warning in release
+    CHECK(val1.has_value());
+    CHECK(*val1 == 1);
 
-    // Can't pop item at cycle 15 until cycle 15
-    // But this queue doesn't enforce that - tryPop at any cycle
-    // Let's check minArrivalCycle
-    assert(queue.minArrivalCycle().value() == 15);
+    auto val2 = queue.tryPop(10);
+    CHECK(!val2.has_value());
+
+    val2 = queue.tryPop(15);
+    CHECK(val2.has_value());
+    CHECK(*val2 == 2);
+
+    auto val3 = queue.tryPop(15);
+    CHECK(val3.has_value());
+    CHECK(*val3 == 3);
+
+    CHECK(queue.empty());
 
     std::cout << "PASSED\n";
 }
 
 int main() {
-    std::cout << "=== MessageQueue Tests ===\n\n";
+    std::cout << "=== Registered Queue Tests ===\n\n";
 
     test_basic_push_pop();
     test_pop_all();
@@ -245,9 +219,9 @@ int main() {
     test_min_arrival_cycle();
     test_clear();
     test_complex_types();
-    test_thread_safety();
+    test_capacity_tracking();
     test_lock_free_queue_basic();
 
-    std::cout << "\n=== All MessageQueue tests PASSED ===\n";
+    std::cout << "\nAll registered queue tests PASSED!\n";
     return 0;
 }

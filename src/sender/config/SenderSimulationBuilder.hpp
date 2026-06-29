@@ -248,6 +248,7 @@ private:
             }
 
             auto* conn = bind_registry.bind(source, dest, conn_spec.delay);
+            conn->configureRegisteredEdge(conn_spec.capacity, conn_spec.rate);
 
             result.simulation->registerConnection(conn);
             result.connections_made++;

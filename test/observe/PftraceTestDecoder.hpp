@@ -18,27 +18,15 @@
 #include <zlib.h>
 
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <map>
 #include <optional>
 #include <string>
 #include <vector>
 
-// Always-evaluated check: survives NDEBUG builds.
-#ifndef CHECK
-#define CHECK(cond)                                                                         \
-    do {                                                                                    \
-        if (!(cond)) {                                                                      \
-            std::cerr << "CHECK failed at " << __FILE__ << ":" << __LINE__ << ": " << #cond \
-                      << "\n";                                                              \
-            std::abort();                                                                   \
-        }                                                                                   \
-    } while (0)
-#endif
+#include "../TestAssertions.hpp"
 
 namespace pftrace_test {
 

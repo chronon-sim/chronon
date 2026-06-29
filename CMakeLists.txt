@@ -39,14 +39,46 @@ elseif(DEFINED ENV{CPM_SOURCE_CACHE})
 else()
     set(CPM_DOWNLOAD_LOCATION "${CMAKE_BINARY_DIR}/cmake/CPM_${CPM_DOWNLOAD_VERSION}.cmake")
 endif()
-if(NOT (EXISTS ${CPM_DOWNLOAD_LOCATION}))
-    message(STATUS "Downloading CPM.cmake to ${CPM_DOWNLOAD_LOCATION}")
+
+function(chronon_download_cpm output_path)
+    get_filename_component(cpm_download_dir "${output_path}" DIRECTORY)
+    file(MAKE_DIRECTORY "${cpm_download_dir}")
+    message(STATUS "Downloading CPM.cmake to ${output_path}")
+    set(cpm_download_status "")
     file(DOWNLOAD
         https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_DOWNLOAD_VERSION}/CPM.cmake
-        ${CPM_DOWNLOAD_LOCATION}
+        "${output_path}"
+        STATUS cpm_download_status
+        TLS_VERIFY ON
     )
+    list(GET cpm_download_status 0 cpm_download_code)
+    list(GET cpm_download_status 1 cpm_download_message)
+    if(NOT cpm_download_code EQUAL 0)
+        file(REMOVE "${output_path}")
+        message(FATAL_ERROR "Failed to download CPM.cmake: ${cpm_download_message}")
+    endif()
+endfunction()
+
+if(NOT (EXISTS ${CPM_DOWNLOAD_LOCATION}))
+    chronon_download_cpm("${CPM_DOWNLOAD_LOCATION}")
 endif()
-include(${CPM_DOWNLOAD_LOCATION})
+
+file(READ "${CPM_DOWNLOAD_LOCATION}" CPM_DOWNLOAD_CONTENT LIMIT 65536)
+if(NOT CPM_DOWNLOAD_CONTENT MATCHES "CPMAddPackage")
+    message(STATUS "Cached CPM.cmake is incomplete; retrying download")
+    file(REMOVE "${CPM_DOWNLOAD_LOCATION}")
+    chronon_download_cpm("${CPM_DOWNLOAD_LOCATION}")
+    file(READ "${CPM_DOWNLOAD_LOCATION}" CPM_DOWNLOAD_CONTENT LIMIT 65536)
+endif()
+if(NOT CPM_DOWNLOAD_CONTENT MATCHES "CPMAddPackage")
+    message(FATAL_ERROR "CPM.cmake at ${CPM_DOWNLOAD_LOCATION} does not define CPMAddPackage")
+endif()
+unset(CPM_DOWNLOAD_CONTENT)
+
+include("${CPM_DOWNLOAD_LOCATION}")
+if(NOT COMMAND CPMAddPackage)
+    message(FATAL_ERROR "CPM.cmake at ${CPM_DOWNLOAD_LOCATION} did not load CPMAddPackage")
+endif()
 
 # Options
 option(CHRONON_BUILD_TESTS "Build Chronon tests" ON)

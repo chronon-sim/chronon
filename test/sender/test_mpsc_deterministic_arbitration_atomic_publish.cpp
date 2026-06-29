@@ -74,7 +74,7 @@ public:
     Producer(uint32_t id, uint64_t total_ticks)
         : TickableUnit("producer_" + std::to_string(id)), id_(id), total_ticks_(total_ticks) {}
 
-    OutPort<Msg> out{this, "out"};
+    OutPort<Msg> out{this, "out", 2};
 
     void tick() override {
         if (ticks_ >= total_ticks_) return;

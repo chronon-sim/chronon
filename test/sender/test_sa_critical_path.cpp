@@ -18,21 +18,13 @@
 // is slightly worse.
 
 #include <cmath>
-#include <cstdlib>
 #include <iostream>
 
+#include "../TestAssertions.hpp"
 #include "sender/schedule/SimulatedAnnealingPartitioner.hpp"
 #include "sender/schedule/WeightedPartitioner.hpp"
 
 using namespace chronon::sender;
-
-#define REQUIRE(cond)                                                              \
-    do {                                                                           \
-        if (!(cond)) {                                                             \
-            std::cerr << "FAILED: " #cond " at " __FILE__ ":" << __LINE__ << "\n"; \
-            std::abort();                                                          \
-        }                                                                          \
-    } while (0)
 
 // Topology builder for the chain-vs-split scenario.
 //

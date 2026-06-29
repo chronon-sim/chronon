@@ -41,8 +41,9 @@ public:
     static constexpr const char* unit_description =
         "Instruction fetch unit with I-Cache and branch prediction";
     using ParameterSet = FetchParams;
+    static constexpr uint32_t kFetchWidth = 4;
 
-    OutPort<Instruction> out_instr{this, "out_instr"};
+    OutPort<Instruction> out_instr{this, "out_instr", kFetchWidth};
     OutPort<CacheRequest> out_icache_miss{this, "out_icache_miss"};
     InPort<CacheResponse> in_l2_resp{this, "in_l2_resp", 64};
     InPort<FlushSignal> in_flush{this, "in_flush", 8};
@@ -149,8 +150,7 @@ public:
             return;
         }
 
-        constexpr uint32_t FETCH_WIDTH = 4;
-        for (uint32_t i = 0; i < FETCH_WIDTH && fetched_count_ < max_instructions_; ++i) {
+        for (uint32_t i = 0; i < kFetchWidth && fetched_count_ < max_instructions_; ++i) {
             if (!out_instr.canSend()) {
                 break;
             }

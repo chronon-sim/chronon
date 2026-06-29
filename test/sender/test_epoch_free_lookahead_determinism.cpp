@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -123,13 +124,16 @@ public:
 struct RunResult {
     uint64_t checksum;
     uint64_t epoch_free_runs;
+    uint64_t rebalances;
 };
 
 // A and B fan in to C with delays (dA, dB); C -> D -> {A, B} closes a feedback
 // loop so producer rates are coupled.
 RunResult runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, bool epoch_free,
                   uint32_t max_lookahead, uint64_t cycles, size_t out_rate = 1,
-                  bool scheduler_timeline = false, bool dynamic_rebalance = false) {
+                  bool scheduler_timeline = false, bool dynamic_rebalance = false,
+                  std::optional<size_t> edge_capacity = std::nullopt,
+                  std::optional<size_t> edge_rate = std::nullopt) {
     TickSimulationConfig cfg;
     cfg.num_threads = num_threads;
     cfg.enable_parallel = (num_threads > 1);
@@ -147,14 +151,21 @@ RunResult runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, 
     auto* B = sim.createUnit<Node>("B", 22, kWork, out_rate);
     auto* C = sim.createUnit<Node>("C", 33, kWork, out_rate);
     auto* D = sim.createUnit<Node>("D", 44, kWork, out_rate);
-    sim.connect(A->out, C->in, dA);  // mixed-delay MPSC fan-in into C
-    sim.connect(B->out, C->in, dB);
-    sim.connect(C->out, D->in, 1);
-    sim.connect(D->out, A->in, 1);  // feedback couples A, B, C rates
-    sim.connect(D->out, B->in, 1);
+    auto connect = [&](auto& out, auto& in, uint32_t delay) {
+        auto* conn = sim.connect(out, in, delay);
+        if (edge_capacity.has_value() || edge_rate.has_value()) {
+            conn->configureRegisteredEdge(edge_capacity, edge_rate);
+        }
+    };
+    connect(A->out, C->in, dA);  // mixed-delay MPSC fan-in into C
+    connect(B->out, C->in, dB);
+    connect(C->out, D->in, 1);
+    connect(D->out, A->in, 1);  // feedback couples A, B, C rates
+    connect(D->out, B->in, 1);
     sim.initialize();
     sim.run(cycles);
-    return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount()};
+    return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount(),
+            sim.rebalanceCount()};
 }
 
 void verify_scheduler_timeline_does_not_veto_epoch_free(uint64_t cycles, unsigned hw) {
@@ -299,41 +310,64 @@ void verify(uint32_t dA, uint32_t dB, uint64_t cycles, unsigned hw) {
 
 // The fan-in ports into C have unlimited capacity, so their MPSC staging rings
 // (4096) never back-pressure. If max_lookahead_cycles could exceed that ring,
-// the epoch-free path (no per-epoch drain) might silently drop staged sends, so
-// the gate must veto and fall back to the barrier path. Verify it does, and that
-// the result still matches the single-thread reference.
-void verify_staging_veto(uint64_t cycles, unsigned hw) {
+// the epoch-free path (no per-epoch drain) might silently drop staged sends. The
+// scheduler should add per-edge headroom dependencies when possible and resize
+// lock-free buffers for long-delay edges. Unproven edge rates veto epoch-free
+// instead of switching queue semantics.
+void verify_staging_headroom(uint64_t cycles, unsigned hw) {
     if (hw < 2) return;
     const uint64_t ref = runOnce(2, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
                                  /*max_lookahead=*/100, cycles)
                              .checksum;
 
-    // (1) Rate-1 source, but max_lookahead (5000) exceeds the 4095-slot ring ->
-    //     headroom 4095 < 5000 -> veto, fall back to the barrier path.
+    // (1) Rate-1 source, but max_lookahead (5000) exceeds the 4095-slot ring.
+    //     Per-edge headroom deps should keep epoch-free without globally
+    //     shrinking the lookahead floor.
     RunResult far = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
                             /*max_lookahead=*/5000, cycles, /*out_rate=*/1);
-    check(far.checksum == ref, "staging-veto(lookahead) epoch-free == ref (barrier fallback)");
-    check(far.epoch_free_runs == 0, "staging-veto vetoes epoch-free past ring capacity");
+    check(far.checksum == ref, "staging-clamp(lookahead) epoch-free == ref");
+    check(far.epoch_free_runs > 0, "staging-clamp keeps epoch-free past configured ring capacity");
 
-    // (2) Uncapped source (out_rate unlimited): the per-cycle send rate is
-    //     unbounded, so even a small max_lookahead could overflow -> veto.
+    // (1b) A one-entry DFF-style edge is still epoch-free safe. The scheduler
+    //      represents it as a zero-slack reverse dependency instead of falling
+    //      back to per-epoch progress barriers.
+    const uint64_t ref_cap1 =
+        runOnce(1, 1, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
+                /*max_lookahead=*/100, cycles, /*out_rate=*/1, /*scheduler_timeline=*/false,
+                /*dynamic_rebalance=*/false, /*edge_capacity=*/1, /*edge_rate=*/1)
+            .checksum;
+    RunResult cap1 = runOnce(1, 1, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                             /*max_lookahead=*/64, cycles, /*out_rate=*/1,
+                             /*scheduler_timeline=*/false, /*dynamic_rebalance=*/false,
+                             /*edge_capacity=*/1, /*edge_rate=*/1);
+    check(cap1.checksum == ref_cap1, "staging-capacity-one epoch-free == ref");
+    check(cap1.epoch_free_runs > 0, "staging-capacity-one keeps epoch-free");
+
+    // (2) Default/unlimited source rate is not provable for bounded registered
+    //     headroom, so epoch-free must be vetoed unless the edge declares a rate.
     const size_t kUnlimited = OutPort<uint64_t>::UNLIMITED_CAPACITY;
     RunResult uncapped = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
                                  /*max_lookahead=*/64, cycles, /*out_rate=*/kUnlimited);
-    check(uncapped.checksum == ref, "staging-veto(rate) epoch-free == ref (barrier fallback)");
-    check(uncapped.epoch_free_runs == 0, "staging-veto vetoes epoch-free for uncapped source rate");
+    check(uncapped.checksum == ref, "staging unproven default-rate == ref");
+    check(uncapped.epoch_free_runs == 0, "staging unproven default-rate vetoes epoch-free");
+    RunResult declared = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                                 /*max_lookahead=*/64, cycles, /*out_rate=*/kUnlimited,
+                                 /*scheduler_timeline=*/false, /*dynamic_rebalance=*/false,
+                                 /*edge_capacity=*/128, /*edge_rate=*/1);
+    check(declared.checksum == ref, "staging declared edge rate == ref");
+    check(declared.epoch_free_runs > 0, "staging declared edge rate keeps epoch-free");
 
     // (3) Long edge delay: the consumer can't drain not-yet-due entries, so even a
-    //     small max_lookahead exceeds headroom (cycles - delay). delay 5000 on the
-    //     A->C edge -> headroom 0 -> veto. Reference uses the same delay.
+    //     small max_lookahead exceeds the default ring headroom. The scheduler
+    //     should grow that ring instead of falling back to epochs.
     const uint64_t ref_d =
         runOnce(5000, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
                 /*max_lookahead=*/100, cycles)
             .checksum;
     RunResult long_delay = runOnce(5000, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
                                    /*max_lookahead=*/64, cycles);
-    check(long_delay.checksum == ref_d, "staging-veto(delay) epoch-free == ref (barrier fallback)");
-    check(long_delay.epoch_free_runs == 0, "staging-veto vetoes epoch-free for long edge delay");
+    check(long_delay.checksum == ref_d, "staging-resize(delay) epoch-free == ref");
+    check(long_delay.epoch_free_runs > 0, "staging-resize keeps epoch-free for long edge delay");
 }
 
 // Pure single-producer cycle A->B->C->D->A (delay 1). Every InPort has exactly
@@ -361,7 +395,8 @@ RunResult runCycle(size_t num_threads, bool epoch_free, uint32_t max_lookahead, 
     sim.connect(D->out, A->in, 1);  // close the cycle; one producer per port -> SPSC
     sim.initialize();
     sim.run(cycles);
-    return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount()};
+    return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount(),
+            sim.rebalanceCount()};
 }
 
 // The SPSC lock-free ring (USABLE_CAPACITY, ~4095) is bounded even for unlimited
@@ -376,13 +411,14 @@ void verify_spsc_gate(uint64_t cycles, unsigned hw) {
     check(ok.checksum == ref, "spsc-gate epoch-free == ref (engaged)");
     check(ok.epoch_free_runs > 0, "spsc-gate epoch-free engages within SPSC ring");
 
-    // Lookahead beyond the SPSC ring -> veto, fall back to barrier, still matches.
-    RunResult veto = runCycle(/*threads=*/4, /*epoch_free=*/true, /*max_lookahead=*/5000, cycles);
-    check(veto.checksum == ref, "spsc-gate epoch-free == ref (veto fallback)");
-    check(veto.epoch_free_runs == 0, "spsc-gate vetoes epoch-free past SPSC ring");
+    // Lookahead beyond the SPSC ring -> clamp, stay epoch-free, still matches.
+    RunResult clamped =
+        runCycle(/*threads=*/4, /*epoch_free=*/true, /*max_lookahead=*/5000, cycles);
+    check(clamped.checksum == ref, "spsc-clamp epoch-free == ref");
+    check(clamped.epoch_free_runs > 0, "spsc-clamp keeps epoch-free past configured SPSC ring");
 }
 
-void verify_dynamic_rebalance_vetoes_epoch_free(uint64_t cycles, unsigned hw) {
+void verify_dynamic_rebalance_uses_epoch_free(uint64_t cycles, unsigned hw) {
     if (hw < 2) return;
     const uint64_t ref = runOnce(2, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
                                  /*max_lookahead=*/100, cycles)
@@ -391,8 +427,45 @@ void verify_dynamic_rebalance_vetoes_epoch_free(uint64_t cycles, unsigned hw) {
     RunResult dynamic = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
                                 /*max_lookahead=*/64, cycles, /*out_rate=*/1,
                                 /*scheduler_timeline=*/false, /*dynamic_rebalance=*/true);
-    check(dynamic.checksum == ref, "dynamic-rebalance veto epoch-free == ref");
-    check(dynamic.epoch_free_runs == 0, "dynamic rebalance vetoes epoch-free");
+    check(dynamic.checksum == ref, "dynamic-rebalance epoch-free == ref");
+    check(dynamic.epoch_free_runs > 0, "dynamic rebalance keeps epoch-free enabled");
+}
+
+void verify_dynamic_rebalance_clamps_headroom(uint64_t cycles, unsigned hw) {
+    if (hw < 2) return;
+    const uint64_t ref = runOnce(2, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
+                                 /*max_lookahead=*/100, cycles)
+                             .checksum;
+
+    RunResult far = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                            /*max_lookahead=*/5000, cycles, /*out_rate=*/1,
+                            /*scheduler_timeline=*/false, /*dynamic_rebalance=*/true);
+    check(far.checksum == ref, "dynamic-rebalance staging-clamp epoch-free == ref");
+    check(far.epoch_free_runs > 0, "dynamic rebalance keeps epoch-free with clamped lookahead");
+
+    const uint64_t ref_d =
+        runOnce(5000, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
+                /*max_lookahead=*/100, cycles)
+            .checksum;
+    RunResult unsafe = runOnce(5000, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                               /*max_lookahead=*/64, cycles, /*out_rate=*/1,
+                               /*scheduler_timeline=*/false, /*dynamic_rebalance=*/true);
+    check(unsafe.checksum == ref_d, "dynamic-rebalance headroom resize == ref");
+    check(unsafe.epoch_free_runs > 0, "dynamic rebalance avoids epoch fallback for long delay");
+
+    const size_t kUnlimited = OutPort<uint64_t>::UNLIMITED_CAPACITY;
+    RunResult uncapped = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                                 /*max_lookahead=*/64, cycles, /*out_rate=*/kUnlimited,
+                                 /*scheduler_timeline=*/false, /*dynamic_rebalance=*/true);
+    check(uncapped.checksum == ref, "dynamic-rebalance unproven default-rate == ref");
+    check(uncapped.epoch_free_runs == 0,
+          "dynamic rebalance unproven default-rate vetoes epoch-free");
+    RunResult declared = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
+                                 /*max_lookahead=*/64, cycles, /*out_rate=*/kUnlimited,
+                                 /*scheduler_timeline=*/false, /*dynamic_rebalance=*/true,
+                                 /*edge_capacity=*/128, /*edge_rate=*/1);
+    check(declared.checksum == ref, "dynamic-rebalance declared edge rate == ref");
+    check(declared.epoch_free_runs > 0, "dynamic rebalance declared edge rate keeps epoch-free");
 }
 
 }  // namespace
@@ -410,9 +483,10 @@ int main() {
     verify(1, 8, cycles, hw);
     verify(2, 5, cycles, hw);
 
-    verify_staging_veto(cycles, hw);
+    verify_staging_headroom(cycles, hw);
     verify_spsc_gate(cycles, hw);
-    verify_dynamic_rebalance_vetoes_epoch_free(cycles, hw);
+    verify_dynamic_rebalance_uses_epoch_free(cycles, hw);
+    verify_dynamic_rebalance_clamps_headroom(cycles, hw);
     verify_scheduler_timeline_does_not_veto_epoch_free(cycles, hw);
     verify_run_until_termination_uses_epoch_free(hw);
     verify_run_until_termination_default_max_after_warmup(hw);

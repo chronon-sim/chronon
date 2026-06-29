@@ -495,6 +495,14 @@ private:
             if (bus_def["delay"]) {
                 delay = bus_def["delay"].as<uint32_t>();
             }
+            std::optional<size_t> capacity;
+            if (bus_def["capacity"]) {
+                capacity = bus_def["capacity"].as<size_t>();
+            }
+            std::optional<size_t> rate;
+            if (bus_def["rate"]) {
+                rate = bus_def["rate"].as<size_t>();
+            }
 
             if (!bus_def["inputs"] || !bus_def["inputs"].IsSequence()) {
                 throw ConfigLoadError(source,
@@ -511,6 +519,8 @@ private:
                     spec.source_path = input_node.as<std::string>();
                     spec.dest_path = output_node.as<std::string>();
                     spec.delay = delay;
+                    spec.capacity = capacity;
+                    spec.rate = rate;
                     config.connections.push_back(std::move(spec));
                 }
             }
@@ -609,6 +619,12 @@ private:
         // Defaults to 1; 0 = tight coupling / INLINE.
         if (conn_node["delay"]) {
             spec.delay = conn_node["delay"].as<uint32_t>();
+        }
+        if (conn_node["capacity"]) {
+            spec.capacity = conn_node["capacity"].as<size_t>();
+        }
+        if (conn_node["rate"]) {
+            spec.rate = conn_node["rate"].as<size_t>();
         }
 
         config.connections.push_back(std::move(spec));

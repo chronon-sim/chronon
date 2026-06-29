@@ -34,6 +34,7 @@
 #pragma GCC diagnostic pop
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -48,9 +49,10 @@ namespace chronon::sender {
 /**
  * High-performance simulation using stdexec.
  *
- * Execution model: for each epoch, compute safe boundaries (lookahead),
- * dispatch parallel work via stdexec::bulk + starts_on, then sync_wait at
- * the epoch boundary. No per-cycle sync overhead.
+ * Execution model: Chronon selects sequential, barrier, per-epoch lookahead,
+ * or epoch-free lookahead at runtime. In lookahead mode, tight clusters advance
+ * on dependency progress atomics; the epoch-free path is the default when the
+ * safety gate can prove that no per-epoch flush is required.
  *
  * @code
  * TickSimulation sim;
@@ -122,10 +124,11 @@ public:
     }
 
     template <typename T>
-    void connect(OutPort<T>& from, InPort<T>& to, uint32_t delay = 1) {
+    Connection<T>* connect(OutPort<T>& from, InPort<T>& to, uint32_t delay = 1) {
         auto* conn = from.connect(&to, delay);
         conn->setConnId(static_cast<uint32_t>(connections_.size()));
         connections_.push_back(conn);
+        return conn;
     }
 
     /// For YAML-driven builders that create connections via type-erased port
@@ -179,9 +182,10 @@ public:
     /**
      * Run until termination is requested or max_cycles is reached.
      *
-     * Termination is checked at epoch boundaries (~64 cycles) with very low
-     * overhead. If max_cycles is reached without a request, the controller
-     * is updated with MaxCyclesReached.
+     * Termination is observed at scheduler boundaries with very low overhead;
+     * parallel lookahead paths also propagate the stop token into spin waits.
+     * If max_cycles is reached without a request, the controller is updated
+     * with MaxCyclesReached.
      */
     uint64_t runUntilTermination(uint64_t max_cycles = UINT64_MAX);
 
@@ -443,6 +447,7 @@ private:
     bool performRebalance_();
     void maybeRebalanceAfterEpoch_(uint64_t epoch_executed);
     void recordTickSample_(size_t thread_idx, size_t unit_local_idx, uint64_t ticks, bool active);
+    void recordClusterTickSample_(size_t cluster, uint64_t ticks, bool active);
 
     /**
      * Topology-only cluster-aware placement (no cost profiling). Used as
@@ -457,7 +462,7 @@ private:
 
     /**
      * Pick queue adapters that remain valid after runtime cluster
-     * migration. Dynamic rebalance can move endpoints at epoch boundaries,
+     * migration. Dynamic rebalance can move endpoints at scheduler fence points,
      * so queue type cannot depend on initial thread placement, and
      * reconfiguring adapters mid-run would drop future-cycle messages.
      */
@@ -485,8 +490,8 @@ private:
      * Persistent-worker variant of executeEpochProgressBased: one bulk launch for
      * the whole run, epoch boundaries crossed via a reusable std::barrier, so the
      * stdexec thread pool no longer heap-allocates a bulk op-state per epoch. Used
-     * by runParallel() only when lookahead is on, rebalance is off, and tracing is
-     * disabled (the per-epoch path handles the rest). Returns cycles executed.
+     * by runParallel() as the fixed-layout fallback when the epoch-free gate is
+     * unavailable. Returns cycles executed.
      */
     uint64_t executeRunProgressBased(uint64_t total_cycles);
 
@@ -501,6 +506,7 @@ private:
      * max_lookahead_cycles > 0. Returns cycles actually executed.
      */
     uint64_t executeRunEpochFree_(uint64_t total_cycles);
+    uint64_t executeRunEpochFreeDynamic_(uint64_t total_cycles);
 
     /// Completed cycles reported by a run-spanning worker launch. When a unit
     /// requests termination on a nonzero cluster, cluster 0 may lag behind the
@@ -513,20 +519,32 @@ private:
     /// Precondition for executeRunEpochFree_ (see enable_epoch_free_lookahead).
     bool allMPSCPortsHaveConnProgress_() const noexcept;
 
-    /// True iff every cross-thread connection (MPSC staging ring or SPSC lock-free
-    /// ring) can absorb @p max_lookahead cycles of producer run-ahead without
-    /// overflowing. Without the per-epoch barrier the producer can lead the
-    /// consumer by up to max_lookahead_cycles; back-pressured (bounded-capacity)
-    /// ports would diverge from the barrier flush and an unlimited-capacity port
-    /// would silently drop once its ring fills. Vetoing the epoch-free path here
-    /// (fall back to the per-epoch barrier, which drains every epoch) keeps
-    /// long-delay / large-lookahead topologies lossless.
+    /// Grow registered lock-free buffers where the model declares enough edge
+    /// rate to prove epoch-free headroom. Returns the number of connections
+    /// whose reverse space dependency cannot be proven, which vetoes
+    /// epoch-free instead of changing queue semantics.
+    size_t prepareEpochFreeHeadroom_();
+
+    /// Minimum cross-thread queue headroom over all connections. SIZE_MAX means
+    /// no bounded cross-thread ring constrains epoch-free run-ahead.
+    size_t crossThreadHeadroomLimit_() const noexcept;
+
+    /// True when every finite cross-thread queue has a provable capacity
+    /// dependency after headroom preparation, and those dependencies do not
+    /// introduce a zero-delay cluster cycle. Zero-slack cycles fall back to the
+    /// per-cycle barrier path because progress-based lookahead has no cluster
+    /// that can legally make the first tick.
+    bool crossThreadHeadroomAllowsEpochFree_() const noexcept;
+
+    /// Compatibility helper used by logs/tests.
     bool crossThreadHeadroomFits_(uint64_t max_lookahead) const noexcept;
 
     /// Per-thread epoch body. Spin-waits on cross-thread progress atomics
     /// and exits via stop_token on termination or exception.
     void executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
                              stdexec::inplace_stop_token token);
+    void executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_cycle,
+                                    stdexec::inplace_stop_token token);
 
     /// Monotonically raise lookahead_floor_ to the global-min completed cycle.
     /// Slow-path only (a stalled worker); see lookahead_floor_ for the contract.
@@ -544,6 +562,17 @@ private:
     std::string formatBlockerDetail_(const BlockedClusterInfo& blocker) const;
     void executeClusterOneCycle_(size_t thread_idx, size_t cluster, uint64_t cycle,
                                  bool trace_units);
+
+    void initDynamicMigrationRuntime_();
+    void rebuildThreadUnitsFromClusterOwners_();
+    bool maybeRequestEpochFreeMigration_(uint64_t cycle);
+    void serviceEpochFreeMigration_();
+    void clearDynamicMigrationRequest_();
+    void recordDynamicWaitSample_(size_t thread_idx, const BlockedClusterInfo& blocker,
+                                  uint64_t wait_ns);
+    void resetDynamicSchedulerMarkers_();
+    void recordDynamicSchedulerMarker_(std::string name, uint64_t cycle, std::string detail);
+    void flushDynamicSchedulerMarkers_();
 
     /**
      * Drive cycle-boundary MPSC arbitration on every registered InPort.
@@ -577,11 +606,13 @@ private:
     ExecutionMode execution_mode_ = ExecutionMode::Sequential;
     bool has_tight_connections_ = false;
     bool has_tight_inter_cluster_ = false;
+    bool has_zero_delay_cross_thread_cycle_ = false;
     bool parallel_beneficial_ = false;
 
     /// Count of runParallel() invocations dispatched to executeRunEpochFree_.
     /// Introspection only (see epochFreeRunCount()).
     uint64_t epoch_free_run_count_ = 0;
+    bool epoch_free_veto_logged_ = false;
 
     TerminationController termination_ctrl_;
 
@@ -627,6 +658,56 @@ private:
     std::vector<std::vector<TickableUnit*>> cluster_unit_ptrs_;
     std::vector<std::vector<size_t>> cluster_thread_unit_positions_;
     std::vector<std::vector<SchedulerTimelineTrace::TimePoint>> thread_trace_points_;
+
+    enum class MigrationRequestState : uint8_t {
+        None = 0,
+        Requested,
+        Quiescing,
+        ReadyToCommit,
+        Committed,
+    };
+
+    struct RuntimeMigrationRequest {
+        std::atomic<uint8_t> state{static_cast<uint8_t>(MigrationRequestState::None)};
+        std::atomic<size_t> cluster{SIZE_MAX};
+        std::atomic<size_t> source_thread{SIZE_MAX};
+        std::atomic<size_t> target_thread{SIZE_MAX};
+        std::atomic<uint64_t> fence_cycle{0};
+    };
+
+    RuntimeMigrationRequest migration_request_;
+    // unique_ptr owns variable-size arrays; atomic elements publish runtime
+    // ownership/progress between worker threads during epoch-free rebalance.
+    std::unique_ptr<std::atomic<size_t>[]> cluster_runtime_owner_;
+    std::unique_ptr<std::atomic<size_t>[]> cluster_execution_owner_;
+    std::unique_ptr<std::atomic<uint8_t>[]> cluster_migration_pending_;
+    std::unique_ptr<std::atomic<uint64_t>[]> cluster_sample_time_ns_;
+    std::unique_ptr<std::atomic<uint64_t>[]> cluster_sample_count_;
+    std::unique_ptr<std::atomic<uint64_t>[]> cluster_active_sample_count_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_floor_wait_ns_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_dep_wait_ns_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_no_ready_wait_ns_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_cluster_blocked_wait_ns_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_cluster_blocker_wait_ns_;
+    std::vector<uint64_t> dynamic_cluster_last_migration_cycle_;
+    std::vector<size_t> dynamic_cluster_last_source_thread_;
+    std::vector<size_t> dynamic_cluster_last_target_thread_;
+    std::atomic<uint64_t> cluster_assignment_generation_{0};
+    size_t dynamic_runtime_cluster_count_ = 0;
+    size_t dynamic_runtime_thread_count_ = 0;
+    alignas(64) std::atomic<uint64_t> next_dynamic_rebalance_check_cycle_{0};
+    alignas(64) std::atomic<bool> epoch_free_dynamic_runtime_active_{false};
+
+    struct DynamicSchedulerMarker {
+        SchedulerTimelineTrace::TimePoint time{};
+        uint64_t cycle = 0;
+        std::string name;
+        std::string detail;
+    };
+    static constexpr size_t kDynamicSchedulerMarkerCapacity = 1024;
+    std::array<DynamicSchedulerMarker, kDynamicSchedulerMarkerCapacity> dynamic_scheduler_markers_;
+    std::atomic<size_t> dynamic_scheduler_marker_count_{0};
+    std::atomic<uint64_t> dynamic_scheduler_marker_drops_{0};
 
     /// Unified stop source: prevents spin-wait deadlock AND propagates
     /// unit-initiated termination into worker threads. Wrapped in optional

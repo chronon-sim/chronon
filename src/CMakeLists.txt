@@ -17,8 +17,11 @@ add_library(chronon STATIC
 
     # Tick-based simulation driver (split across three files by concern)
     sender/core/TickSimulation.cpp
+    sender/core/TickSimulationDependencies.cpp
     sender/core/TickSimulationPartition.cpp
     sender/core/TickSimulationParallel.cpp
+    sender/core/TickSimulationDynamicRebalance.cpp
+    sender/core/TickSimulationDynamicRuntime.cpp
     sender/core/TickSimulationValidation.cpp
 
     # SimulationApp - unified entry point for simulations

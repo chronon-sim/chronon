@@ -6,10 +6,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-#include <cassert>
 #include <iostream>
 #include <vector>
 
+#include "../TestAssertions.hpp"
 #include "params/ParameterSet.hpp"
 #include "sender/config/SenderConfigLoader.hpp"
 #include "sender/config/SenderSimulationBuilder.hpp"
@@ -53,18 +53,18 @@ simulation:
   initial_partition_sync_cost_ns: 12.5
 )yaml");
 
-    assert(config.name == "tuning_parse");
-    assert(config.num_workers == 8);
-    assert(config.enable_parallel);
-    assert(config.enable_lookahead);
-    assert(config.trace_execution);
-    assert(config.max_lookahead_cycles == 256);
-    assert(config.epoch_size == 1024);
-    assert(config.run_cycles == 12345);
-    assert(config.rebalance_min_gain == 0.05);
-    assert(config.rebalance_cooldown_cycles == 2048);
-    assert(config.partition_solver == "SA");
-    assert(config.initial_partition_sync_cost_ns == 12.5);
+    CHECK(config.name == "tuning_parse");
+    CHECK(config.num_workers == 8);
+    CHECK(config.enable_parallel);
+    CHECK(config.enable_lookahead);
+    CHECK(config.trace_execution);
+    CHECK(config.max_lookahead_cycles == 256);
+    CHECK(config.epoch_size == 1024);
+    CHECK(config.run_cycles == 12345);
+    CHECK(config.rebalance_min_gain == 0.05);
+    CHECK(config.rebalance_cooldown_cycles == 2048);
+    CHECK(config.partition_solver == "SA");
+    CHECK(config.initial_partition_sync_cost_ns == 12.5);
 
     std::cout << "PASSED\n";
 }
@@ -78,15 +78,15 @@ simulation:
   name: defaults
 )yaml");
 
-    assert(!config.trace_execution);
-    assert(config.max_lookahead_cycles == 100);
-    assert(config.epoch_size == 64);
-    assert(!config.enable_dynamic_rebalance);
-    assert(config.rebalance_check_interval_cycles == 8192);
-    assert(config.rebalance_min_gain == 0.05);
-    assert(config.rebalance_cooldown_cycles == 0);
-    assert(config.partition_solver == "SA");
-    assert(config.initial_partition_sync_cost_ns == 8.0);
+    CHECK(!config.trace_execution);
+    CHECK(config.max_lookahead_cycles == 100);
+    CHECK(config.epoch_size == 64);
+    CHECK(!config.enable_dynamic_rebalance);
+    CHECK(config.rebalance_check_interval_cycles == 8192);
+    CHECK(config.rebalance_min_gain == 0.05);
+    CHECK(config.rebalance_cooldown_cycles == 0);
+    CHECK(config.partition_solver == "SA");
+    CHECK(config.initial_partition_sync_cost_ns == 8.0);
 
     std::cout << "PASSED\n";
 }
@@ -111,7 +111,7 @@ simulation:
 
     const std::vector<std::string> names = config.unitNames();
     const std::vector<std::string> expected = {"fetch", "decode", "rename"};
-    assert(names == expected);
+    CHECK(names == expected);
 
     std::cout << "PASSED\n";
 }
@@ -135,7 +135,7 @@ simulation:
 
     const std::vector<std::string> names = config.unitNames();
     const std::vector<std::string> expected = {"fetch", "rename"};
-    assert(names == expected);
+    CHECK(names == expected);
 
     std::cout << "PASSED\n";
 }
@@ -158,12 +158,56 @@ simulation:
     const auto* fetch = config.getUnit("fetch");
     (void)uart;
     (void)fetch;
-    assert(uart != nullptr);
-    assert(fetch != nullptr);
-    assert(uart->tick_interval == 1000);
-    assert(uart->has_tick_interval);
-    assert(fetch->tick_interval == 1);
-    assert(!fetch->has_tick_interval);
+    CHECK(uart != nullptr);
+    CHECK(fetch != nullptr);
+    CHECK(uart->tick_interval == 1000);
+    CHECK(uart->has_tick_interval);
+    CHECK(fetch->tick_interval == 1);
+    CHECK(!fetch->has_tick_interval);
+
+    std::cout << "PASSED\n";
+}
+
+void test_registered_edge_fields_parse() {
+    std::cout << "Testing registered edge capacity/rate parse... ";
+
+    SenderConfigLoader loader;
+    auto config = loader.loadFromString(R"yaml(
+simulation:
+  bus:
+    wakeup:
+      delay: 1
+      capacity: 32
+      rate: 4
+      inputs: [exe0.out_wakeup]
+      outputs: [iq0.in_wakeup, iq1.in_wakeup]
+  unit:
+    fetch:
+      type: FetchUnit
+      port:
+        out_fetch:
+          to: decode.in_fetch
+          delay: 2
+          capacity: 16
+          rate: 2
+    decode:
+      type: DecodeUnit
+)yaml");
+
+    CHECK(config.connections.size() == 3);
+    const auto& direct = config.connections[2];
+    CHECK(direct.source_path == "fetch.out_fetch");
+    CHECK(direct.dest_path == "decode.in_fetch");
+    CHECK(direct.delay == 2);
+    CHECK(direct.capacity.has_value() && *direct.capacity == 16);
+    CHECK(direct.rate.has_value() && *direct.rate == 2);
+
+    for (size_t i = 0; i < 2; ++i) {
+        CHECK(config.connections[i].capacity.has_value());
+        CHECK(*config.connections[i].capacity == 32);
+        CHECK(config.connections[i].rate.has_value());
+        CHECK(*config.connections[i].rate == 4);
+    }
 
     std::cout << "PASSED\n";
 }
@@ -189,8 +233,8 @@ simulation:
     auto* explicit_unit = result.unit_map.at("explicit");
     (void)omitted;
     (void)explicit_unit;
-    assert(omitted->tickInterval() == 7);
-    assert(explicit_unit->tickInterval() == 2);
+    CHECK(omitted->tickInterval() == 7);
+    CHECK(explicit_unit->tickInterval() == 2);
 
     std::cout << "PASSED\n";
 }
@@ -205,6 +249,7 @@ int main() {
     test_unit_names_include_programmatic_additions();
     test_unit_names_skip_programmatic_deletions();
     test_unit_tick_interval_parse();
+    test_registered_edge_fields_parse();
     test_builder_preserves_constructor_tick_interval_when_yaml_omits_override();
 
     std::cout << "\n=== Config loader tuning tests PASSED ===\n";

@@ -57,7 +57,7 @@ template <typename T>
 class InPort : public PortBase, public IArbitratablePort {
 public:
     using StoredMessage = detail::PortEnvelope<T>;
-    static constexpr size_t UNLIMITED_CAPACITY = MessageQueue<StoredMessage>::UNLIMITED_CAPACITY;
+    static constexpr size_t UNLIMITED_CAPACITY = std::numeric_limits<size_t>::max();
 
     /**
      * Create an input port.
@@ -73,7 +73,7 @@ public:
         : PortBase(owner, std::move(name)),
           capacity_(capacity),
           policy_(policy),
-          queue_(std::make_unique<MessageQueueAdapter<StoredMessage>>(capacity)) {
+          queue_(std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity)) {
         reserveScratch_();
         installAutoRegistration_();
     }
@@ -83,7 +83,7 @@ public:
         : PortBase(owner, std::move(name)),
           capacity_(UNLIMITED_CAPACITY),
           policy_(policy),
-          queue_(std::make_unique<MessageQueueAdapter<StoredMessage>>(UNLIMITED_CAPACITY)) {
+          queue_(std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(UNLIMITED_CAPACITY)) {
         reserveScratch_();
         installAutoRegistration_();
     }
@@ -138,10 +138,11 @@ public:
      * there is only ONE source thread writing to this port.
      * Uses atomic operations instead of mutex.
      */
-    void useLockFreeQueue() {
+    void useLockFreeQueue(size_t min_usable_capacity = 0) {
         multi_producer_queue_raw_ = nullptr;
         lock_free_queue_ = true;
-        queue_ = std::make_unique<LockFreeQueueAdapter<StoredMessage>>(capacity_);
+        queue_ =
+            std::make_unique<LockFreeQueueAdapter<StoredMessage>>(capacity_, min_usable_capacity);
     }
 
     /**
@@ -149,14 +150,18 @@ public:
      *
      * Call this during initialization for cross-thread connections where
      * multiple source threads write to this port.
-     * Creates per-thread SPSC queues polled by consumer.
+     * Creates independent SPSC queues polled by the consumer. TickSimulation
+     * uses stable connection ids as the producer keys.
      */
-    void useMultiProducerQueue() {
+    void useMultiProducerQueue(size_t min_per_thread_usable_capacity = 0) {
         if (multi_producer_queue_raw_) {
+            multi_producer_queue_raw_->ensurePerThreadUsableCapacity(
+                min_per_thread_usable_capacity);
             return;
         }
         lock_free_queue_ = false;
-        auto mpq = std::make_unique<MultiProducerQueueAdapter<StoredMessage>>(capacity_);
+        auto mpq = std::make_unique<MultiProducerQueueAdapter<StoredMessage>>(
+            capacity_, min_per_thread_usable_capacity);
         multi_producer_queue_raw_ = mpq.get();
         queue_ = std::move(mpq);
     }
@@ -176,11 +181,11 @@ public:
     }
 
     /**
-     * Register a source thread and get its queue ID.
+     * Register a stable producer key and get its queue ID.
      *
      * Only valid in multi-producer mode.
-     * @param thread_id The source thread ID
-     * @return Queue ID for this thread (used in pushToThreadQueue)
+     * @param thread_id Stable producer key; TickSimulation passes conn_id + 1.
+     * @return Queue ID for this producer key (used in pushToThreadQueue)
      */
     size_t registerProducerThread(size_t thread_id) {
         if (!multi_producer_queue_raw_) {
@@ -189,7 +194,7 @@ public:
         return multi_producer_queue_raw_->addProducerThread(thread_id);
     }
 
-    /// Get the queue ID for a given source thread (multi-producer mode only).
+    /// Get the queue ID for a given producer key (multi-producer mode only).
     size_t getQueueIdForThread(size_t thread_id) const {
         if (!multi_producer_queue_raw_) {
             return SIZE_MAX;
@@ -262,11 +267,12 @@ public:
      * Used by Connection to support OutPort::cancelInFlight().
      */
     bool enqueueCancelable(T data, uint64_t arrive_cycle, const std::atomic<uint64_t>* cancel_epoch,
-                           uint64_t epoch_snapshot) {
+                           uint64_t epoch_snapshot, uint32_t sender_id = 0) {
         StoredMessage msg{.data = std::move(data),
                           .cancel_epoch = cancel_epoch,
                           .epoch_snapshot = epoch_snapshot};
         msg.enqueue_cycle = 0;
+        msg.sender_id = sender_id;
         return enqueueStored_(std::move(msg), arrive_cycle);
     }
 
@@ -278,11 +284,13 @@ public:
      * decide whether the message predates the most recent flush.
      */
     bool enqueueCancelable(T data, uint64_t arrive_cycle, const std::atomic<uint64_t>* cancel_epoch,
-                           uint64_t epoch_snapshot, uint64_t enqueue_cycle) {
+                           uint64_t epoch_snapshot, uint64_t enqueue_cycle,
+                           uint32_t sender_id = 0) {
         StoredMessage msg{.data = std::move(data),
                           .cancel_epoch = cancel_epoch,
                           .epoch_snapshot = epoch_snapshot};
         msg.enqueue_cycle = enqueue_cycle;
+        msg.sender_id = sender_id;
         return enqueueStored_(std::move(msg), arrive_cycle);
     }
 
@@ -308,7 +316,13 @@ public:
         return !multi_producer_queue_raw_->fullForThread(queue_id);
     }
 
+    bool canPushToThreadQueue(size_t queue_id) const {
+        return multi_producer_queue_raw_ && !multi_producer_queue_raw_->fullForThread(queue_id);
+    }
+
     size_t capacity() const { return queue_->capacity(); }
+    size_t storageCapacity() const noexcept { return queue_->storageCapacity(); }
+    size_t configuredCapacity() const noexcept { return capacity_; }
     size_t available() const { return queue_->available(); }
 
     void setCapacity(size_t capacity) {

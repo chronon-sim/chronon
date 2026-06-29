@@ -11,22 +11,13 @@
 // Unit tests for SimulatedAnnealingPartitioner.
 
 #include <cmath>
-#include <cstdlib>
 #include <iostream>
 
+#include "../TestAssertions.hpp"
 #include "sender/schedule/SimulatedAnnealingPartitioner.hpp"
 #include "sender/schedule/WeightedPartitioner.hpp"
 
 using namespace chronon::sender;
-
-// Release-safe assertion
-#define REQUIRE(cond)                                                              \
-    do {                                                                           \
-        if (!(cond)) {                                                             \
-            std::cerr << "FAILED: " #cond " at " __FILE__ ":" << __LINE__ << "\n"; \
-            std::abort();                                                          \
-        }                                                                          \
-    } while (0)
 
 void assertValidResult(const PartitionResult& result, [[maybe_unused]] size_t num_units,
                        [[maybe_unused]] size_t num_threads) {

@@ -13,25 +13,17 @@
 // partitioning → parallel run completes without crash.
 
 #include <cstdint>
-#include <cstdlib>
 #include <iostream>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "../TestAssertions.hpp"
 #include "sender/core/TickSimulation.hpp"
 #include "sender/core/TickableUnit.hpp"
 #include "sender/schedule/SimulatedAnnealingPartitioner.hpp"
 
 using namespace chronon::sender;
-
-#define REQUIRE(cond)                                                              \
-    do {                                                                           \
-        if (!(cond)) {                                                             \
-            std::cerr << "FAILED: " #cond " at " __FILE__ ":" << __LINE__ << "\n"; \
-            std::abort();                                                          \
-        }                                                                          \
-    } while (0)
 
 // Simple unit with configurable work per tick.
 class WorkUnit : public TickableUnit {

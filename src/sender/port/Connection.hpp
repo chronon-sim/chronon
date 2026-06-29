@@ -51,8 +51,7 @@ public:
      * Call this during initialization when both source and destination
      * are determined to be on the same thread (same cluster).
      *
-     * This eliminates mutex overhead (~18% of execution time) for
-     * intra-cluster connections.
+     * This keeps intra-cluster registered edges on the cheapest storage.
      */
     virtual void optimizeForSameThread() = 0;
 
@@ -68,16 +67,28 @@ public:
     /**
      * Optimize destination port for cross-thread MPSC access.
      *
-     * Switches InPort to use MultiProducerQueueAdapter with per-thread
-     * producer queues.
+     * Switches InPort to use MultiProducerQueueAdapter with one producer
+     * queue per Connection.
      */
     virtual void optimizeForMPSC() = 0;
 
+    /// Configure the registered edge modeled by this connection. `capacity`
+    /// is the number of entries the producer may have in flight on this edge;
+    /// `rate` is the maximum entries this edge can accept per producer cycle.
+    virtual void configureRegisteredEdge(std::optional<size_t> capacity,
+                                         std::optional<size_t> rate) = 0;
+
+    /// Try to grow physical lock-free buffers enough for epoch-free run-ahead
+    /// when the model-visible registered edge is unbounded. A finite declared
+    /// edge capacity is semantic backpressure and must not be bypassed by
+    /// resizing the storage ring.
+    virtual bool ensureEpochFreeHeadroom(uint32_t max_lookahead_cycles) = 0;
+
     /**
-     * Register a producer thread for MPSC mode.
+     * Register a stable producer key for MPSC mode.
      *
-     * @param thread_id Source thread identifier
-     * @return Queue ID for this producer thread, or SIZE_MAX on failure
+     * @param thread_id Stable producer key. TickSimulation passes conn_id + 1.
+     * @return Queue ID for this producer key, or SIZE_MAX on failure
      */
     virtual size_t registerProducerThread(size_t thread_id) = 0;
 
@@ -85,10 +96,9 @@ public:
      * Set the thread queue ID for multi-producer mode.
      *
      * Called during initialization when the destination InPort is in
-     * multi-producer mode (multiple source threads writing to it).
-     * All connections from the same source thread share the same queue_id.
+     * multi-producer mode.
      *
-     * @param queue_id The queue ID for this connection's source thread
+     * @param queue_id The queue ID for this connection
      */
     virtual void setThreadQueueId(size_t queue_id) = 0;
 
@@ -119,13 +129,13 @@ public:
      * Max producer run-ahead (in cycles) this connection's cross-thread buffer
      * (MPSC staging ring or SPSC lock-free ring) can absorb while the epoch-free
      * path keeps results identical to the reference: roughly
-     * `threshold / rate - delay`, where `threshold` is the entry count at which
-     * transfer() stops accepting (the ring, or the InPort capacity if smaller),
-     * `rate` is the source's per-cycle send cap, and `delay` accounts for
-     * not-yet-due entries the consumer cannot drain. Returns SIZE_MAX for
-     * connections with no bounded cross-thread ring (same-thread / unbounded) and
-     * 0 when no finite run-ahead is provably safe (uncapped source rate). Used to
-     * gate the epoch-free lookahead path, which removes the per-epoch drain.
+     * `threshold / rate - delay + 1`, where `threshold` is the entry count at
+     * which transfer() stops accepting (the ring, or the InPort capacity if
+     * smaller), `rate` is the source's per-cycle send cap, and `delay` accounts
+     * for not-yet-due entries the consumer cannot drain. Returns SIZE_MAX for
+     * connections with no bounded cross-thread ring (same-thread / unbounded)
+     * and 0 when no finite capacity dependency is provably safe. Used to gate
+     * the epoch-free lookahead path, which removes the per-epoch drain.
      */
     virtual size_t crossThreadHeadroom() const noexcept { return SIZE_MAX; }
 
@@ -211,10 +221,13 @@ public:
             // MPSC mode: stage for the InPort arbiter. The arbiter runs on
             // the consumer thread at the start of its next tick (under the
             // lookahead scheduler) or at scheduler sync points (Sequential /
-            // Barrier), forwarding from staging into the shared per-thread
-            // queue in deterministic conn_id order. See
-            // docs/mpsc-atomic-publish.md.
-            if (stagingSize_() >= to_->capacity()) {
+            // Barrier), forwarding from staging into the destination MPSC
+            // adapter in deterministic conn_id order. See docs/mpsc-atomic-publish.md.
+            if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
+                return false;
+            }
+            const size_t edge_cap = edgeAdmissionCapacity_();
+            if (edge_cap != InPort<T>::UNLIMITED_CAPACITY && stagingSize_() >= edge_cap) {
                 return false;  // staging full -> producer sees back-pressure
             }
             if (!stagingTryPush_(
@@ -231,11 +244,11 @@ public:
         // never exceed the model-side capacity. This keeps push() and
         // canAccept() agreeing on the same rate limit without reading
         // the live queue size (which races with the consumer thread).
-        if (pushes_this_cycle_ >= to_->admissionCapacity()) {
+        if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
             return false;
         }
         const bool ok = to_->enqueueCancelable(std::move(data), arrive_cycle, &cancel_epoch_,
-                                               epoch_snapshot, send_cycle);
+                                               epoch_snapshot, send_cycle, conn_id_);
         if (ok) {
             ++pushes_this_cycle_;
             wakeUnitAt(destination(), arrive_cycle);
@@ -261,7 +274,7 @@ public:
     /**
      * Type-erased MPSC admission helper invoked by the InPort arbiter.
      *
-     * Legacy unbounded variant: drains every staging entry whose epoch
+     * Unbounded drain variant: drains every staging entry whose epoch
      * matches the current cancel_epoch_. Called by the main-thread
      * arbiter path (Sequential per-cycle loop, Barrier sync_wait,
      * lookahead epoch-end flush).
@@ -328,7 +341,11 @@ public:
         // sync point) in deterministic conn_id order, so the push path
         // itself does not race on wall-clock ordering across worker threads.
         if (thread_queue_id_ != SIZE_MAX) {
-            return stagingSize_() < to_->capacity();
+            if (currentPendingPushes_() >= edgeCycleRateLimit_()) {
+                return false;
+            }
+            const size_t edge_cap = edgeAdmissionCapacity_();
+            return edge_cap == InPort<T>::UNLIMITED_CAPACITY || stagingSize_() < edge_cap;
         }
         // Rate-based admission: producer may push up to effectiveCapacity_()
         // items per simulated cycle, tracked locally via pushes_this_cycle_.
@@ -336,7 +353,7 @@ public:
         // which matches a hardware pipeline register whose per-edge admission
         // is bounded by width rather than downstream FIFO depth.
         const size_t pending = currentPendingPushes_();
-        return to_->canAccept(pending);
+        return pending < edgeCycleRateLimit_();
     }
 
     bool isDestinationFull() const { return !canTransfer(); }
@@ -349,16 +366,23 @@ public:
 
     void optimizeForSameThread() override {
         thread_queue_id_ = SIZE_MAX;
+        if (registered_capacity_.has_value()) {
+            to_->setCapacity(*registered_capacity_);
+        }
         to_->useSingleThreadQueue();
     }
 
     void optimizeForSPSC() override {
         thread_queue_id_ = SIZE_MAX;
-        to_->useLockFreeQueue();
+        if (registered_capacity_.has_value()) {
+            to_->setCapacity(*registered_capacity_);
+            to_->useLockFreeQueue(*registered_capacity_);
+        } else {
+            to_->useLockFreeQueue();
+        }
     }
 
     void optimizeForMPSC() override {
-        to_->useMultiProducerQueue();
         // Size the SPSC staging ring now that to_->capacity() is finalized.
         // The producer back-pressures on stagingSize() >= to_->capacity(),
         // so the physical ring only needs room for the user cap plus one
@@ -366,22 +390,49 @@ public:
         // of 2 for fast masking. Bounded user capacities must not be capped
         // below the model-visible limit, otherwise canTransfer() and the
         // physical push path disagree for large ports.
-        const size_t user_cap = to_->capacity();
-        const size_t requested = (user_cap == InPort<T>::UNLIMITED_CAPACITY)
-                                     ? kDefaultUnlimitedStagingRing
-                                     : (user_cap + 1);
-        size_t phys = 1;
-        const size_t target = std::max(requested, kStagingRingMin);
-        while (phys < target) {
-            if (phys > (std::numeric_limits<size_t>::max() / 2)) {
-                throw std::length_error("MPSC staging ring capacity is too large");
+        const size_t user_cap = edgeAdmissionCapacity_();
+        to_->useMultiProducerQueue(user_cap == InPort<T>::UNLIMITED_CAPACITY ? 0 : user_cap);
+        configureStagingRing_((user_cap == InPort<T>::UNLIMITED_CAPACITY)
+                                  ? (kDefaultUnlimitedStagingRing - 1)
+                                  : user_cap);
+    }
+
+    void configureRegisteredEdge(std::optional<size_t> capacity,
+                                 std::optional<size_t> rate) override {
+        if (capacity.has_value()) {
+            if (*capacity == 0) {
+                throw std::invalid_argument("registered edge capacity must be positive");
             }
-            phys <<= 1;
+            registered_capacity_ = *capacity;
         }
-        staging_buf_.assign(phys, Staged{});
-        staging_mask_ = phys - 1;
-        staging_head_.store(0, std::memory_order_relaxed);
-        staging_tail_.store(0, std::memory_order_relaxed);
+        if (rate.has_value()) {
+            if (*rate == 0) {
+                throw std::invalid_argument("registered edge rate must be positive");
+            }
+            registered_rate_ = *rate;
+        }
+    }
+
+    bool ensureEpochFreeHeadroom(uint32_t max_lookahead_cycles) override {
+        if (crossThreadHeadroom() > 0) return true;
+        if (edgeAdmissionCapacity_() != InPort<T>::UNLIMITED_CAPACITY) {
+            return false;
+        }
+        const auto requested = requiredUsableForHeadroom_(max_lookahead_cycles);
+        if (!requested.has_value()) return false;
+        try {
+            if (thread_queue_id_ != SIZE_MAX) {
+                to_->useMultiProducerQueue(*requested);
+                configureStagingRing_(*requested);
+            } else if (to_->usesLockFreeQueue()) {
+                to_->useLockFreeQueue(*requested);
+            } else {
+                return true;
+            }
+        } catch (const std::length_error&) {
+            return false;
+        }
+        return crossThreadHeadroom() > 1;
     }
 
     size_t registerProducerThread(size_t thread_id) override {
@@ -400,27 +451,21 @@ public:
         //   same-thread / unbounded     -> no ring to overflow (SIZE_MAX).
         size_t ring_usable;
         if (thread_queue_id_ != SIZE_MAX) {
-            ring_usable = staging_mask_;
+            ring_usable = mpscLogicalHeadroomCapacity_();
         } else if (to_->usesLockFreeQueue()) {
-            ring_usable = to_->capacity();
+            ring_usable = spscLogicalHeadroomCapacity_();
         } else {
             return SIZE_MAX;  // single-thread queue drains synchronously each tick
         }
-        const size_t rate = from_->perCycleCapacity();
-        // An uncapped per-cycle send rate can stage unboundedly per cycle, so no
-        // finite run-ahead is provably safe.
-        if (rate == OutPort<T>::UNLIMITED_CAPACITY) return 0;
-        // transfer() stops accepting once buffered entries reach this many: a
-        // bounded port back-pressures at to_->capacity(); an unlimited port fills
-        // the ring. Past it the epoch-free path either drops (unlimited: overflow)
-        // or back-pressures where the per-epoch barrier flush would not (bounded),
-        // so results would diverge from the reference.
-        const size_t threshold = std::min(to_->capacity(), ring_usable);
-        const size_t cycles = threshold / rate;
+        const auto rate = effectiveHeadroomRate_();
+        if (!rate.has_value()) return 0;
+        const size_t buffered_cycles = ring_usable / *rate;
         // The consumer drains only *due* entries (arrive_cycle <= k, i.e.
         // send_cycle <= k - delay_), so delay_ cycles of not-yet-due entries always
-        // sit buffered. The supportable producer run-ahead is cycles - delay_.
-        return (cycles > delay_) ? (cycles - delay_) : 0;
+        // sit buffered. A delay-1, capacity-1 DFF-style edge is still safe with
+        // zero producer slack, represented as headroom=1.
+        if (buffered_cycles < delay_) return 0;
+        return buffered_cycles - delay_ + 1;
     }
 
     void setConnId(uint32_t conn_id) noexcept override { conn_id_ = conn_id; }
@@ -430,6 +475,62 @@ public:
     InPort<T>* to() const noexcept { return to_; }
 
 private:
+    std::optional<size_t> effectiveHeadroomRate_() const noexcept {
+        if (registered_rate_.has_value()) {
+            return *registered_rate_;
+        }
+        const size_t rate = from_->perCycleCapacity();
+        if (rate == OutPort<T>::UNLIMITED_CAPACITY) {
+            return std::nullopt;
+        }
+        return rate;
+    }
+
+    size_t edgeAdmissionCapacity_() const noexcept {
+        return registered_capacity_.value_or(to_->configuredCapacity());
+    }
+
+    static constexpr size_t minCapacity_(size_t lhs, size_t rhs) noexcept {
+        if (lhs == InPort<T>::UNLIMITED_CAPACITY) return rhs;
+        if (rhs == InPort<T>::UNLIMITED_CAPACITY) return lhs;
+        return std::min(lhs, rhs);
+    }
+
+    size_t edgeCycleRateLimit_() const noexcept {
+        size_t limit = from_->perCycleCapacity();
+        if (registered_rate_.has_value()) {
+            limit = *registered_rate_;
+        }
+        return minCapacity_(limit, edgeAdmissionCapacity_());
+    }
+
+    size_t mpscLogicalHeadroomCapacity_() const noexcept {
+        const size_t user_cap = edgeAdmissionCapacity_();
+        if (user_cap == InPort<T>::UNLIMITED_CAPACITY) {
+            return staging_mask_;
+        }
+        return std::min(staging_mask_, user_cap);
+    }
+
+    size_t spscLogicalHeadroomCapacity_() const noexcept {
+        const size_t user_cap = edgeAdmissionCapacity_();
+        if (user_cap == InPort<T>::UNLIMITED_CAPACITY) {
+            return to_->storageCapacity();
+        }
+        return std::min(to_->storageCapacity(), user_cap);
+    }
+
+    std::optional<size_t> requiredUsableForHeadroom_(uint32_t max_lookahead_cycles) const {
+        const uint64_t desired = std::max<uint64_t>(max_lookahead_cycles, 2);
+        const uint64_t cycles = static_cast<uint64_t>(delay_) + desired - 1;
+        const auto rate = effectiveHeadroomRate_();
+        if (!rate.has_value()) return std::nullopt;
+        if (*rate != 0 && cycles > std::numeric_limits<size_t>::max() / *rate) {
+            return std::nullopt;
+        }
+        return static_cast<size_t>(cycles) * *rate;
+    }
+
     /// Per-connection staging entry. Holds the original arrive_cycle and
     /// send_cycle (as enqueue_cycle) so that even if the InPort arbiter
     /// defers admission by back-pressure, downstream predicates and
@@ -441,7 +542,28 @@ private:
         uint64_t epoch_snapshot;
     };
 
+    void configureStagingRing_(size_t requested_usable) {
+        if (requested_usable == std::numeric_limits<size_t>::max()) {
+            throw std::length_error("MPSC staging ring capacity is too large");
+        }
+        size_t phys = 1;
+        const size_t target = std::max(requested_usable + 1, kStagingRingMin);
+        while (phys < target) {
+            if (phys > (std::numeric_limits<size_t>::max() / 2)) {
+                throw std::length_error("MPSC staging ring capacity is too large");
+            }
+            phys <<= 1;
+        }
+        staging_buf_.assign(phys, Staged{});
+        staging_mask_ = phys - 1;
+        staging_head_.store(0, std::memory_order_relaxed);
+        staging_tail_.store(0, std::memory_order_relaxed);
+    }
+
     bool transferToSharedQueue_(Staged& entry) {
+        if (!to_->canPushToThreadQueue(thread_queue_id_)) {
+            return false;
+        }
         return to_->pushToThreadQueueCancelable(
             thread_queue_id_, std::move(entry.data), entry.arrive_cycle, &cancel_epoch_,
             entry.epoch_snapshot, entry.enqueue_cycle, conn_id_);
@@ -450,6 +572,8 @@ private:
     OutPort<T>* from_;
     InPort<T>* to_;
     uint32_t delay_;
+    std::optional<size_t> registered_capacity_;
+    std::optional<size_t> registered_rate_;
     size_t thread_queue_id_ = SIZE_MAX;  ///< SIZE_MAX means not in MPSC mode
     uint32_t conn_id_ = 0;               ///< Stable topology-based tiebreaker
 
@@ -474,13 +598,17 @@ private:
     alignas(64) std::atomic<size_t> staging_head_{0};  ///< consumer reads/advances
     alignas(64) std::atomic<size_t> staging_tail_{0};  ///< producer writes/advances
 
-    size_t stagingSize_() const noexcept {
+    size_t stagingSize_() const noexcept { return stagingRingSize_(); }
+
+    size_t stagingRingSize_() const noexcept {
         const size_t head = staging_head_.load(std::memory_order_acquire);
         const size_t tail = staging_tail_.load(std::memory_order_acquire);
         return (tail - head) & staging_mask_;
     }
 
-    bool stagingTryPush_(Staged&& e) {
+    bool stagingTryPush_(Staged&& e) { return stagingRingTryPush_(std::move(e)); }
+
+    bool stagingRingTryPush_(Staged&& e) {
         const size_t tail = staging_tail_.load(std::memory_order_relaxed);
         const size_t next = (tail + 1) & staging_mask_;
         if (next == staging_head_.load(std::memory_order_acquire)) {
@@ -491,7 +619,9 @@ private:
         return true;
     }
 
-    Staged* stagingPeekFront_() noexcept {
+    Staged* stagingPeekFront_() noexcept { return stagingRingPeekFront_(); }
+
+    Staged* stagingRingPeekFront_() noexcept {
         const size_t head = staging_head_.load(std::memory_order_relaxed);
         if (head == staging_tail_.load(std::memory_order_acquire)) {
             return nullptr;
@@ -499,7 +629,9 @@ private:
         return &staging_buf_[head];
     }
 
-    void stagingPopFront_() noexcept {
+    void stagingPopFront_() noexcept { stagingRingPopFront_(); }
+
+    void stagingRingPopFront_() noexcept {
         const size_t head = staging_head_.load(std::memory_order_relaxed);
         staging_buf_[head] = Staged{};  // release owned T early
         staging_head_.store((head + 1) & staging_mask_, std::memory_order_release);
