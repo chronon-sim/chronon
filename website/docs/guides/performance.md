@@ -214,22 +214,25 @@ slices indicate spin-wait time on predecessor cluster progress atomics; sparse
 or non-overlapping `unit` slices indicate poor stream packing or insufficient
 lookahead.
 
-### Tune Epoch Size
+### Tune Lookahead Headroom
 
-Larger epochs reduce sync overhead but increase memory:
+Epoch-free lookahead is the default scheduler path. Tune
+`max_lookahead_cycles` together with connection capacity/rate declarations so
+the safety gate can prove enough cross-thread buffer headroom:
 
 ```cpp
 TickSimulationConfig config;
-config.epoch_size = 1024;  // Default: 64
+config.max_lookahead_cycles = 256;
+config.enable_epoch_free_lookahead = true;
 ```
 
 YAML and CLI equivalents:
 
 ```yaml
 simulation:
-  epoch_size: 1024
   max_lookahead_cycles: 256              # uint32_t
   enable_epoch_free_lookahead: true      # Drop the per-epoch barrier when safe
+  epoch_size: 1024                       # Deprecated: fallback-only
   enable_weighted_partitioning: true     # Cost-aware thread assignment (default)
   profiling_warmup_cycles: 512           # Warmup ticks before measuring
   profiling_measurement_cycles: 1024     # Measurement window for tick costs
@@ -248,16 +251,17 @@ at scheduler fence points; it never splits a delay=0 cluster. Use
 frequent migrations.
 
 ```bash
-./examples/cpu_pipeline_yaml_example config.yaml --epoch-size=1024
+./examples/cpu_pipeline_yaml_example config.yaml --param simulation.max_lookahead_cycles=256
 ```
 
 When the staging-capacity gate is satisfied, `enable_epoch_free_lookahead`
 (default on) removes the per-epoch barrier entirely instead of just widening it:
 run-ahead is then bounded only by dependency progress and
 `max_lookahead_cycles`. If the gate rejects the topology, Chronon falls back to
-the per-epoch path. Dynamic rebalance remains opt-in and can run on the
-epoch-free dynamic driver when its gate holds, or on the per-epoch fallback when
-epoch-free is vetoed; see [Epoch-Free Lookahead](scheduling.md) for the
+the deprecated per-epoch path. Treat that fallback warning as a topology or
+capacity issue to fix before the fallback is removed. Dynamic rebalance remains
+opt-in and can run on the epoch-free dynamic driver when its gate holds; see
+[Epoch-Free Lookahead](scheduling.md) for the
 conditions and MPSC requirements.
 
 Notes:

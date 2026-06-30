@@ -70,9 +70,13 @@ struct SimulationYAMLConfig {
     bool enable_lookahead = true;
     bool trace_execution = false;  ///< Print execution policy details.
     uint32_t max_lookahead_cycles = 100;
-    uint64_t epoch_size = 64;                 ///< Synchronization period in cycles.
-    bool enable_epoch_free_lookahead = true;  ///< Drop the per-epoch barrier when safe.
-    uint64_t run_cycles = 0;                  ///< 0 = run until completion.
+    /// Deprecated compatibility knob for the per-epoch lookahead fallback.
+    /// Epoch-free lookahead ignores this value.
+    uint64_t epoch_size = 64;
+    /// Drop the per-epoch barrier when safe. Setting this false selects the
+    /// deprecated per-epoch fallback, which will be removed in a future release.
+    bool enable_epoch_free_lookahead = true;
+    uint64_t run_cycles = 0;  ///< 0 = run until completion.
     std::string name = "simulation";
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< Default 1 GHz.
 

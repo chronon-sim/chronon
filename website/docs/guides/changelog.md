@@ -19,6 +19,14 @@ It now defaults on when the safety gate can prove that cross-thread connection
 headroom can absorb the configured run-ahead; otherwise Chronon falls back to the
 per-epoch path.
 
+### Deprecation
+
+The per-epoch lookahead fallback is deprecated and will be removed in a future
+release. Keep `enable_epoch_free_lookahead` enabled and treat fallback warnings
+as configuration or topology issues to resolve before that removal. `epoch_size`
+now only controls the compatibility fallback and is ignored by epoch-free
+lookahead.
+
 ### Safety
 
 The dispatch gate keeps the per-epoch barrier path (no result change) unless every

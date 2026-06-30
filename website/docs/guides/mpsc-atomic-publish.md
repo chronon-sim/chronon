@@ -11,11 +11,13 @@ previous `BulkBarrier` backend was removed once this path became the default
 
 ## Background
 
-The lookahead scheduler (`executeEpochProgressBased` in `TickSimulation.hpp`)
-issues a single `stdexec::bulk` for an entire epoch. Worker threads advance
-independently, spinning on predecessor-cluster `completed_cycle` atomics
-(`thread_progress_array_`) instead of rejoining the main thread at every cycle.
-There is no per-cycle sync point where an auxiliary main-thread arbiter can run.
+The lookahead scheduler advances worker threads independently, spinning on
+predecessor-cluster `completed_cycle` atomics (`thread_progress_array_`) instead
+of rejoining the main thread at every cycle. The default epoch-free driver runs
+one window for the whole call; the deprecated per-epoch fallback
+(`executeEpochProgressBased` / `executeRunProgressBased`) keeps the same
+consumer-driven arbitration invariant but adds epoch boundaries. There is no
+per-cycle sync point where an auxiliary main-thread arbiter can run.
 
 MPSC admission uses a two-stage path (`Connection::transfer`,
 `InPort::arbitrateMPSC`):
@@ -159,13 +161,14 @@ during producer cycle `c`. Given a fixed topology and fixed initial state:
 
 The proof does NOT rely on wall-clock fairness between producer threads.
 
-## Epoch-end drain (R8)
+## Tail drain (R8)
 
 At epoch end every thread reaches `end_cycle` but publishes `end_cycle - 1` as
 completed just before exiting the per-thread loop. Staging entries with
 `enqueue_cycle == end_cycle - 1` are still pending. After the epoch
 `sync_wait`, `executeEpochProgressBased` calls `arbitrateAllMPSCPorts_()` once
-to drain the tail. Inexpensive; runs once per epoch.
+to drain the tail. The default epoch-free path performs the same tail drain once
+after the run-spanning worker launch joins.
 
 ## Termination
 

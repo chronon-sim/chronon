@@ -40,6 +40,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -49,10 +50,11 @@ namespace chronon::sender {
 /**
  * High-performance simulation using stdexec.
  *
- * Execution model: Chronon selects sequential, barrier, per-epoch lookahead,
- * or epoch-free lookahead at runtime. In lookahead mode, tight clusters advance
- * on dependency progress atomics; the epoch-free path is the default when the
- * safety gate can prove that no per-epoch flush is required.
+ * Execution model: Chronon selects sequential, barrier, or lookahead at
+ * runtime. In lookahead mode, tight clusters advance on dependency progress
+ * atomics; epoch-free lookahead is the default when the safety gate can prove
+ * that no per-epoch flush is required. The older per-epoch lookahead fallback
+ * is deprecated and kept only as a compatibility/safety fallback.
  *
  * @code
  * TickSimulation sim;
@@ -320,6 +322,8 @@ private:
     uint64_t runParallel(uint64_t num_cycles);
     bool persistentLookaheadEligible_() const;
     bool epochFreeLookaheadEligible_() const;
+    std::string epochFreeVetoReason_() const;
+    void warnDeprecatedEpochLookaheadFallback_(std::string_view reason);
 
     bool executeUnitCycle_(TickableUnit* unit, uint64_t cycle) {
         if (!unit->usesActivityScheduling()) {
@@ -491,7 +495,11 @@ private:
      * the whole run, epoch boundaries crossed via a reusable std::barrier, so the
      * stdexec thread pool no longer heap-allocates a bulk op-state per epoch. Used
      * by runParallel() as the fixed-layout fallback when the epoch-free gate is
-     * unavailable. Returns cycles executed.
+     * unavailable.
+     *
+     * Deprecated: this per-epoch lookahead fallback is retained only for
+     * compatibility and for topologies that the epoch-free safety gate cannot
+     * prove yet. It will be removed in a future release.
      */
     uint64_t executeRunProgressBased(uint64_t total_cycles);
 

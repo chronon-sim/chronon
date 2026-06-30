@@ -286,6 +286,12 @@ cluster advances) and per-connection MPSC arbitration, with one MPSC flush at th
 end of the run instead of one per epoch. Results stay bit-identical to every other
 mode; only wall-clock changes.
 
+The per-epoch lookahead fallback is deprecated and will be removed in a future
+release. It remains only as a compatibility/safety fallback while epoch-free
+coverage is hardened. Keep `enable_epoch_free_lookahead` enabled and treat any
+runtime fallback warning as a topology or headroom issue to fix. `epoch_size`
+only affects the deprecated fallback; epoch-free lookahead ignores it.
+
 If the safety gate rejects epoch-free execution, Chronon transparently falls
 back to the per-epoch path. Scheduler timeline tracing does not veto epoch-free
 lookahead; idle fast paths are then paced by dependency progress and
@@ -394,7 +400,7 @@ struct TickSimulationConfig {
 
     // Lookahead configuration
     uint32_t max_lookahead_cycles = 100;    // Max cycles a unit can run ahead
-    uint64_t epoch_size = 64;               // Cycles per epoch before sync
+    uint64_t epoch_size = 64;               // Deprecated: fallback-only
     bool enable_epoch_free_lookahead = true;  // Drop the per-epoch barrier when safe
 
     // Debug options

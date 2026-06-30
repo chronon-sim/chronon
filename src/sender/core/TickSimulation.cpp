@@ -15,9 +15,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <exception>
+#include <iostream>
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace chronon::sender {
@@ -68,6 +70,7 @@ void TickSimulation::initialize() {
             obs_mgr.createContextForUnit("simulation", [this]() { return current_cycle_; }, 0);
         if (observe_ctx_) {
             observe_ctx_->enableCategory(observe::category::LOG_INFO);
+            observe_ctx_->enableCategory(observe::category::LOG_WARN);
         }
     }
 
@@ -335,6 +338,7 @@ uint64_t TickSimulation::runParallelEpoch(uint64_t epoch_cycles, uint64_t /*exec
                                !has_zero_delay_cross_thread_cycle_;
 
     if (use_lookahead && thread_progress_count_ > 0) {
+        warnDeprecatedEpochLookaheadFallback_(epochFreeVetoReason_());
         executeEpochProgressBased(epoch_cycles);
     } else {
         auto sched = pool_.get_scheduler();
@@ -357,6 +361,51 @@ bool TickSimulation::epochFreeLookaheadEligible_() const {
            crossThreadHeadroomAllowsEpochFree_();
 }
 
+std::string TickSimulation::epochFreeVetoReason_() const {
+    if (!persistentLookaheadEligible_()) {
+        return "persistent lookahead unavailable";
+    }
+    if (!config_.enable_epoch_free_lookahead) {
+        return "enable_epoch_free_lookahead=false";
+    }
+    if (config_.max_lookahead_cycles == 0) {
+        return "max_lookahead_cycles=0";
+    }
+    if (!allMPSCPortsHaveConnProgress_()) {
+        return "MPSC producer progress unresolved";
+    }
+    if (!crossThreadHeadroomAllowsEpochFree_()) {
+        if (has_zero_delay_cross_thread_cycle_) {
+            return "zero-delay cross-thread cycle";
+        }
+        if (crossThreadHeadroomLimit_() == 0) {
+            return "cross-thread buffer headroom unproven";
+        }
+        return "cross-thread buffer headroom gate rejected";
+    }
+    return "unknown";
+}
+
+void TickSimulation::warnDeprecatedEpochLookaheadFallback_(std::string_view reason) {
+    static std::atomic<bool> warned{false};
+    bool expected = false;
+    if (!warned.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
+
+    std::string reason_str(reason);
+    if (observe_ctx_) {
+        observe::log_warn<
+            "DEPRECATED: per-epoch lookahead fallback is deprecated and will be removed in a "
+            "future release; enable epoch-free lookahead and satisfy its safety gate. reason={}">(
+            observe_ctx_, reason_str.c_str());
+    } else {
+        std::cerr
+            << "[chronon] DEPRECATED: per-epoch lookahead fallback is deprecated and will be "
+               "removed in a future release; enable epoch-free lookahead and satisfy its safety "
+               "gate. reason="
+            << reason << '\n';
+    }
+}
+
 uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
     // Persistent-worker fast path (see executeRunProgressBased). The
     // epoch-free driver is the default when its dependency/queue safety gate
@@ -366,11 +415,13 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
         const bool epoch_free = epochFreeLookaheadEligible_();
         if (config_.enable_epoch_free_lookahead && !epoch_free && observe_ctx_ &&
             !epoch_free_veto_logged_) {
+            const std::string reason = epochFreeVetoReason_();
             observe::log_info<
                 "epoch-free lookahead requested but vetoed "
-                "(max_lookahead={}, mpsc_progress_full={}, headroom={}); using barrier path">(
-                observe_ctx_, config_.max_lookahead_cycles, allMPSCPortsHaveConnProgress_(),
-                crossThreadHeadroomLimit_());
+                "(reason={}, max_lookahead={}, mpsc_progress_full={}, headroom={}); using "
+                "deprecated per-epoch lookahead fallback">(
+                observe_ctx_, reason.c_str(), config_.max_lookahead_cycles,
+                allMPSCPortsHaveConnProgress_(), crossThreadHeadroomLimit_());
             epoch_free_veto_logged_ = true;
         }
         if (epoch_free) {
@@ -382,6 +433,7 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
             return executeRunEpochFree_(num_cycles);
         }
         if (!config_.enable_dynamic_rebalance) {
+            warnDeprecatedEpochLookaheadFallback_(epochFreeVetoReason_());
             return executeRunProgressBased(num_cycles);
         }
     }

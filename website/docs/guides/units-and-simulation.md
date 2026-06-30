@@ -86,7 +86,8 @@ struct TickSimulationConfig {
     // arbitration). Placement is always cluster-aware: when there are no
     // tight (delay=0) edges every unit becomes its own single-member cluster.
     uint32_t max_lookahead_cycles = 100;     // Upper bound for per-unit lookahead window
-    uint64_t epoch_size = 64;
+    uint64_t epoch_size = 64;                // Deprecated: fallback-only
+    bool enable_epoch_free_lookahead = true; // Keep enabled; fallback is deprecated
     bool trace_execution = false;            // Print execution policy details
 
     // Cost-aware weighted partitioning (profiles tick costs, partitions by weight)
