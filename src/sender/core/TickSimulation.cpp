@@ -15,9 +15,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <exception>
+#include <iostream>
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace chronon::sender {
@@ -52,15 +54,9 @@ void TickSimulation::initialize() {
         precomputed_unit_costs_ = std::move(remapped);
     }
 
-    if (config_.enable_lookahead && !unit_ptrs_.empty()) {
-        analysis_ = CycleAnalyzer::analyze(dep_graph_);
-    }
-
     // With tight (delay=0) connections, lookahead degenerates to per-cycle
     // and barrier mode has less sync overhead.
     has_tight_connections_ = hasTightConnections();
-
-    buildPredecessorCache();
 
     auto& obs_mgr = observe::ObservationManager::instance();
     if (obs_mgr.isEnabled()) {
@@ -68,6 +64,7 @@ void TickSimulation::initialize() {
             obs_mgr.createContextForUnit("simulation", [this]() { return current_cycle_; }, 0);
         if (observe_ctx_) {
             observe_ctx_->enableCategory(observe::category::LOG_INFO);
+            observe_ctx_->enableCategory(observe::category::LOG_WARN);
         }
     }
 
@@ -335,6 +332,7 @@ uint64_t TickSimulation::runParallelEpoch(uint64_t epoch_cycles, uint64_t /*exec
                                !has_zero_delay_cross_thread_cycle_;
 
     if (use_lookahead && thread_progress_count_ > 0) {
+        warnDeprecatedEpochLookaheadFallback_(epochFreeVetoReason_());
         executeEpochProgressBased(epoch_cycles);
     } else {
         auto sched = pool_.get_scheduler();
@@ -357,6 +355,51 @@ bool TickSimulation::epochFreeLookaheadEligible_() const {
            crossThreadHeadroomAllowsEpochFree_();
 }
 
+std::string TickSimulation::epochFreeVetoReason_() const {
+    if (!persistentLookaheadEligible_()) {
+        return "persistent lookahead unavailable";
+    }
+    if (!config_.enable_epoch_free_lookahead) {
+        return "enable_epoch_free_lookahead=false";
+    }
+    if (config_.max_lookahead_cycles == 0) {
+        return "max_lookahead_cycles=0";
+    }
+    if (!allMPSCPortsHaveConnProgress_()) {
+        return "MPSC producer progress unresolved";
+    }
+    if (!crossThreadHeadroomAllowsEpochFree_()) {
+        if (has_zero_delay_cross_thread_cycle_) {
+            return "zero-delay cross-thread cycle";
+        }
+        if (crossThreadHeadroomLimit_() == 0) {
+            return "cross-thread buffer headroom unproven";
+        }
+        return "cross-thread buffer headroom gate rejected";
+    }
+    return "unknown";
+}
+
+void TickSimulation::warnDeprecatedEpochLookaheadFallback_(std::string_view reason) {
+    static std::atomic<bool> warned{false};
+    bool expected = false;
+    if (!warned.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
+
+    std::string reason_str(reason);
+    if (observe_ctx_) {
+        observe::log_warn<
+            "DEPRECATED: per-epoch lookahead fallback is deprecated and will be removed in a "
+            "future release; enable epoch-free lookahead and satisfy its safety gate. reason={}">(
+            observe_ctx_, reason_str.c_str());
+    } else {
+        std::cerr
+            << "[chronon] DEPRECATED: per-epoch lookahead fallback is deprecated and will be "
+               "removed in a future release; enable epoch-free lookahead and satisfy its safety "
+               "gate. reason="
+            << reason << '\n';
+    }
+}
+
 uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
     // Persistent-worker fast path (see executeRunProgressBased). The
     // epoch-free driver is the default when its dependency/queue safety gate
@@ -366,11 +409,13 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
         const bool epoch_free = epochFreeLookaheadEligible_();
         if (config_.enable_epoch_free_lookahead && !epoch_free && observe_ctx_ &&
             !epoch_free_veto_logged_) {
+            const std::string reason = epochFreeVetoReason_();
             observe::log_info<
                 "epoch-free lookahead requested but vetoed "
-                "(max_lookahead={}, mpsc_progress_full={}, headroom={}); using barrier path">(
-                observe_ctx_, config_.max_lookahead_cycles, allMPSCPortsHaveConnProgress_(),
-                crossThreadHeadroomLimit_());
+                "(reason={}, max_lookahead={}, mpsc_progress_full={}, headroom={}); using "
+                "deprecated per-epoch lookahead fallback">(
+                observe_ctx_, reason.c_str(), config_.max_lookahead_cycles,
+                allMPSCPortsHaveConnProgress_(), crossThreadHeadroomLimit_());
             epoch_free_veto_logged_ = true;
         }
         if (epoch_free) {
@@ -382,6 +427,7 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
             return executeRunEpochFree_(num_cycles);
         }
         if (!config_.enable_dynamic_rebalance) {
+            warnDeprecatedEpochLookaheadFallback_(epochFreeVetoReason_());
             return executeRunProgressBased(num_cycles);
         }
     }
@@ -393,35 +439,6 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
         executed += epoch_cycles;
     }
     return executed;
-}
-
-void TickSimulation::executeUnitToTarget(size_t unit_idx, uint64_t target_cycle) {
-    auto* unit = unit_ptrs_[unit_idx];
-    while (unit->localCycle() < target_cycle) {
-        executeUnitCycle_(unit, unit->localCycle());
-    }
-    // No try-catch: stdexec propagates exceptions natively in parallel
-    // paths; sequential paths use throwTickException.
-}
-
-uint64_t TickSimulation::computeSafeBoundary(size_t unit_idx, uint64_t epoch_end) const {
-    if (!config_.enable_lookahead) {
-        return epoch_end;
-    }
-
-    uint64_t min_safe = epoch_end;
-
-    // DIRECT predecessors only; transitive constraints are already enforced
-    // by intermediate units. Using Floyd-Warshall distances would
-    // over-constrain the schedule.
-    for (const auto& [pred_idx, delay] : predecessor_cache_[unit_idx]) {
-        uint64_t pred_cycle = unit_progress_[pred_idx].load(std::memory_order_acquire);
-        uint64_t safe = pred_cycle + delay;
-        min_safe = std::min(min_safe, safe);
-    }
-
-    uint64_t current = unit_ptrs_[unit_idx]->localCycle();
-    return std::min(min_safe, current + config_.max_lookahead_cycles);
 }
 
 // ---------------------------------------------------------------------------
@@ -436,26 +453,6 @@ void TickSimulation::buildDependencyGraph() {
     }
 
     dep_graph_.build(unit_as_base, connections_);
-}
-
-void TickSimulation::buildPredecessorCache() {
-    predecessor_cache_.clear();
-    predecessor_cache_.resize(units_.size());
-
-    std::unordered_map<Unit*, size_t> unit_to_idx;
-    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-        unit_to_idx[static_cast<Unit*>(unit_ptrs_[i])] = i;
-    }
-
-    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-        Unit* unit = static_cast<Unit*>(unit_ptrs_[i]);
-        for (const auto& [pred, delay] : dep_graph_.predecessors(unit)) {
-            auto it = unit_to_idx.find(pred);
-            if (it != unit_to_idx.end()) {
-                predecessor_cache_[i].emplace_back(it->second, delay);
-            }
-        }
-    }
 }
 
 void TickSimulation::reorderUnitsTopologically_() {

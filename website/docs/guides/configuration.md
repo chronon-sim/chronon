@@ -132,8 +132,9 @@ simulation:
   name: my_simulation
   num_workers: 4
   enable_parallel: true    # Enable parallel execution (requires num_workers > 1)
-  enable_lookahead: true   # Enable lookahead scheduling for parallel epochs
+  enable_lookahead: true   # Enable lookahead scheduling
   enable_epoch_free_lookahead: true   # Drop the per-epoch barrier when safe
+  epoch_size: 64           # Deprecated: only used by the fallback scheduler
   run_cycles: 1000000
 
   unit:

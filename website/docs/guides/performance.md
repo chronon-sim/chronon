@@ -112,14 +112,14 @@ In debug builds, producers spin-yield when the per-thread SPSC queue is full, wa
 
 TickSimulation selects the best thread assignment strategy based on configuration:
 
-**Primary path: Cost-aware weighted partitioning** (`enable_weighted_partitioning = true`, default)
+**Primary path: Cluster-aware cost partitioning** (`enable_weighted_partitioning = true`, default)
 
 When at least 4 units exist, the unified cluster-aware + cost-aware pipeline:
 
-1. **Measure platform sync cost**: Benchmarks atomic round-trip latency (~36-50ns typical)
-2. **Profile tick costs**: Measures per-unit tick latency in nanoseconds (warmup + measurement phases)
+1. **Build a deterministic cost model**: Uses unit cost `1.0` plus `initial_partition_sync_cost_ns` as a locality weight
+2. **Apply optional precomputed costs**: Callers can provide measured unit/platform costs with `setPrecomputedUnitCosts(...)`
 3. **Detect tight clusters**: Groups delay=0 units into clusters that must share a thread
-4. **Partition clusters**: `WeightedPartitioner` assigns cluster super-nodes to threads via a 4-phase algorithm (LPT placement → FM refinement → pairwise swap → multi-unit relocate), minimizing max thread time with delay-aware sync cost model
+4. **Partition clusters**: The configured solver (`partition_solver: SA` by default, or `Weighted`) assigns cluster super-nodes to threads while minimizing max thread time with a delay-aware sync cost model
 5. **Optimize queues**: Same-thread connections use `SingleThreadMessageQueue` (zero overhead), cross-thread uses lock-free queues
 
 The sync cost model uses directed adjacency (one edge per Connection object) to avoid double-counting bus connections. Cost scales inversely with connection delay: delay=0 edges get 100x the sync penalty (forcing co-location), while high-delay edges tolerate cross-thread placement.
@@ -214,25 +214,28 @@ slices indicate spin-wait time on predecessor cluster progress atomics; sparse
 or non-overlapping `unit` slices indicate poor stream packing or insufficient
 lookahead.
 
-### Tune Epoch Size
+### Tune Lookahead Headroom
 
-Larger epochs reduce sync overhead but increase memory:
+Epoch-free lookahead is the default scheduler path. Tune
+`max_lookahead_cycles` together with connection capacity/rate declarations so
+the safety gate can prove enough cross-thread buffer headroom:
 
 ```cpp
 TickSimulationConfig config;
-config.epoch_size = 1024;  // Default: 64
+config.max_lookahead_cycles = 256;
+config.enable_epoch_free_lookahead = true;
 ```
 
 YAML and CLI equivalents:
 
 ```yaml
 simulation:
-  epoch_size: 1024
   max_lookahead_cycles: 256              # uint32_t
   enable_epoch_free_lookahead: true      # Drop the per-epoch barrier when safe
-  enable_weighted_partitioning: true     # Cost-aware thread assignment (default)
-  profiling_warmup_cycles: 512           # Warmup ticks before measuring
-  profiling_measurement_cycles: 1024     # Measurement window for tick costs
+  epoch_size: 1024                       # Deprecated: fallback-only
+  enable_weighted_partitioning: true     # Cluster-aware thread assignment (default)
+  partition_solver: SA                   # Initial solver: SA or Weighted
+  initial_partition_sync_cost_ns: 8.0    # Locality weight for deterministic placement
   enable_dynamic_rebalance: false        # Runtime cluster migration (opt-in)
   rebalance_check_interval_cycles: 8192  # Scheduler-fence imbalance checks
   rebalance_min_gain: 0.05               # Skip if predicted gain is too small
@@ -248,21 +251,22 @@ at scheduler fence points; it never splits a delay=0 cluster. Use
 frequent migrations.
 
 ```bash
-./examples/cpu_pipeline_yaml_example config.yaml --epoch-size=1024
+./examples/cpu_pipeline_yaml_example config.yaml --param simulation.max_lookahead_cycles=256
 ```
 
 When the staging-capacity gate is satisfied, `enable_epoch_free_lookahead`
 (default on) removes the per-epoch barrier entirely instead of just widening it:
 run-ahead is then bounded only by dependency progress and
 `max_lookahead_cycles`. If the gate rejects the topology, Chronon falls back to
-the per-epoch path. Dynamic rebalance remains opt-in and can run on the
-epoch-free dynamic driver when its gate holds, or on the per-epoch fallback when
-epoch-free is vetoed; see [Epoch-Free Lookahead](scheduling.md) for the
+the deprecated per-epoch path. Treat that fallback warning as a topology or
+capacity issue to fix before the fallback is removed. Dynamic rebalance remains
+opt-in and can run on the epoch-free dynamic driver when its gate holds; see
+[Epoch-Free Lookahead](scheduling.md) for the
 conditions and MPSC requirements.
 
 Notes:
 - In single-thread mode, Chronon uses a per-cycle fast path to avoid lookahead bookkeeping overhead.
-- In multi-thread mode, cost-aware weighted partitioning profiles per-unit tick costs and assigns threads to minimize max thread time. Set `enable_weighted_partitioning: false` for topology-only assignment.
+- In multi-thread mode, cluster-aware partitioning uses deterministic unit costs by default, or caller-supplied precomputed costs, then assigns threads to minimize max thread time. Set `enable_weighted_partitioning: false` for topology-only assignment.
 
 ### Use delay>0 for Parallelism
 

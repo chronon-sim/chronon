@@ -128,7 +128,7 @@ Chronon performs **static dependency analysis** at initialization time to determ
               │          │          │
               └──────────┼──────────┘
                          ▼
-                WeightedPartitioner
+              Cluster-aware solver
                          │
                          ▼
                      Lookahead
@@ -219,13 +219,13 @@ void gpgpu_sim::cycle() {
 
 ## 3. Parallelization Strategy
 
-### 3.1 Chronon: Cost-Aware Graph Partitioning
+### 3.1 Chronon: Cluster-Aware Graph Partitioning
 
-Chronon uses a sophisticated **four-phase partitioning algorithm** (WeightedPartitioner) to distribute units across threads:
+Chronon's cluster-aware partitioning distributes units across threads using the configured solver. `SA` is the default initial solver; the optional `Weighted` solver uses this four-phase algorithm:
 
 ```
 Phase 1: LPT (Longest Processing Time first)
-  → Sort units by measured tick cost, assign to lightest thread
+  → Sort units by unit cost, assign to lightest thread
   → 4/3-OPT approximation for multiprocessor scheduling
 
 Phase 2: FM Refinement
@@ -597,7 +597,7 @@ Among all the frameworks above, **SST** and **Manifold** are architecturally clo
 |--------|-----|----------|---------|
 | **Graph analysis** | Computes a single global min-latency across all cross-partition links (`findSyncInterval`); no per-pair analysis, no cycle detection | Computes global or pairwise lookahead during link setup; no cycle detection or topological analysis | Floyd-Warshall all-pairs shortest paths + Tarjan SCC + Johnson's cycle enumeration; classifies every component pair as tight / loose / independent |
 | **Zero-delay connections** | Prohibited between Components (links must have latency > 0); zero-delay interaction requires SubComponent function calls within the same Component tree | Half-tick minimum for inter-component links; intra-LP links can be zero but require same-LP placement | First-class `delay=0` connections on acyclic paths; zero-delay feedback cycles are rejected during initialization |
-| **Partitioning** | 5 built-in strategies; `simple` partitioner maximizes cross-cut latency via pairwise swap; balances component *count*, not computational *cost* | Manual only — user specifies LP assignment per component in driver code | Cost-aware WeightedPartitioner: models per-unit compute cost + sync cost scaled by delay (100x penalty for delay=0, 1/N for delay=N); four-phase optimization (LPT + FM refinement + pairwise swap + multi-unit relocate) minimizes max thread execution time |
+| **Partitioning** | 5 built-in strategies; `simple` partitioner maximizes cross-cut latency via pairwise swap; balances component *count*, not computational *cost* | Manual only — user specifies LP assignment per component in driver code | Cluster-aware solver: models per-unit compute cost + sync cost scaled by delay (100x penalty for delay=0, 1/N for delay=N); default SA solver and optional Weighted solver minimize max thread execution time |
 | **Synchronization protocol** | Barrier-based with skip-ahead: `MPI_Allreduce` computes global min next-activity time, then advances by the static lookahead period; no null messages | Chandy-Misra-Bryant null-message protocol with multiple variants (basic CMB, tick-optimized, Forecast Null-Message for dynamic lookahead, LBTS barrier, quantum) | No runtime protocol. Lookahead bounds are precomputed from the dependency graph; progress tracking uses cache-line-aligned atomics. Each unit checks only its direct predecessors' progress — no global barrier or null-message exchange |
 | **Lookahead exploitation** | Single global value (min cross-partition latency); all components sync at the same interval regardless of local topology | Global or pairwise; FNM variant allows runtime forecast-based dynamic lookahead per LP pair | Per-unit direct-edge lookahead: each unit independently advances based on its immediate predecessors' progress. Transitive closure penalties do not propagate — if A→B (delay=5) and B→C (delay=3), C uses 3 from B directly, not min(5,3) from the transitive path |
 | **Execution model adaptation** | Fixed: always event-driven PDES regardless of topology | Fixed: always null-message PDES (choice of 5 variants, but always PDES) | Adaptive: automatically selects Sequential (when parallel overhead exceeds benefit), Barrier (tight connections present), or Lookahead (loose connections dominate) based on topology analysis |
@@ -616,7 +616,7 @@ Among all the frameworks above, **SST** and **Manifold** are architecturally clo
 
 2. **Per-unit direct-edge lookahead admits more parallelism than global sync intervals.** SST's single global `max_period` is bottlenecked by the shortest cross-partition link in the entire system. A 1-cycle link between two components forces *all* components to synchronize every cycle, even if most have 10+ cycle lookahead. Chronon's per-unit progress tracking means each unit advances at its own safe rate — a tight pair syncs frequently while the rest of the system runs ahead freely.
 
-3. **Cost-aware partitioning outperforms count-balanced or manual placement.** SST's `simple` partitioner balances component count and maximizes cross-cut latency, but ignores that a branch predictor's `tick()` costs 10x less than an OOO scheduler's. If both end up on the same thread, the imbalance is invisible to the partitioner. Manifold has no automatic partitioner at all. Chronon's WeightedPartitioner uses measured per-unit tick costs and a delay-scaled sync cost model to directly minimize the metric that determines simulation throughput: max thread execution time.
+3. **Cost-aware partitioning outperforms count-balanced or manual placement.** SST's `simple` partitioner balances component count and maximizes cross-cut latency, but ignores that a branch predictor's `tick()` costs 10x less than an OOO scheduler's. If both end up on the same thread, the imbalance is invisible to the partitioner. Manifold has no automatic partitioner at all. Chronon's cluster-aware partitioning can use supplied per-unit tick costs and a delay-scaled sync cost model to directly minimize the metric that determines simulation throughput: max thread execution time.
 
 4. **Adaptive execution mode avoids unnecessary overhead.** A deeply pipelined single-core model with mostly `delay=0` connections has little exploitable parallelism. SST and Manifold would still run the full PDES machinery (barrier reduction or null-message exchange) for negligible benefit. Chronon detects this topology and falls back to Sequential mode — zero synchronization overhead, deterministic, and often faster than parallel execution with its attendant scheduling cost.
 
@@ -667,8 +667,8 @@ Beyond SST and Manifold, four other projects tackle subsets of the problems Chro
 
 | Aspect | P-GAS/CRAW/P | Virtual Time III | POSE/CharmDES | DDA-DES | Chronon |
 |--------|-------------|-----------------|---------------|---------|---------|
-| **Initial placement** | Manual — topology-based square-tile grouping; CRAW/P separates cores and routers into different thread types | Not addressed — UVT is purely a synchronization protocol | Manual — user assigns integer handle per poser; Charm++ default round-robin across PEs | Not addressed — no parallel runtime | Automatic — WeightedPartitioner with four-phase optimization (LPT + FM + swap + relocate) |
-| **Cost model** | CRAW/P: per-tile simulation time measured at barriers; standard deviation across threads used to detect imbalance | None | Per-poser metrics: event count, rollback count, avg rollback offset, avg events per step. Load score: 100 if at GVT frontier, 90 if within spec window, 80 otherwise, 50 if idle. PE load = sum of local object scores | N/A | Per-unit measured tick cost + delay-scaled sync cost (100× for delay=0, 1/N for delay=N); minimizes max thread execution time |
+| **Initial placement** | Manual — topology-based square-tile grouping; CRAW/P separates cores and routers into different thread types | Not addressed — UVT is purely a synchronization protocol | Manual — user assigns integer handle per poser; Charm++ default round-robin across PEs | Not addressed — no parallel runtime | Automatic — cluster-aware solver (`SA` by default, `Weighted` optional) |
+| **Cost model** | CRAW/P: per-tile simulation time measured at barriers; standard deviation across threads used to detect imbalance | None | Per-poser metrics: event count, rollback count, avg rollback offset, avg events per step. Load score: 100 if at GVT frontier, 90 if within spec window, 80 otherwise, 50 if idle. PE load = sum of local object scores | N/A | Deterministic unit costs by default, optional measured unit costs, plus delay-scaled sync cost (100× for delay=0, 1/N for delay=N); minimizes max thread execution time |
 | **Rebalancing** | CRAW/P: at barrier points every T cycles, one thread redistributes tiles; interval T set dynamically to keep overhead < 2%. ALWP achieves 14–42% speedup over static | None | Every 51st GVT iteration (configurable `LB_SKIP`): centralized coordinator collects PE loads, identifies overloaded PEs, migrates posers to underloaded PEs. Communication-aware: only migrates objects whose `remoteComm > localComm`, preferentially to the PE with highest communication affinity. Migration happens during GVT quiescence | N/A | Continuous: per-unit tick costs, dependency pressure, and wait attribution sampled at runtime; at scheduler fence points (default interval 8192 cycles), candidate whole-cluster moves are scored and committed only if gain exceeds minimum |
 | **Migration granularity** | Per-tile (1 core + 1 router) | N/A | Per-poser (individual Charm++ chare); leverages Charm++ object migration infrastructure | N/A | Per-tight-cluster (preserves co-located zero-delay groups) |
 
@@ -706,7 +706,7 @@ Beyond SST and Manifold, four other projects tackle subsets of the problems Chro
 
 3. **Per-unit lookahead outperforms global or per-LP synchronization.** P-GAS/CRAW/P uses a single quantum for all components of each type (Q=1 for routers, Q=8 for cores). UVT computes CVT per-LP but requires null-message propagation to advance it. POSE has no lookahead at all — its leash is a speculation bound, not a safety guarantee. Chronon computes per-unit direct-edge lookahead from the connection delay graph: each unit independently advances based on its immediate predecessors' progress. A fetch unit with a 3-cycle queue to decode advances freely while decode and rename (connected at delay=0) synchronize tightly — no global barrier or message exchange needed.
 
-4. **Architecture-aware partitioning requires both topology and cost information.** CRAW/P's insight of separating core and router threads by type is valuable but domain-specific (assumes a mesh NoC topology). UVT and DDA-DES do not address partitioning at all. POSE's load balancer uses coarse event-count-based scoring (100/90/80/50 buckets) without considering per-event execution cost. Chronon's WeightedPartitioner combines measured per-unit tick costs with delay-scaled synchronization costs in a unified objective function, then applies a four-phase optimization that is topology-agnostic — it works for any DAG of TickableUnits, whether modeling a pipeline, a cache hierarchy, or a NoC.
+4. **Architecture-aware partitioning requires both topology and cost information.** CRAW/P's insight of separating core and router threads by type is valuable but domain-specific (assumes a mesh NoC topology). UVT and DDA-DES do not address partitioning at all. POSE's load balancer uses coarse event-count-based scoring (100/90/80/50 buckets) without considering per-event execution cost. Chronon's partition input combines topology, optional measured unit costs, and delay-scaled synchronization costs in a unified objective function, then applies topology-agnostic optimization — it works for any DAG of TickableUnits, whether modeling a pipeline, a cache hierarchy, or a NoC.
 
 5. **DDA-DES identifies a complementary form of parallelism.** DDA-DES's ready-event discovery is orthogonal to spatial decomposition: it finds events that are data-independent regardless of which component they belong to. For architecture simulation, this suggests a potential hybrid approach — Chronon's topology-based spatial parallelism could be augmented with event-level parallelism within each thread's assigned units. However, DDA-DES currently lacks a parallel runtime and its O(k²) pairwise comparison cost at runtime may limit practical applicability for cycle-level simulation where event sets are large and event granularity is small.
 

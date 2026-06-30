@@ -286,6 +286,12 @@ cluster advances) and per-connection MPSC arbitration, with one MPSC flush at th
 end of the run instead of one per epoch. Results stay bit-identical to every other
 mode; only wall-clock changes.
 
+The per-epoch lookahead fallback is deprecated and will be removed in a future
+release. It remains only as a compatibility/safety fallback while epoch-free
+coverage is hardened. Keep `enable_epoch_free_lookahead` enabled and treat any
+runtime fallback warning as a topology or headroom issue to fix. `epoch_size`
+only affects the deprecated fallback; epoch-free lookahead ignores it.
+
 If the safety gate rejects epoch-free execution, Chronon transparently falls
 back to the per-epoch path. Scheduler timeline tracing does not veto epoch-free
 lookahead; idle fast paths are then paced by dependency progress and
@@ -394,16 +400,16 @@ struct TickSimulationConfig {
 
     // Lookahead configuration
     uint32_t max_lookahead_cycles = 100;    // Max cycles a unit can run ahead
-    uint64_t epoch_size = 64;               // Cycles per epoch before sync
+    uint64_t epoch_size = 64;               // Deprecated: fallback-only
     bool enable_epoch_free_lookahead = true;  // Drop the per-epoch barrier when safe
 
     // Debug options
     bool trace_execution = false;           // Log execution mode selection
 
-    // Cost-aware weighted partitioning (default: enabled)
+    // Cluster-aware partitioning (default: enabled)
     bool enable_weighted_partitioning = true;
-    uint64_t profiling_warmup_cycles = 512;       // Warmup before measuring
-    uint64_t profiling_measurement_cycles = 1024; // Measurement window
+    PartitionSolverType partition_solver = PartitionSolverType::SA;
+    double initial_partition_sync_cost_ns = 8.0;  // Locality weight for placement
 
     // Dynamic rebalancing
     bool enable_dynamic_rebalance = false;
@@ -438,16 +444,16 @@ All execution modes wrap tick calls with try-catch to capture exceptions with cr
 
 A unified `stdexec::inplace_stop_source` handles both exception-driven abort and unit-initiated termination. Worker spin-waits check `token.stop_requested()` to exit promptly on either condition. Exceptions are wrapped as `TickException` with unit name and cycle, then rethrown on the main thread by `stdexec::sync_wait`.
 
-## Cost-Aware Weighted Partitioning
+## Cluster-Aware Cost Partitioning
 
 When `enable_weighted_partitioning = true` (default) and at least 4 units exist, TickSimulation uses a unified cluster-aware + cost-aware partitioning pipeline:
 
 ### Algorithm Pipeline
 
-1. **Platform benchmarking**: Measures atomic round-trip sync cost (~36ns typical)
-2. **Tick cost profiling**: Runs each unit for `profiling_warmup_cycles` + `profiling_measurement_cycles` to measure per-unit tick latency (mean/median in nanoseconds)
+1. **Cost model selection**: Uses deterministic unit cost `1.0` plus `initial_partition_sync_cost_ns` by default, or caller-supplied measured costs from `setPrecomputedUnitCosts(...)`
+2. **Solver selection**: Runs `partition_solver` (`SA` by default, `Weighted` optional) against the same partition input
 3. **Tight cluster detection**: Groups units with delay=0 connections into clusters (units within a cluster must share a thread)
-4. **Cluster-level graph partitioning**: Treats each cluster as a super-node with aggregated cost and runs `WeightedPartitioner` to minimize max thread time
+4. **Cluster-level graph partitioning**: Treats each cluster as a super-node with aggregated cost and delay-aware edges
 5. **Thread assignment**: Maps cluster assignments back to per-unit thread assignments
 6. **Queue optimization**: Selects optimal queue type per connection based on thread placement
 

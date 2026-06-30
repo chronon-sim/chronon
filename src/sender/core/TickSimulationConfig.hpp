@@ -40,7 +40,10 @@ struct TickSimulationConfig {
     bool enable_lookahead = true;
 
     uint32_t max_lookahead_cycles = 100;
-    uint64_t epoch_size = 64;  ///< Cycles per epoch before sync.
+    /// Deprecated compatibility knob for the per-epoch lookahead fallback.
+    /// Epoch-free lookahead ignores this value; it will be removed or ignored
+    /// once the fallback scheduler is removed.
+    uint64_t epoch_size = 64;
 
     /// Epoch-free lookahead: in the persistent-worker lookahead path, collapse
     /// the per-epoch std::barrier into a single
@@ -52,6 +55,10 @@ struct TickSimulationConfig {
     /// per-connection progress; otherwise it falls back to the barrier path.
     /// Results are identical to the barrier path — it trades per-epoch straggler
     /// idle for lookahead-window slack.
+    ///
+    /// Setting this to false selects the deprecated per-epoch lookahead
+    /// fallback. That fallback is retained for compatibility and will be
+    /// removed in a future release.
     bool enable_epoch_free_lookahead = true;
 
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< 1 GHz default.
@@ -59,6 +66,8 @@ struct TickSimulationConfig {
     bool trace_execution = false;
     SchedulerTimelineTraceConfig timeline_trace;
 
+    /// Enables the cluster-aware partitioning path. When false, Chronon falls
+    /// back to the legacy topology-only thread assignment.
     bool enable_weighted_partitioning = true;
 
     bool enable_dynamic_rebalance = false;
@@ -68,6 +77,8 @@ struct TickSimulationConfig {
     uint64_t rebalance_cooldown_cycles =
         0;  ///< Minimum cycles between rebalances (0 disables cooldown).
 
+    /// Initial partition solver used by the cluster-aware path. SA is the
+    /// default; Weighted keeps the deterministic four-phase solver available.
     enum class PartitionSolverType { Weighted, SA };
     PartitionSolverType partition_solver = PartitionSolverType::SA;
 

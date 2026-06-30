@@ -70,18 +70,24 @@ struct SimulationYAMLConfig {
     bool enable_lookahead = true;
     bool trace_execution = false;  ///< Print execution policy details.
     uint32_t max_lookahead_cycles = 100;
-    uint64_t epoch_size = 64;                 ///< Synchronization period in cycles.
-    bool enable_epoch_free_lookahead = true;  ///< Drop the per-epoch barrier when safe.
-    uint64_t run_cycles = 0;                  ///< 0 = run until completion.
+    /// Deprecated compatibility knob for the per-epoch lookahead fallback.
+    /// Epoch-free lookahead ignores this value.
+    uint64_t epoch_size = 64;
+    /// Drop the per-epoch barrier when safe. Setting this false selects the
+    /// deprecated per-epoch fallback, which will be removed in a future release.
+    bool enable_epoch_free_lookahead = true;
+    uint64_t run_cycles = 0;  ///< 0 = run until completion.
     std::string name = "simulation";
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< Default 1 GHz.
 
+    /// Enables cluster-aware partitioning. False keeps the legacy topology-only path.
     bool enable_weighted_partitioning = true;
     bool enable_dynamic_rebalance = false;
     double rebalance_imbalance_threshold = 1.3;
     uint64_t rebalance_check_interval_cycles = 8192;
     double rebalance_min_gain = 0.05;
     uint64_t rebalance_cooldown_cycles = 0;
+    /// Initial cluster-aware partition solver: "SA" (default) or "Weighted".
     std::string partition_solver = "SA";
     double sa_critical_path_weight = 0.0;  ///< 0 disables the SA critical-path term.
     double initial_partition_sync_cost_ns =
