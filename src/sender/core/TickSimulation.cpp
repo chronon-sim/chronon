@@ -54,15 +54,9 @@ void TickSimulation::initialize() {
         precomputed_unit_costs_ = std::move(remapped);
     }
 
-    if (config_.enable_lookahead && !unit_ptrs_.empty()) {
-        analysis_ = CycleAnalyzer::analyze(dep_graph_);
-    }
-
     // With tight (delay=0) connections, lookahead degenerates to per-cycle
     // and barrier mode has less sync overhead.
     has_tight_connections_ = hasTightConnections();
-
-    buildPredecessorCache();
 
     auto& obs_mgr = observe::ObservationManager::instance();
     if (obs_mgr.isEnabled()) {
@@ -447,35 +441,6 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
     return executed;
 }
 
-void TickSimulation::executeUnitToTarget(size_t unit_idx, uint64_t target_cycle) {
-    auto* unit = unit_ptrs_[unit_idx];
-    while (unit->localCycle() < target_cycle) {
-        executeUnitCycle_(unit, unit->localCycle());
-    }
-    // No try-catch: stdexec propagates exceptions natively in parallel
-    // paths; sequential paths use throwTickException.
-}
-
-uint64_t TickSimulation::computeSafeBoundary(size_t unit_idx, uint64_t epoch_end) const {
-    if (!config_.enable_lookahead) {
-        return epoch_end;
-    }
-
-    uint64_t min_safe = epoch_end;
-
-    // DIRECT predecessors only; transitive constraints are already enforced
-    // by intermediate units. Using Floyd-Warshall distances would
-    // over-constrain the schedule.
-    for (const auto& [pred_idx, delay] : predecessor_cache_[unit_idx]) {
-        uint64_t pred_cycle = unit_progress_[pred_idx].load(std::memory_order_acquire);
-        uint64_t safe = pred_cycle + delay;
-        min_safe = std::min(min_safe, safe);
-    }
-
-    uint64_t current = unit_ptrs_[unit_idx]->localCycle();
-    return std::min(min_safe, current + config_.max_lookahead_cycles);
-}
-
 // ---------------------------------------------------------------------------
 // Dependency analysis and topological ordering
 // ---------------------------------------------------------------------------
@@ -488,26 +453,6 @@ void TickSimulation::buildDependencyGraph() {
     }
 
     dep_graph_.build(unit_as_base, connections_);
-}
-
-void TickSimulation::buildPredecessorCache() {
-    predecessor_cache_.clear();
-    predecessor_cache_.resize(units_.size());
-
-    std::unordered_map<Unit*, size_t> unit_to_idx;
-    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-        unit_to_idx[static_cast<Unit*>(unit_ptrs_[i])] = i;
-    }
-
-    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-        Unit* unit = static_cast<Unit*>(unit_ptrs_[i]);
-        for (const auto& [pred, delay] : dep_graph_.predecessors(unit)) {
-            auto it = unit_to_idx.find(pred);
-            if (it != unit_to_idx.end()) {
-                predecessor_cache_[i].emplace_back(it->second, delay);
-            }
-        }
-    }
 }
 
 void TickSimulation::reorderUnitsTopologically_() {

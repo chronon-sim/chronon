@@ -406,10 +406,10 @@ struct TickSimulationConfig {
     // Debug options
     bool trace_execution = false;           // Log execution mode selection
 
-    // Cost-aware weighted partitioning (default: enabled)
+    // Cluster-aware partitioning (default: enabled)
     bool enable_weighted_partitioning = true;
-    uint64_t profiling_warmup_cycles = 512;       // Warmup before measuring
-    uint64_t profiling_measurement_cycles = 1024; // Measurement window
+    PartitionSolverType partition_solver = PartitionSolverType::SA;
+    double initial_partition_sync_cost_ns = 8.0;  // Locality weight for placement
 
     // Dynamic rebalancing
     bool enable_dynamic_rebalance = false;
@@ -444,16 +444,16 @@ All execution modes wrap tick calls with try-catch to capture exceptions with cr
 
 A unified `stdexec::inplace_stop_source` handles both exception-driven abort and unit-initiated termination. Worker spin-waits check `token.stop_requested()` to exit promptly on either condition. Exceptions are wrapped as `TickException` with unit name and cycle, then rethrown on the main thread by `stdexec::sync_wait`.
 
-## Cost-Aware Weighted Partitioning
+## Cluster-Aware Cost Partitioning
 
 When `enable_weighted_partitioning = true` (default) and at least 4 units exist, TickSimulation uses a unified cluster-aware + cost-aware partitioning pipeline:
 
 ### Algorithm Pipeline
 
-1. **Platform benchmarking**: Measures atomic round-trip sync cost (~36ns typical)
-2. **Tick cost profiling**: Runs each unit for `profiling_warmup_cycles` + `profiling_measurement_cycles` to measure per-unit tick latency (mean/median in nanoseconds)
+1. **Cost model selection**: Uses deterministic unit cost `1.0` plus `initial_partition_sync_cost_ns` by default, or caller-supplied measured costs from `setPrecomputedUnitCosts(...)`
+2. **Solver selection**: Runs `partition_solver` (`SA` by default, `Weighted` optional) against the same partition input
 3. **Tight cluster detection**: Groups units with delay=0 connections into clusters (units within a cluster must share a thread)
-4. **Cluster-level graph partitioning**: Treats each cluster as a super-node with aggregated cost and runs `WeightedPartitioner` to minimize max thread time
+4. **Cluster-level graph partitioning**: Treats each cluster as a super-node with aggregated cost and delay-aware edges
 5. **Thread assignment**: Maps cluster assignments back to per-unit thread assignments
 6. **Queue optimization**: Selects optimal queue type per connection based on thread placement
 

@@ -80,12 +80,14 @@ struct SimulationYAMLConfig {
     std::string name = "simulation";
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< Default 1 GHz.
 
+    /// Enables cluster-aware partitioning. False keeps the legacy topology-only path.
     bool enable_weighted_partitioning = true;
     bool enable_dynamic_rebalance = false;
     double rebalance_imbalance_threshold = 1.3;
     uint64_t rebalance_check_interval_cycles = 8192;
     double rebalance_min_gain = 0.05;
     uint64_t rebalance_cooldown_cycles = 0;
+    /// Initial cluster-aware partition solver: "SA" (default) or "Weighted".
     std::string partition_solver = "SA";
     double sa_critical_path_weight = 0.0;  ///< 0 disables the SA critical-path term.
     double initial_partition_sync_cost_ns =

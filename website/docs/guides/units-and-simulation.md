@@ -90,10 +90,10 @@ struct TickSimulationConfig {
     bool enable_epoch_free_lookahead = true; // Keep enabled; fallback is deprecated
     bool trace_execution = false;            // Print execution policy details
 
-    // Cost-aware weighted partitioning (profiles tick costs, partitions by weight)
+    // Cluster-aware partitioning
     bool enable_weighted_partitioning = true;
-    uint64_t profiling_warmup_cycles = 512;
-    uint64_t profiling_measurement_cycles = 1024;
+    PartitionSolverType partition_solver = PartitionSolverType::SA;
+    double initial_partition_sync_cost_ns = 8.0;  // Locality weight for placement
 
     // Dynamic rebalancing
     bool enable_dynamic_rebalance = false;

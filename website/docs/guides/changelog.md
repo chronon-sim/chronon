@@ -141,7 +141,7 @@ The previous thread assignment used topology-only heuristics (cluster size, unit
 
 ### Changes
 
-- **Unified cluster-aware + cost-aware partitioning**: New default path (`enable_weighted_partitioning = true`) that profiles per-unit tick costs, detects tight clusters, builds a cluster-level partition graph, and runs `WeightedPartitioner` to minimize max thread time.
+- **Unified cluster-aware + cost-aware partitioning**: New default path (`enable_weighted_partitioning = true`) that detects tight clusters, builds a cluster-level partition graph, and minimizes max thread time. Current initial placement uses deterministic unit costs by default, with measured costs available through `setPrecomputedUnitCosts(...)`.
 - **WeightedPartitioner** (`src/sender/schedule/WeightedPartitioner.hpp`): Four-phase algorithm — LPT initial placement (4/3-OPT makespan), FM refinement (up to 5 passes, move units between heaviest/lightest threads), all-pairs pairwise swap (escapes balanced-but-suboptimal local minima), and multi-unit relocate (removes pairs from bottleneck thread).
 - **Delay-aware sync cost model**: Sync cost scales as `platform_sync_ns * connections * delay_factor`. Delay=0 edges get 100x penalty (forcing co-location for inline connections), delay=1 gets 1x, delay=N gets 1/N. Adjacency uses directed edges (one entry per Connection) to avoid double-counting bus connections.
 - **Improved parallel-beneficial heuristic**: `max_cost * 1.10 < total_cost` instead of `max < 1.5 * avg`. Correctly accepts parallelization at moderate imbalance (e.g., 1.75x speedup) while rejecting extreme cases.
@@ -168,8 +168,8 @@ New `TickSimulationConfig` fields:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enable_weighted_partitioning` | `true` | Enable cost-aware weighted partitioning |
-| `profiling_warmup_cycles` | `512` | Warmup ticks before measuring |
-| `profiling_measurement_cycles` | `1024` | Measurement window for tick costs |
+| `partition_solver` | `SA` | Initial partition solver (`SA` or `Weighted`) |
+| `initial_partition_sync_cost_ns` | `8.0` | Locality weight for deterministic initial placement |
 | `enable_dynamic_rebalance` | `false` | Runtime rebalancing based on tick samples |
 | `rebalance_imbalance_threshold` | `1.3` | Imbalance ratio to trigger rebalance |
 | `rebalance_check_interval_cycles` | `8192` | Cycles between rebalance checks |

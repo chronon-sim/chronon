@@ -15,7 +15,6 @@
 #include "../../observe/ObservationManager.hpp"
 #include "../port/Connection.hpp"
 #include "../port/Port.hpp"
-#include "../schedule/CycleAnalyzer.hpp"
 #include "../schedule/DependencyGraph.hpp"
 #include "../schedule/PlatformBenchmark.hpp"
 #include "../schedule/SchedulerTimelineTrace.hpp"
@@ -405,17 +404,7 @@ private:
         }
     }
 
-    void executeUnitToTarget(size_t unit_idx, uint64_t target_cycle);
-
-    /**
-     * Compute safe execution boundary for a unit using DIRECT predecessors
-     * only — transitive constraints are already enforced by intermediate
-     * units. Floyd-Warshall distances would over-constrain the schedule.
-     */
-    uint64_t computeSafeBoundary(size_t unit_idx, uint64_t epoch_end) const;
-
     void buildDependencyGraph();
-    void buildPredecessorCache();
     void validateNoZeroDelayCycles_() const;
 
     /**
@@ -640,11 +629,6 @@ private:
     std::vector<IArbitratablePort*> mpsc_inports_;
 
     DependencyGraph dep_graph_;
-    AnalysisResult analysis_;
-
-    /// predecessor_cache_[unit_idx] = [(pred_idx, delay), ...]
-    std::vector<std::vector<std::pair<size_t, uint32_t>>> predecessor_cache_;
-
     TightCouplingResult clusters_;
     std::vector<size_t> unit_to_cluster_;
     std::vector<size_t> cluster_to_thread_;

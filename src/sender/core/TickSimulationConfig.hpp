@@ -66,6 +66,8 @@ struct TickSimulationConfig {
     bool trace_execution = false;
     SchedulerTimelineTraceConfig timeline_trace;
 
+    /// Enables the cluster-aware partitioning path. When false, Chronon falls
+    /// back to the legacy topology-only thread assignment.
     bool enable_weighted_partitioning = true;
 
     bool enable_dynamic_rebalance = false;
@@ -75,6 +77,8 @@ struct TickSimulationConfig {
     uint64_t rebalance_cooldown_cycles =
         0;  ///< Minimum cycles between rebalances (0 disables cooldown).
 
+    /// Initial partition solver used by the cluster-aware path. SA is the
+    /// default; Weighted keeps the deterministic four-phase solver available.
     enum class PartitionSolverType { Weighted, SA };
     PartitionSolverType partition_solver = PartitionSolverType::SA;
 
