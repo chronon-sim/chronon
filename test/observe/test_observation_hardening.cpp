@@ -105,6 +105,33 @@ void test_source_registry_freezes_after_backend_start() {
     std::cout << "PASSED\n";
 }
 
+void test_timeline_disabled_config_disables_producer() {
+    std::cout << "Testing timeline disabled config disables producer... ";
+
+    auto& mgr = ObservationManager::instance();
+    mgr.reset();
+
+    auto cfg = makeEnabledConfig("/tmp/chronon_obs_timeline_disabled");
+    cfg.timeline.enabled = false;
+    mgr.initialize(cfg);
+
+    ObservationContext* ctx = mgr.createContextForUnit("timeline_disabled", []() { return 0ULL; });
+    assert(ctx != nullptr);
+    assert(!ctx->timelineEventsEnabled());
+
+    ctx->enableCategory(category::TRACE);
+    assert(!ctx->timelineEvent(category::TRACE, TimelineEventKind::Instant, /*track_id=*/1,
+                               /*slot=*/0, /*name_id=*/0, /*payload=*/0, nullptr, 0));
+    assert(ctx->observationStats().get<ObservationChannel::Trace>().emitted == 0);
+    assert(ctx->observationStats().get<ObservationChannel::Trace>().dropped == 0);
+
+    mgr.shutdown();
+    mgr.reset();
+    std::filesystem::remove_all(cfg.output_dir);
+
+    std::cout << "PASSED\n";
+}
+
 void test_reorder_buffer_force_flush() {
     std::cout << "Testing reorder buffer force flush behavior... ";
 
@@ -622,6 +649,7 @@ int main() {
 
     test_reinitialize_without_deadlock();
     test_source_registry_freezes_after_backend_start();
+    test_timeline_disabled_config_disables_producer();
     test_reorder_buffer_force_flush();
     test_lookahead_structured_args_commit_and_rollback();
     test_no_drops_under_pressure_debug();
