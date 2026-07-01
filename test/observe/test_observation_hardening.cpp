@@ -47,6 +47,25 @@
 #include "observe/ReorderBuffer.hpp"
 #include "observe/ThreadContextManager.hpp"
 
+namespace chronon::observe {
+
+struct ObservationBackendTestAccess {
+    static size_t pipelineSliceNameCacheMaxEntries() {
+        return ObservationBackend::PIPELINE_SLICE_NAME_CACHE_MAX_ENTRIES;
+    }
+
+    static const ObservationBackend::PipelineSliceNames& pipelineSliceNames(
+        ObservationBackend& backend, uint64_t payload, bool hex_name) {
+        return backend.pipelineSliceNames_(payload, hex_name);
+    }
+
+    static size_t pipelineSliceNameCacheSize(ObservationBackend& backend, bool hex_name) {
+        return backend.pipeline_slice_name_cache_[hex_name ? 1 : 0].size();
+    }
+};
+
+}  // namespace chronon::observe
+
 using namespace chronon::observe;
 using namespace pftrace_test;
 
@@ -642,6 +661,32 @@ void test_counter_group_does_not_collide_with_child_unit() {
     std::cout << "PASSED\n";
 }
 
+void test_pipeline_slice_name_cache_is_bounded() {
+    std::cout << "Testing pipeline slice name cache bound... ";
+
+    ObservationQueue queue(1024);
+    ObservationBackend backend(queue);
+    const size_t max_entries = ObservationBackendTestAccess::pipelineSliceNameCacheMaxEntries();
+
+    for (size_t i = 0; i < max_entries; ++i) {
+        const auto& names = ObservationBackendTestAccess::pipelineSliceNames(backend, i, false);
+        CHECK(!names.category.empty());
+        CHECK(names.event_name.starts_with(std::to_string(i)));
+    }
+    CHECK(ObservationBackendTestAccess::pipelineSliceNameCacheSize(backend, false) == max_entries);
+
+    const auto& overflow = ObservationBackendTestAccess::pipelineSliceNames(
+        backend, static_cast<uint64_t>(max_entries), false);
+    CHECK(overflow.event_name.starts_with(std::to_string(max_entries)));
+    CHECK(ObservationBackendTestAccess::pipelineSliceNameCacheSize(backend, false) == max_entries);
+
+    const auto& hex = ObservationBackendTestAccess::pipelineSliceNames(backend, 0x2a, true);
+    CHECK(hex.event_name.starts_with("0x2a"));
+    CHECK(ObservationBackendTestAccess::pipelineSliceNameCacheSize(backend, true) == 1);
+
+    std::cout << "PASSED\n";
+}
+
 }  // namespace
 
 int main() {
@@ -657,6 +702,7 @@ int main() {
     test_spin_wait_exits_when_wakeup_is_removed();
     test_timeline_restart_redeclares_tracks();
     test_counter_group_does_not_collide_with_child_unit();
+    test_pipeline_slice_name_cache_is_bounded();
 
     std::cout << "\n=== Observation hardening tests PASSED ===\n";
     return 0;

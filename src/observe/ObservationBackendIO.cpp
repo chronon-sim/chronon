@@ -281,7 +281,7 @@ const ObservationBackend::PipelineSliceNames& ObservationBackend::pipelineSliceN
     uint64_t payload, bool hex_name) {
     auto& cache = pipeline_slice_name_cache_[hex_name ? 1 : 0];
     if (cache.empty()) {
-        cache.reserve(65536);
+        cache.reserve(PIPELINE_SLICE_NAME_CACHE_MAX_ENTRIES);
     }
     auto it = cache.find(payload);
     if (it != cache.end()) {
@@ -293,6 +293,11 @@ const ObservationBackend::PipelineSliceNames& ObservationBackend::pipelineSliceN
         hex_name ? fmt::format("0x{:x}", payload) : fmt::format("{}", payload);
     PipelineSliceNames names{pipelineColorCategory(color_hash),
                              pipelineColoredEventName(visible_name, color_hash)};
+    if (cache.size() >= PIPELINE_SLICE_NAME_CACHE_MAX_ENTRIES) {
+        pipeline_slice_name_scratch_ = std::move(names);
+        return pipeline_slice_name_scratch_;
+    }
+
     auto [inserted, _] = cache.emplace(payload, std::move(names));
     return inserted->second;
 }
