@@ -368,20 +368,31 @@ private:
                 stdexec::just(), stdexec::par, num_threads, [this, cycle](std::size_t thread_idx) {
                     if (timeline_trace_.traceUnits()) {
                         auto& points = thread_trace_points_[thread_idx];
+                        const bool trace_thread_cpu = timeline_trace_.traceThreadCpuTime();
+                        auto* cpu_points =
+                            trace_thread_cpu ? &thread_trace_cpu_points_[thread_idx] : nullptr;
                         std::vector<char> active(thread_units_[thread_idx].size(), 0);
                         points[0] = SchedulerTimelineTrace::Clock::now();
+                        if (cpu_points) {
+                            (*cpu_points)[0] = threadTraceCpuPoint_();
+                        }
                         for (size_t pos = 0; pos < thread_units_[thread_idx].size(); ++pos) {
                             size_t unit_idx = thread_units_[thread_idx][pos];
                             active[pos] = executeUnitCycle_(unit_ptrs_[unit_idx],
                                                             unit_ptrs_[unit_idx]->localCycle());
                             points[pos + 1] = SchedulerTimelineTrace::Clock::now();
+                            if (cpu_points) {
+                                (*cpu_points)[pos + 1] = threadTraceCpuPoint_();
+                            }
                         }
                         for (size_t pos = 0; pos < thread_units_[thread_idx].size(); ++pos) {
                             size_t unit_idx = thread_units_[thread_idx][pos];
-                            timeline_trace_.recordDuration(
+                            recordUnitDuration_(
                                 thread_idx, active[pos] ? "unit" : "unit idle",
                                 unit_ptrs_[unit_idx]->name(), cycle, points[pos], points[pos + 1],
-                                active[pos] ? "" : "cycles=1");
+                                active[pos] ? "" : "cycles=1", trace_thread_cpu,
+                                cpu_points ? (*cpu_points)[pos] : ThreadTraceCpuPoint{},
+                                cpu_points ? (*cpu_points)[pos + 1] : ThreadTraceCpuPoint{});
                         }
                     } else {
                         for (size_t unit_idx : thread_units_[thread_idx]) {
@@ -557,6 +568,17 @@ private:
                             SchedulerTimelineTrace::TimePoint begin,
                             SchedulerTimelineTrace::TimePoint end);
     std::string formatBlockerDetail_(const BlockedClusterInfo& blocker) const;
+    struct ThreadTraceCpuPoint {
+        uint64_t cpu_time_ns = 0;
+        uint32_t tid = 0;
+        int cpu = -1;
+    };
+    static ThreadTraceCpuPoint threadTraceCpuPoint_() noexcept;
+    void recordUnitDuration_(size_t thread_idx, std::string_view category, std::string_view name,
+                             uint64_t cycle, SchedulerTimelineTrace::TimePoint begin,
+                             SchedulerTimelineTrace::TimePoint end, std::string_view detail,
+                             bool include_thread_cpu_time, ThreadTraceCpuPoint cpu_begin,
+                             ThreadTraceCpuPoint cpu_end);
     void executeClusterOneCycle_(size_t thread_idx, size_t cluster, uint64_t cycle,
                                  bool trace_units);
 
@@ -650,6 +672,7 @@ private:
     std::vector<std::vector<TickableUnit*>> cluster_unit_ptrs_;
     std::vector<std::vector<size_t>> cluster_thread_unit_positions_;
     std::vector<std::vector<SchedulerTimelineTrace::TimePoint>> thread_trace_points_;
+    std::vector<std::vector<ThreadTraceCpuPoint>> thread_trace_cpu_points_;
 
     enum class MigrationRequestState : uint8_t {
         None = 0,

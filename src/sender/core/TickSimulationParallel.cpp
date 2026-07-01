@@ -14,11 +14,18 @@
 #include <barrier>
 #include <chrono>
 #include <cstdlib>
+#include <ctime>
 #include <exception>
 #include <limits>
 #include <new>
 #include <string>
 #include <unordered_map>
+
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #include "../../chronon/CpuPause.hpp"
 #include "TickSimulation.hpp"
@@ -47,6 +54,23 @@ bool clusterHasMPSCConnections(const std::vector<TickableUnit*>& units) noexcept
     return false;
 }
 }  // namespace
+
+TickSimulation::ThreadTraceCpuPoint TickSimulation::threadTraceCpuPoint_() noexcept {
+    ThreadTraceCpuPoint point{};
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec ts{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+        point.cpu_time_ns =
+            static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ull + static_cast<uint64_t>(ts.tv_nsec);
+    }
+#endif
+#if defined(__linux__)
+    static thread_local uint32_t cached_tid = static_cast<uint32_t>(::syscall(SYS_gettid));
+    point.tid = cached_tid;
+    point.cpu = ::sched_getcpu();
+#endif
+    return point;
+}
 
 // ---------------------------------------------------------------------------
 // MPSC producer progress wiring
@@ -220,11 +244,18 @@ void TickSimulation::initProgressSync() {
 
 void TickSimulation::initTimelineTraceScratch_() {
     thread_trace_points_.clear();
+    thread_trace_cpu_points_.clear();
     if (!timeline_trace_.traceUnits() || thread_units_.empty()) return;
 
     thread_trace_points_.resize(thread_units_.size());
+    if (timeline_trace_.traceThreadCpuTime()) {
+        thread_trace_cpu_points_.resize(thread_units_.size());
+    }
     for (size_t t = 0; t < thread_units_.size(); ++t) {
         thread_trace_points_[t].resize(thread_units_[t].size() + 1);
+        if (!thread_trace_cpu_points_.empty()) {
+            thread_trace_cpu_points_[t].resize(thread_units_[t].size() + 1);
+        }
     }
 }
 
@@ -746,6 +777,40 @@ std::string TickSimulation::formatBlockerDetail_(const BlockedClusterInfo& block
            " delay=" + std::to_string(blocker.delay);
 }
 
+void TickSimulation::recordUnitDuration_(size_t thread_idx, std::string_view category,
+                                         std::string_view name, uint64_t cycle,
+                                         SchedulerTimelineTrace::TimePoint begin,
+                                         SchedulerTimelineTrace::TimePoint end,
+                                         std::string_view detail, bool include_thread_cpu_time,
+                                         ThreadTraceCpuPoint cpu_begin,
+                                         ThreadTraceCpuPoint cpu_end) {
+    if (!include_thread_cpu_time) {
+        timeline_trace_.recordDuration(thread_idx, category, name, cycle, begin, end, detail);
+        return;
+    }
+
+    const uint64_t wall_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+    const uint64_t thread_cpu_ns = cpu_end.cpu_time_ns >= cpu_begin.cpu_time_ns
+                                       ? cpu_end.cpu_time_ns - cpu_begin.cpu_time_ns
+                                       : 0;
+    const uint64_t wall_cpu_gap_ns = wall_ns > thread_cpu_ns ? wall_ns - thread_cpu_ns : 0;
+
+    std::string enriched;
+    if (!detail.empty()) {
+        enriched.assign(detail);
+        enriched.push_back(' ');
+    }
+    enriched += "wall_ns=" + std::to_string(wall_ns);
+    enriched += " thread_cpu_ns=" + std::to_string(thread_cpu_ns);
+    enriched += " wall_cpu_gap_ns=" + std::to_string(wall_cpu_gap_ns);
+    enriched += " tid=" + std::to_string(cpu_begin.tid);
+    enriched += " cpu_begin=" + std::to_string(cpu_begin.cpu);
+    enriched += " cpu_end=" + std::to_string(cpu_end.cpu);
+
+    timeline_trace_.recordDuration(thread_idx, category, name, cycle, begin, end, enriched);
+}
+
 void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, uint64_t cycle,
                                              bool trace_units) {
     auto* const* units = cluster_unit_ptrs_[cluster].data();
@@ -756,8 +821,16 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
         if (points.size() < num_units + 1) {
             points.resize(num_units + 1);
         }
+        const bool trace_thread_cpu = timeline_trace_.traceThreadCpuTime();
+        auto* cpu_points = trace_thread_cpu ? &thread_trace_cpu_points_[thread_idx] : nullptr;
+        if (cpu_points && cpu_points->size() < num_units + 1) {
+            cpu_points->resize(num_units + 1);
+        }
         std::vector<char> active(num_units, 0);
         points[0] = SchedulerTimelineTrace::Clock::now();
+        if (cpu_points) {
+            (*cpu_points)[0] = threadTraceCpuPoint_();
+        }
         for (size_t u = 0; u < num_units; ++u) {
             const bool sample_tick =
                 config_.enable_dynamic_rebalance &&
@@ -765,6 +838,9 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
                 (cycle & 1023u) == 0;
             active[u] = executeUnitCycle_(units[u], cycle);
             points[u + 1] = SchedulerTimelineTrace::Clock::now();
+            if (cpu_points) {
+                (*cpu_points)[u + 1] = threadTraceCpuPoint_();
+            }
 
             if (__builtin_expect(sample_tick, 0)) {
                 uint64_t elapsed_ns = static_cast<uint64_t>(
@@ -775,9 +851,11 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
             }
         }
         for (size_t u = 0; u < num_units; ++u) {
-            timeline_trace_.recordDuration(thread_idx, active[u] ? "unit" : "unit idle",
-                                           units[u]->name(), cycle, points[u], points[u + 1],
-                                           active[u] ? "" : "cycles=1");
+            recordUnitDuration_(thread_idx, active[u] ? "unit" : "unit idle", units[u]->name(),
+                                cycle, points[u], points[u + 1], active[u] ? "" : "cycles=1",
+                                trace_thread_cpu,
+                                cpu_points ? (*cpu_points)[u] : ThreadTraceCpuPoint{},
+                                cpu_points ? (*cpu_points)[u + 1] : ThreadTraceCpuPoint{});
         }
     } else if (__builtin_expect(
                    config_.enable_dynamic_rebalance &&

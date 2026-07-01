@@ -88,6 +88,9 @@ public:
     bool countersEnabled() const noexcept { return counters_enabled_; }
     void setCountersEnabled(bool enabled) noexcept { counters_enabled_ = enabled; }
 
+    bool timelineEventsEnabled() const noexcept { return timeline_events_enabled_; }
+    void setTimelineEventsEnabled(bool enabled) noexcept { timeline_events_enabled_ = enabled; }
+
     FixedCounterStorage& counters() noexcept { return counters_; }
     const FixedCounterStorage& counters() const noexcept { return counters_; }
 
@@ -274,6 +277,10 @@ public:
     bool timelineEvent(CategoryMask category, TimelineEventKind kind, uint32_t track_id,
                        uint16_t slot, uint16_t name_id, uint64_t payload,
                        const TimelineArgValue* args, size_t arg_count, uint8_t flags = 0) noexcept {
+        if (OBSERVE_UNLIKELY(!timeline_events_enabled_)) {
+            return false;
+        }
+
         const bool allowed =
             (kind == TimelineEventKind::SpanEnd)
                 ? (category != category::NONE ? filter_.shouldObserve(category | category::TRACE)
@@ -601,6 +608,7 @@ private:
 
     FixedCounterStorage counters_{"unit"};
     bool counters_enabled_ = true;
+    bool timeline_events_enabled_ = true;
 
     std::vector<DerivedCounterDef> derived_counter_defs_;
 

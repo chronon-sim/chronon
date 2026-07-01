@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <deque>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -95,6 +96,7 @@ size_t nextTopLevelPacketEnd(const uint8_t* data, size_t size, size_t pos) {
 struct PerfettoTraceWriter::Impl {
     std::ofstream file;
     protozero::HeapBuffered<pbz::Trace> trace;
+    std::vector<uint8_t> compression_buffer;
     size_t packets_buffered = 0;
     Options options;
     std::unordered_map<uint64_t, int32_t> next_child_rank;
@@ -102,15 +104,27 @@ struct PerfettoTraceWriter::Impl {
     /// String → iid map for one InternedData field; iids restart at 1 after
     /// every SEQ_INCREMENTAL_STATE_CLEARED.
     struct InternTable {
-        std::unordered_map<std::string, uint64_t> map;
+        std::deque<std::string> storage;
+        std::unordered_map<std::string_view, uint64_t> map;
 
-        void clear() { map.clear(); }
+        void clear() {
+            map.clear();
+            storage.clear();
+        }
 
         /// @return {iid, inserted}; inserted means the caller must emit the
         /// InternedData entry on the current packet.
         std::pair<uint64_t, bool> intern(std::string_view s) {
-            auto [it, inserted] = map.try_emplace(std::string(s), map.size() + 1);
-            return {it->second, inserted};
+            auto it = map.find(s);
+            if (it != map.end()) {
+                return {it->second, false};
+            }
+
+            storage.emplace_back(s);
+            const std::string_view stable_key(storage.back());
+            const uint64_t iid = map.size() + 1;
+            auto [entry, _] = map.emplace(stable_key, iid);
+            return {entry->second, true};
         }
     };
 
@@ -680,7 +694,8 @@ void PerfettoTraceWriter::flush() {
 /// appends it raw when compression fails.
 void PerfettoTraceWriter::writeChunk_(const uint8_t* data, size_t size) {
     uLongf compressed_size = compressBound(static_cast<uLong>(size));
-    std::vector<uint8_t> compressed(compressed_size);
+    auto& compressed = impl_->compression_buffer;
+    compressed.resize(compressed_size);
     // compress2 emits a zlib stream, matching Perfetto's own
     // compressed_packets producer; readers auto-detect the format.
     int rc = compress2(compressed.data(), &compressed_size, data, static_cast<uLong>(size),

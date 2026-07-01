@@ -277,6 +277,31 @@ std::string_view ObservationBackend::timelineCategoryName_(uint8_t category_bit)
     return name;
 }
 
+const ObservationBackend::PipelineSliceNames& ObservationBackend::pipelineSliceNames_(
+    uint64_t payload, bool hex_name) {
+    auto& cache = pipeline_slice_name_cache_[hex_name ? 1 : 0];
+    if (cache.empty()) {
+        cache.reserve(PIPELINE_SLICE_NAME_CACHE_MAX_ENTRIES);
+    }
+    auto it = cache.find(payload);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    const uint64_t color_hash = pipelineColorHash(payload);
+    const std::string visible_name =
+        hex_name ? fmt::format("0x{:x}", payload) : fmt::format("{}", payload);
+    PipelineSliceNames names{pipelineColorCategory(color_hash),
+                             pipelineColoredEventName(visible_name, color_hash)};
+    if (cache.size() >= PIPELINE_SLICE_NAME_CACHE_MAX_ENTRIES) {
+        pipeline_slice_name_scratch_ = std::move(names);
+        return pipeline_slice_name_scratch_;
+    }
+
+    auto [inserted, _] = cache.emplace(payload, std::move(names));
+    return inserted->second;
+}
+
 uint64_t ObservationBackend::timelineSlotTrack_(uint32_t track_id, uint16_t slot) {
     if (track_id >= timeline_track_uuids_.size()) {
         timeline_track_uuids_.resize(static_cast<size_t>(track_id) + 1);
@@ -374,19 +399,10 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
 
     switch (kind) {
         case TimelineEventKind::PipelineSlice: {
-            timeline_msg_buffer_.clear();
-            if ((rec.padding[0] & TIMELINE_FLAG_NAME_HEX) != 0) {
-                fmt::format_to(std::back_inserter(timeline_msg_buffer_), "0x{:x}", rec.payload);
-            } else {
-                fmt::format_to(std::back_inserter(timeline_msg_buffer_), "{}", rec.payload);
-            }
-            const std::string_view visible_name(timeline_msg_buffer_.data(),
-                                                timeline_msg_buffer_.size());
-            const uint64_t color_hash = pipelineColorHash(rec.payload);
-            const std::string category = pipelineColorCategory(color_hash);
-            const std::string event_name = pipelineColoredEventName(visible_name, color_hash);
-            perfetto_writer_->sliceBeginWithFlow(track_uuid, category, event_name, rec.cycle,
-                                                 rec.payload, ann_span);
+            const auto& names =
+                pipelineSliceNames_(rec.payload, (rec.padding[0] & TIMELINE_FLAG_NAME_HEX) != 0);
+            perfetto_writer_->sliceBeginWithFlow(track_uuid, names.category, names.event_name,
+                                                 rec.cycle, rec.payload, ann_span);
             const uint64_t end_cycle = rec.cycle + 1;
             perfetto_writer_->sliceEnd(track_uuid, end_cycle);
             if (end_cycle > timeline_max_cycle_) {

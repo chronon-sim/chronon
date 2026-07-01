@@ -793,6 +793,34 @@ void test_disabled_pipeline_skips_track_registration() {
     std::cout << "PASSED\n";
 }
 
+void test_timeline_event_producer_gate() {
+    std::cout << "Testing timeline event producer gate... ";
+
+    ObservationQueue queue(256 * 1024);
+    ObservationContext ctx(&queue, []() { return 0ULL; }, 0, "fetch", 1);
+    ctx.enableCategory(category::TRACE | LANE_CAT.mask());
+
+    TestUnit unit;
+    unit.setObservationContext(&ctx);
+
+    CHECK(ctx.timelineEventsEnabled());
+    ctx.setTimelineEventsEnabled(false);
+    CHECK(!ctx.timelineEventsEnabled());
+
+    unit.cycle = 20;
+    CHECK(!unit.mshr.begin(0, LANE_CAT, "disabled"_ev, flow(7), arg<"addr">(0x100ULL)));
+    unit.cycle = 21;
+    CHECK(!unit.mshr.end(0));
+    unit.cycle = 22;
+    CHECK(!unit.port.instant(0, LANE_CAT, "disabled_instant"_ev));
+
+    const auto& trace_stats = ctx.observationStats().get<ObservationChannel::Trace>();
+    CHECK(trace_stats.emitted == 0);
+    CHECK(trace_stats.dropped == 0);
+
+    std::cout << "PASSED\n";
+}
+
 void test_lookahead_commit_rollback() {
     std::cout << "Testing lookahead commit/rollback of timeline events... ";
 
@@ -992,6 +1020,7 @@ int main() {
     test_timeline_observe_convenience_api();
     test_pipeline_counter_track_ordering();
     test_disabled_pipeline_skips_track_registration();
+    test_timeline_event_producer_gate();
     test_lookahead_commit_rollback();
     measure_producer_cost();
 

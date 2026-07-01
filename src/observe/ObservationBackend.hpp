@@ -166,6 +166,8 @@ public:
     }
 
 private:
+    friend struct ObservationBackendTestAccess;
+
     enum class Channel : uint8_t { Trace = 0, Debug = 1, Info = 2, Warn = 3, Error = 4, Count = 5 };
 
     /// @brief Per-channel file sink: owns an ofstream and a write buffer.
@@ -264,6 +266,15 @@ private:
     /// "timeline" for TIMELINE_NO_CATEGORY / unregistered bits.
     std::string_view timelineCategoryName_(uint8_t category_bit);
 
+    struct PipelineSliceNames {
+        std::string category;
+        std::string event_name;
+    };
+
+    const PipelineSliceNames& pipelineSliceNames_(uint64_t payload, bool hex_name);
+
+    static constexpr size_t PIPELINE_SLICE_NAME_CACHE_MAX_ENTRIES = 65536;
+
     ObservationQueue& queue_;
     Config config_;
 
@@ -274,6 +285,9 @@ private:
     std::unique_ptr<LogFileSink> default_sink_;
     std::array<LogFileSink*, static_cast<size_t>(Channel::Count)> channel_sink_{};
     std::unordered_map<std::string, std::unique_ptr<LogFileSink>> custom_sinks_;
+
+    std::array<std::unordered_map<uint64_t, PipelineSliceNames>, 2> pipeline_slice_name_cache_;
+    PipelineSliceNames pipeline_slice_name_scratch_;
 
     std::thread worker_thread_;
     std::thread io_worker_thread_;
