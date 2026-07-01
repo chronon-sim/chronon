@@ -40,6 +40,8 @@ struct SchedulerTimelineTraceConfig {
     bool trace_waits = true;
     bool trace_epochs = true;
     bool trace_arbitration = true;
+    /// When enabled, unit slices append per-thread CPU time diagnostics to detail.
+    bool trace_thread_cpu_time = false;
     uint64_t min_duration_ns = 0;
 };
 
@@ -64,6 +66,8 @@ public:
         trace_waits_ = config_.enabled && config_.trace_waits;
         trace_epochs_ = config_.enabled && config_.trace_epochs;
         trace_arbitration_ = config_.enabled && config_.trace_arbitration;
+        trace_thread_cpu_time_ =
+            config_.enabled && config_.trace_units && config_.trace_thread_cpu_time;
         written_ = false;
         dropped_events_.store(0, std::memory_order_relaxed);
         event_count_.store(0, std::memory_order_relaxed);
@@ -74,6 +78,7 @@ public:
     bool traceWaits() const noexcept { return trace_waits_; }
     bool traceEpochs() const noexcept { return trace_epochs_; }
     bool traceArbitration() const noexcept { return trace_arbitration_; }
+    bool traceThreadCpuTime() const noexcept { return trace_thread_cpu_time_; }
 
     void start(const std::vector<std::vector<size_t>>& thread_units,
                const std::vector<TickableUnit*>& unit_ptrs) {
@@ -234,6 +239,7 @@ private:
     bool trace_waits_ = false;
     bool trace_epochs_ = false;
     bool trace_arbitration_ = false;
+    bool trace_thread_cpu_time_ = false;
     bool started_ = false;
     bool written_ = false;
     TimePoint base_time_{};

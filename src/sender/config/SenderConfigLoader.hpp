@@ -143,6 +143,7 @@ private:
         LOAD_IF_PRESENT(trace_node, trace_config, trace_waits);
         LOAD_IF_PRESENT(trace_node, trace_config, trace_epochs);
         LOAD_IF_PRESENT(trace_node, trace_config, trace_arbitration);
+        LOAD_IF_PRESENT(trace_node, trace_config, trace_thread_cpu_time);
         LOAD_IF_PRESENT(trace_node, trace_config, min_duration_ns);
 
 #undef LOAD_IF_PRESENT

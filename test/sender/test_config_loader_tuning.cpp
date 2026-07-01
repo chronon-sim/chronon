@@ -91,6 +91,27 @@ simulation:
     std::cout << "PASSED\n";
 }
 
+void test_scheduler_timeline_cpu_time_parse() {
+    std::cout << "Testing scheduler timeline thread CPU time parse... ";
+
+    SenderConfigLoader loader;
+    auto config = loader.loadFromString(R"yaml(
+simulation:
+  observation:
+    timeline:
+      scheduler:
+        enabled: true
+        trace_thread_cpu_time: true
+        min_duration_ns: 100
+)yaml");
+
+    CHECK(config.timeline_trace.enabled);
+    CHECK(config.timeline_trace.trace_thread_cpu_time);
+    CHECK(config.timeline_trace.min_duration_ns == 100);
+
+    std::cout << "PASSED\n";
+}
+
 void test_unit_names_include_programmatic_additions() {
     std::cout << "Testing unitNames includes programmatic additions... ";
 
@@ -246,6 +267,7 @@ int main() {
 
     test_tuning_fields_parse();
     test_tuning_defaults();
+    test_scheduler_timeline_cpu_time_parse();
     test_unit_names_include_programmatic_additions();
     test_unit_names_skip_programmatic_deletions();
     test_unit_tick_interval_parse();
