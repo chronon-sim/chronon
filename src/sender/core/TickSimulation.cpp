@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <cstdlib>
 #include <exception>
-#include <iostream>
 #include <set>
 #include <sstream>
 #include <string>
@@ -278,14 +277,29 @@ void TickSimulation::selectExecutionMode_() {
 }
 
 void TickSimulation::traceExecutionMode_() {
-    if (!observe_ctx_) {
-        return;
+    if (observe_ctx_) {
+        observe::log_info<
+            "Execution policy: mode={} (parallel_requested={}, tight_connections={}, "
+            "parallel_beneficial={})">(
+            observe_ctx_, shouldUseParallelExecution_() ? "parallel" : "sequential",
+            config_.enable_parallel ? "yes" : "no", has_tight_connections_ ? "yes" : "no",
+            parallel_beneficial_ ? "yes" : "no");
     }
-    observe::log_info<
-        "Execution policy: mode={} (parallel_requested={}, tight_connections={}, "
-        "parallel_beneficial={})">(
-        observe_ctx_, shouldUseParallelExecution_() ? "parallel" : "sequential",
-        config_.enable_parallel ? "yes" : "no", has_tight_connections_ ? "yes" : "no",
+    warnParallelFallbackIfNeeded_();
+}
+
+void TickSimulation::warnParallelFallbackIfNeeded_() {
+    if (parallel_fallback_warned_) return;
+    if (!config_.enable_parallel || units_.size() <= 1 || shouldUseParallelExecution_()) return;
+    if (!observe_ctx_) return;
+
+    parallel_fallback_warned_ = true;
+    const uint64_t units = static_cast<uint64_t>(units_.size());
+    const uint64_t threads = static_cast<uint64_t>(config_.num_threads);
+    observe::log_warn<
+        "parallel execution requested but falling back to sequential "
+        "(units={}, num_threads={}, tight_connections={}, parallel_beneficial={})">(
+        observe_ctx_, units, threads, has_tight_connections_ ? "yes" : "no",
         parallel_beneficial_ ? "yes" : "no");
 }
 
@@ -381,23 +395,17 @@ std::string TickSimulation::epochFreeVetoReason_() const {
 }
 
 void TickSimulation::warnDeprecatedEpochLookaheadFallback_(std::string_view reason) {
+    if (!observe_ctx_) return;
+
     static std::atomic<bool> warned{false};
     bool expected = false;
     if (!warned.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
 
     std::string reason_str(reason);
-    if (observe_ctx_) {
-        observe::log_warn<
-            "DEPRECATED: per-epoch lookahead fallback is deprecated and will be removed in a "
-            "future release; enable epoch-free lookahead and satisfy its safety gate. reason={}">(
-            observe_ctx_, reason_str.c_str());
-    } else {
-        std::cerr
-            << "[chronon] DEPRECATED: per-epoch lookahead fallback is deprecated and will be "
-               "removed in a future release; enable epoch-free lookahead and satisfy its safety "
-               "gate. reason="
-            << reason << '\n';
-    }
+    observe::log_warn<
+        "DEPRECATED: per-epoch lookahead fallback is deprecated and will be removed in a "
+        "future release; enable epoch-free lookahead and satisfy its safety gate. reason={}">(
+        observe_ctx_, reason_str.c_str());
 }
 
 uint64_t TickSimulation::runParallel(uint64_t num_cycles) {

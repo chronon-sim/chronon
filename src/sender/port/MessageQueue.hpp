@@ -11,8 +11,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <queue>
 #include <stdexcept>
@@ -20,6 +22,8 @@
 #include <vector>
 
 namespace chronon::sender {
+
+struct LockFreeQueueAdapterTestAccess;
 
 /**
  * LockFreeMessageQueue - Single-producer single-consumer message queue.
@@ -86,7 +90,10 @@ public:
      * @param current_cycle The current simulation cycle
      * @return The message data if available, std::nullopt otherwise
      */
-    std::optional<T> tryPop(uint64_t current_cycle) {
+    template <typename BeforeRelease, typename AfterRelease>
+    std::optional<T> tryPopWithReleaseCallbacks(uint64_t current_cycle,
+                                                BeforeRelease&& before_release,
+                                                AfterRelease&& after_release) {
         size_t head = head_.load(std::memory_order_relaxed);
 
         // Symmetric to tryPush: re-read the producer's tail_ only when the
@@ -103,9 +110,22 @@ public:
             return std::nullopt;
         }
 
+        const uint64_t arrive_cycle = buffer_[head].arrive_cycle;
         T data = std::move(buffer_[head].data);
+        before_release(arrive_cycle);
         head_.store((head + 1) % capacity_, std::memory_order_release);
+        after_release(arrive_cycle);
         return data;
+    }
+
+    template <typename AfterRelease>
+    std::optional<T> tryPopAfterRelease(uint64_t current_cycle, AfterRelease&& after_release) {
+        return tryPopWithReleaseCallbacks(
+            current_cycle, [](uint64_t) {}, [&after_release](uint64_t) { after_release(); });
+    }
+
+    std::optional<T> tryPop(uint64_t current_cycle) {
+        return tryPopAfterRelease(current_cycle, [] {});
     }
 
     /**
@@ -243,7 +263,9 @@ public:
      * @return true if push succeeded, false if queue is full (back pressure)
      */
     bool push(T data, uint64_t arrive_cycle) {
-        // Capacity admission is enforced upstream by Connection/InPort.
+        // Model-visible capacity admission is enforced by Connection. Keeping
+        // this queue permissive preserves same-cycle dequeue/enqueue semantics
+        // for delay>0 register-style edges in single-thread execution.
         messages_.push({std::move(data), arrive_cycle, sequence_++});
         return true;
     }
@@ -307,6 +329,9 @@ public:
         if (capacity_ == UNLIMITED_CAPACITY) {
             return UNLIMITED_CAPACITY;
         }
+        if (messages_.size() >= capacity_) {
+            return 0;
+        }
         return capacity_ - messages_.size();
     }
 
@@ -362,6 +387,14 @@ public:
     virtual size_t capacity() const noexcept = 0;
     virtual size_t storageCapacity() const noexcept { return capacity(); }
     virtual size_t available() const = 0;
+    virtual size_t admissionOccupancy(uint64_t send_cycle) const {
+        (void)send_cycle;
+        return size();
+    }
+    virtual std::optional<uint64_t> admissionMinArrivalCycle(uint64_t send_cycle) const {
+        (void)send_cycle;
+        return minArrivalCycle();
+    }
     virtual void setCapacity(size_t capacity) = 0;
     virtual void clear() = 0;
 };
@@ -435,19 +468,23 @@ public:
                              : std::min(capacity, queue_.usableCapacity())) {}
 
     bool push(T data, uint64_t arrive_cycle) override {
-        // Model-side admission is enforced upstream (Connection::transfer
-        // uses a per-cycle push counter, InPort::canAccept(pending)
-        // checks the same bound). The push path here is authoritative only
-        // about the physical ring capacity: reading the live queue size to
-        // gate on user_capacity_ would race with the consumer thread's
-        // mid-cycle pops (num_workers>=2) and spuriously back-pressure the
-        // producer in sequential num_workers=1 where the consumer always
-        // runs after the producer within the same simulated cycle.
-        return queue_.tryPush(std::move(data), arrive_cycle);
+        // Model-visible capacity admission is enforced by Connection. The ring
+        // remains the physical overflow guard, while Connection supplies the
+        // architectural back-pressure bound.
+        if (!queue_.tryPush(std::move(data), arrive_cycle)) {
+            return false;
+        }
+        admitted_pushes_.fetch_add(1, std::memory_order_release);
+        return true;
     }
 
     std::optional<T> tryPop(uint64_t current_cycle) override {
-        return queue_.tryPop(current_cycle);
+        return queue_.tryPopWithReleaseCallbacks(
+            current_cycle,
+            [this, current_cycle](uint64_t arrive_cycle) {
+                recordPopArrivalForAdmission_(current_cycle, arrive_cycle);
+            },
+            [this, current_cycle](uint64_t) { recordPopCreditForAdmission_(current_cycle); });
     }
 
     std::vector<T> popAll(uint64_t current_cycle) override {
@@ -458,7 +495,7 @@ public:
 
     void popAllInto(std::vector<T>& out, uint64_t current_cycle) override {
         out.clear();
-        while (auto v = queue_.tryPop(current_cycle)) {
+        while (auto v = tryPop(current_cycle)) {
             out.push_back(std::move(*v));
         }
     }
@@ -479,14 +516,92 @@ public:
         const size_t sz = queue_.size();
         return sz < user_capacity_ ? user_capacity_ - sz : 0;
     }
+    size_t admissionOccupancy(uint64_t send_cycle) const override {
+        const size_t pushed = admitted_pushes_.load(std::memory_order_acquire);
+        std::lock_guard<std::mutex> lock(admission_mutex_);
+        retireAdmissionHistoryBeforeLocked_(send_cycle);
+        return pushed > popped_before_front_ ? pushed - popped_before_front_ : 0;
+    }
+    std::optional<uint64_t> admissionMinArrivalCycle(uint64_t send_cycle) const override {
+        std::optional<uint64_t> min = queue_.minArrivalCycle();
+        std::lock_guard<std::mutex> lock(admission_mutex_);
+        retireAdmissionHistoryBeforeLocked_(send_cycle);
+        if (!pop_arrivals_.empty() && pop_arrivals_.front().cycle == send_cycle) {
+            if (!min.has_value() || pop_arrivals_.front().min_arrival < *min) {
+                min = pop_arrivals_.front().min_arrival;
+            }
+        }
+        return min;
+    }
     void setCapacity(size_t capacity) override {
         user_capacity_ = std::min(capacity, queue_.usableCapacity());
     }
-    void clear() override { queue_.clear(); }
+    void clear() override {
+        queue_.clear();
+        admitted_pushes_.store(0, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(admission_mutex_);
+        pop_credits_.clear();
+        pop_arrivals_.clear();
+        popped_before_front_ = 0;
+    }
 
 private:
+    friend struct LockFreeQueueAdapterTestAccess;
+
+    struct PopCredit {
+        uint64_t cycle;
+        size_t count;
+    };
+
+    struct PopArrival {
+        uint64_t cycle;
+        uint64_t min_arrival;
+    };
+
+    void retirePopCreditsBeforeLocked_(uint64_t cycle) const {
+        while (!pop_credits_.empty() && pop_credits_.front().cycle < cycle) {
+            popped_before_front_ += pop_credits_.front().count;
+            pop_credits_.pop_front();
+        }
+    }
+
+    void retirePopArrivalsBeforeLocked_(uint64_t cycle) const {
+        while (!pop_arrivals_.empty() && pop_arrivals_.front().cycle < cycle) {
+            pop_arrivals_.pop_front();
+        }
+    }
+
+    void retireAdmissionHistoryBeforeLocked_(uint64_t cycle) const {
+        retirePopCreditsBeforeLocked_(cycle);
+        retirePopArrivalsBeforeLocked_(cycle);
+    }
+
+    void recordPopCreditForAdmission_(uint64_t cycle) {
+        std::lock_guard<std::mutex> lock(admission_mutex_);
+        if (!pop_credits_.empty() && pop_credits_.back().cycle == cycle) {
+            ++pop_credits_.back().count;
+            return;
+        }
+        pop_credits_.push_back(PopCredit{cycle, 1});
+    }
+
+    void recordPopArrivalForAdmission_(uint64_t cycle, uint64_t arrive_cycle) {
+        std::lock_guard<std::mutex> lock(admission_mutex_);
+        if (!pop_arrivals_.empty() && pop_arrivals_.back().cycle == cycle) {
+            pop_arrivals_.back().min_arrival =
+                std::min(pop_arrivals_.back().min_arrival, arrive_cycle);
+            return;
+        }
+        pop_arrivals_.push_back(PopArrival{cycle, arrive_cycle});
+    }
+
     mutable LockFreeMessageQueue<T> queue_;
     size_t user_capacity_;
+    std::atomic<size_t> admitted_pushes_{0};
+    mutable std::mutex admission_mutex_;
+    mutable std::deque<PopCredit> pop_credits_;
+    mutable std::deque<PopArrival> pop_arrivals_;
+    mutable size_t popped_before_front_ = 0;
 };
 
 /**

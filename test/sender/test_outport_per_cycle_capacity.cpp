@@ -369,6 +369,110 @@ void test_connection_and_receive_convenience_methods() {
     std::cout << "PASSED\n";
 }
 
+void test_capacity_one_rate_one_special_case_requires_delay_one() {
+    std::cout << "Testing capacity-one/rate-one special case requires delay one... ";
+
+    TestUnit prod("prod");
+    TestUnit cons("cons");
+    OutPort<int> out{&prod, "out", 1};
+    InPort<int> in{&cons, "in", 1};
+    auto* conn = out.connect(&in, 2);
+    conn->configureRegisteredEdge(/*capacity=*/1, /*rate=*/1);
+    conn->optimizeForSPSC();
+
+    require(conn->crossThreadHeadroom() == 0,
+            "delay>1 capacity-one/rate-one edge used DFF-style headroom");
+    require(!conn->ensureEpochFreeHeadroom(8),
+            "delay>1 capacity-one/rate-one edge accepted bounded epoch-free headroom");
+
+    prod.setCycle(0);
+    require(out.canSend(), "delay>1 edge rejected first send");
+    require(out.send(1), "delay>1 edge failed first send");
+
+    prod.setCycle(1);
+    require(!out.canSend(), "delay>1 edge reused capacity before arrival cycle");
+    require(!out.send(2), "delay>1 edge sent before arrival cycle freed capacity");
+
+    auto first = in.tryReceive(2);
+    require(first.has_value() && *first == 1, "delay>1 edge did not deliver at arrival cycle");
+
+    require(!out.canSend(), "delay>1 edge reused same-cycle drain credit");
+    prod.setCycle(3);
+    require(out.canSend(), "delay>1 edge did not release prior-cycle drain credit");
+    require(out.send(2), "delay>1 edge failed after prior-cycle drain credit");
+
+    std::cout << "PASSED\n";
+}
+
+void test_capacity_one_rate_one_delay_one_backpressures_after_missed_drain() {
+    std::cout << "Testing capacity-one/rate-one delay-one backpressures after missed drain... ";
+
+    TestUnit prod("prod");
+    TestUnit cons("cons");
+    OutPort<int> out{&prod, "out", 1};
+    InPort<int> in{&cons, "in", 1};
+    auto* conn = out.connect(&in, 1);
+    conn->configureRegisteredEdge(/*capacity=*/1, /*rate=*/1);
+    conn->optimizeForSameThread();
+
+    prod.setCycle(0);
+    require(out.canSend(), "delay-1 edge rejected first send");
+    require(out.send(1), "delay-1 edge failed first send");
+
+    prod.setCycle(1);
+    require(out.canSend(), "delay-1 edge rejected same-cycle DFF refill");
+    require(out.send(2), "delay-1 edge failed same-cycle DFF refill");
+
+    prod.setCycle(2);
+    require(!out.canSend(), "delay-1 edge ignored a stale undrained output");
+    require(!out.send(3), "delay-1 edge kept accepting while receiver stalled");
+
+    auto first = in.tryReceive(2);
+    require(first.has_value() && *first == 1, "delay-1 edge did not deliver at arrival cycle");
+    require(out.canSend(), "delay-1 edge did not reopen after receiver drained stale output");
+    require(out.send(3), "delay-1 edge failed after receiver drained stale output");
+
+    std::cout << "PASSED\n";
+}
+
+void test_capacity_one_rate_one_spsc_reconstructs_cycle_start_min_arrival() {
+    std::cout << "Testing capacity-one/rate-one SPSC reconstructs cycle-start min arrival... ";
+
+    TestUnit prod("prod");
+    TestUnit cons("cons");
+    OutPort<int> out{&prod, "out", 1};
+    InPort<int> in{&cons, "in", 1};
+    auto* conn = out.connect(&in, 1);
+    conn->configureRegisteredEdge(/*capacity=*/1, /*rate=*/1);
+    conn->optimizeForSPSC();
+
+    prod.setCycle(0);
+    require(out.canSend(), "SPSC delay-1 edge rejected first send");
+    require(out.send(1), "SPSC delay-1 edge failed first send");
+
+    prod.setCycle(1);
+    require(out.canSend(), "SPSC delay-1 edge rejected current-cycle DFF output");
+    require(out.send(2), "SPSC delay-1 edge failed current-cycle DFF refill");
+
+    auto first = in.tryReceive(2);
+    require(first.has_value() && *first == 1, "SPSC delay-1 edge did not drain stale output");
+    prod.setCycle(2);
+    require(!out.canSend(), "SPSC delay-1 edge ignored stale cycle-start output");
+    require(!out.send(3), "SPSC delay-1 edge accepted after same-cycle stale pop");
+
+    auto second = in.tryReceive(3);
+    require(second.has_value() && *second == 2, "SPSC delay-1 edge did not drain second output");
+    prod.setCycle(3);
+    require(!out.canSend(), "SPSC delay-1 edge ignored second stale cycle-start output");
+    require(!out.send(3), "SPSC delay-1 edge accepted while second output was stale");
+
+    prod.setCycle(4);
+    require(out.canSend(), "SPSC delay-1 edge did not reopen after stale outputs drained");
+    require(out.send(3), "SPSC delay-1 edge failed after stale outputs drained");
+
+    std::cout << "PASSED\n";
+}
+
 }  // namespace
 
 int main() {
@@ -385,6 +489,9 @@ int main() {
     test_cancel_does_not_reset_counter();
     test_query_methods();
     test_connection_and_receive_convenience_methods();
+    test_capacity_one_rate_one_special_case_requires_delay_one();
+    test_capacity_one_rate_one_delay_one_backpressures_after_missed_drain();
+    test_capacity_one_rate_one_spsc_reconstructs_cycle_start_min_arrival();
 
     std::cout << "\n=== All OutPort Per-Cycle Capacity tests PASSED ===\n";
     return 0;
