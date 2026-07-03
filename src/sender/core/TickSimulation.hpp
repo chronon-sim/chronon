@@ -322,6 +322,7 @@ private:
     bool persistentLookaheadEligible_() const;
     bool epochFreeLookaheadEligible_() const;
     std::string epochFreeVetoReason_() const;
+    void warnParallelFallbackIfNeeded_();
     void warnDeprecatedEpochLookaheadFallback_(std::string_view reason);
 
     bool executeUnitCycle_(TickableUnit* unit, uint64_t cycle) {
@@ -627,6 +628,7 @@ private:
     bool has_tight_inter_cluster_ = false;
     bool has_zero_delay_cross_thread_cycle_ = false;
     bool parallel_beneficial_ = false;
+    bool parallel_fallback_warned_ = false;
 
     /// Count of runParallel() invocations dispatched to executeRunEpochFree_.
     /// Introspection only (see epochFreeRunCount()).

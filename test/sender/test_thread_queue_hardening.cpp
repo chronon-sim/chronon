@@ -6,17 +6,25 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cassert>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "chronon/Chronon.hpp"
+#include "observe/ObservationManager.hpp"
+#include "observe/ObservationYAMLConfig.hpp"
 
 using namespace chronon::sender;
+namespace observe = chronon::observe;
 
 namespace {
 
@@ -122,10 +130,89 @@ private:
     uint64_t ticks_ = 0;
 };
 
+class FeedbackUnit : public TickableUnit {
+public:
+    explicit FeedbackUnit(std::string name, uint64_t seed)
+        : TickableUnit(std::move(name)), seed_(seed) {}
+
+    InPort<uint64_t> in{this, "in", 64};
+    OutPort<uint64_t> out{this, "out", 1};
+
+    void tick() override {
+        while (auto value = in.tryReceive(localCycle())) {
+            state_ ^= (*value + seed_) * 1000003ULL;
+        }
+        (void)out.send(state_ ^ localCycle());
+    }
+
+private:
+    uint64_t seed_ = 0;
+    uint64_t state_ = 1;
+};
+
 void require(bool condition, const char* message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+std::string readTextFile(const std::filesystem::path& path) {
+    std::ifstream file(path);
+    return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+}
+
+size_t countOccurrences(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string::npos) {
+        ++count;
+        pos += needle.size();
+    }
+    return count;
+}
+
+SourceUnit* createSmallNonTightFallbackGraph(TickSimulation& sim) {
+    auto* src = sim.createUnit<SourceUnit>("src", 7);
+    auto* relay0 = sim.createUnit<RelayUnit>("relay0");
+    auto* relay1 = sim.createUnit<RelayUnit>("relay1");
+    auto* relay2 = sim.createUnit<RelayUnit>("relay2");
+    auto* relay3 = sim.createUnit<RelayUnit>("relay3");
+    auto* relay4 = sim.createUnit<RelayUnit>("relay4");
+    auto* relay5 = sim.createUnit<RelayUnit>("relay5");
+    auto* relay6 = sim.createUnit<RelayUnit>("relay6");
+    auto* sink = sim.createUnit<SinkUnit>("sink");
+
+    // No tight edges: all connections have delay=1.
+    sim.connect(src->out, relay0->in, 1);
+    sim.connect(src->out, relay1->in, 1);
+    sim.connect(src->out, relay2->in, 1);
+    sim.connect(src->out, relay3->in, 1);
+    sim.connect(src->out, relay4->in, 1);
+    sim.connect(src->out, relay5->in, 1);
+    sim.connect(src->out, relay6->in, 1);
+    sim.connect(relay0->out, sink->in, 1);
+    sim.connect(relay1->out, sink->in, 1);
+    sim.connect(relay2->out, sink->in, 1);
+    sim.connect(relay3->out, sink->in, 1);
+    sim.connect(relay4->out, sink->in, 1);
+    sim.connect(relay5->out, sink->in, 1);
+    sim.connect(relay6->out, sink->in, 1);
+    sim.connect(src->out, sink->in, 1);
+
+    return src;
+}
+
+void createMixedDelayFeedbackGraph(TickSimulation& sim) {
+    auto* a = sim.createUnit<FeedbackUnit>("A", 11);
+    auto* b = sim.createUnit<FeedbackUnit>("B", 22);
+    auto* c = sim.createUnit<FeedbackUnit>("C", 33);
+    auto* d = sim.createUnit<FeedbackUnit>("D", 44);
+
+    sim.connect(a->out, c->in, 1);
+    sim.connect(b->out, c->in, 3);
+    sim.connect(c->out, d->in, 1);
+    sim.connect(d->out, a->in, 1);
+    sim.connect(d->out, b->in, 1);
 }
 
 void test_tick_simulation_mpsc_delivery() {
@@ -618,6 +705,121 @@ void test_lockfree_backpressure_contract() {
     std::cout << "PASSED\n";
 }
 
+void test_spsc_user_capacity_backpressures_across_cycles() {
+    std::cout << "Testing SPSC user capacity backpressures across cycles... ";
+
+    constexpr size_t kRate = 8;
+    constexpr size_t kDepth = 16;
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", kRate};
+    InPort<int> in{&cons, "in", kDepth};
+    auto* conn = out.connect(&in, 1);
+    conn->optimizeForSPSC();
+
+    size_t value = 0;
+    for (uint64_t cycle = 0; cycle < 2; ++cycle) {
+        prod.setCycle(cycle);
+        for (size_t lane = 0; lane < kRate; ++lane) {
+            require(out.canSend(), "SPSC capacity rejected before destination depth");
+            require(out.send(static_cast<int>(value++)),
+                    "SPSC send failed before destination depth");
+        }
+        require(!out.canSend(), "SPSC rate allowed an extra same-cycle send");
+    }
+
+    require(in.queuedMessageCount() == kDepth, "SPSC queue did not fill to declared depth");
+
+    prod.setCycle(2);
+    require(!out.canSend(), "SPSC capacity allowed send beyond destination depth");
+    require(!out.send(99999), "SPSC send succeeded beyond destination depth");
+    require(in.queuedMessageCount() == kDepth, "failed SPSC send changed queue depth");
+
+    auto first = in.tryReceive(2);
+    require(first.has_value() && *first == 0, "SPSC drain changed delivery order");
+    require(in.queuedMessageCount() == kDepth - 1, "SPSC drain did not free one slot");
+
+    require(!out.canSend(), "SPSC capacity reopened after same-cycle drain");
+    require(!out.send(99998), "SPSC send succeeded after same-cycle drain");
+    require(in.queuedMessageCount() == kDepth - 1,
+            "failed same-cycle SPSC refill changed queue depth");
+
+    prod.setCycle(3);
+    require(out.canSend(), "SPSC capacity did not reopen after next-cycle drain credit");
+    require(out.send(static_cast<int>(value)), "SPSC send failed after next-cycle drain credit");
+    require(in.queuedMessageCount() == kDepth, "SPSC queue did not refill to declared depth");
+
+    std::cout << "PASSED\n";
+}
+
+void test_spsc_capacity_ignores_same_cycle_consumer_pop_interleaving() {
+    std::cout << "Testing SPSC capacity ignores same-cycle consumer pop interleaving... ";
+
+    constexpr size_t kRate = 2;
+    constexpr size_t kDepth = 2;
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", kRate};
+    InPort<int> in{&cons, "in", kDepth};
+    auto* conn = out.connect(&in, 1);
+    conn->optimizeForSPSC();
+
+    prod.setCycle(0);
+    require(out.send(1), "SPSC failed to fill first slot");
+    require(out.send(2), "SPSC failed to fill second slot");
+    require(in.queuedMessageCount() == kDepth, "SPSC queue did not fill to declared depth");
+
+    auto first = in.tryReceive(1);
+    require(first.has_value() && *first == 1, "SPSC drain changed delivery order");
+    require(in.queuedMessageCount() == kDepth - 1, "SPSC drain did not remove one entry");
+
+    prod.setCycle(1);
+    require(!out.canSend(), "SPSC capacity used same-cycle consumer pop for admission");
+    require(!out.send(3), "SPSC send succeeded after same-cycle consumer pop");
+
+    prod.setCycle(2);
+    require(out.canSend(), "SPSC capacity did not release prior-cycle consumer pop");
+    require(out.send(3), "SPSC send failed after prior-cycle consumer pop");
+
+    std::cout << "PASSED\n";
+}
+
+void test_spsc_capacity_receive_all_returns_prior_cycle_credit() {
+    std::cout << "Testing SPSC capacity receiveAll returns prior-cycle credit... ";
+
+    constexpr size_t kRate = 2;
+    constexpr size_t kDepth = 2;
+
+    ManualUnit prod("prod");
+    ManualUnit cons("cons");
+
+    OutPort<int> out{&prod, "out", kRate};
+    InPort<int> in{&cons, "in", kDepth};
+    auto* conn = out.connect(&in, 1);
+    conn->optimizeForSPSC();
+
+    prod.setCycle(0);
+    require(out.send(1), "SPSC failed to fill first slot before receiveAll");
+    require(out.send(2), "SPSC failed to fill second slot before receiveAll");
+
+    std::vector<int> drained = in.receiveAll(1);
+    require(drained.size() == kDepth, "receiveAll did not drain ready SPSC messages");
+
+    prod.setCycle(1);
+    require(!out.canSend(), "SPSC receiveAll pop reopened capacity in the same cycle");
+
+    prod.setCycle(2);
+    require(out.canSend(), "SPSC receiveAll pop did not release prior-cycle credit");
+    require(out.send(3), "SPSC send failed after receiveAll prior-cycle credit");
+    require(out.send(4), "SPSC second send failed after receiveAll prior-cycle credit");
+
+    std::cout << "PASSED\n";
+}
+
 void test_small_non_tight_graph_parallel_fallback() {
     std::cout << "Testing small non-tight graph parallel fallback... ";
 
@@ -629,33 +831,7 @@ void test_small_non_tight_graph_parallel_fallback() {
     config.epoch_size = 8;
 
     TickSimulation sim(config);
-
-    auto* src = sim.createUnit<SourceUnit>("src", 7);
-    auto* relay0 = sim.createUnit<RelayUnit>("relay0");
-    auto* relay1 = sim.createUnit<RelayUnit>("relay1");
-    auto* relay2 = sim.createUnit<RelayUnit>("relay2");
-    auto* relay3 = sim.createUnit<RelayUnit>("relay3");
-    auto* relay4 = sim.createUnit<RelayUnit>("relay4");
-    auto* relay5 = sim.createUnit<RelayUnit>("relay5");
-    auto* relay6 = sim.createUnit<RelayUnit>("relay6");
-    auto* sink = sim.createUnit<SinkUnit>("sink");
-
-    // No tight edges: all connections have delay=1.
-    sim.connect(src->out, relay0->in, 1);
-    sim.connect(src->out, relay1->in, 1);
-    sim.connect(src->out, relay2->in, 1);
-    sim.connect(src->out, relay3->in, 1);
-    sim.connect(src->out, relay4->in, 1);
-    sim.connect(src->out, relay5->in, 1);
-    sim.connect(src->out, relay6->in, 1);
-    sim.connect(relay0->out, sink->in, 1);
-    sim.connect(relay1->out, sink->in, 1);
-    sim.connect(relay2->out, sink->in, 1);
-    sim.connect(relay3->out, sink->in, 1);
-    sim.connect(relay4->out, sink->in, 1);
-    sim.connect(relay5->out, sink->in, 1);
-    sim.connect(relay6->out, sink->in, 1);
-    sim.connect(src->out, sink->in, 1);
+    auto* src = createSmallNonTightFallbackGraph(sim);
 
     sim.initialize();
 
@@ -664,7 +840,127 @@ void test_small_non_tight_graph_parallel_fallback() {
     assert(!sim.useParallelExecution());
 
     sim.run(2);
-    assert(src->sendSucceeded());
+    require(src->sendSucceeded(), "source send failed after sequential fallback");
+
+    std::cout << "PASSED\n";
+}
+
+void test_parallel_fallback_warns_via_observe() {
+    std::cout << "Testing parallel fallback emits observe warning... ";
+
+    auto& obs_mgr = observe::ObservationManager::instance();
+    obs_mgr.reset();
+
+    const std::filesystem::path out_dir =
+        std::filesystem::temp_directory_path() /
+        ("chronon_parallel_fallback_warn_" + std::to_string(getpid()));
+    std::filesystem::remove_all(out_dir);
+
+    observe::ObservationYAMLConfig obs_config;
+    obs_config.enabled = true;
+    obs_config.output_dir = out_dir.string();
+    obs_config.counters.enabled = false;
+    obs_config.counters.csv_output = false;
+    obs_config.timeline.enabled = false;
+    obs_config.unified_logging.enabled = true;
+    obs_config.unified_logging.info_channel.enabled = false;
+    obs_config.unified_logging.warn_channel.enabled = true;
+    obs_config.unified_logging.warn_channel.file = "warn.log";
+    obs_mgr.initialize(obs_config);
+
+    TickSimulationConfig config;
+    config.num_threads = 4;
+    config.enable_parallel = true;
+    config.enable_lookahead = true;
+    config.enable_weighted_partitioning = false;
+    config.epoch_size = 8;
+
+    std::filesystem::path warn_log;
+    {
+        TickSimulation sim(config);
+        createSmallNonTightFallbackGraph(sim);
+
+        sim.initialize();
+        assert(!sim.useParallelExecution());
+
+        obs_mgr.startBackend();
+        warn_log = obs_mgr.backend()->outputDir() / "warn.log";
+        obs_mgr.stopBackend();
+    }
+
+    const std::string content = readTextFile(warn_log);
+    require(content.find("[ WARN] simulation: parallel execution requested but falling back to "
+                         "sequential") != std::string::npos,
+            "parallel fallback warning was not written through observe");
+    require(content.find("units=9") != std::string::npos,
+            "parallel fallback warning omitted unit count");
+    require(content.find("num_threads=4") != std::string::npos,
+            "parallel fallback warning omitted thread count");
+    require(countOccurrences(content, "falling back to sequential") == 1,
+            "parallel fallback warning emitted more than once");
+
+    obs_mgr.reset();
+    std::filesystem::remove_all(out_dir);
+
+    std::cout << "PASSED\n";
+}
+
+void test_deprecated_epoch_fallback_warns_via_observe() {
+    std::cout << "Testing deprecated epoch fallback emits observe warning... ";
+
+    auto& obs_mgr = observe::ObservationManager::instance();
+    obs_mgr.reset();
+
+    const std::filesystem::path out_dir =
+        std::filesystem::temp_directory_path() /
+        ("chronon_deprecated_epoch_fallback_warn_" + std::to_string(getpid()));
+    std::filesystem::remove_all(out_dir);
+
+    observe::ObservationYAMLConfig obs_config;
+    obs_config.enabled = true;
+    obs_config.output_dir = out_dir.string();
+    obs_config.counters.enabled = false;
+    obs_config.counters.csv_output = false;
+    obs_config.timeline.enabled = false;
+    obs_config.unified_logging.enabled = true;
+    obs_config.unified_logging.info_channel.enabled = false;
+    obs_config.unified_logging.warn_channel.enabled = true;
+    obs_config.unified_logging.warn_channel.file = "warn.log";
+    obs_mgr.initialize(obs_config);
+
+    TickSimulationConfig config;
+    config.num_threads = 2;
+    config.enable_parallel = true;
+    config.enable_lookahead = true;
+    config.enable_epoch_free_lookahead = false;
+    config.max_lookahead_cycles = 8;
+    config.epoch_size = 8;
+
+    std::filesystem::path warn_log;
+    {
+        TickSimulation sim(config);
+        createMixedDelayFeedbackGraph(sim);
+
+        sim.initialize();
+        require(sim.useParallelExecution(), "deprecated fallback test did not enter parallel mode");
+
+        obs_mgr.startBackend();
+        warn_log = obs_mgr.backend()->outputDir() / "warn.log";
+        sim.run(8);
+        obs_mgr.stopBackend();
+    }
+
+    const std::string content = readTextFile(warn_log);
+    require(content.find("[ WARN] simulation: DEPRECATED: per-epoch lookahead fallback") !=
+                std::string::npos,
+            "deprecated epoch fallback warning was not written through observe");
+    require(content.find("reason=enable_epoch_free_lookahead=false") != std::string::npos,
+            "deprecated epoch fallback warning omitted veto reason");
+    require(countOccurrences(content, "per-epoch lookahead fallback") == 1,
+            "deprecated epoch fallback warning emitted more than once");
+
+    obs_mgr.reset();
+    std::filesystem::remove_all(out_dir);
 
     std::cout << "PASSED\n";
 }
@@ -688,7 +984,12 @@ int main() {
     test_spsc_epoch_free_headroom_respects_registered_capacity();
     test_idle_advance_drains_mpsc_staging();
     test_lockfree_backpressure_contract();
+    test_spsc_user_capacity_backpressures_across_cycles();
+    test_spsc_capacity_ignores_same_cycle_consumer_pop_interleaving();
+    test_spsc_capacity_receive_all_returns_prior_cycle_credit();
     test_small_non_tight_graph_parallel_fallback();
+    test_parallel_fallback_warns_via_observe();
+    test_deprecated_epoch_fallback_warns_via_observe();
 
     std::cout << "\n=== Thread queue hardening tests PASSED ===\n";
     return 0;

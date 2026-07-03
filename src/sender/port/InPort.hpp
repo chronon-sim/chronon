@@ -324,6 +324,12 @@ public:
     size_t storageCapacity() const noexcept { return queue_->storageCapacity(); }
     size_t configuredCapacity() const noexcept { return capacity_; }
     size_t available() const { return queue_->available(); }
+    size_t admissionOccupancy(uint64_t send_cycle) const {
+        return queue_->admissionOccupancy(send_cycle);
+    }
+    std::optional<uint64_t> admissionMinArrivalCycle(uint64_t send_cycle) const {
+        return queue_->admissionMinArrivalCycle(send_cycle);
+    }
 
     void setCapacity(size_t capacity) {
         queue_->setCapacity(capacity);

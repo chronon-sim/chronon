@@ -239,12 +239,14 @@ public:
             wakeUnitAt(destination(), arrive_cycle);
             return true;
         }
-        // SPSC/SingleThread mode: enforce the per-cycle admission bound
-        // (same as canTransfer()) so that callers who bypass canSend()
-        // never exceed the model-side capacity. This keeps push() and
-        // canAccept() agreeing on the same rate limit without reading
-        // the live queue size (which races with the consumer thread).
+        // SPSC/SingleThread mode: enforce both the per-cycle send bound and the
+        // model-visible destination capacity. The backing SPSC ring can be much
+        // larger than the architectural FIFO depth, so admission uses a
+        // producer-cycle snapshot instead of live target queue fullness.
         if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
+            return false;
+        }
+        if (!hasDestinationAdmissionSlot_(send_cycle)) {
             return false;
         }
         const bool ok = to_->enqueueCancelable(std::move(data), arrive_cycle, &cancel_epoch_,
@@ -347,13 +349,10 @@ public:
             const size_t edge_cap = edgeAdmissionCapacity_();
             return edge_cap == InPort<T>::UNLIMITED_CAPACITY || stagingSize_() < edge_cap;
         }
-        // Rate-based admission: producer may push up to effectiveCapacity_()
-        // items per simulated cycle, tracked locally via pushes_this_cycle_.
-        // The receiver's live occupancy is never read from the producer thread,
-        // which matches a hardware pipeline register whose per-edge admission
-        // is bounded by width rather than downstream FIFO depth.
-        const size_t pending = currentPendingPushes_();
-        return pending < edgeCycleRateLimit_();
+        const uint64_t send_cycle = from_->getCurrentCycle();
+        maybeResetPushesCycle_(send_cycle);
+        return pushes_this_cycle_ < edgeCycleRateLimit_() &&
+               hasDestinationAdmissionSlot_(send_cycle);
     }
 
     bool isDestinationFull() const { return !canTransfer(); }
@@ -449,22 +448,43 @@ public:
         //   SPSC (lock-free ring)       -> the InPort's lock-free queue (finite
         //                                  even for an unlimited-capacity port),
         //   same-thread / unbounded     -> no ring to overflow (SIZE_MAX).
+        const bool dff_style = isDFFStyleEdge_();
         size_t ring_usable;
+        bool cycle_strict_spsc = false;
         if (thread_queue_id_ != SIZE_MAX) {
             ring_usable = mpscLogicalHeadroomCapacity_();
         } else if (to_->usesLockFreeQueue()) {
             ring_usable = spscLogicalHeadroomCapacity_();
+            cycle_strict_spsc = true;
         } else {
+            if (dff_style) {
+                // Same-thread DFF-style edges have no physical ring, but they
+                // still need a logical dependency so a separate producer cluster
+                // cannot run arbitrarily far ahead of its consumer. One cycle of
+                // slack lets the event queue represent current output plus next
+                // input without creating a zero-delay dependency cycle.
+                return 2;
+            }
             return SIZE_MAX;  // single-thread queue drains synchronously each tick
+        }
+        if (dff_style) {
+            return 1;
         }
         const auto rate = effectiveHeadroomRate_();
         if (!rate.has_value()) return 0;
         const size_t buffered_cycles = ring_usable / *rate;
         // The consumer drains only *due* entries (arrive_cycle <= k, i.e.
         // send_cycle <= k - delay_), so delay_ cycles of not-yet-due entries always
-        // sit buffered. A delay-1, capacity-1 DFF-style edge is still safe with
-        // zero producer slack, represented as headroom=1.
+        // sit buffered. Cross-thread SPSC admission is cycle-strict: a consumer
+        // pop at cycle k does not free producer capacity for another send in
+        // cycle k, so its safe run-ahead window is one cycle smaller than the
+        // live-drained MPSC staging window. A delay-1, capacity-1 DFF-style edge
+        // is handled above and remains safe with headroom=1.
         if (buffered_cycles < delay_) return 0;
+        if (cycle_strict_spsc) {
+            if (buffered_cycles == delay_) return 0;
+            return buffered_cycles - delay_;
+        }
         return buffered_cycles - delay_ + 1;
     }
 
@@ -502,6 +522,39 @@ private:
             limit = *registered_rate_;
         }
         return minCapacity_(limit, edgeAdmissionCapacity_());
+    }
+
+    bool hasDestinationAdmissionSlot_(uint64_t send_cycle) const noexcept {
+        if (isDFFStyleEdge_()) {
+            const auto min_arrival = to_->admissionMinArrivalCycle(send_cycle);
+            return !min_arrival.has_value() || *min_arrival == send_cycle;
+        }
+        size_t admission_cap = edgeAdmissionCapacity_();
+        if (admission_cap == InPort<T>::UNLIMITED_CAPACITY) {
+            admission_cap = to_->capacity();
+        }
+        if (admission_cap == InPort<T>::UNLIMITED_CAPACITY) {
+            return true;
+        }
+        if (admission_cap == 0) {
+            return false;
+        }
+        const size_t occupancy = destinationAdmissionOccupancy_(send_cycle);
+        return occupancy < admission_cap && pushes_this_cycle_ < admission_cap - occupancy;
+    }
+
+    size_t destinationAdmissionOccupancy_(uint64_t send_cycle) const noexcept {
+        if (!admission_snapshot_valid_ || send_cycle != last_admission_cycle_) {
+            admission_occupancy_at_cycle_start_ = to_->admissionOccupancy(send_cycle);
+            last_admission_cycle_ = send_cycle;
+            admission_snapshot_valid_ = true;
+        }
+        return admission_occupancy_at_cycle_start_;
+    }
+
+    bool isDFFStyleEdge_() const noexcept {
+        const auto rate = effectiveHeadroomRate_();
+        return delay_ == 1 && edgeAdmissionCapacity_() == 1 && rate.has_value() && *rate == 1;
     }
 
     size_t mpscLogicalHeadroomCapacity_() const noexcept {
@@ -649,11 +702,15 @@ private:
     /// and break cycle-count reproducibility across num_workers).
     mutable size_t pushes_this_cycle_ = 0;
     mutable uint64_t last_pushes_cycle_ = 0;
+    mutable bool admission_snapshot_valid_ = false;
+    mutable uint64_t last_admission_cycle_ = 0;
+    mutable size_t admission_occupancy_at_cycle_start_ = 0;
 
     void maybeResetPushesCycle_(uint64_t send_cycle) const noexcept {
         if (send_cycle != last_pushes_cycle_) {
             pushes_this_cycle_ = 0;
             last_pushes_cycle_ = send_cycle;
+            admission_snapshot_valid_ = false;
         }
     }
     size_t currentPendingPushes_() const noexcept {
@@ -662,6 +719,7 @@ private:
         if (now != last_pushes_cycle_) {
             pushes_this_cycle_ = 0;
             last_pushes_cycle_ = now;
+            admission_snapshot_valid_ = false;
         }
         return pushes_this_cycle_;
     }

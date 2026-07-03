@@ -7,6 +7,7 @@
 // staging.
 
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,24 @@
 #include "sender/port/MessageQueue.hpp"
 
 using namespace chronon::sender;
+
+namespace chronon::sender {
+
+struct LockFreeQueueAdapterTestAccess {
+    template <typename T>
+    static size_t popCreditHistorySize(const LockFreeQueueAdapter<T>& queue) {
+        std::lock_guard<std::mutex> lock(queue.admission_mutex_);
+        return queue.pop_credits_.size();
+    }
+
+    template <typename T>
+    static size_t popArrivalHistorySize(const LockFreeQueueAdapter<T>& queue) {
+        std::lock_guard<std::mutex> lock(queue.admission_mutex_);
+        return queue.pop_arrivals_.size();
+    }
+};
+
+}  // namespace chronon::sender
 
 void test_basic_push_pop() {
     std::cout << "Testing basic push/pop... ";
@@ -210,6 +229,36 @@ void test_lock_free_queue_basic() {
     std::cout << "PASSED\n";
 }
 
+void test_lock_free_adapter_retires_all_admission_histories() {
+    std::cout << "Testing LockFreeQueueAdapter admission history retirement... ";
+
+    LockFreeQueueAdapter<int> queue(1);
+
+    CHECK(queue.push(1, 0));
+    auto first = queue.tryPop(0);
+    CHECK(first.has_value());
+    CHECK(*first == 1);
+    CHECK(LockFreeQueueAdapterTestAccess::popCreditHistorySize(queue) == 1);
+    CHECK(LockFreeQueueAdapterTestAccess::popArrivalHistorySize(queue) == 1);
+
+    CHECK(queue.admissionOccupancy(1) == 0);
+    CHECK(LockFreeQueueAdapterTestAccess::popCreditHistorySize(queue) == 0);
+    CHECK(LockFreeQueueAdapterTestAccess::popArrivalHistorySize(queue) == 0);
+
+    CHECK(queue.push(2, 2));
+    auto second = queue.tryPop(2);
+    CHECK(second.has_value());
+    CHECK(*second == 2);
+    CHECK(LockFreeQueueAdapterTestAccess::popCreditHistorySize(queue) == 1);
+    CHECK(LockFreeQueueAdapterTestAccess::popArrivalHistorySize(queue) == 1);
+
+    CHECK(!queue.admissionMinArrivalCycle(3).has_value());
+    CHECK(LockFreeQueueAdapterTestAccess::popCreditHistorySize(queue) == 0);
+    CHECK(LockFreeQueueAdapterTestAccess::popArrivalHistorySize(queue) == 0);
+
+    std::cout << "PASSED\n";
+}
+
 int main() {
     std::cout << "=== Registered Queue Tests ===\n\n";
 
@@ -221,6 +270,7 @@ int main() {
     test_complex_types();
     test_capacity_tracking();
     test_lock_free_queue_basic();
+    test_lock_free_adapter_retires_all_admission_histories();
 
     std::cout << "\nAll registered queue tests PASSED!\n";
     return 0;
