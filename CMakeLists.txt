@@ -6,7 +6,7 @@
 # A fast, multithreaded simulation framework for CPU microarchitecture modeling
 
 cmake_minimum_required(VERSION 3.25)
-project(chronon VERSION 0.3.0 LANGUAGES CXX)
+project(chronon VERSION 0.3.1 LANGUAGES CXX)
 
 # Auto-configure git hooks only when built as the top-level project
 # (skip when fetched as a dependency via CPM/FetchContent).
