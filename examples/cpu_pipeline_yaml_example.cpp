@@ -49,7 +49,7 @@ int main(int argc, char* argv[]) {
                          "Demonstrating YAML-driven simulation with Chronon")
         .setDefaultConfig("cpu_pipeline.yaml")
         .setConfigSearchPaths({".", "../examples", "examples"})
-        .setVersion("0.3.1")
+        .setVersion("0.3.2")
         .onPostBuild([](SimulationApp::Result& /*result*/) {
             // Print pipeline architecture info after build
             std::cout << "Pipeline Architecture:\n";
