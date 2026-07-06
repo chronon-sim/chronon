@@ -39,12 +39,12 @@ class TimelineTrackBase;
  *   inline const auto CACHE_HIT = Category<"cache_hit", "Cache hit">{};
  *
  *   class MyUnit : public Unit, public ObservableUnit {
- *       Counter ops_{this, "ops", "Operations executed"};
+ *       EventCounter ops_{this, "ops", "Operations executed"};
  *
  *   public:
  *       void tick() override {
  *           ++ops_;
- *           trace<"Hit at 0x{:x}">(CACHE_HIT, addr);
+ *           event<"cache_hit">(CACHE_HIT, arg<"addr">(addr));
  *           debug<"Processing cycle {}">(cycle);
  *       }
  *   };
@@ -133,7 +133,7 @@ public:
     // =========================================================================
 
     /**
-     * Emit a trace event with compile-time format string.
+     * Emit a deprecated text trace event with compile-time format string.
      *
      * Usage:
      *   trace<"I-Cache HIT: pc=0x{:x}">(ICACHE_HIT, pc);
@@ -143,10 +143,13 @@ public:
      * @param args Format arguments
      */
     template <FixedString Fmt, typename Cat, typename... Args>
+    [[deprecated(
+        "trace<> text events are deprecated and will be removed after 0.4; use timeline events for "
+        "structured Perfetto data or debug/info/warn/error for text logs")]]
     void trace(Cat category, Args&&... args) {
         if (observe_ctx_ && observe_ctx_->shouldTrace(category)) {
             observe_ctx_->setCurrentCycleValue(getObserveCycle());
-            chronon::observe::trace<Fmt>(observe_ctx_, category, std::forward<Args>(args)...);
+            observe_detail::emitTrace<Fmt>(observe_ctx_, category, std::forward<Args>(args)...);
         }
     }
 
@@ -204,7 +207,8 @@ public:
      */
     template <FixedString Name, typename Cat, typename... Items>
     void event(Cat category, Items&&... items) {
-        chronon::observe::event<Name>(*this, category, std::forward<Items>(items)...);
+        timeline_observe_detail::emitUnitEvent<Name>(*this, category,
+                                                     std::forward<Items>(items)...);
     }
 
     /**
@@ -212,7 +216,8 @@ public:
      */
     template <FixedString Track, typename Cat, typename... Items>
     void instant(Cat category, EventNameRef name, Items&&... items) {
-        chronon::observe::instant<Track>(*this, category, name, std::forward<Items>(items)...);
+        timeline_observe_detail::emitUnitInstant<Track>(*this, category, name,
+                                                        std::forward<Items>(items)...);
     }
 
     /**
@@ -220,36 +225,44 @@ public:
      */
     template <FixedString Track, typename Cat, typename... Items>
     void spanBegin(Cat category, EventNameRef name, Items&&... items) {
-        chronon::observe::spanBegin<Track>(*this, category, name, std::forward<Items>(items)...);
+        timeline_observe_detail::emitUnitSpanBegin<Track>(*this, category, name,
+                                                          std::forward<Items>(items)...);
     }
 
     template <FixedString Track, typename Cat, typename... Items>
     void spanBegin(uint16_t slot, Cat category, EventNameRef name, Items&&... items) {
-        chronon::observe::spanBegin<Track>(*this, slot, category, name,
-                                           std::forward<Items>(items)...);
+        timeline_observe_detail::emitUnitSpanBegin<Track>(*this, slot, category, name,
+                                                          std::forward<Items>(items)...);
     }
 
     template <FixedString Track>
     void spanEnd() {
-        chronon::observe::spanEnd<Track>(*this);
+        timeline_observe_detail::emitUnitSpanEnd<Track>(*this);
     }
 
     template <FixedString Track>
     void spanEnd(uint16_t slot) {
-        chronon::observe::spanEnd<Track>(*this, slot);
+        timeline_observe_detail::emitUnitSpanEnd<Track>(*this, slot);
     }
 
     /**
      * Emit push-model counter samples under this unit.
      */
     template <FixedString Name, typename T>
+    [[deprecated(
+        "ObservableUnit::gauge() is deprecated; use EventCounter::add() for aggregate metrics or "
+        "EventCounter::mark() when a timeline instant is needed")]]
     void gauge(T value, std::string_view unit_name = {}) {
-        chronon::observe::gauge<Name>(*this, value, unit_name);
+        timeline_observe_detail::emitUnitGauge<Name>(*this, category::NONE, value, unit_name);
     }
 
     template <FixedString Name, typename Used, typename Capacity>
+    [[deprecated(
+        "ObservableUnit::capacity() is deprecated; use EventCounter-based metrics instead of "
+        "push-model timeline counters")]]
     void capacity(Used used, Capacity total, std::string_view unit_name = {}) {
-        chronon::observe::capacity<Name>(*this, used, total, unit_name);
+        timeline_observe_detail::emitUnitCapacity<Name>(*this, category::NONE, used, total,
+                                                        unit_name);
     }
 
     /**

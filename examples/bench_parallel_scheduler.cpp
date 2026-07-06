@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,7 +32,7 @@ namespace {
 class Worklet : public TickableUnit {
 public:
     Worklet(uint32_t id, uint32_t work)
-        : TickableUnit("w" + std::to_string(id)),
+        : TickableUnit(makeName(id)),
           work_(work),
           acc_(0x1234567ULL + static_cast<uint64_t>(id) * 2654435761ULL) {}
     void tick() override {
@@ -46,6 +47,12 @@ public:
     uint64_t checksum() const { return acc_; }
 
 private:
+    static std::string makeName(uint32_t id) {
+        std::ostringstream out;
+        out << 'w' << id;
+        return out.str();
+    }
+
     uint32_t work_;
     uint64_t acc_;
     uint64_t ticks_ = 0;

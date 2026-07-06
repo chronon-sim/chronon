@@ -29,13 +29,17 @@
 #include "observe/ObservationContext.hpp"
 #include "observe/ObservationQueue.hpp"
 #include "observe/ObserveApi.hpp"
-#include "observe/PipelineTraceFormat.hpp"
 #include "observe/ThreadContextManager.hpp"
 #include "observe/TimelineObserve.hpp"
 #include "observe/TimelineTrack.hpp"
 
 using namespace chronon::observe;
 using namespace pftrace_test;
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
 
 namespace {
 
@@ -72,40 +76,6 @@ const DecodedTrack* childTrack(const DecodedTrace& trace, std::string_view name,
         }
     }
     return nullptr;
-}
-
-const DecodedTrack* childTrackNameEndsWith(const DecodedTrace& trace, std::string_view suffix,
-                                           uint64_t parent_uuid) {
-    for (const auto& t : trace.tracks) {
-        if (t.name.ends_with(suffix) && t.parent_uuid == parent_uuid) {
-            return &t;
-        }
-    }
-    return nullptr;
-}
-
-void test_legacy_pipeline_parser() {
-    std::cout << "Testing legacy pipeline trace parser... ";
-
-    PipelineTraceFields pipe;
-    CHECK(parsePipelineTraceMessage("simulation.fetch", "12DEC#42;pc=0x100", pipe));
-    CHECK(pipe.track_path == "simulation.fetch.DEC pipe12");
-    CHECK(pipe.id == "42");
-    CHECK(pipe.note == "pc=0x100");
-    CHECK(pipe.flow_id == 42);
-    CHECK(pipe.has_flow_id);
-
-    CHECK(parsePipelineTraceMessage("", "BP0#0x2a", pipe));
-    CHECK(pipe.track_path == "unknown.BP0");
-    CHECK(pipe.id == "0x2a");
-    CHECK(pipe.flow_id == 0x2a);
-    CHECK(pipe.has_flow_id);
-
-    CHECK(parsePipelineTraceMessage("", "DEC#0", pipe));
-    CHECK(pipe.flow_id == 0);
-    CHECK(pipe.has_flow_id);
-
-    std::cout << "PASSED\n";
 }
 
 void test_lanes_end_to_end() {
@@ -351,10 +321,11 @@ void test_high_bit_category() {
     std::cout << "PASSED\n";
 }
 
-void test_high_bit_legacy_pipe_category() {
-    std::cout << "Testing high-bit legacy pipe category... ";
+void test_trace_pipe_category_is_plain_trace() {
+    std::cout << "Testing pipe-category trace stays a plain trace instant... ";
 
-    static const auto PIPE_CAT = Category<"pipe", "Legacy pipeline visualization events">{};
+    static const auto PIPE_CAT =
+        Category<"pipe", "Pipeline category for deprecated trace events">{};
     CHECK(std::countr_zero(PIPE_CAT.mask()) >= 32);
 
     const std::string out_dir = "/tmp/chronon_timeline_api_highbit_pipe";
@@ -402,15 +373,12 @@ void test_high_bit_legacy_pipe_category() {
     CHECK(cpu0 != nullptr);
     const DecodedTrack* fetch = childTrack(trace, "fetch", cpu0->uuid);
     CHECK(fetch != nullptr);
-    const DecodedTrack* dec = childTrackNameEndsWith(trace, "DEC pipe12", fetch->uuid);
-    CHECK(dec != nullptr);
-
-    auto events = eventsOn(trace, dec->uuid);
-    CHECK(events.size() == 2);
-    CHECK(events[0].type == 1 && events[0].timestamp == 7);
-    CHECK(events[0].name.starts_with("0"));
-    CHECK(events[0].flow_ids == std::vector<uint64_t>{0});
-    CHECK(events[1].type == 2 && events[1].timestamp == 8);
+    auto trace_events = eventsOn(trace, fetch->uuid);
+    CHECK(trace_events.size() == 2);
+    CHECK(trace_events[0].type == 3 && trace_events[0].timestamp == 7);
+    CHECK(trace_events[0].name == "12DEC#0;pc=0x100");
+    CHECK(trace_events[1].type == 3 && trace_events[1].timestamp == 9);
+    CHECK(trace_events[1].name == "ordinary trace");
 
     const DecodedTrack* mshr = childTrack(trace, "mshr", fetch->uuid);
     CHECK(mshr != nullptr);
@@ -1011,11 +979,10 @@ void measure_producer_cost() {
 int main() {
     std::cout << "=== Timeline API Tests ===\n";
 
-    test_legacy_pipeline_parser();
     test_lanes_end_to_end();
     test_path_track_hierarchy();
     test_high_bit_category();
-    test_high_bit_legacy_pipe_category();
+    test_trace_pipe_category_is_plain_trace();
     test_temporal_filter_span_semantics();
     test_timeline_observe_convenience_api();
     test_pipeline_counter_track_ordering();
@@ -1027,3 +994,7 @@ int main() {
     std::cout << "\nAll tests PASSED\n";
     return 0;
 }
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif

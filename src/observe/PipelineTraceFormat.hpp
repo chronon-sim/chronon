@@ -12,28 +12,11 @@
 #include <string>
 #include <string_view>
 
-#include "Types.hpp"
-
 namespace chronon::observe {
-
-struct PipelineTraceFields {
-    std::string_view id;
-    std::string_view note;
-    std::string track_path;
-    std::string category;
-    std::string event_name;
-    uint64_t flow_id = 0;
-    bool has_flow_id = false;
-};
-
-bool isPipeCategory(CategoryMask category);
 
 uint64_t pipelineColorHash(uint64_t id);
 uint64_t pipelineColorHash(std::string_view key);
 std::string pipelineColorCategory(uint64_t color_hash);
 std::string pipelineColoredEventName(std::string_view visible_name, uint64_t color_hash);
-
-bool parsePipelineTraceMessage(std::string_view source_name, std::string_view message,
-                               PipelineTraceFields& out);
 
 }  // namespace chronon::observe

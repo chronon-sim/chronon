@@ -49,11 +49,11 @@ public:
     InPort<FlushSignal> in_flush{this, "in_flush", 8};
 
     // Per-instance counters
-    Counter fetched_{this, "fetched", "Instructions fetched", "instrs"};
-    Counter icache_hits_{this, "icache_hits", "I-Cache hits", "accesses"};
-    Counter icache_misses_{this, "icache_misses", "I-Cache misses", "accesses"};
-    Counter bp_predictions_{this, "bp_predictions", "Predictions made", "preds"};
-    Counter flushes_{this, "flushes", "Pipeline flushes", "events"};
+    EventCounter fetched_{this, "fetched", "Instructions fetched", "instrs"};
+    EventCounter icache_hits_{this, "icache_hits", "I-Cache hits", "accesses"};
+    EventCounter icache_misses_{this, "icache_misses", "I-Cache misses", "accesses"};
+    EventCounter bp_predictions_{this, "bp_predictions", "Predictions made", "preds"};
+    EventCounter flushes_{this, "flushes", "Pipeline flushes", "events"};
 
     // Instruction-lifetime pilot: every stage stamps its events with
     // flow(instr_id), so Perfetto links one instruction's journey
@@ -87,8 +87,9 @@ public:
 
         // 1. Handle flush signals first (highest priority)
         while (auto flush = in_flush.tryReceive(localCycle())) {
-            trace<"Flush received: redirect_pc=0x{:x} flush_id={}">(
-                trace_cat::FLUSH, flush->redirect_pc, flush->flush_id);
+            flushes_.mark<"flush_received">(trace_cat::FLUSH,
+                                            arg<"redirect_pc">(flush->redirect_pc),
+                                            arg<"flush_id">(flush->flush_id));
             flushing_ = true;
             redirect_pc_ = flush->redirect_pc;
 
@@ -98,7 +99,6 @@ public:
             bp_stage1_.reset();
             bp_stage2_.reset();
             pending_send_.reset();
-            ++flushes_;
         }
 
         // Apply flush redirect
@@ -107,26 +107,26 @@ public:
             instr_id_ = redirect_pc_;
             flushing_ = false;
             stalled_ = false;
-            trace<"Flush applied: new_pc=0x{:x} pipelines_reset">(trace_cat::FLUSH, pc_);
+            event<"flush_applied">(trace_cat::FLUSH, arg<"pc">(pc_));
         }
 
         // 2. Handle L2 responses
         while (auto resp = in_l2_resp.tryReceive(localCycle())) {
             icache_lines_.insert(resp->addr >> 6);
             stalled_ = false;
-            trace<"L2 response received: addr=0x{:x} cache_line={} unstalling">(
-                trace_cat::ICACHE_MISS, resp->addr, resp->addr >> 6);
+            event<"l2_response_received">(trace_cat::ICACHE_MISS, arg<"addr">(resp->addr),
+                                          arg<"cache_line">(resp->addr >> 6));
             stall_cycles_ = 0;
         }
 
         // 3. Branch Prediction Pipeline (dual pipeline demonstration)
         bp_stage2_.template forEachValidConsume<P>([&](auto& pred) {
-            trace<"Branch prediction consumed: pc=0x{:x} taken={} target=0x{:x}">(
-                trace_cat::BRANCH_PRED, pred.prediction.pc, pred.prediction.predicted_taken,
-                pred.prediction.target_pc);
+            bp_predictions_.mark<"branch_prediction_consumed">(
+                trace_cat::BRANCH_PRED, arg<"pc">(pred.prediction.pc),
+                arg<"taken">(pred.prediction.predicted_taken),
+                arg<"target">(pred.prediction.target_pc));
             if (pred.prediction.predicted_taken) {
             }
-            ++bp_predictions_;
         });
 
         bp_stage1_.template forEachValidConsume<P>([&](auto& s1) {
@@ -162,9 +162,7 @@ public:
                 Instruction instr{.pc = pc_, .id = instr_id_};
                 sendWithValidation(instr);
                 fetch_lane_.instant(0, trace_cat::FETCH, "fetch"_ev, flow(instr_id_),
-                                    arg<"pc">(pc_));
-                trace<"I-Cache HIT: pc=0x{:x} cache_line={} instr_id={}">(
-                    trace_cat::ICACHE_HIT, pc_, cache_line, instr_id_);
+                                    arg<"pc">(pc_), arg<"cache_line">(cache_line));
                 ++pc_;
                 ++instr_id_;
                 ++fetched_count_;
@@ -174,10 +172,9 @@ public:
                     CacheRequest req{
                         .addr = cache_line << 6, .is_write = false, .req_id = instr_id_};
                     if (out_icache_miss.send(req)) {
-                        trace<"I-Cache MISS: pc=0x{:x} cache_line={} stalling">(
-                            trace_cat::ICACHE_MISS, pc_, cache_line);
+                        icache_misses_.mark<"icache_miss">(trace_cat::ICACHE_MISS, arg<"pc">(pc_),
+                                                           arg<"cache_line">(cache_line));
                         stalled_ = true;
-                        ++icache_misses_;
                     }
                 }
                 break;
@@ -217,9 +214,10 @@ private:
             predicted_taken = it->second;
         }
 
-        trace<"Branch prediction: pc=0x{:x} taken={} target=0x{:x} from_history={}">(
-            trace_cat::BRANCH_PRED, pc, predicted_taken, predicted_taken ? pc + 4 : pc + 1,
-            it != branch_history_.end());
+        event<"branch_prediction">(trace_cat::BRANCH_PRED, arg<"pc">(pc),
+                                   arg<"taken">(predicted_taken),
+                                   arg<"target">(predicted_taken ? pc + 4 : pc + 1),
+                                   arg<"from_history">(it != branch_history_.end()));
 
         return BranchPrediction{.pc = pc, .predicted_taken = predicted_taken, .target_pc = pc + 4};
     }
@@ -267,7 +265,7 @@ public:
     OutPort<DecodedOp> out_decoded_2{this, "out_decoded_2"};
     OutPort<DecodedOp> out_decoded_3{this, "out_decoded_3"};
 
-    Counter decoded_{this, "decoded", "Instructions decoded", "instrs"};
+    EventCounter decoded_{this, "decoded", "Instructions decoded", "instrs"};
 
     /// Dispatch instants carry the instruction flow plus the target ALU.
     TimelineLane dispatch_lane_{this, "dispatch"};
@@ -286,8 +284,8 @@ public:
     void tick() override {
         // Handle flush signals
         while (auto flush = in_flush.tryReceive(localCycle())) {
-            trace<"Decode flush: flush_id={} - clearing {} buffered instructions">(
-                trace_cat::FLUSH, flush->flush_id, decode_buffer_.size());
+            event<"decode_flush">(trace_cat::FLUSH, arg<"flush_id">(flush->flush_id),
+                                  arg<"buffered">(decode_buffer_.size()));
 
             in_instr.flush();
 
@@ -318,10 +316,9 @@ public:
             if (ports[op.dispatch_target]->canSend()) {
                 bool sent = sendWithValidation(op, *ports[op.dispatch_target], op.dispatch_target);
                 dispatch_lane_.instant(0, trace_cat::DISPATCH, "dispatch"_ev, flow(op.instr_id),
-                                       arg<"alu">(op.dispatch_target));
-                trace<"Dispatch buffered to ALU{}: instr_id={} op_type={}">(
-                    trace_cat::DISPATCH, op.dispatch_target, op.instr_id,
-                    static_cast<int>(op.op_type));
+                                       arg<"alu">(op.dispatch_target),
+                                       arg<"op_type">(static_cast<int>(op.op_type)),
+                                       arg<"buffered">(true));
                 decode_buffer_.pop_front();
                 dispatched++;
                 if (sent) {
@@ -352,17 +349,15 @@ public:
                          .pc = instr.pc,
                          .dispatch_target = static_cast<uint8_t>(dispatch_rr_ % 4)};
 
-            trace<"Decode: instr_id={} pc=0x{:x} op_type={} dest_reg=r{} dispatch_to_alu{}">(
-                trace_cat::DECODE, instr.id, instr.pc, static_cast<int>(op.op_type), op.dest_reg,
-                op.dispatch_target);
+            event<"decode">(trace_cat::DECODE, flow(op.instr_id), arg<"pc">(instr.pc),
+                            arg<"op_type">(static_cast<int>(op.op_type)),
+                            arg<"dest_reg">(op.dest_reg), arg<"alu">(op.dispatch_target));
 
             if (ports[op.dispatch_target]->canSend()) {
                 bool sent = sendWithValidation(op, *ports[op.dispatch_target], op.dispatch_target);
                 dispatch_lane_.instant(0, trace_cat::DISPATCH, "dispatch"_ev, flow(op.instr_id),
-                                       arg<"alu">(op.dispatch_target));
-                trace<"Dispatch to ALU{}: instr_id={} op_type={}">(trace_cat::DISPATCH,
-                                                                   op.dispatch_target, op.instr_id,
-                                                                   static_cast<int>(op.op_type));
+                                       arg<"alu">(op.dispatch_target),
+                                       arg<"op_type">(static_cast<int>(op.op_type)));
                 dispatch_rr_++;
                 dispatched++;
                 if (sent) {
@@ -370,8 +365,9 @@ public:
                 }
             } else {
                 decode_buffer_.push_back(op);
-                trace<"Buffering decode for ALU{}: instr_id={} buffer_size={}">(
-                    trace_cat::DECODE, op.dispatch_target, op.instr_id, decode_buffer_.size());
+                event<"decode_buffered">(trace_cat::DECODE, flow(op.instr_id),
+                                         arg<"alu">(op.dispatch_target),
+                                         arg<"buffer_size">(decode_buffer_.size()));
                 dispatch_rr_++;
                 break;
             }

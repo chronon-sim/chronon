@@ -160,44 +160,6 @@ void ObservationBackend::writeTraceToTimeline_(const StructuredRecord* rec,
     reconstructMessageTo_(timeline_msg_buffer_, fmt_info, rec, args_data, args_size);
     const std::string_view message(timeline_msg_buffer_.data(), timeline_msg_buffer_.size());
 
-    std::string_view source_name;
-    if (rec->source_id > 0 && rec->source_id < source_name_cache_.size()) {
-        source_name = source_name_cache_[rec->source_id];
-    }
-
-    PipelineTraceFields pipe;
-    if (isPipeCategory(rec->category) && parsePipelineTraceMessage(source_name, message, pipe)) {
-        PerfettoTraceWriter::Annotation annotations[1] = {
-            {.name = "note",
-             .kind = PerfettoTraceWriter::Annotation::Kind::String,
-             .bits = 0,
-             .string = pipe.note},
-        };
-        std::span<const PerfettoTraceWriter::Annotation> ann_span;
-        if (!pipe.note.empty()) {
-            ann_span = std::span<const PerfettoTraceWriter::Annotation>(annotations, 1);
-        }
-
-        constexpr uint32_t kPipeTraceRankStride = 10000;
-        const uint32_t rank = static_cast<uint32_t>(rec->source_id) * kPipeTraceRankStride;
-        const uint64_t track_uuid =
-            timelineTrackForPath_(pipe.track_path, static_cast<int32_t>(rank));
-        if (pipe.has_flow_id) {
-            perfetto_writer_->sliceBeginWithFlow(track_uuid, pipe.category, pipe.event_name,
-                                                 rec->cycle, pipe.flow_id, ann_span);
-        } else {
-            perfetto_writer_->sliceBegin(track_uuid, pipe.category, pipe.event_name, rec->cycle,
-                                         pipe.flow_id, ann_span);
-        }
-        const uint64_t end_cycle = rec->cycle + 1;
-        perfetto_writer_->sliceEnd(track_uuid, end_cycle);
-        if (end_cycle > timeline_max_cycle_) {
-            timeline_max_cycle_ = end_cycle;
-        }
-        local_bytes_written_ += timeline_msg_buffer_.size() + pipe.track_path.size() + 32;
-        return;
-    }
-
     // 1 cycle is rendered as 1 ns on the timeline axis.
     perfetto_writer_->instant(timelineTrackForSource_(rec->source_id), "trace", message,
                               rec->cycle);

@@ -203,6 +203,84 @@ void emitCapacitySamples(ObservationContext* ctx, CategoryMask category, Used us
     emitNamedCounterSample<Name, TrackSuffix::Free>(ctx, category, values.free, unit_name);
 }
 
+template <FixedString Name, typename Unit, typename Cat, typename... Items>
+inline void emitUnitEvent(Unit& unit, Cat category, Items&&... items) {
+    auto* ctx = contextFor(unit);
+    using Track = EventTrack;
+    const uint32_t track_id = resolveTrack<Track>(ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
+    timeline_detail::emitEventWithItems(
+        ctx, static_cast<CategoryMask>(category), TimelineEventKind::Instant, track_id,
+        /*slot=*/0, EventName<Name>::ref(), std::forward<Items>(items)...);
+}
+
+template <FixedString Track, typename Unit, typename Cat, typename... Items>
+inline void emitUnitInstant(Unit& unit, Cat category, EventNameRef name, Items&&... items) {
+    auto* ctx = contextFor(unit);
+    using Site = NamedLaneTrack<Track>;
+    const uint32_t track_id = resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
+    timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
+                                        TimelineEventKind::Instant, track_id, /*slot=*/0, name,
+                                        std::forward<Items>(items)...);
+}
+
+template <FixedString Track, typename Unit, typename Cat, typename... Items>
+inline void emitUnitSpanBegin(Unit& unit, Cat category, EventNameRef name, Items&&... items) {
+    auto* ctx = contextFor(unit);
+    using Site = NamedLaneTrack<Track>;
+    const uint32_t track_id = resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
+    timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
+                                        TimelineEventKind::SpanBegin, track_id, /*slot=*/0, name,
+                                        std::forward<Items>(items)...);
+}
+
+template <FixedString Track, typename Unit, typename Cat, typename... Items>
+inline void emitUnitSpanBegin(Unit& unit, uint16_t slot, Cat category, EventNameRef name,
+                              Items&&... items) {
+    auto* ctx = contextFor(unit);
+    using Site = NamedLaneTrack<Track, true>;
+    const uint32_t track_id = resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Lane,
+                                                 std::numeric_limits<uint16_t>::max());
+    timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
+                                        TimelineEventKind::SpanBegin, track_id, slot, name,
+                                        std::forward<Items>(items)...);
+}
+
+template <FixedString Track, typename Unit>
+inline void emitUnitSpanEnd(Unit& unit) {
+    auto* ctx = contextFor(unit);
+    using Site = NamedLaneTrack<Track>;
+    const uint32_t track_id = resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
+    if (ctx && track_id != 0) {
+        ctx->timelineEvent(category::NONE, TimelineEventKind::SpanEnd, track_id, /*slot=*/0,
+                           /*name_id=*/0, /*payload=*/0, nullptr, 0);
+    }
+}
+
+template <FixedString Track, typename Unit>
+inline void emitUnitSpanEnd(Unit& unit, uint16_t slot) {
+    auto* ctx = contextFor(unit);
+    using Site = NamedLaneTrack<Track, true>;
+    const uint32_t track_id = resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Lane,
+                                                 std::numeric_limits<uint16_t>::max());
+    if (ctx && track_id != 0) {
+        ctx->timelineEvent(category::NONE, TimelineEventKind::SpanEnd, track_id, slot,
+                           /*name_id=*/0, /*payload=*/0, nullptr, 0);
+    }
+}
+
+template <FixedString Name, typename Unit, typename T>
+inline void emitUnitGauge(Unit& unit, CategoryMask category, T value, std::string_view unit_name) {
+    auto* ctx = contextFor(unit);
+    emitNamedCounterSample<Name>(ctx, category, value, unit_name);
+}
+
+template <FixedString Name, typename Unit, typename Used, typename Capacity>
+inline void emitUnitCapacity(Unit& unit, CategoryMask category, Used used, Capacity total,
+                             std::string_view unit_name) {
+    auto* ctx = contextFor(unit);
+    emitCapacitySamples<Name>(ctx, category, used, total, unit_name);
+}
+
 }  // namespace timeline_observe_detail
 
 /**
@@ -212,123 +290,120 @@ void emitCapacitySamples(ObservationContext* ctx, CategoryMask category, Used us
  * observe::event<"flush">(*this, CAT, arg<"removed">(n)).
  */
 template <FixedString Name, typename Unit, typename Cat, typename... Items>
+[[deprecated(
+    "free observe::event() is deprecated; use ObservableUnit::event() or EventCounter::mark()")]]
 inline void event(Unit& unit, Cat category, Items&&... items) {
-    auto* ctx = timeline_observe_detail::contextFor(unit);
-    using Track = timeline_observe_detail::EventTrack;
-    const uint32_t track_id = timeline_observe_detail::resolveTrack<Track>(
-        ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
-    timeline_detail::emitEventWithItems(
-        ctx, static_cast<CategoryMask>(category), TimelineEventKind::Instant, track_id,
-        /*slot=*/0, EventName<Name>::ref(), std::forward<Items>(items)...);
+    timeline_observe_detail::emitUnitEvent<Name>(unit, category, std::forward<Items>(items)...);
 }
 
 /**
  * @brief Emit an instant event on a named track.
  */
 template <FixedString Track, typename Unit, typename Cat, typename... Items>
+[[deprecated(
+    "free observe::instant() is deprecated; use ObservableUnit::instant() or a TimelineLane "
+    "member")]]
 inline void instant(Unit& unit, Cat category, EventNameRef name, Items&&... items) {
-    auto* ctx = timeline_observe_detail::contextFor(unit);
-    using Site = timeline_observe_detail::NamedLaneTrack<Track>;
-    const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
-        ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
-    timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
-                                        TimelineEventKind::Instant, track_id, /*slot=*/0, name,
-                                        std::forward<Items>(items)...);
+    timeline_observe_detail::emitUnitInstant<Track>(unit, category, name,
+                                                    std::forward<Items>(items)...);
 }
 
 /**
  * @brief Begin/end named occupancy spans without declaring a TimelineLane member.
  */
 template <FixedString Track, typename Unit, typename Cat, typename... Items>
+[[deprecated(
+    "free observe::spanBegin() is deprecated; use ObservableUnit::spanBegin() or a TimelineSpan "
+    "member")]]
 inline void spanBegin(Unit& unit, Cat category, EventNameRef name, Items&&... items) {
-    auto* ctx = timeline_observe_detail::contextFor(unit);
-    using Site = timeline_observe_detail::NamedLaneTrack<Track>;
-    const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
-        ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
-    timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
-                                        TimelineEventKind::SpanBegin, track_id, /*slot=*/0, name,
-                                        std::forward<Items>(items)...);
+    timeline_observe_detail::emitUnitSpanBegin<Track>(unit, category, name,
+                                                      std::forward<Items>(items)...);
 }
 
 template <FixedString Track, typename Unit, typename Cat, typename... Items>
+[[deprecated(
+    "free observe::spanBegin() is deprecated; use ObservableUnit::spanBegin() or a TimelineSpan "
+    "member")]]
 inline void spanBegin(Unit& unit, uint16_t slot, Cat category, EventNameRef name,
                       Items&&... items) {
-    auto* ctx = timeline_observe_detail::contextFor(unit);
-    using Site = timeline_observe_detail::NamedLaneTrack<Track, true>;
-    const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
-        ctx, TimelineTrackInfo::Kind::Lane, std::numeric_limits<uint16_t>::max());
-    timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
-                                        TimelineEventKind::SpanBegin, track_id, slot, name,
-                                        std::forward<Items>(items)...);
+    timeline_observe_detail::emitUnitSpanBegin<Track>(unit, slot, category, name,
+                                                      std::forward<Items>(items)...);
 }
 
 template <FixedString Track, typename Unit>
+[[deprecated(
+    "free observe::spanEnd() is deprecated; use ObservableUnit::spanEnd() or a TimelineSpan "
+    "member")]]
 inline void spanEnd(Unit& unit) {
-    auto* ctx = timeline_observe_detail::contextFor(unit);
-    using Site = timeline_observe_detail::NamedLaneTrack<Track>;
-    const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
-        ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
-    if (ctx && track_id != 0) {
-        ctx->timelineEvent(category::NONE, TimelineEventKind::SpanEnd, track_id, /*slot=*/0,
-                           /*name_id=*/0, /*payload=*/0, nullptr, 0);
-    }
+    timeline_observe_detail::emitUnitSpanEnd<Track>(unit);
 }
 
 template <FixedString Track, typename Unit>
+[[deprecated(
+    "free observe::spanEnd() is deprecated; use ObservableUnit::spanEnd() or a TimelineSpan "
+    "member")]]
 inline void spanEnd(Unit& unit, uint16_t slot) {
-    auto* ctx = timeline_observe_detail::contextFor(unit);
-    using Site = timeline_observe_detail::NamedLaneTrack<Track, true>;
-    const uint32_t track_id = timeline_observe_detail::resolveTrack<Site>(
-        ctx, TimelineTrackInfo::Kind::Lane, std::numeric_limits<uint16_t>::max());
-    if (ctx && track_id != 0) {
-        ctx->timelineEvent(category::NONE, TimelineEventKind::SpanEnd, track_id, slot,
-                           /*name_id=*/0, /*payload=*/0, nullptr, 0);
-    }
+    timeline_observe_detail::emitUnitSpanEnd<Track>(unit, slot);
 }
 
 /**
  * @brief Emit one push-model counter sample on a named Perfetto counter track.
  */
 template <FixedString Name, typename Unit, typename T>
+[[deprecated(
+    "free observe::gauge() is deprecated; use EventCounter for aggregate metrics or "
+    "ObservableUnit::gauge() during migration")]]
 inline void gauge(Unit& unit, T value, std::string_view unit_name = {}) {
-    auto* ctx = timeline_observe_detail::contextFor(unit);
-    timeline_observe_detail::emitNamedCounterSample<Name>(ctx, category::NONE, value, unit_name);
+    timeline_observe_detail::emitUnitGauge<Name>(unit, category::NONE, value, unit_name);
 }
 
 template <FixedString Name, typename Unit, typename Cat, typename T>
     requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
+[[deprecated(
+    "free observe::gauge() is deprecated; use EventCounter for aggregate metrics or "
+    "ObservableUnit::gauge() during migration")]]
 inline void gauge(Unit& unit, Cat category, T value, std::string_view unit_name = {}) {
-    auto* ctx = timeline_observe_detail::contextFor(unit);
-    timeline_observe_detail::emitNamedCounterSample<Name>(ctx, static_cast<CategoryMask>(category),
-                                                          value, unit_name);
+    timeline_observe_detail::emitUnitGauge<Name>(unit, static_cast<CategoryMask>(category), value,
+                                                 unit_name);
 }
 
 /**
  * @brief Emit used/free capacity samples on sibling counter tracks.
  */
 template <FixedString Name, typename Unit, typename Used, typename Capacity>
+[[deprecated(
+    "free observe::capacity() is deprecated; use EventCounter for aggregate metrics or "
+    "ObservableUnit::capacity() during migration")]]
 inline void capacity(Unit& unit, Used used, Capacity total, std::string_view unit_name = {}) {
-    auto* ctx = timeline_observe_detail::contextFor(unit);
-    timeline_observe_detail::emitCapacitySamples<Name>(ctx, category::NONE, used, total, unit_name);
+    timeline_observe_detail::emitUnitCapacity<Name>(unit, category::NONE, used, total, unit_name);
 }
 
 template <FixedString Name, typename Unit, typename Cat, typename Used, typename Capacity>
     requires(!std::is_arithmetic_v<std::decay_t<Cat>>)
+[[deprecated(
+    "free observe::capacity() is deprecated; use EventCounter for aggregate metrics or "
+    "ObservableUnit::capacity() during migration")]]
 inline void capacity(Unit& unit, Cat category, Used used, Capacity total,
                      std::string_view unit_name = {}) {
-    auto* ctx = timeline_observe_detail::contextFor(unit);
-    timeline_observe_detail::emitCapacitySamples<Name>(ctx, static_cast<CategoryMask>(category),
-                                                       used, total, unit_name);
+    timeline_observe_detail::emitUnitCapacity<Name>(unit, static_cast<CategoryMask>(category), used,
+                                                    total, unit_name);
 }
 
 template <FixedString Name, typename Unit, typename Port>
+[[deprecated(
+    "observe::portRemaining() is deprecated; sample the metric through EventCounter or a "
+    "unit-level helper")]]
 inline void portRemaining(Unit& unit, const Port& port, std::string_view unit_name = "sends") {
-    gauge<Name>(unit, port.remainingThisCycle(), unit_name);
+    timeline_observe_detail::emitUnitGauge<Name>(unit, category::NONE, port.remainingThisCycle(),
+                                                 unit_name);
 }
 
 template <FixedString Name, typename Unit, typename Port>
+[[deprecated(
+    "observe::portAvailable() is deprecated; sample the metric through EventCounter or a "
+    "unit-level helper")]]
 inline void portAvailable(Unit& unit, const Port& port, std::string_view unit_name = "entries") {
-    gauge<Name>(unit, port.available(), unit_name);
+    timeline_observe_detail::emitUnitGauge<Name>(unit, category::NONE, port.available(), unit_name);
 }
 
 /**
@@ -446,8 +521,11 @@ private:
  */
 class TimelineGauge {
 public:
+    [[deprecated(
+        "TimelineGauge is deprecated for user code; use EventCounter::add() for aggregate metrics "
+        "or EventCounter::mark() for timeline-visible events")]]
     TimelineGauge(ObservableUnit* owner, std::string_view name, std::string_view unit = {})
-        : counter_(owner, name, unit) {}
+        : counter_(timeline_detail::InternalTimelineCounterTag{}, owner, name, unit) {}
 
     template <typename T>
     void sample(T value) noexcept {
@@ -499,9 +577,14 @@ private:
  */
 class TimelineCapacity {
 public:
+    [[deprecated(
+        "TimelineCapacity is deprecated for user code; use EventCounter-based metrics instead of "
+        "push-model timeline counters")]]
     TimelineCapacity(ObservableUnit* owner, std::string_view name, std::string_view unit = {})
-        : used_(owner, suffixedName_(name, ".used"), unit),
-          free_(owner, suffixedName_(name, ".free"), unit) {}
+        : used_(timeline_detail::InternalTimelineCounterTag{}, owner, suffixedName_(name, ".used"),
+                unit),
+          free_(timeline_detail::InternalTimelineCounterTag{}, owner, suffixedName_(name, ".free"),
+                unit) {}
 
     template <typename Used, typename Capacity>
     void sample(Used used, Capacity total) noexcept {

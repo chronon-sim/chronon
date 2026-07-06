@@ -87,8 +87,8 @@ struct RingSimSetup {
                 role = PipelineStage::Role::Writer;
             else if (reader_indices.count(i))
                 role = PipelineStage::Role::Reader;
-            stages.push_back(
-                sim.createUnit<PipelineStage>("s" + std::to_string(i), role, nullptr, nullptr));
+            stages.push_back(sim.createUnit<PipelineStage>(std::string{"s"} + std::to_string(i),
+                                                           role, nullptr, nullptr));
         }
         for (size_t i = 0; i < n; ++i) {
             sim.connect(stages[i]->out, stages[(i + 1) % n]->in, delays[i]);
@@ -178,8 +178,8 @@ void test_depth_chain() {
         PipelineStage::Role role = PipelineStage::Role::None;
         if (i == 0) role = PipelineStage::Role::Writer;
         if (i == N - 1) role = PipelineStage::Role::Reader;
-        stages.push_back(
-            sim.createUnit<PipelineStage>("s" + std::to_string(i), role, nullptr, nullptr));
+        stages.push_back(sim.createUnit<PipelineStage>(std::string{"s"} + std::to_string(i), role,
+                                                       nullptr, nullptr));
     }
     for (size_t i = 0; i + 1 < N; ++i) {
         sim.connect(stages[i]->out, stages[i + 1]->in, delays[i]);
@@ -297,8 +297,8 @@ void test_simulation_chain() {
         PipelineStage::Role role = PipelineStage::Role::None;
         if (i == 0) role = PipelineStage::Role::Writer;
         if (i == N - 1) role = PipelineStage::Role::Reader;
-        stages.push_back(
-            sim.createUnit<PipelineStage>("s" + std::to_string(i), role, nullptr, &violations));
+        stages.push_back(sim.createUnit<PipelineStage>(std::string{"s"} + std::to_string(i), role,
+                                                       nullptr, &violations));
     }
     for (size_t i = 0; i + 1 < N; ++i) {
         sim.connect(stages[i]->out, stages[i + 1]->in, 1);

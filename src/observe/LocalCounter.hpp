@@ -25,6 +25,14 @@ namespace chronon::observe {
 // Forward declaration
 class ObservableUnit;
 
+namespace counter_detail {
+
+struct InternalConstructionTag {
+    explicit InternalConstructionTag() = default;
+};
+
+}  // namespace counter_detail
+
 /**
  * Counter - Per-instance counter declared as a unit member.
  *
@@ -63,8 +71,14 @@ public:
      * @param description Counter description
      * @param unit Unit of measurement (e.g., "ops", "cycles", "bytes")
      */
+    [[deprecated(
+        "Counter is deprecated for user code; use EventCounter and call add() for counter-only "
+        "updates or mark() for timeline-visible events")]]
     Counter(ObservableUnit* owner, std::string_view name, std::string_view description = "",
             std::string_view unit = "");
+
+    Counter(counter_detail::InternalConstructionTag, ObservableUnit* owner, std::string_view name,
+            std::string_view description = "", std::string_view unit = "");
 
     // Non-copyable (tied to specific unit instance)
     Counter(const Counter&) = delete;
