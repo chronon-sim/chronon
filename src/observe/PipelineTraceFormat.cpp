@@ -10,11 +10,6 @@
 
 #include <fmt/format.h>
 
-#include <bit>
-#include <cctype>
-
-#include "ObserveApi.hpp"
-
 namespace chronon::observe {
 
 namespace {
@@ -87,11 +82,6 @@ void appendInvisibleColorSuffix(std::string& out, uint64_t hash) {
     }
 }
 
-std::string_view pipelineColorKey(std::string_view /*source_name*/, std::string_view id,
-                                  std::string_view /*note*/) {
-    return id;
-}
-
 }  // namespace
 
 uint64_t pipelineColorHash(uint64_t id) { return mixColorKey(id); }
@@ -106,71 +96,6 @@ std::string pipelineColoredEventName(std::string_view visible_name, uint64_t col
     std::string name(visible_name);
     appendInvisibleColorSuffix(name, color_hash);
     return name;
-}
-
-bool isPipeCategory(CategoryMask category) {
-    CategoryMask remaining = category;
-    while (remaining != 0) {
-        const uint32_t bit = static_cast<uint32_t>(std::countr_zero(remaining));
-        if (CategoryRegistry::instance().nameForBit(bit) == "pipe") {
-            return true;
-        }
-        remaining &= remaining - 1;
-    }
-    return false;
-}
-
-bool parsePipelineTraceMessage(std::string_view source_name, std::string_view message,
-                               PipelineTraceFields& out) {
-    const size_t hash = message.find('#');
-    if (hash == std::string_view::npos || hash == 0) {
-        return false;
-    }
-
-    const size_t semi = message.find(';', hash + 1);
-    const std::string_view header = message.substr(0, hash);
-    out.id = message.substr(
-        hash + 1, semi == std::string_view::npos ? std::string_view::npos : semi - hash - 1);
-    out.note = semi == std::string_view::npos ? std::string_view{} : message.substr(semi + 1);
-    if (out.id.empty()) {
-        return false;
-    }
-
-    size_t stage_start = 0;
-    std::string_view pipe_id;
-    const unsigned char first = static_cast<unsigned char>(header.front());
-    if (std::isdigit(first)) {
-        while (stage_start < header.size() &&
-               std::isdigit(static_cast<unsigned char>(header[stage_start]))) {
-            ++stage_start;
-        }
-        pipe_id = header.substr(0, stage_start);
-    } else if (header.front() == '-') {
-        stage_start = 1;
-    }
-    const std::string_view stage = header.substr(stage_start);
-    if (stage.empty()) {
-        return false;
-    }
-    out.track_path.clear();
-    std::string_view source = source_name.empty() ? std::string_view("unknown") : source_name;
-    out.track_path.reserve(source.size() + stage.size() + pipe_id.size() + 8);
-    out.track_path.append(source);
-    out.track_path.push_back('.');
-    out.track_path.append(stage);
-    if (!pipe_id.empty()) {
-        out.track_path.append(" pipe");
-        out.track_path.append(pipe_id);
-    }
-
-    const std::string_view color_key = pipelineColorKey(source_name, out.id, out.note);
-    const uint64_t color_hash = pipelineColorHash(color_key);
-    out.category = pipelineColorCategory(color_hash);
-    out.event_name = pipelineColoredEventName(out.id, color_hash);
-
-    out.flow_id = 0;
-    out.has_flow_id = parseFlowId(out.id, out.flow_id);
-    return true;
 }
 
 }  // namespace chronon::observe

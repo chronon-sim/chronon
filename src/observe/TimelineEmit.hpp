@@ -20,6 +20,17 @@
 
 namespace chronon::observe::timeline_detail {
 
+/// Folds one begin()/instant() pack item into the arg array or the flow id.
+template <typename T>
+inline void foldTimelineItem(ObservationContext* ctx, TimelineArgValue* args, size_t& arg_count,
+                             uint64_t& flow_id, const T& item) noexcept {
+    if constexpr (std::is_same_v<std::decay_t<T>, Flow>) {
+        flow_id = item.id;
+    } else {
+        args[arg_count++] = ctx->normalizeTimelineArgForEmit(item);
+    }
+}
+
 template <typename... Items>
 bool emitEventWithItems(ObservationContext* ctx, CategoryMask category, TimelineEventKind kind,
                         uint32_t track_id, uint16_t slot, EventNameRef name,
@@ -39,12 +50,20 @@ bool emitEventWithItems(ObservationContext* ctx, CategoryMask category, Timeline
         return ctx->timelineEvent(category, kind, track_id, slot, name.id, /*payload=*/0, nullptr,
                                   0);
     } else {
+        if (!ctx->shouldEmitTimelineEvent(category, kind)) {
+            return false;
+        }
+        const size_t string_checkpoint = ctx->checkpointPendingTimelineStrings();
         TimelineArgValue args[item_count];
         size_t arg_count = 0;
         uint64_t flow_id = 0;
-        (foldTimelineItem(args, arg_count, flow_id, std::forward<Items>(items)), ...);
-        return ctx->timelineEvent(category, kind, track_id, slot, name.id, flow_id, args,
-                                  arg_count);
+        (foldTimelineItem(ctx, args, arg_count, flow_id, std::forward<Items>(items)), ...);
+        const bool emitted =
+            ctx->timelineEvent(category, kind, track_id, slot, name.id, flow_id, args, arg_count);
+        if (!emitted || !ctx->isLookaheadMode()) {
+            ctx->restorePendingTimelineStrings(string_checkpoint);
+        }
+        return emitted;
     }
 }
 

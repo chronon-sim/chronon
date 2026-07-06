@@ -96,10 +96,10 @@ struct TickSimulationConfig {
     double initial_partition_sync_cost_ns = 8.0;  // Locality weight for placement
 
     // Dynamic rebalancing
-    bool enable_dynamic_rebalance = false;
-    double rebalance_imbalance_threshold = 1.3;
-    uint64_t rebalance_check_interval_cycles = 8192;
-    double rebalance_min_gain = 0.05;
+    bool enable_dynamic_rebalance = true;
+    double rebalance_imbalance_threshold = 1.03;
+    uint64_t rebalance_check_interval_cycles = 2048;
+    double rebalance_min_gain = 0.01;
     uint64_t rebalance_cooldown_cycles = 0;
 };
 

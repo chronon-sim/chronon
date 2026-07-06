@@ -412,20 +412,20 @@ struct TickSimulationConfig {
     double initial_partition_sync_cost_ns = 8.0;  // Locality weight for placement
 
     // Dynamic rebalancing
-    bool enable_dynamic_rebalance = false;
-    double rebalance_imbalance_threshold = 1.3;
-    uint64_t rebalance_check_interval_cycles = 8192;
-    double rebalance_min_gain = 0.05;
+    bool enable_dynamic_rebalance = true;
+    double rebalance_imbalance_threshold = 1.03;
+    uint64_t rebalance_check_interval_cycles = 2048;
+    double rebalance_min_gain = 0.01;
     uint64_t rebalance_cooldown_cycles = 0;
 };
 ```
 
 These settings can be configured via YAML (`enable_parallel`, `enable_lookahead`) or set directly in code. All scheduling modes produce identical cycle-accurate results — they differ only in wall-clock performance.
 
-Dynamic rebalance is opt-in. It samples unit tick cost periodically, combines
+Dynamic rebalance is enabled by default. It samples unit tick cost periodically, combines
 measured active cost with dependency topology and wait attribution, and migrates
 whole tight clusters at scheduler fence points when the predicted objective gain
-clears the configured thresholds. Leave `enable_dynamic_rebalance: false` when a
+clears the configured thresholds. Set `enable_dynamic_rebalance: false` when a
 fixed initial layout is more important; epoch-free lookahead itself remains the
 default path when the safety gate holds.
 `rebalance_min_gain` can suppress migrations with too little predicted speedup,

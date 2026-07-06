@@ -27,6 +27,14 @@ namespace chronon::observe {
 
 class ObservableUnit;
 
+namespace timeline_detail {
+
+struct InternalTimelineCounterTag {
+    explicit InternalTimelineCounterTag() = default;
+};
+
+}  // namespace timeline_detail
+
 /**
  * @brief Base for declarative timeline tracks; handles owner registration and
  * context attach (track-id assignment).
@@ -156,20 +164,25 @@ private:
 };
 
 /**
- * @brief Push-model counter track: explicit samples on the Perfetto timeline.
+ * @brief Deprecated push-model counter track: explicit samples on the Perfetto timeline.
  *
  * Independent of the pull-model Counter/counters.csv machinery — sample() is
  * an event through the trace channel, so temporal filters apply and lookahead
  * rollback discards speculative samples.
  *
- * @code
- *   TimelineCounter occ_{this, "lsq_occupancy", "entries"};
- *   occ_.sample(lsq_.size());
- * @endcode
+ * New code should use EventCounter::add() for aggregate metrics and
+ * EventCounter::mark() when a timeline-visible sample is needed.
  */
 class TimelineCounter : public TimelineTrackBase {
 public:
+    [[deprecated(
+        "TimelineCounter is deprecated for user code; use EventCounter::add() for aggregate "
+        "metrics or EventCounter::mark() for timeline-visible events")]]
     TimelineCounter(ObservableUnit* owner, std::string_view name, std::string_view unit = {})
+        : TimelineCounter(timeline_detail::InternalTimelineCounterTag{}, owner, name, unit) {}
+
+    TimelineCounter(timeline_detail::InternalTimelineCounterTag, ObservableUnit* owner,
+                    std::string_view name, std::string_view unit = {})
         : TimelineTrackBase(owner, name, unit, /*lanes=*/1, TimelineTrackInfo::Kind::Counter) {}
 
     bool sample(int64_t value) noexcept { return sample(category::NONE, value); }

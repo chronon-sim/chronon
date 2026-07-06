@@ -74,7 +74,7 @@ private:
  *
  * @code
  *   inline const auto CACHE_HIT = Category<"cache_hit", "Cache hit events">{};
- *   trace<"Hit at addr=0x{:x}">(CACHE_HIT, addr);
+ *   unit.event<"cache_hit">(CACHE_HIT, arg<"addr">(addr));
  * @endcode
  */
 template <FixedString Name, FixedString Desc = "">
@@ -125,15 +125,10 @@ struct Format {
     }
 };
 
-/**
- * @brief Emit a trace event with compile-time format string.
- *
- * @code
- *   trace<"Cache HIT: addr=0x{:x}">(ctx, CACHE_HIT, addr);
- * @endcode
- */
+namespace observe_detail {
+
 template <FixedString Fmt, typename Cat, typename... Args>
-inline void trace(ObservationContext* ctx, Cat category, Args&&... args) {
+inline void emitTrace(ObservationContext* ctx, Cat category, Args&&... args) {
     if (!ctx) return;
 
     CategoryMask cat_mask = static_cast<CategoryMask>(category);
@@ -142,6 +137,23 @@ inline void trace(ObservationContext* ctx, Cat category, Args&&... args) {
         static FormatId fmt_id = Format<Fmt>::template getIdWithTypes<Args...>("", 0, false);
         ctx->trace(cat_mask, fmt_id, std::forward<Args>(args)...);
     }
+}
+
+}  // namespace observe_detail
+
+/**
+ * @brief Emit a deprecated text trace event with compile-time format string.
+ *
+ * @code
+ *   trace<"Cache HIT: addr=0x{:x}">(ctx, CACHE_HIT, addr);
+ * @endcode
+ */
+template <FixedString Fmt, typename Cat, typename... Args>
+[[deprecated(
+    "trace<> text events are deprecated and will be removed after 0.4; use timeline events for "
+    "structured Perfetto data or log_* for text logs")]]
+inline void trace(ObservationContext* ctx, Cat category, Args&&... args) {
+    observe_detail::emitTrace<Fmt>(ctx, category, std::forward<Args>(args)...);
 }
 
 template <LogLevel Level, FixedString Fmt, typename... Args>

@@ -20,6 +20,10 @@ void ObservableUnit::initializePendingCounters() { attachPending_(pending_counte
 
 Counter::Counter(ObservableUnit* owner, std::string_view name, std::string_view description,
                  std::string_view unit)
+    : Counter(counter_detail::InternalConstructionTag{}, owner, name, description, unit) {}
+
+Counter::Counter(counter_detail::InternalConstructionTag, ObservableUnit* owner,
+                 std::string_view name, std::string_view description, std::string_view unit)
     : owner_(owner), name_(name), description_(description), unit_(unit) {
     if (owner_) {
         owner_->registerCounter(this);

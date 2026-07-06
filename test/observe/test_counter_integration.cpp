@@ -23,9 +23,12 @@ using namespace chronon::observe;
 // Test unit with Counter members
 class TestUnit : public ObservableUnit {
 public:
-    Counter counter1{this, "counter1", "First test counter"};
-    Counter counter2{this, "counter2", "Second test counter"};
-    Counter counter3{this, "counter3", "Third test counter"};
+    Counter counter1{counter_detail::InternalConstructionTag{}, this, "counter1",
+                     "First test counter"};
+    Counter counter2{counter_detail::InternalConstructionTag{}, this, "counter2",
+                     "Second test counter"};
+    Counter counter3{counter_detail::InternalConstructionTag{}, this, "counter3",
+                     "Third test counter"};
 };
 
 int main() {

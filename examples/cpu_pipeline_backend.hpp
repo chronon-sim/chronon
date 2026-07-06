@@ -44,12 +44,12 @@ public:
     OutPort<Result> out_result{this, "out_result"};
     OutPort<FlushSignal> out_flush_request{this, "out_flush_request"};
 
-    Counter ops_{this, "ops", "Operations executed", "ops"};
-    Counter executed_{this, "executed", "Operations completed", "ops"};
-    Counter alu_ops_{this, "alu_ops", "ALU operations", "ops"};
-    Counter load_ops_{this, "load_ops", "Load operations", "ops"};
-    Counter store_ops_{this, "store_ops", "Store operations", "ops"};
-    Counter branch_mispred_{this, "branch_mispred", "Branch mispredictions", "events"};
+    EventCounter ops_{this, "ops", "Operations executed", "ops"};
+    EventCounter executed_{this, "executed", "Operations completed", "ops"};
+    EventCounter alu_ops_{this, "alu_ops", "ALU operations", "ops"};
+    EventCounter load_ops_{this, "load_ops", "Load operations", "ops"};
+    EventCounter store_ops_{this, "store_ops", "Store operations", "ops"};
+    EventCounter branch_mispred_{this, "branch_mispred", "Branch mispredictions", "events"};
 
     /// EX-stage occupancy: span opens when an op enters the pipeline register
     /// and closes when its result leaves (so output-port stalls stretch the
@@ -82,8 +82,8 @@ public:
 
         // 1. Handle incoming flush - clear pipeline
         while (auto flush = in_flush.tryReceive(localCycle())) {
-            trace<"ALU{} flush received: flush_id={} pipeline_cleared">(trace_cat::FLUSH, alu_id_,
-                                                                        flush->flush_id);
+            event<"alu_flush_received">(trace_cat::FLUSH, arg<"alu">(alu_id_),
+                                        arg<"flush_id">(flush->flush_id));
 
             in_op.flush();
             out_result.cancelInFlight();
@@ -108,11 +108,9 @@ public:
                     if (out_flush_request.send(FlushSignal{.flush_id = op.instr_id,
                                                            .redirect_pc = op.pc + 4,
                                                            .flush_point_id = op.instr_id})) {
-                        trace<
-                            "Branch misprediction: instr_id={} redirect_pc=0x{:x} flush_id={} "
-                            "alu_id={}">(trace_cat::FLUSH, op.instr_id, op.pc + 4, op.instr_id,
-                                         alu_id_);
-                        ++branch_mispred_;
+                        branch_mispred_.mark<"branch_mispred">(
+                            trace_cat::FLUSH, flow(op.instr_id), arg<"redirect_pc">(op.pc + 4),
+                            arg<"flush_id">(op.instr_id), arg<"alu">(alu_id_));
                     }
                 }
             }
@@ -124,9 +122,10 @@ public:
                     .value = result_value, .dest_reg = op.dest_reg, .instr_id = op.instr_id};
                 bool sent = sendWithValidation(result);
                 ex_.end(0);
-                trace<"Execute ALU{}: instr_id={} op_type={} result={} dest_reg=r{}">(
-                    trace_cat::EXECUTE, alu_id_, op.instr_id, static_cast<int>(op.op_type),
-                    result_value, op.dest_reg);
+                event<"execute_complete">(
+                    trace_cat::EXECUTE, flow(op.instr_id), arg<"alu">(alu_id_),
+                    arg<"op_type">(static_cast<int>(op.op_type)), arg<"result">(result_value),
+                    arg<"dest_reg">(op.dest_reg));
                 if (sent) {
                     ++executed_;
                     ++ops_;
@@ -234,7 +233,7 @@ public:
     InPort<FlushSignal> in_flush_request{this, "in_flush_request", 64};
     OutPort<FlushSignal> out_flush_broadcast{this, "out_flush_broadcast"};
 
-    Counter flushes_{this, "flushes", "Pipeline flushes", "events"};
+    EventCounter flushes_{this, "flushes", "Pipeline flushes", "events"};
 
     CHRONON_UNIT_CONSTRUCTOR(FlushEngine, ParameterSet, )
     () : AutoRegisteredUnit("flush_engine") {}
@@ -247,9 +246,10 @@ public:
         while (auto req = in_flush_request.tryReceive(localCycle())) {
             if (out_flush_broadcast.canSend()) {
                 if (out_flush_broadcast.send(*req)) {
-                    trace<"Flush broadcast: flush_id={} redirect_pc=0x{:x} flush_point_id={}">(
-                        trace_cat::FLUSH, req->flush_id, req->redirect_pc, req->flush_point_id);
-                    ++flushes_;
+                    flushes_.mark<"flush_broadcast">(trace_cat::FLUSH,
+                                                     arg<"flush_id">(req->flush_id),
+                                                     arg<"redirect_pc">(req->redirect_pc),
+                                                     arg<"flush_point_id">(req->flush_point_id));
                 }
             } else {
                 error<"Flush broadcast blocked: critical flush request dropped, flush_id={}">(
@@ -276,7 +276,7 @@ public:
     InPort<Result> in_result_3{this, "in_result_3", 64};
     InPort<FlushSignal> in_flush{this, "in_flush", 8};
 
-    Counter committed_{this, "committed", "Results committed", "results"};
+    EventCounter committed_{this, "committed", "Results committed", "results"};
 
     /// Commit instants close out each instruction's flow.
     TimelineLane commit_lane_{this, "commit"};
@@ -302,7 +302,7 @@ public:
     void tick() override {
         // Handle flush signals
         while (auto flush = in_flush.tryReceive(localCycle())) {
-            trace<"Writeback flush: flush_id={}">(trace_cat::FLUSH, flush->flush_id);
+            event<"writeback_flush">(trace_cat::FLUSH, arg<"flush_id">(flush->flush_id));
 
             in_result_0.flush();
             in_result_1.flush();
@@ -322,9 +322,7 @@ public:
             while (auto result = ports[i]->tryReceive(localCycle())) {
                 validatePacket(*result, i);
                 commit_lane_.instant(0, trace_cat::COMMIT, "commit"_ev, flow(result->instr_id),
-                                     arg<"reg">(result->dest_reg));
-                trace<"Commit: instr_id={} value=0x{:x} dest_reg=r{}">(
-                    trace_cat::COMMIT, result->instr_id, result->value, result->dest_reg);
+                                     arg<"reg">(result->dest_reg), arg<"value">(result->value));
                 ++committed_;
                 ++total_commits_;
 
@@ -383,7 +381,7 @@ public:
     InPort<CacheRequest> in_req{this, "in_req", 64};
     OutPort<CacheResponse> out_resp{this, "out_resp"};
 
-    Counter l2_hits_{this, "l2_hits", "L2 cache hits", "accesses"};
+    EventCounter l2_hits_{this, "l2_hits", "L2 cache hits", "accesses"};
 
     /// Requests in flight: one span per request on a free-list-allocated slot
     /// (like a real MSHR — slots are only reused after their span closes),
@@ -391,7 +389,8 @@ public:
     /// Requests beyond MISS_SLOTS concurrent are not spanned (slot = -1).
     static constexpr uint16_t MISS_SLOTS = 16;
     TimelineLane miss_{this, "miss", MISS_SLOTS};
-    TimelineCounter inflight_{this, "inflight", "reqs"};
+    EventCounter inflight_samples_{this, "inflight_samples", "L2 inflight occupancy samples",
+                                   "samples"};
 
     CHRONON_UNIT_CONSTRUCTOR(L2CacheUnit, ParameterSet, params->latency, params->cache_lines)
     (uint32_t latency = 10, uint64_t cache_lines = 1000)
@@ -409,8 +408,9 @@ public:
 
     void tick() override {
         while (auto req = in_req.tryReceive(localCycle())) {
-            trace<"L2 request: addr=0x{:x} is_write={} req_id={} latency={}">(
-                trace_cat::L2_ACCESS, req->addr, req->is_write, req->req_id, latency_);
+            l2_hits_.mark<"l2_request">(trace_cat::L2_ACCESS, flow(req->req_id),
+                                        arg<"addr">(req->addr), arg<"is_write">(req->is_write),
+                                        arg<"latency">(latency_));
             // Allocate a span slot like an MSHR entry: only reuse a slot once
             // its span closed. Bursts beyond MISS_SLOTS go unspanned.
             int slot = -1;
@@ -420,7 +420,6 @@ public:
                 miss_.begin(static_cast<uint16_t>(slot), trace_cat::L2_ACCESS, "l2_miss"_ev,
                             flow(req->req_id), arg<"addr">(req->addr));
             }
-            ++l2_hits_;
             pending_.push({*req, localCycle() + latency_, slot});
 
             if (pending_.size() > 50) {
@@ -430,8 +429,8 @@ public:
 
         while (!pending_.empty() && pending_.front().ready_cycle <= localCycle()) {
             auto& p = pending_.front();
-            trace<"L2 response: addr=0x{:x} req_id={} hit=true">(trace_cat::L2_ACCESS, p.req.addr,
-                                                                 p.req.req_id);
+            event<"l2_response">(trace_cat::L2_ACCESS, flow(p.req.req_id), arg<"addr">(p.req.addr),
+                                 arg<"hit">(true));
             if (out_resp.send(CacheResponse{
                     .addr = p.req.addr, .data = p.req.addr, .req_id = p.req.req_id, .hit = true})) {
                 if (p.slot >= 0) {
@@ -446,7 +445,8 @@ public:
 
         if (pending_.size() != last_inflight_) {
             last_inflight_ = pending_.size();
-            inflight_.sample(static_cast<int64_t>(last_inflight_));
+            inflight_samples_.mark<"l2_inflight">(trace_cat::L2_ACCESS,
+                                                  arg<"reqs">(last_inflight_));
         }
     }
 

@@ -25,9 +25,12 @@ using namespace chronon::observe;
 class TestUnit : public ObservableUnit {
 public:
     // Per-instance counters - each TestUnit instance has its own
-    Counter ops{this, "ops", "Operations executed", "ops"};
-    Counter stalls{this, "stalls", "Stall cycles", "cycles"};
-    Counter cache_hits{this, "cache_hits", "Cache hits", "hits"};
+    Counter ops{counter_detail::InternalConstructionTag{}, this, "ops", "Operations executed",
+                "ops"};
+    Counter stalls{counter_detail::InternalConstructionTag{}, this, "stalls", "Stall cycles",
+                   "cycles"};
+    Counter cache_hits{counter_detail::InternalConstructionTag{}, this, "cache_hits", "Cache hits",
+                       "hits"};
 
     void doWork() {
         ++ops;

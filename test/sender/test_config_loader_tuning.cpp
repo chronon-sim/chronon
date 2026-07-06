@@ -81,9 +81,10 @@ simulation:
     CHECK(!config.trace_execution);
     CHECK(config.max_lookahead_cycles == 100);
     CHECK(config.epoch_size == 64);
-    CHECK(!config.enable_dynamic_rebalance);
-    CHECK(config.rebalance_check_interval_cycles == 8192);
-    CHECK(config.rebalance_min_gain == 0.05);
+    CHECK(config.enable_dynamic_rebalance);
+    CHECK(config.rebalance_imbalance_threshold == 1.03);
+    CHECK(config.rebalance_check_interval_cycles == 2048);
+    CHECK(config.rebalance_min_gain == 0.01);
     CHECK(config.rebalance_cooldown_cycles == 0);
     CHECK(config.partition_solver == "SA");
     CHECK(config.initial_partition_sync_cost_ns == 8.0);

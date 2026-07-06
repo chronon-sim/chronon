@@ -38,6 +38,7 @@
 #include "ObservableUnit.hpp"
 
 // Per-instance counters
+#include "EventCounter.hpp"
 #include "LocalCounter.hpp"
 
 // Derived (computed) counters

@@ -241,6 +241,35 @@ add_test(
 )
 
 # ==============================================================================
+# Timeline string annotation args
+# ==============================================================================
+
+add_executable(test_timeline_string_args
+    test_timeline_string_args.cpp
+)
+
+target_include_directories(test_timeline_string_args PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_link_libraries(test_timeline_string_args
+    chronon::core
+    chronon_observe
+    chronon_compile_options
+    ZLIB::ZLIB
+)
+
+target_compile_features(test_timeline_string_args PRIVATE cxx_std_20)
+
+add_dependencies(regress test_timeline_string_args)
+
+add_test(
+    NAME timeline_string_args_test
+    COMMAND test_timeline_string_args
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+# ==============================================================================
 # Runtime Pipeline API Test
 # ==============================================================================
 
