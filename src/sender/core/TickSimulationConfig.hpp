@@ -70,10 +70,10 @@ struct TickSimulationConfig {
     /// back to the legacy topology-only thread assignment.
     bool enable_weighted_partitioning = true;
 
-    bool enable_dynamic_rebalance = false;
-    double rebalance_imbalance_threshold = 1.3;
-    uint64_t rebalance_check_interval_cycles = 8192;
-    double rebalance_min_gain = 0.05;  ///< Skip rebalance if predicted gain below this fraction.
+    bool enable_dynamic_rebalance = true;
+    double rebalance_imbalance_threshold = 1.03;
+    uint64_t rebalance_check_interval_cycles = 2048;
+    double rebalance_min_gain = 0.01;  ///< Skip rebalance if predicted gain below this fraction.
     uint64_t rebalance_cooldown_cycles =
         0;  ///< Minimum cycles between rebalances (0 disables cooldown).
 

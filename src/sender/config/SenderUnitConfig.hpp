@@ -82,10 +82,10 @@ struct SimulationYAMLConfig {
 
     /// Enables cluster-aware partitioning. False keeps the legacy topology-only path.
     bool enable_weighted_partitioning = true;
-    bool enable_dynamic_rebalance = false;
-    double rebalance_imbalance_threshold = 1.3;
-    uint64_t rebalance_check_interval_cycles = 8192;
-    double rebalance_min_gain = 0.05;
+    bool enable_dynamic_rebalance = true;
+    double rebalance_imbalance_threshold = 1.03;
+    uint64_t rebalance_check_interval_cycles = 2048;
+    double rebalance_min_gain = 0.01;
     uint64_t rebalance_cooldown_cycles = 0;
     /// Initial cluster-aware partition solver: "SA" (default) or "Weighted".
     std::string partition_solver = "SA";

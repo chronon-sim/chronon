@@ -236,13 +236,13 @@ simulation:
   enable_weighted_partitioning: true     # Cluster-aware thread assignment (default)
   partition_solver: SA                   # Initial solver: SA or Weighted
   initial_partition_sync_cost_ns: 8.0    # Locality weight for deterministic placement
-  enable_dynamic_rebalance: false        # Runtime cluster migration (opt-in)
-  rebalance_check_interval_cycles: 8192  # Scheduler-fence imbalance checks
-  rebalance_min_gain: 0.05               # Skip if predicted gain is too small
+  enable_dynamic_rebalance: true         # Runtime cluster migration
+  rebalance_check_interval_cycles: 2048  # Scheduler-fence imbalance checks
+  rebalance_min_gain: 0.01               # Skip if predicted gain is too small
   rebalance_cooldown_cycles: 0           # Minimum cycles between rebalances
 ```
 
-Dynamic rebalance is an opt-in whole-cluster migration path. It is most useful
+Dynamic rebalance is a whole-cluster migration path enabled by default. It is most useful
 when timeline traces show one stream doing most unit work while others spend
 time in dependency waits. The rebalancer samples unit tick cost, combines it
 with dependency topology and wait attribution, and migrates whole tight clusters
