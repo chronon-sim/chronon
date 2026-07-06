@@ -147,7 +147,13 @@ public:
     void commitEpoch() noexcept {
         counters_.commitAllEpochs();
         if (lookahead_buffer_.hasEvents() && queue_) {
-            lookahead_buffer_.commit(*queue_);
+            lookahead_buffer_.commit(*queue_,
+                                     [this](std::byte* record, size_t total_size) noexcept {
+                                         globalizePendingTimelineStrings_(record, total_size);
+                                     });
+            clearPendingTimelineStrings_();
+        } else if (!lookahead_buffer_.hasEvents()) {
+            clearPendingTimelineStrings_();
         }
         recordLookaheadTransition_(LookaheadTransition::Commit);
         ++lookahead_epoch_generation_;
@@ -158,6 +164,7 @@ public:
     void rollbackEpoch() noexcept {
         counters_.rollbackAllEpochs();
         lookahead_buffer_.rollback();
+        clearPendingTimelineStrings_();
         recordLookaheadTransition_(LookaheadTransition::Rollback);
         ++lookahead_epoch_generation_;
         applyLookaheadTransition_(LookaheadTransition::Rollback);
@@ -166,6 +173,29 @@ public:
     /// When enabled, events buffer locally rather than going to the global queue.
     void setLookaheadMode(bool enabled) noexcept { lookahead_mode_ = enabled; }
     bool isLookaheadMode() const noexcept { return lookahead_mode_; }
+
+    size_t checkpointPendingTimelineStrings() const noexcept {
+        return pending_timeline_strings_.size();
+    }
+
+    void restorePendingTimelineStrings(size_t checkpoint) noexcept {
+        if (pending_timeline_strings_.size() > checkpoint) {
+            pending_timeline_strings_.resize(checkpoint);
+        }
+    }
+
+    template <typename T>
+    [[gnu::always_inline]] TimelineArgValue normalizeTimelineArgForEmit(
+        const TypedArg<T>& arg) noexcept {
+        using V = std::decay_t<T>;
+        if constexpr (timeline_arg_detail::is_string_arg_v<V>) {
+            const uint64_t id =
+                registerPendingTimelineString_(timeline_arg_detail::stringArgView(arg.value));
+            return {makeTimelineLocalStringId(id), arg.key_id, TimelineArgKind::String};
+        }
+        return chronon::observe::normalizeTimelineArg(arg);
+    }
+
     uint64_t lookaheadEpochGeneration() const noexcept { return lookahead_epoch_generation_; }
     LookaheadTransition firstLookaheadTransitionAfter(uint64_t generation) const noexcept {
         if (generation >= lookahead_epoch_generation_) {
@@ -263,6 +293,18 @@ public:
     void setQueue(ObservationQueue* queue) noexcept { queue_ = queue; }
     ObservationQueue* queue() noexcept { return queue_; }
 
+    [[gnu::always_inline]] bool shouldEmitTimelineEvent(CategoryMask category,
+                                                        TimelineEventKind kind) const noexcept {
+        if (OBSERVE_UNLIKELY(!timeline_events_enabled_)) {
+            return false;
+        }
+
+        return (kind == TimelineEventKind::SpanEnd)
+                   ? (category != category::NONE ? filter_.shouldObserve(category | category::TRACE)
+                                                 : filter_.anyEnabled())
+                   : filter_.shouldObserve(category | category::TRACE, currentCycle());
+    }
+
     /**
      * @brief Emit a timeline event (span begin/end, lane instant, counter sample).
      *
@@ -277,16 +319,7 @@ public:
     bool timelineEvent(CategoryMask category, TimelineEventKind kind, uint32_t track_id,
                        uint16_t slot, uint16_t name_id, uint64_t payload,
                        const TimelineArgValue* args, size_t arg_count, uint8_t flags = 0) noexcept {
-        if (OBSERVE_UNLIKELY(!timeline_events_enabled_)) {
-            return false;
-        }
-
-        const bool allowed =
-            (kind == TimelineEventKind::SpanEnd)
-                ? (category != category::NONE ? filter_.shouldObserve(category | category::TRACE)
-                                              : filter_.anyEnabled())
-                : filter_.shouldObserve(category | category::TRACE, currentCycle());
-        if (OBSERVE_LIKELY(!allowed)) {
+        if (OBSERVE_LIKELY(!shouldEmitTimelineEvent(category, kind))) {
             return false;
         }
 
@@ -334,6 +367,7 @@ public:
 
         fillTimelineRecord_(ptr + sizeof(ObservationQueue::RecordHeader), category, kind, track_id,
                             slot, name_id, payload, args, arg_count, flags);
+        globalizePendingTimelineStrings_(ptr, aligned_size);
 
         ctx->queue().finishAndCommitWrite(aligned_size);
         stats_.recordEmit<ObservationChannel::Trace>();
@@ -364,6 +398,57 @@ private:
         std::byte* arg_dest = dest + sizeof(TimelineRecord);
         for (size_t i = 0; i < arg_count; ++i) {
             packTimelineArg(arg_dest + i * TIMELINE_ARG_SIZE, args[i]);
+        }
+    }
+
+    uint64_t registerPendingTimelineString_(std::string_view value) {
+        pending_timeline_strings_.emplace_back(value);
+        return static_cast<uint64_t>(pending_timeline_strings_.size());
+    }
+
+    bool lookupPendingTimelineString_(uint64_t id, std::string_view& out) const noexcept {
+        if (id == 0 || id > pending_timeline_strings_.size()) {
+            return false;
+        }
+        out = pending_timeline_strings_[static_cast<size_t>(id - 1)];
+        return true;
+    }
+
+    void clearPendingTimelineStrings_() noexcept { pending_timeline_strings_.clear(); }
+
+    void globalizePendingTimelineStrings_(std::byte* record, size_t total_size) noexcept {
+        if (pending_timeline_strings_.empty() ||
+            total_size < sizeof(ObservationQueue::RecordHeader) + sizeof(TimelineRecord)) {
+            return;
+        }
+
+        auto* header = reinterpret_cast<ObservationQueue::RecordHeader*>(record);
+        if (header->type != ObservationQueue::EventType::TIMELINE_EVENT) {
+            return;
+        }
+
+        std::byte* payload = record + sizeof(ObservationQueue::RecordHeader);
+        const size_t payload_size = total_size - sizeof(ObservationQueue::RecordHeader);
+        TimelineRecord rec;
+        std::memcpy(&rec, payload, sizeof(TimelineRecord));
+        if (rec.arg_count > MAX_TIMELINE_ARGS ||
+            payload_size < sizeof(TimelineRecord) + rec.arg_count * TIMELINE_ARG_SIZE) {
+            return;
+        }
+
+        std::byte* arg_data = payload + sizeof(TimelineRecord);
+        for (size_t i = 0; i < rec.arg_count; ++i) {
+            TimelineArgValue arg = unpackTimelineArg(arg_data + i * TIMELINE_ARG_SIZE);
+            if (arg.kind != TimelineArgKind::String || !isTimelineLocalStringId(arg.bits)) {
+                continue;
+            }
+
+            std::string_view value;
+            if (!lookupPendingTimelineString_(timelineLocalStringId(arg.bits), value)) {
+                continue;
+            }
+            arg.bits = AnnotationValueRegistry::instance().registerString(value);
+            packTimelineArg(arg_data + i * TIMELINE_ARG_SIZE, arg);
         }
     }
 
@@ -615,6 +700,7 @@ private:
     ObservationFilter filter_;
 
     LookaheadBuffer lookahead_buffer_;
+    std::vector<std::string> pending_timeline_strings_;
     bool lookahead_mode_ = false;
     static constexpr size_t LOOKAHEAD_TRANSITION_HISTORY_CAPACITY = 64;
     std::array<LookaheadTransition, LOOKAHEAD_TRANSITION_HISTORY_CAPACITY>

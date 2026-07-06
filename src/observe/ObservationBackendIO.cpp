@@ -389,6 +389,10 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
             case TimelineArgKind::Pointer:
                 annotations[i].kind = PerfettoTraceWriter::Annotation::Kind::Pointer;
                 break;
+            case TimelineArgKind::String:
+                annotations[i].kind = PerfettoTraceWriter::Annotation::Kind::String;
+                annotations[i].string = AnnotationValueRegistry::instance().get(arg.bits);
+                break;
             case TimelineArgKind::Uint:
             default:
                 annotations[i].kind = PerfettoTraceWriter::Annotation::Kind::Uint;

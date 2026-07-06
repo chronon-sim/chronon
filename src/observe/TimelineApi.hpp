@@ -25,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -78,7 +79,14 @@ struct TimelineRecord {
 static_assert(sizeof(TimelineRecord) == 32, "TimelineRecord size mismatch");
 
 /// Value categories for typed annotation args (normalized at the producer).
-enum class TimelineArgKind : uint8_t { Uint = 0, Int = 1, Double = 2, Bool = 3, Pointer = 4 };
+enum class TimelineArgKind : uint8_t {
+    Uint = 0,
+    Int = 1,
+    Double = 2,
+    Bool = 3,
+    Pointer = 4,
+    String = 5
+};
 
 /// Producer-side normalized arg, serialized via packTimelineArg().
 struct TimelineArgValue {
@@ -90,6 +98,19 @@ struct TimelineArgValue {
 /// On-the-wire arg size: [bits u64][key_id u16][kind u8][pad u8].
 constexpr size_t TIMELINE_ARG_SIZE = 12;
 constexpr size_t MAX_TIMELINE_ARGS = 8;
+constexpr uint64_t TIMELINE_LOCAL_STRING_ID_BIT = 1ULL << 63;
+
+inline uint64_t makeTimelineLocalStringId(uint64_t id) noexcept {
+    return id | TIMELINE_LOCAL_STRING_ID_BIT;
+}
+
+inline bool isTimelineLocalStringId(uint64_t id) noexcept {
+    return (id & TIMELINE_LOCAL_STRING_ID_BIT) != 0;
+}
+
+inline uint64_t timelineLocalStringId(uint64_t id) noexcept {
+    return id & ~TIMELINE_LOCAL_STRING_ID_BIT;
+}
 
 inline void packTimelineArg(std::byte* dest, const TimelineArgValue& arg) noexcept {
     std::memcpy(dest, &arg.bits, 8);
@@ -159,6 +180,45 @@ public:
         static AnnotationKeyRegistry registry;
         return registry;
     }
+};
+
+/// Global registry of typed-annotation string values.
+class AnnotationValueRegistry {
+public:
+    uint64_t registerString(std::string_view s) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (auto it = ids_.find(s); it != ids_.end()) {
+            return it->second;
+        }
+
+        strings_.emplace_back(s);
+        const uint64_t id = static_cast<uint64_t>(strings_.size());  // 1-based; 0 = none.
+        ids_.emplace(std::string_view(strings_.back()), id);
+        return id;
+    }
+
+    std::string_view get(uint64_t id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (id > 0 && id <= strings_.size()) {
+            return strings_[static_cast<size_t>(id - 1)];
+        }
+        return {};
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return strings_.size();
+    }
+
+    static AnnotationValueRegistry& instance() {
+        static AnnotationValueRegistry registry;
+        return registry;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::deque<std::string> strings_;
+    std::unordered_map<std::string_view, uint64_t> ids_;
 };
 
 /** @brief Metadata for one declared timeline track (lane group or counter). */
@@ -315,16 +375,33 @@ struct TypedArg {
 
 template <FixedString Key, typename T>
 inline TypedArg<T> arg(T value) {
-    static_assert(std::is_arithmetic_v<std::decay_t<T>> || std::is_pointer_v<std::decay_t<T>>,
-                  "typed timeline args support arithmetic and pointer values");
+    using V = std::decay_t<T>;
+    static_assert(std::is_arithmetic_v<V> || std::is_pointer_v<V> ||
+                      std::is_same_v<V, std::string> || std::is_same_v<V, std::string_view>,
+                  "typed timeline args support arithmetic, pointer, and string values");
     return {AnnotationKey<Key>::id(), value};
 }
+
+namespace timeline_arg_detail {
+
+template <typename T>
+inline constexpr bool is_string_arg_v =
+    std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view>;
+
+inline std::string_view stringArgView(const std::string& s) noexcept { return s; }
+inline std::string_view stringArgView(std::string_view s) noexcept { return s; }
+
+}  // namespace timeline_arg_detail
 
 /// Normalizes a typed arg to its wire representation.
 template <typename T>
 inline TimelineArgValue normalizeTimelineArg(const TypedArg<T>& a) noexcept {
     using V = std::decay_t<T>;
-    if constexpr (std::is_same_v<V, bool>) {
+    if constexpr (timeline_arg_detail::is_string_arg_v<V>) {
+        const uint64_t id = AnnotationValueRegistry::instance().registerString(
+            timeline_arg_detail::stringArgView(a.value));
+        return {id, a.key_id, TimelineArgKind::String};
+    } else if constexpr (std::is_same_v<V, bool>) {
         return {a.value ? 1ULL : 0ULL, a.key_id, TimelineArgKind::Bool};
     } else if constexpr (std::is_floating_point_v<V>) {
         return {std::bit_cast<uint64_t>(static_cast<double>(a.value)), a.key_id,

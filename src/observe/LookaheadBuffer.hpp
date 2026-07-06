@@ -87,6 +87,11 @@ public:
      * @return Number of events successfully committed (others are dropped if queue full).
      */
     size_t commit(ObservationQueue& queue) {
+        return commit(queue, [](std::byte*, size_t) noexcept {});
+    }
+
+    template <typename RewriteFn>
+    size_t commit(ObservationQueue& queue, RewriteFn rewrite) {
         if (write_pos_ == 0) {
             return 0;
         }
@@ -101,6 +106,7 @@ public:
             auto* dest = queue.prepareWrite(header->total_size);
             if (dest) {
                 std::memcpy(dest, buffer_.data() + read_pos, header->total_size);
+                rewrite(dest, header->total_size);
                 queue.finishAndCommitWrite(header->total_size);
                 events_committed++;
             } else {

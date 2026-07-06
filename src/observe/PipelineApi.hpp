@@ -145,11 +145,19 @@ void emitPipelineSliceWithFlags(ObservationContext* ctx, CategoryMask category, 
         ctx->timelineEvent(category, TimelineEventKind::PipelineSlice, track_id, /*slot=*/0,
                            /*name_id=*/0, id, nullptr, 0, flags);
     } else {
+        if (!ctx->shouldEmitTimelineEvent(category, TimelineEventKind::PipelineSlice)) {
+            return;
+        }
+        const size_t string_checkpoint = ctx->checkpointPendingTimelineStrings();
         TimelineArgValue args[item_count];
         size_t arg_count = 0;
-        ((args[arg_count++] = normalizeTimelineArg(std::forward<Items>(items))), ...);
-        ctx->timelineEvent(category, TimelineEventKind::PipelineSlice, track_id, /*slot=*/0,
-                           /*name_id=*/0, id, args, arg_count, flags);
+        ((args[arg_count++] = ctx->normalizeTimelineArgForEmit(std::forward<Items>(items))), ...);
+        const bool emitted =
+            ctx->timelineEvent(category, TimelineEventKind::PipelineSlice, track_id, /*slot=*/0,
+                               /*name_id=*/0, id, args, arg_count, flags);
+        if (!emitted || !ctx->isLookaheadMode()) {
+            ctx->restorePendingTimelineStrings(string_checkpoint);
+        }
     }
 }
 

@@ -90,6 +90,7 @@ using observe::Counter;
 using observe::CounterId;
 using observe::DerivedCounter;
 using observe::DerivedCounterDef;
+using observe::EventCounter;
 using observe::LogLevel;
 using observe::ObservableUnit;
 using observe::ObservationChannel;
