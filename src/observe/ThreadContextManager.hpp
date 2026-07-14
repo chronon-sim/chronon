@@ -21,7 +21,8 @@ namespace chronon::observe {
 /**
  * @brief Singleton managing per-thread observability contexts.
  *
- * Pre-allocated context pool, thread-local pointer cache, lock-free hot path.
+ * Bounded context pool, thread-local pointer cache, lock-free publication and
+ * hot path.
  */
 class ThreadContextManager {
 public:
@@ -48,7 +49,7 @@ public:
     void forEachContext(Fn&& fn) {
         uint32_t count = active_count_.load(std::memory_order_acquire);
         for (uint32_t i = 0; i < count && i < MAX_THREADS; ++i) {
-            ThreadContext* ctx = contexts_[i].get();
+            ThreadContext* ctx = contexts_[i].load(std::memory_order_acquire);
             if (ctx) {
                 fn(ctx);
             }
@@ -63,8 +64,8 @@ public:
         uint64_t total = 0;
         uint32_t count = active_count_.load(std::memory_order_acquire);
         for (uint32_t i = 0; i < count && i < MAX_THREADS; ++i) {
-            if (contexts_[i]) {
-                total += contexts_[i]->droppedCount();
+            if (ThreadContext* ctx = contexts_[i].load(std::memory_order_acquire)) {
+                total += ctx->droppedCount();
             }
         }
         return total;
@@ -143,8 +144,8 @@ public:
     void flushAll() noexcept {
         uint32_t count = active_count_.load(std::memory_order_acquire);
         for (uint32_t i = 0; i < count && i < MAX_THREADS; ++i) {
-            if (contexts_[i]) {
-                contexts_[i]->queue().forceCommitWrite();
+            if (ThreadContext* ctx = contexts_[i].load(std::memory_order_acquire)) {
+                ctx->queue().forceCommitWrite();
             }
         }
     }
@@ -162,11 +163,18 @@ private:
             return nullptr;
         }
 
+        std::unique_ptr<ThreadContext> owned;
         try {
-            contexts_[id] = std::make_unique<ThreadContext>(id, queue_capacity_);
+            owned = std::make_unique<ThreadContext>(id, queue_capacity_);
         } catch (...) {
             return nullptr;
         }
+        ThreadContext* context = owned.get();
+        owned_contexts_[id] = std::move(owned);
+        // Backend scans use only this atomic publication array. Ownership is
+        // kept in a separate single-writer slot, so late producer registration
+        // never races a reader of std::unique_ptr state.
+        contexts_[id].store(context, std::memory_order_release);
 
         // Monotonic max via CAS loop: concurrent allocations may get IDs out of
         // order, so a plain store(id+1) could shrink active_count_ and hide a
@@ -180,13 +188,14 @@ private:
             }
         }
 
-        tls_context_ = contexts_[id].get();
+        tls_context_ = context;
         return tls_context_;
     }
 
     static inline thread_local ThreadContext* tls_context_ = nullptr;
 
-    std::array<std::unique_ptr<ThreadContext>, MAX_THREADS> contexts_;
+    std::array<std::unique_ptr<ThreadContext>, MAX_THREADS> owned_contexts_;
+    std::array<std::atomic<ThreadContext*>, MAX_THREADS> contexts_{};
     std::atomic<uint32_t> next_id_{0};
     std::atomic<uint32_t> active_count_{0};
 

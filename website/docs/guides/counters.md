@@ -40,6 +40,18 @@ cycle,alu0.ops,alu1.ops,alu2.ops
 
 Each periodic dump appends one row, so the file can be monitored during simulation (like log files). Column names are discovered from the first dump and written as the CSV header.
 
+All schedulers use one owner-based push implementation. Sequential and barrier
+execution publish at the exact boundary. Lookahead workers snapshot and reset
+the counters owned by their scheduler clusters when local progress crosses the
+boundary, then publish records through their lock-free SPSC observation queue.
+Rows use the nominal periodic cycle; lookahead contributors may be sampled
+within one configured run-ahead window. Periodic output never introduces a run
+split, intermediate MPSC port flush, or worker relaunch.
+
+Chronon supports up to 64 observation producer threads in one process. If that
+pool is exhausted, periodic counter execution fails explicitly instead of
+silently omitting owner rows.
+
 **Long format** (`csv_format: long`):
 One row per (cycle, unit, counter, value) — traditional streaming format:
 
@@ -151,7 +163,7 @@ Memory usage scales with the number of counters per unit:
 
 **Formula:** Per-unit memory = `N counters × 16 bytes`
 
-## Registration-Based Pull Model
+## Registration and Snapshot Paths
 
 Counters register with ObservationManager at initialization:
 
@@ -163,9 +175,13 @@ Counters register with ObservationManager at initialization:
    └─► Counter::onContextAttached(ctx)
        └─► ctx.counters().addCounter(name, desc, unit)
 
-3. Counter Snapshots
-   └─► manager.dumpCounterSnapshots(cycle)
-       └─► Read from registered addresses (lock-free)
+3. Periodic Counter Snapshots
+   └─► scheduler owner snapshots its cluster counters
+       └─► worker SPSC queue ─► observation backend
+
+4. Final Counter Snapshot
+   └─► manager.dumpFinalCounterSnapshot(final_cycle)
+       └─► Read remaining values from registered addresses
 ```
 
 ## Epoch Operations

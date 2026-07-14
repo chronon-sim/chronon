@@ -25,17 +25,26 @@
 // worker-local predecessor-progress cache in both the fixed-layout and dynamic
 // EpochFree driver; test_predecessor_cycle_cache.cpp owns its direct semantics.
 
+#include <array>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <numeric>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "observe/EventCounter.hpp"
+#include "observe/ObservationManager.hpp"
+#include "observe/ObservationYAMLConfig.hpp"
 #include "sender/core/TickSimulation.hpp"
 #include "sender/core/TickableUnit.hpp"
 
 using namespace chronon::sender;
+namespace observe = chronon::observe;
 
 namespace {
 
@@ -55,7 +64,7 @@ void check(bool cond, const std::string& msg) {
 // Same node as the mixed-delay test: folds (value, arrival cycle) into an
 // accumulator with non-elidable work, so the checksum is sensitive to WHICH
 // simulated cycle each message arrives at.
-class Node : public TickableUnit {
+class Node : public TickableUnit, public observe::ObservableUnit {
 public:
     OutPort<uint64_t> out;
     InPort<uint64_t> in{this, "in"};
@@ -67,6 +76,7 @@ public:
         : TickableUnit(std::move(name)), out(this, "out", out_rate), acc_(seed), work_(work) {}
 
     void tick() override {
+        ++ticks_;
         for (uint64_t v : in.receiveAll(localCycle())) {
             acc_ ^= (v * 1000003ULL) ^ (localCycle() * 2654435761ULL);
         }
@@ -78,10 +88,33 @@ public:
     }
 
     uint64_t checksum() const { return acc_; }
+    uint64_t getObserveCycle() const noexcept override { return localCycle(); }
 
 private:
+    observe::EventCounter ticks_{this, "ticks", "Executed ticks"};
     uint64_t acc_;
     uint32_t work_;
+};
+
+class CounterSink : public TickableUnit, public observe::ObservableUnit {
+public:
+    CounterSink() : TickableUnit("sink") {}
+
+    InPort<uint64_t> in{this, "in"};
+
+    void tick() override {
+        ++ticks_;
+        for (uint64_t value : in.receiveAll(localCycle())) {
+            checksum_ ^= value + localCycle() * 1000003ULL;
+        }
+    }
+
+    uint64_t checksum() const noexcept { return checksum_; }
+    uint64_t getObserveCycle() const noexcept override { return localCycle(); }
+
+private:
+    observe::EventCounter ticks_{this, "ticks", "Executed ticks"};
+    uint64_t checksum_ = 0;
 };
 
 class TerminatorNode : public TickableUnit {
@@ -470,6 +503,423 @@ void verify_dynamic_rebalance_clamps_headroom(uint64_t cycles, unsigned hw) {
     check(declared.epoch_free_runs > 0, "dynamic rebalance declared edge rate keeps epoch-free");
 }
 
+observe::ObservationYAMLConfig observationConfig(const std::filesystem::path& output,
+                                                 bool counters_enabled, uint64_t period) {
+    observe::ObservationYAMLConfig cfg;
+    cfg.enabled = true;
+    cfg.output_dir = output.string();
+    cfg.queue_capacity = 256 * 1024;
+    cfg.counters.enabled = counters_enabled;
+    cfg.counters.csv_output = counters_enabled;
+    cfg.counters.periodic_dump_cycles = period;
+    cfg.counters.dump_on_shutdown = true;
+    cfg.timeline.enabled = false;
+    cfg.unified_logging.enabled = false;
+    return cfg;
+}
+
+std::set<uint64_t> readCounterCycles(const std::filesystem::path& csv) {
+    std::ifstream input(csv);
+    std::set<uint64_t> cycles;
+    std::string line;
+    if (!std::getline(input, line)) return cycles;
+    while (std::getline(input, line)) {
+        const size_t comma = line.find(',');
+        const std::string cycle = line.substr(0, comma);
+        if (!cycle.empty()) cycles.insert(std::stoull(cycle));
+    }
+    return cycles;
+}
+
+std::vector<uint64_t> readCounterColumn(const std::filesystem::path& csv,
+                                        const std::string& column) {
+    std::ifstream input(csv);
+    std::string line;
+    if (!std::getline(input, line)) return {};
+
+    size_t column_index = SIZE_MAX;
+    size_t index = 0;
+    size_t begin = 0;
+    while (begin <= line.size()) {
+        const size_t end = line.find(',', begin);
+        if (line.substr(begin, end - begin) == column) {
+            column_index = index;
+            break;
+        }
+        if (end == std::string::npos) break;
+        begin = end + 1;
+        ++index;
+    }
+    if (column_index == SIZE_MAX) return {};
+
+    std::vector<uint64_t> values;
+    while (std::getline(input, line)) {
+        index = 0;
+        begin = 0;
+        while (begin <= line.size()) {
+            const size_t end = line.find(',', begin);
+            if (index == column_index) {
+                values.push_back(std::stoull(line.substr(begin, end - begin)));
+                break;
+            }
+            if (end == std::string::npos) break;
+            begin = end + 1;
+            ++index;
+        }
+    }
+    return values;
+}
+
+void verify_all_scheduler_modes_use_spsc_periodic_snapshots(unsigned hw) {
+    namespace fs = std::filesystem;
+    struct Mode {
+        const char* name;
+        bool parallel;
+        bool lookahead;
+        bool direct_run;
+        bool idle;
+    };
+    const std::array modes{Mode{"sequential", false, false, false, false},
+                           Mode{"sequential-run", false, false, true, false},
+                           Mode{"barrier", hw >= 2, false, false, false},
+                           Mode{"progress", hw >= 2, true, false, false},
+                           Mode{"progress-idle", hw >= 2, true, false, true}};
+    for (const auto& mode : modes) {
+        const fs::path output =
+            fs::temp_directory_path() / (std::string("chronon-periodic-") + mode.name);
+        fs::remove_all(output);
+        auto& manager = observe::ObservationManager::instance();
+        manager.reset();
+        auto obs_config = observationConfig(output, true, 37);
+        obs_config.unified_logging.enabled = true;
+        manager.initialize(obs_config);
+
+        TickSimulationConfig cfg;
+        cfg.num_threads = 2;
+        cfg.enable_parallel = mode.parallel;
+        cfg.enable_lookahead = mode.lookahead;
+        cfg.enable_epoch_free_lookahead = false;
+        cfg.enable_dynamic_rebalance = false;
+        cfg.max_lookahead_cycles = 64;
+        cfg.initial_partition_sync_cost_ns = 0.0;
+        TickSimulation sim(cfg);
+        std::array<Node*, 4> nodes{
+            sim.createUnit<Node>("A", 11, 1500), sim.createUnit<Node>("B", 22, 1500),
+            sim.createUnit<Node>("C", 33, 1500), sim.createUnit<Node>("D", 44, 1500)};
+        if (mode.idle) {
+            for (Node* node : nodes) node->sleepForever();
+        }
+        for (Node* node : nodes) {
+            auto* context = manager.createContextForUnit(
+                node->name(), [node]() noexcept { return node->localCycle(); });
+            node->setObservationContext(context);
+        }
+        sim.initialize();
+        manager.reregisterAllCounters();
+        nodes.front()->info<"runtime observation after counter registration">();
+        manager.startBackend();
+
+        const uint64_t cycles = mode.direct_run ? 296 : 300;
+        const size_t shared_before = manager.sharedQueue()->bytesWritten();
+        const uint64_t executed =
+            mode.direct_run ? sim.run(cycles) : sim.runUntilTermination(cycles);
+        const size_t shared_after = manager.sharedQueue()->bytesWritten();
+        manager.dumpFinalCounterSnapshot(executed);
+        manager.stopBackend();
+
+        std::set<uint64_t> expected;
+        for (uint64_t boundary = 37; boundary <= cycles; boundary += 37) {
+            expected.insert(boundary);
+        }
+        if (cycles % 37 != 0) expected.insert(cycles);
+        const fs::path csv = output / "latest" / "counters.csv";
+        check(readCounterCycles(csv) == expected,
+              std::string(mode.name) + " uses nominal periodic counter boundaries");
+        check(shared_after == shared_before,
+              std::string(mode.name) + " periodic counters bypass the shared pull queue");
+        for (const char* node : {"A", "B", "C", "D"}) {
+            const auto values = readCounterColumn(csv, std::string(node) + ".ticks");
+            const uint64_t expected_ticks = mode.idle ? 0 : cycles;
+            check(std::accumulate(values.begin(), values.end(), uint64_t{0}) == expected_ticks,
+                  std::string(mode.name) + " preserves interval deltas for " + node);
+            check(values.size() == expected.size(),
+                  std::string(mode.name) + " emits every crossed periodic boundary for " + node);
+        }
+        const auto runtime_stats = readCounterColumn(csv, "A.obs_info_emitted");
+        check(runtime_stats.size() == expected.size(),
+              std::string(mode.name) + " includes observation stats created after registration");
+        manager.reset();
+        fs::remove_all(output);
+    }
+}
+
+void verify_epoch_free_pushes_periodic_snapshots_without_reentry(unsigned hw,
+                                                                 bool dynamic_rebalance) {
+    if (hw < 2) return;
+    namespace fs = std::filesystem;
+    const fs::path output =
+        fs::temp_directory_path() / (dynamic_rebalance ? "chronon-epoch-free-dynamic-periodic-test"
+                                                       : "chronon-epoch-free-periodic-test");
+    fs::remove_all(output);
+
+    auto& manager = observe::ObservationManager::instance();
+    manager.reset();
+    manager.initialize(observationConfig(output, true, 37));
+
+    TickSimulationConfig cfg;
+    cfg.num_threads = 2;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_dynamic_rebalance = dynamic_rebalance;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.max_lookahead_cycles = 64;
+
+    TickSimulation sim(cfg);
+    constexpr uint32_t kWork = 1500;
+    auto* A = sim.createUnit<Node>("A", 11, kWork);
+    auto* B = sim.createUnit<Node>("B", 22, kWork);
+    auto* C = sim.createUnit<Node>("C", 33, kWork);
+    auto* D = sim.createUnit<Node>("D", 44, kWork);
+    sim.connect(A->out, C->in, 2);
+    sim.connect(B->out, C->in, 5);
+    sim.connect(C->out, D->in, 1);
+    sim.connect(D->out, A->in, 1);
+    sim.connect(D->out, B->in, 1);
+
+    for (Node* node : {A, B, C, D}) {
+        auto* context = manager.createContextForUnit(
+            node->name(), [node]() noexcept { return node->localCycle(); });
+        node->setObservationContext(context);
+    }
+    sim.initialize();
+    manager.reregisterAllCounters();
+    manager.startBackend();
+
+    constexpr uint64_t cycles = 300;
+    const size_t shared_bytes_before = manager.sharedQueue()->bytesWritten();
+    const uint64_t executed = sim.runUntilTermination(cycles);
+    const size_t shared_bytes_after_run = manager.sharedQueue()->bytesWritten();
+    manager.dumpFinalCounterSnapshot(executed);
+    manager.stopBackend();
+
+    const uint64_t reference =
+        runOnce(2, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
+                /*max_lookahead=*/64, cycles)
+            .checksum;
+    const uint64_t digest = A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum();
+    const std::string mode = dynamic_rebalance ? "dynamic" : "static";
+    check(digest == reference,
+          "periodic observation " + mode + " epoch-free digest == sequential reference");
+    check(sim.epochFreeRunCount() == 1,
+          "periodic observation " + mode + " keeps one epoch-free scheduler invocation");
+    check(shared_bytes_after_run == shared_bytes_before,
+          mode + " epoch-free counters bypass the mutex-protected shared queue");
+
+    const auto snapshot_cycles = readCounterCycles(output / "latest" / "counters.csv");
+    std::set<uint64_t> expected;
+    for (uint64_t boundary = 37; boundary < cycles; boundary += 37) {
+        expected.insert(boundary);
+    }
+    expected.insert(cycles);
+    if (snapshot_cycles != expected) {
+        std::cout << "    observed counter cycles:";
+        for (uint64_t cycle : snapshot_cycles) std::cout << ' ' << cycle;
+        std::cout << "\n";
+    }
+    check(snapshot_cycles == expected, mode +
+                                           " epoch-free pushes periodic and final snapshots "
+                                           "without truncation");
+    for (const char* node : {"A", "B", "C", "D"}) {
+        const auto values =
+            readCounterColumn(output / "latest" / "counters.csv", std::string(node) + ".ticks");
+        const uint64_t sum = std::accumulate(values.begin(), values.end(), uint64_t{0});
+        check(sum == cycles,
+              mode + " epoch-free preserves all interval counter deltas for " + node);
+        check(
+            values.size() == expected.size() &&
+                std::all_of(values.begin(), values.end(), [](uint64_t value) { return value > 0; }),
+            mode + " epoch-free emits every owner at every periodic boundary for " + node);
+    }
+
+    manager.reset();
+    fs::remove_all(output);
+}
+
+void verify_periodic_snapshots_follow_dynamic_migration(unsigned hw) {
+    if (hw < 3) return;
+    namespace fs = std::filesystem;
+    const fs::path output =
+        fs::temp_directory_path() / "chronon-epoch-free-migration-periodic-test";
+    fs::remove_all(output);
+
+    auto& manager = observe::ObservationManager::instance();
+    manager.reset();
+    constexpr uint64_t period = 257;
+    manager.initialize(observationConfig(output, true, period));
+
+    TickSimulationConfig cfg;
+    cfg.num_threads = 3;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_dynamic_rebalance = true;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.max_lookahead_cycles = 64;
+    cfg.rebalance_check_interval_cycles = 64;
+    cfg.rebalance_imbalance_threshold = 1.05;
+    cfg.rebalance_min_gain = 0.0;
+    cfg.rebalance_cooldown_cycles = 0;
+    cfg.initial_partition_sync_cost_ns = 0.0;
+
+    TickSimulation sim(cfg);
+#ifdef CHRONON_SANITIZER_BUILD
+    constexpr std::array<uint32_t, 4> work{6000, 300, 300, 4000};
+    constexpr uint64_t cycles = 8192;
+#else
+    constexpr std::array<uint32_t, 4> work{12000, 300, 300, 8000};
+    constexpr uint64_t cycles = 16384;
+#endif
+    auto* H0 = sim.createUnit<Node>("heavy0", 11, work[0]);
+    auto* H1 = sim.createUnit<Node>("heavy1", 22, work[1]);
+    auto* H2 = sim.createUnit<Node>("heavy2", 33, work[2]);
+    auto* H3 = sim.createUnit<Node>("heavy3", 44, work[3]);
+    auto* sink = sim.createUnit<CounterSink>();
+    sim.connect(H0->out, sink->in, 1);
+    sim.connect(H1->out, sink->in, 1);
+    sim.connect(H2->out, sink->in, 1);
+    sim.connect(H3->out, sink->in, 1);
+
+    for (observe::ObservableUnit* unit :
+         {static_cast<observe::ObservableUnit*>(H0), static_cast<observe::ObservableUnit*>(H1),
+          static_cast<observe::ObservableUnit*>(H2), static_cast<observe::ObservableUnit*>(H3),
+          static_cast<observe::ObservableUnit*>(sink)}) {
+        auto* tickable = dynamic_cast<TickableUnit*>(unit);
+        auto* context = manager.createContextForUnit(
+            tickable->name(), [tickable]() noexcept { return tickable->localCycle(); });
+        unit->setObservationContext(context);
+    }
+    sim.initialize();
+    manager.reregisterAllCounters();
+    manager.startBackend();
+
+    const size_t shared_bytes_before = manager.sharedQueue()->bytesWritten();
+    const uint64_t executed = sim.runUntilTermination(cycles);
+    const size_t shared_bytes_after_run = manager.sharedQueue()->bytesWritten();
+    manager.dumpFinalCounterSnapshot(executed);
+    manager.stopBackend();
+
+    check(sim.epochFreeRunCount() == 1,
+          "periodic counter migration keeps one epoch-free scheduler invocation");
+    check(sim.rebalanceCount() > 0,
+          "periodic counter migration test moves ownership between workers");
+    check(shared_bytes_after_run == shared_bytes_before,
+          "migrated periodic counters bypass the mutex-protected shared queue");
+
+    const fs::path csv = output / "latest" / "counters.csv";
+    std::set<uint64_t> expected;
+    for (uint64_t boundary = period; boundary < cycles; boundary += period) {
+        expected.insert(boundary);
+    }
+    expected.insert(cycles);
+    check(readCounterCycles(csv) == expected,
+          "migration preserves every nominal periodic counter boundary");
+    for (const char* unit : {"heavy0", "heavy1", "heavy2", "heavy3", "sink"}) {
+        const auto values = readCounterColumn(csv, std::string(unit) + ".ticks");
+        const uint64_t sum = std::accumulate(values.begin(), values.end(), uint64_t{0});
+        check(sum == cycles,
+              std::string("migration preserves all interval counter deltas for ") + unit);
+        check(
+            values.size() == expected.size() &&
+                std::all_of(values.begin(), values.end(), [](uint64_t value) { return value > 0; }),
+            std::string("migration emits every owner at every boundary for ") + unit);
+    }
+
+    manager.reset();
+    fs::remove_all(output);
+}
+
+void verify_disabled_counters_add_no_boundaries(unsigned hw) {
+    if (hw < 2) return;
+    auto& manager = observe::ObservationManager::instance();
+    manager.reset();
+    manager.initialize(observationConfig({}, false, 7));
+
+    TickSimulationConfig cfg;
+    cfg.num_threads = 2;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_dynamic_rebalance = false;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.max_lookahead_cycles = 64;
+
+    TickSimulation sim(cfg);
+    constexpr uint32_t kWork = 1500;
+    auto* A = sim.createUnit<Node>("A", 11, kWork);
+    auto* B = sim.createUnit<Node>("B", 22, kWork);
+    auto* C = sim.createUnit<Node>("C", 33, kWork);
+    auto* D = sim.createUnit<Node>("D", 44, kWork);
+    sim.connect(A->out, C->in, 2);
+    sim.connect(B->out, C->in, 5);
+    sim.connect(C->out, D->in, 1);
+    sim.connect(D->out, A->in, 1);
+    sim.connect(D->out, B->in, 1);
+    sim.initialize();
+    sim.runUntilTermination(100);
+    check(sim.epochFreeRunCount() == 1, "disabled counters add no scheduler boundaries");
+    manager.reset();
+}
+
+void verify_final_snapshot_survives_worker_termination(unsigned hw) {
+    if (hw < 2) return;
+    namespace fs = std::filesystem;
+    const fs::path output = fs::temp_directory_path() / "chronon-epoch-free-final-snapshot-test";
+    fs::remove_all(output);
+
+    auto& manager = observe::ObservationManager::instance();
+    manager.reset();
+    manager.initialize(observationConfig(output, true, 0));
+
+    TickSimulationConfig cfg;
+    cfg.num_threads = 2;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_dynamic_rebalance = false;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.max_lookahead_cycles = 64;
+
+    TickSimulation sim(cfg);
+    sim.createUnit<TerminatorNode>(113);
+    constexpr uint32_t kWork = 1500;
+    auto* A = sim.createUnit<Node>("A", 11, kWork);
+    auto* B = sim.createUnit<Node>("B", 22, kWork);
+    auto* C = sim.createUnit<Node>("C", 33, kWork);
+    auto* D = sim.createUnit<Node>("D", 44, kWork);
+    sim.connect(A->out, B->in, 1);
+    sim.connect(B->out, C->in, 1);
+    sim.connect(C->out, D->in, 1);
+    sim.connect(D->out, A->in, 1);
+
+    for (Node* node : {A, B, C, D}) {
+        auto* context = manager.createContextForUnit(
+            node->name(), [node]() noexcept { return node->localCycle(); });
+        node->setObservationContext(context);
+    }
+    sim.initialize();
+    manager.reregisterAllCounters();
+    manager.startBackend();
+
+    const uint64_t executed = sim.runUntilTermination(1000);
+    manager.dumpFinalCounterSnapshot(executed);
+    manager.stopBackend();
+
+    const auto snapshot_cycles = readCounterCycles(output / "latest" / "counters.csv");
+    check(sim.wasTerminationRequested(), "worker requests termination with observation active");
+    check(snapshot_cycles.contains(executed),
+          "final partial snapshot is drained after worker termination");
+
+    manager.reset();
+    fs::remove_all(output);
+}
+
 }  // namespace
 
 int main() {
@@ -493,6 +943,12 @@ int main() {
     verify_run_until_termination_uses_epoch_free(hw);
     verify_run_until_termination_default_max_after_warmup(hw);
     verify_run_until_termination_accounts_nonzero_worker(hw);
+    verify_all_scheduler_modes_use_spsc_periodic_snapshots(hw);
+    verify_epoch_free_pushes_periodic_snapshots_without_reentry(hw, false);
+    verify_epoch_free_pushes_periodic_snapshots_without_reentry(hw, true);
+    verify_periodic_snapshots_follow_dynamic_migration(hw);
+    verify_disabled_counters_add_no_boundaries(hw);
+    verify_final_snapshot_survives_worker_termination(hw);
 
     std::cout << "\n=== Results: " << g_pass << " passed, " << g_fail << " failed ===\n";
     return g_fail == 0 ? 0 : 1;

@@ -22,6 +22,7 @@
 #include "../schedule/WeightedPartitioner.hpp"
 #include "TerminationRequest.hpp"
 #include "TickSimulationConfig.hpp"
+#include "TickSimulationCycleUtils.hpp"
 #include "TickableUnit.hpp"
 
 #pragma GCC diagnostic push
@@ -316,6 +317,8 @@ private:
     void traceExecutionMode_();
 
     uint64_t runSequential(uint64_t num_cycles);
+    template <bool PushPeriodicCounters>
+    uint64_t runSequentialImpl_(uint64_t num_cycles);
     uint64_t runSequentialEpoch(uint64_t epoch_cycles);
     uint64_t runParallelEpoch(uint64_t epoch_cycles, uint64_t executed_offset);
     uint64_t runParallel(uint64_t num_cycles);
@@ -348,9 +351,39 @@ private:
      */
     template <typename Scheduler>
     void executeEpochBarrier(Scheduler& sched, uint64_t epoch_cycles) {
+        if (observe::ObservationManager::instance().periodicCounterSnapshotsEnabled()) {
+            executeEpochBarrierImpl_<true>(sched, epoch_cycles);
+        } else {
+            executeEpochBarrierImpl_<false>(sched, epoch_cycles);
+        }
+    }
+
+    template <bool PushPeriodicCounters, typename Scheduler>
+    void executeEpochBarrierImpl_(Scheduler& sched, uint64_t epoch_cycles) {
         const size_t num_threads = thread_units_.size();
+        observe::ThreadContext* counter_producer = nullptr;
+        uint64_t next_counter_cycle = UINT64_MAX;
+        uint64_t counter_period = 0;
+        const uint64_t run_target = current_cycle_ + epoch_cycles;
+        if constexpr (PushPeriodicCounters) {
+            auto& obs_mgr = observe::ObservationManager::instance();
+            counter_producer = obs_mgr.periodicCounterProducer();
+            counter_period = obs_mgr.periodicDumpCycles();
+            next_counter_cycle = detail::nextPeriodicCycle(current_cycle_, counter_period);
+        }
+        auto push_counter_boundary = [&](uint64_t completed_cycle) {
+            if constexpr (PushPeriodicCounters) {
+                if (counter_producer && next_counter_cycle <= run_target &&
+                    completed_cycle >= next_counter_cycle) {
+                    (void)observe::ObservationManager::instance().pushPeriodicCounterSnapshots(
+                        next_counter_cycle, counter_owner_ids_, *counter_producer);
+                    next_counter_cycle = detail::nextPeriodicCycle(completed_cycle, counter_period);
+                }
+            }
+        };
         if (num_threads == 0) {
             for (uint64_t c = 0; c < epoch_cycles; ++c) {
+                const uint64_t cycle = current_cycle_ + c;
                 auto work = stdexec::bulk(stdexec::just(), stdexec::par, units_.size(),
                                           [this](std::size_t idx) {
                                               auto* unit = unit_ptrs_[idx];
@@ -359,6 +392,7 @@ private:
                 auto scheduled = stdexec::starts_on(sched, std::move(work));
                 stdexec::sync_wait(std::move(scheduled));
                 arbitrateAllMPSCPorts_();
+                push_counter_boundary(cycle + 1);
             }
             return;
         }
@@ -413,6 +447,7 @@ private:
             } else {
                 arbitrateAllMPSCPorts_();
             }
+            push_counter_boundary(cycle + 1);
         }
     }
 
@@ -552,8 +587,20 @@ private:
     /// and exits via stop_token on termination or exception.
     void executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
                              stdexec::inplace_stop_token token);
+    void executeThreadEpochWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
+                                                 uint64_t run_start, uint64_t period,
+                                                 stdexec::inplace_stop_token token);
+    template <bool PushPeriodicCounters>
+    void executeThreadEpochImpl_(size_t thread_idx, uint64_t end_cycle, uint64_t run_start,
+                                 uint64_t period, stdexec::inplace_stop_token token);
     void executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_cycle,
                                     stdexec::inplace_stop_token token);
+    void executeThreadEpochDynamicWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
+                                                        uint64_t run_start, uint64_t period,
+                                                        stdexec::inplace_stop_token token);
+    template <bool PushPeriodicCounters>
+    void executeThreadEpochDynamicImpl_(size_t thread_idx, uint64_t end_cycle, uint64_t run_start,
+                                        uint64_t period, stdexec::inplace_stop_token token);
 
     /// Monotonically raise lookahead_floor_ to the global-min completed cycle.
     /// Slow-path only (a stalled worker); see lookahead_floor_ for the contract.
@@ -698,6 +745,7 @@ private:
     TightCouplingResult clusters_;
     std::vector<size_t> unit_to_cluster_;
     std::vector<size_t> cluster_to_thread_;
+    std::vector<size_t> counter_owner_ids_;
     std::vector<std::vector<size_t>> thread_units_;
 
     std::vector<std::vector<ThreadCrossDep>> thread_cross_deps_temp_;

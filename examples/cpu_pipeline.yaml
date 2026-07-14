@@ -31,6 +31,7 @@ simulation:
         counters:
             enabled: true
             csv_output: true
+            # Worker-owned snapshots are pushed asynchronously without run truncation.
             periodic_dump_cycles: 10000 # Dump every 10K cycles (0 = disabled)
             dump_on_shutdown: true # Emit final snapshot on shutdown
 

@@ -134,8 +134,10 @@ void ObservationBackend::predeclareTimelineSourceTracks_() {
 }
 
 void ObservationBackend::run_() {
-    // Register stop_callback: when the simulation's stop_source fires,
-    // set should_stop_ and wake the spin-wait so we drain and exit promptly.
+    // The optional token is an observation-lifetime token, not the simulation
+    // worker token.  Simulation termination must not stop this consumer: the
+    // application still has to enqueue its final partial counter interval and
+    // scheduler timeline before stop() requests the final drain.
     auto stop_fn = [this]() noexcept {
         should_stop_.store(true, std::memory_order_release);
         wakeUp();

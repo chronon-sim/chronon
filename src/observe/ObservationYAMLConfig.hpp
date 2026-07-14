@@ -111,7 +111,9 @@ struct CountersYAMLConfig {
     bool enabled = true;
     bool csv_output = true;
     CounterCsvFormat csv_format = CounterCsvFormat::Pivoted;
-    uint64_t periodic_dump_cycles = 0;  ///< 0 = disabled.
+    /// Nominal interval for owner-thread SPSC snapshots (0 = disabled).
+    /// Lookahead workers may sample within their configured run-ahead window.
+    uint64_t periodic_dump_cycles = 0;
     bool dump_on_shutdown = true;
 };
 

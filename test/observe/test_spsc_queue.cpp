@@ -349,6 +349,34 @@ void test_context_manager_foreach() {
     std::cout << "PASSED\n";
 }
 
+void test_context_manager_concurrent_publication() {
+    std::cout << "Testing ThreadContextManager concurrent publication... ";
+
+    std::atomic<bool> stop{false};
+    std::thread scanner([&]() {
+        while (!stop.load(std::memory_order_acquire)) {
+            ThreadContextManager::instance().forEachContext([](ThreadContext* ctx) {
+                const size_t id = ctx->id();
+                assert(id < ThreadContextManager::MAX_THREADS);
+                (void)id;
+            });
+        }
+    });
+    std::vector<std::thread> producers;
+    for (int i = 0; i < 8; ++i) {
+        producers.emplace_back([]() {
+            ThreadContext* ctx = ThreadContextManager::instance().getContext();
+            assert(ctx != nullptr);
+            (void)ctx;
+        });
+    }
+    for (auto& producer : producers) producer.join();
+    stop.store(true, std::memory_order_release);
+    scanner.join();
+
+    std::cout << "PASSED\n";
+}
+
 // ============================================================================
 // Performance Benchmark
 // ============================================================================
@@ -414,6 +442,7 @@ int main() {
     test_context_manager_single_thread();
     test_context_manager_multiple_threads();
     test_context_manager_foreach();
+    test_context_manager_concurrent_publication();
 
     std::cout << "\n=== Performance Benchmarks ===\n";
     benchmark_spsc_throughput();

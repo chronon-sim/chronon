@@ -8,8 +8,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,15 +22,14 @@
 
 namespace chronon::observe {
 class ObservationContext;
-}
-namespace chronon::observe {
 class ObservationQueue;
-}
-
-namespace chronon::observe {
+class ThreadContext;
 
 class CounterRegistry {
 public:
+    static_assert(std::atomic<uint64_t>::is_always_lock_free,
+                  "Periodic counter ownership requires lock-free uint64_t atomics");
+
     struct CounterKey {
         std::string unit_name;
         CounterId id;
@@ -54,19 +55,62 @@ public:
 
     void reregisterAll(const std::vector<std::unique_ptr<ObservationContext>>& contexts);
 
-    void dumpSnapshots(uint64_t cycle, ObservationQueue* queue,
-                       const std::vector<std::unique_ptr<ObservationContext>>& contexts);
+    void dumpFinalSnapshot(uint64_t cycle, ObservationQueue* queue,
+                           const std::vector<std::unique_ptr<ObservationContext>>& contexts);
+
+    /**
+     * Push and reset counters owned by the supplied scheduler clusters.
+     *
+     * The caller must be the sole writer for every owner in @p owner_ids.
+     * Metadata and record sizes are precomputed by reregisterAll(), so this
+     * path performs no allocation and writes only to the caller's SPSC queue.
+     */
+    bool pushOwnerSnapshots(uint64_t cycle, std::span<const size_t> owner_ids,
+                            ThreadContext& thread_context) noexcept;
+
+    /**
+     * Return the next nominal periodic cycle for one stable scheduler owner.
+     *
+     * The returned state follows the owner across worker migration. No counter
+     * storage is accessed, and the query is lock-free.
+     */
+    uint64_t nextOwnerSnapshotCycle(size_t owner_id, uint64_t run_start,
+                                    uint64_t period) const noexcept;
 
     const std::vector<DerivedCounterDef>& derivedDefs() const noexcept { return derived_defs_; }
 
     void clear() {
         counters_.clear();
         derived_defs_.clear();
+        owner_snapshot_plans_.clear();
     }
 
 private:
+    struct OwnerSnapshotEntry {
+        std::string unit_name;
+        std::string counter_name;
+        SimpleCounter* counter = nullptr;
+        const uint64_t* scalar = nullptr;
+        size_t aligned_size = 0;
+
+        uint64_t value() const noexcept { return counter ? counter->get() : *scalar; }
+    };
+
+    struct OwnerSnapshotPlan {
+        std::vector<OwnerSnapshotEntry> entries;
+        size_t total_size = 0;
+        // Lock-free migration deduplication; counter storage itself remains
+        // single-writer under the scheduler's cluster execution claim.
+        std::unique_ptr<std::atomic<uint64_t>> last_pushed_cycle =
+            std::make_unique<std::atomic<uint64_t>>(UINT64_MAX);
+    };
+
+    void rebuildOwnerSnapshotPlans_(
+        const std::vector<std::unique_ptr<ObservationContext>>& contexts);
+
     std::unordered_map<CounterKey, SimpleCounter*, CounterKeyHash> counters_;
     std::vector<DerivedCounterDef> derived_defs_;
+    std::vector<OwnerSnapshotPlan> owner_snapshot_plans_;
 };
 
 }  // namespace chronon::observe

@@ -101,4 +101,19 @@ void TickSimulation::buildCrossThreadDependencies() {
     }
 }
 
+void TickSimulation::collectMPSCInPorts_() {
+    mpsc_inports_.clear();
+    std::unordered_map<void*, bool> seen;
+    for (auto* conn : connections_) {
+        if (!conn->hasThreadQueueId()) continue;
+        void* port_ptr = conn->destPortPtr();
+        if (!port_ptr) continue;
+        IArbitratablePort* arb = conn->registerOnDestMPSC();
+        if (!arb) continue;
+        if (seen.emplace(port_ptr, true).second) {
+            mpsc_inports_.push_back(arb);
+        }
+    }
+}
+
 }  // namespace chronon::sender

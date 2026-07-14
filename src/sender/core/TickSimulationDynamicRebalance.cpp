@@ -594,6 +594,9 @@ uint64_t TickSimulation::executeRunEpochFreeDynamic_(uint64_t total_cycles) {
     const uint64_t run_start =
         thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
     const uint64_t run_target = saturatingCycleAdd(run_start, total_cycles);
+    auto& obs_mgr = observe::ObservationManager::instance();
+    const bool push_periodic_counters = obs_mgr.periodicCounterSnapshotsEnabled();
+    const uint64_t counter_period = push_periodic_counters ? obs_mgr.periodicDumpCycles() : 0;
 
     lookahead_floor_.store(run_start, std::memory_order_relaxed);
     const uint64_t first_check =
@@ -617,7 +620,12 @@ uint64_t TickSimulation::executeRunEpochFreeDynamic_(uint64_t total_cycles) {
     auto work =
         stdexec::bulk(stdexec::just(), stdexec::par, nthreads, [&, token](std::size_t thread_idx) {
             try {
-                executeThreadEpochDynamic_(thread_idx, run_target, token);
+                if (push_periodic_counters) {
+                    executeThreadEpochDynamicWithPeriodicCounters_(
+                        thread_idx, run_target, run_start, counter_period, token);
+                } else {
+                    executeThreadEpochDynamic_(thread_idx, run_target, token);
+                }
             } catch (...) {
                 if (!captured_set.test_and_set(std::memory_order_relaxed)) {
                     captured = std::current_exception();
@@ -651,8 +659,10 @@ uint64_t TickSimulation::executeRunEpochFreeDynamic_(uint64_t total_cycles) {
     return completedCyclesForRun_(run_start, run_target);
 }
 
-void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_cycle,
-                                                stdexec::inplace_stop_token token) {
+template <bool PushPeriodicCounters>
+void TickSimulation::executeThreadEpochDynamicImpl_(size_t thread_idx, uint64_t end_cycle,
+                                                    uint64_t run_start, uint64_t period,
+                                                    stdexec::inplace_stop_token token) {
     const bool trace_units = timeline_trace_.traceUnits();
     const bool trace_waits = timeline_trace_.traceWaits();
     const size_t num_clusters = dynamic_runtime_cluster_count_;
@@ -665,6 +675,10 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
     std::vector<double> priority_cost_ns(num_clusters, 0.0);
     uint64_t seen_generation = 0;
     uint64_t priority_refresh = 0;
+    observe::ThreadContext* counter_producer = nullptr;
+    if constexpr (PushPeriodicCounters) {
+        counter_producer = observe::ObservationManager::instance().periodicCounterProducer();
+    }
 
     auto refresh_owned_clusters = [&]() {
         owned_clusters.clear();
@@ -832,6 +846,44 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
             serviceEpochFreeMigration_();
         }
 
+        if constexpr (PushPeriodicCounters) {
+            auto& obs_mgr = observe::ObservationManager::instance();
+            for (size_t cluster : owned_clusters) {
+                if (!counter_producer || !cluster_runtime_owner_ ||
+                    cluster_runtime_owner_[cluster].load(std::memory_order_acquire) != thread_idx) {
+                    continue;
+                }
+                const uint64_t observed =
+                    thread_progress_array_[cluster].completed_cycle.load(std::memory_order_relaxed);
+                uint64_t nominal_cycle =
+                    obs_mgr.nextPeriodicCounterCycle(cluster, run_start, period);
+                while (OBSERVE_UNLIKELY(nominal_cycle <= observed && nominal_cycle <= end_cycle)) {
+                    size_t claim = SIZE_MAX;
+                    if (!cluster_execution_owner_[cluster].compare_exchange_strong(
+                            claim, thread_idx, std::memory_order_acq_rel)) {
+                        break;
+                    }
+                    if (cluster_runtime_owner_[cluster].load(std::memory_order_acquire) !=
+                        thread_idx) {
+                        cluster_execution_owner_[cluster].store(SIZE_MAX,
+                                                                std::memory_order_release);
+                        break;
+                    }
+
+                    const size_t snapshot_cluster = cluster;
+                    (void)obs_mgr.pushPeriodicCounterSnapshots(
+                        nominal_cycle, std::span<const size_t>(&snapshot_cluster, 1),
+                        *counter_producer);
+                    cluster_execution_owner_[cluster].store(SIZE_MAX, std::memory_order_release);
+
+                    const uint64_t next_cycle =
+                        obs_mgr.nextPeriodicCounterCycle(cluster, run_start, period);
+                    if (next_cycle <= nominal_cycle) break;
+                    nominal_cycle = next_cycle;
+                }
+            }
+        }
+
         if (local_done && all_clusters_done()) return;
         if (made_progress) {
             if (blocker.cluster != SIZE_MAX) {
@@ -906,6 +958,17 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
                 wait_begin, wait_end, formatBlockerDetail_(blocker));
         }
     }
+}
+
+void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_cycle,
+                                                stdexec::inplace_stop_token token) {
+    executeThreadEpochDynamicImpl_<false>(thread_idx, end_cycle, 0, 0, token);
+}
+
+void TickSimulation::executeThreadEpochDynamicWithPeriodicCounters_(
+    size_t thread_idx, uint64_t end_cycle, uint64_t run_start, uint64_t period,
+    stdexec::inplace_stop_token token) {
+    executeThreadEpochDynamicImpl_<true>(thread_idx, end_cycle, run_start, period, token);
 }
 
 }  // namespace chronon::sender

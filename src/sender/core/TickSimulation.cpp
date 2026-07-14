@@ -15,11 +15,15 @@
 #include <algorithm>
 #include <cstdlib>
 #include <exception>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+
+#include "../../observe/ObservableUnit.hpp"
+#include "TickSimulationCycleUtils.hpp"
 
 namespace chronon::sender {
 
@@ -69,13 +73,6 @@ void TickSimulation::initialize() {
 
     termination_ctrl_.setStopSource(&*stop_source_);
 
-    if (obs_mgr.isEnabled()) {
-        auto* backend = obs_mgr.backend();
-        if (backend) {
-            backend->setStopToken(stop_source_->get_token());
-        }
-    }
-
     // Initialize units BEFORE selectExecutionMode_() so tick() is callable
     // during cost profiling.
     for (auto& unit : units_) {
@@ -85,6 +82,25 @@ void TickSimulation::initialize() {
 
     selectExecutionMode_();
     traceExecutionMode_();
+
+    // Counter snapshot ownership follows stable scheduler clusters rather
+    // than worker IDs, so runtime cluster migration does not invalidate the
+    // precomputed lock-free snapshot plans.
+    size_t max_counter_owner = 0;
+    bool has_counter_owner = false;
+    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
+        // Pure sequential configurations do not build scheduler clusters. All
+        // their counters still have one real writer, represented by owner 0.
+        const size_t owner = i < unit_to_cluster_.size() ? unit_to_cluster_[i] : 0;
+        auto* observable = dynamic_cast<observe::ObservableUnit*>(unit_ptrs_[i]);
+        if (observable && observable->observationContext()) {
+            observable->observationContext()->setCounterOwnerId(owner);
+            max_counter_owner = std::max(max_counter_owner, owner);
+            has_counter_owner = true;
+        }
+    }
+    counter_owner_ids_.resize(has_counter_owner ? max_counter_owner + 1 : 0);
+    std::iota(counter_owner_ids_.begin(), counter_owner_ids_.end(), size_t{0});
 
     // Any connection still carrying a thread_queue_id after queue
     // optimization is genuinely MPSC; record its InPort for the per-cycle
@@ -148,10 +164,6 @@ uint64_t TickSimulation::run(uint64_t num_cycles) {
     }
 
     current_cycle_ += executed;
-
-    // Periodic counter dumps are intentionally NOT done here because run()
-    // executes the whole batch, with no observable intermediate boundary.
-    // Use runUntilTermination() for periodic dumps.
     return executed;
 }
 
@@ -168,12 +180,6 @@ uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
 
     const bool use_parallel = shouldUseParallelExecution_();
 
-    auto& obs_mgr = observe::ObservationManager::instance();
-    const bool do_periodic_dump = obs_mgr.isEnabled() && obs_mgr.periodicDumpCycles() > 0;
-    const uint64_t dump_period = do_periodic_dump ? obs_mgr.periodicDumpCycles() : 0;
-    uint64_t next_dump_cycle =
-        do_periodic_dump ? ((current_cycle_ / dump_period) + 1) * dump_period : UINT64_MAX;
-
     while (executed < max_cycles) {
         if (termination_ctrl_.isTerminationRequested()) {
             break;
@@ -181,9 +187,6 @@ uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
 
         const bool use_epoch_free_chunk = use_parallel && epochFreeLookaheadEligible_();
         uint64_t step_cycles = max_cycles - executed;
-        if (do_periodic_dump && next_dump_cycle > current_cycle_) {
-            step_cycles = std::min(step_cycles, next_dump_cycle - current_cycle_);
-        }
         if (!use_epoch_free_chunk) {
             step_cycles = std::min(step_cycles, config_.epoch_size);
         }
@@ -203,11 +206,6 @@ uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
 
         executed += epoch_executed;
         current_cycle_ += epoch_executed;
-
-        while (do_periodic_dump && next_dump_cycle <= current_cycle_) {
-            obs_mgr.dumpCounterSnapshots(next_dump_cycle);
-            next_dump_cycle += dump_period;
-        }
 
         if (config_.enable_dynamic_rebalance && use_parallel && !use_epoch_free_chunk) {
             maybeRebalanceAfterEpoch_(epoch_executed);
@@ -307,15 +305,36 @@ void TickSimulation::warnParallelFallbackIfNeeded_() {
 // Sequential / parallel dispatch
 // ---------------------------------------------------------------------------
 
-uint64_t TickSimulation::runSequential(uint64_t num_cycles) {
+template <bool PushPeriodicCounters>
+uint64_t TickSimulation::runSequentialImpl_(uint64_t num_cycles) {
     // In single-thread mode, per-cycle execution avoids lookahead
     // bookkeeping overhead without changing execution semantics.
+    observe::ThreadContext* counter_producer = nullptr;
+    uint64_t next_counter_cycle = UINT64_MAX;
+    const uint64_t run_target = current_cycle_ + num_cycles;
+    if constexpr (PushPeriodicCounters) {
+        auto& obs_mgr = observe::ObservationManager::instance();
+        counter_producer = obs_mgr.periodicCounterProducer();
+        next_counter_cycle =
+            detail::nextPeriodicCycle(current_cycle_, obs_mgr.periodicDumpCycles());
+    }
     try {
         for (uint64_t i = 0; i < num_cycles; ++i) {
             for (auto* unit : unit_ptrs_) {
                 executeUnitCycle_(unit, unit->localCycle());
             }
             arbitrateAllMPSCPorts_();
+            if constexpr (PushPeriodicCounters) {
+                const uint64_t completed_cycle = current_cycle_ + i + 1;
+                if (counter_producer && next_counter_cycle <= run_target &&
+                    completed_cycle >= next_counter_cycle) {
+                    auto& obs_mgr = observe::ObservationManager::instance();
+                    (void)obs_mgr.pushPeriodicCounterSnapshots(
+                        next_counter_cycle, counter_owner_ids_, *counter_producer);
+                    next_counter_cycle =
+                        detail::nextPeriodicCycle(completed_cycle, obs_mgr.periodicDumpCycles());
+                }
+            }
         }
     } catch (...) {
         throwTickException();
@@ -323,19 +342,15 @@ uint64_t TickSimulation::runSequential(uint64_t num_cycles) {
     return num_cycles;
 }
 
-uint64_t TickSimulation::runSequentialEpoch(uint64_t epoch_cycles) {
-    try {
-        for (uint64_t i = 0; i < epoch_cycles; ++i) {
-            for (auto* unit : unit_ptrs_) {
-                executeUnitCycle_(unit, unit->localCycle());
-            }
-            arbitrateAllMPSCPorts_();
-        }
-    } catch (...) {
-        throwTickException();
+uint64_t TickSimulation::runSequential(uint64_t num_cycles) {
+    if (observe::ObservationManager::instance().periodicCounterSnapshotsEnabled()) {
+        return runSequentialImpl_<true>(num_cycles);
     }
+    return runSequentialImpl_<false>(num_cycles);
+}
 
-    return epoch_cycles;
+uint64_t TickSimulation::runSequentialEpoch(uint64_t epoch_cycles) {
+    return runSequential(epoch_cycles);
 }
 
 uint64_t TickSimulation::runParallelEpoch(uint64_t epoch_cycles, uint64_t /*executed_offset*/) {

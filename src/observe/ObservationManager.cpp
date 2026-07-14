@@ -9,6 +9,7 @@
 #include "ObservationManager.hpp"
 
 #include <iostream>
+#include <stdexcept>
 #include <thread>
 
 #include "ObserveApi.hpp"
@@ -287,7 +288,7 @@ void ObservationManager::reregisterAllCounters() {
     counter_registry_.reregisterAll(contexts_);
 }
 
-void ObservationManager::dumpCounterSnapshots(uint64_t cycle) {
+void ObservationManager::dumpFinalCounterSnapshot(uint64_t cycle) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!initialized_ || !enabled_ || !shared_queue_) {
@@ -303,7 +304,30 @@ void ObservationManager::dumpCounterSnapshots(uint64_t cycle) {
         return;
     }
 
-    counter_registry_.dumpSnapshots(cycle, shared_queue_.get(), contexts_);
+    counter_registry_.dumpFinalSnapshot(cycle, shared_queue_.get(), contexts_);
+}
+
+ThreadContext* ObservationManager::periodicCounterProducer() {
+    if (!periodicCounterSnapshotsEnabled()) return nullptr;
+    ThreadContext* producer = ThreadContextManager::instance().getContext();
+    if (!producer) {
+        throw std::runtime_error(
+            "periodic counters require a producer context, but the 64-context pool is exhausted");
+    }
+    return producer;
+}
+
+bool ObservationManager::pushPeriodicCounterSnapshots(uint64_t cycle,
+                                                      std::span<const size_t> cluster_ids,
+                                                      ThreadContext& producer) noexcept {
+    if (!periodicCounterSnapshotsEnabled()) return false;
+    return counter_registry_.pushOwnerSnapshots(cycle, cluster_ids, producer);
+}
+
+uint64_t ObservationManager::nextPeriodicCounterCycle(size_t cluster_id, uint64_t run_start,
+                                                      uint64_t period) const noexcept {
+    if (!periodicCounterSnapshotsEnabled()) return UINT64_MAX;
+    return counter_registry_.nextOwnerSnapshotCycle(cluster_id, run_start, period);
 }
 
 void ObservationManager::printReport(std::ostream& out) const {

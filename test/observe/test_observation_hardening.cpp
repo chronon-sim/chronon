@@ -618,7 +618,7 @@ void test_counter_group_does_not_collide_with_child_unit() {
     counter.increment(7);
     CounterRegistry registry;
     registry.registerCounter("core", makeCounterId(0), &counter, "ticks");
-    registry.dumpSnapshots(2, &queue, {});
+    registry.dumpFinalSnapshot(2, &queue, {});
     ThreadContextManager::instance().flushAll();
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 

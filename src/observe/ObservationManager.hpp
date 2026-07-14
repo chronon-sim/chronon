@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,8 @@
 #include "Types.hpp"
 
 namespace chronon::observe {
+
+class ThreadContext;
 
 /**
  * @brief Central singleton coordinating observability setup.
@@ -109,15 +112,46 @@ public:
     CounterRegistry& counterRegistry() noexcept { return counter_registry_; }
 
     /**
-     * @brief Emit COUNTER_SNAPSHOT events for all registered counters at @p cycle.
+     * @brief Emit the final COUNTER_SNAPSHOT records at @p cycle.
      *
      * Uses the registration-based pull model: reads from registered counter
      * addresses rather than iterating context storage. Thread-safe.
      */
-    void dumpCounterSnapshots(uint64_t cycle);
+    void dumpFinalCounterSnapshot(uint64_t cycle);
+
+    /**
+     * Return the calling scheduler worker's lock-free observation producer
+     * context. Called once before a worker enters its execution loop.
+     * @throws std::runtime_error if the bounded producer pool is exhausted.
+     */
+    ThreadContext* periodicCounterProducer();
+
+    /**
+     * Push counters owned by scheduler clusters to the worker's SPSC queue.
+     *
+     * No manager or queue mutex is taken. The caller must be the sole writer
+     * of every supplied cluster and must not race manager reconfiguration.
+     */
+    bool pushPeriodicCounterSnapshots(uint64_t cycle, std::span<const size_t> cluster_ids,
+                                      ThreadContext& producer) noexcept;
+
+    /// Return the next nominal periodic cycle for a stable scheduler cluster.
+    uint64_t nextPeriodicCounterCycle(size_t cluster_id, uint64_t run_start,
+                                      uint64_t period) const noexcept;
 
     /// @return Dump interval in cycles (0 = disabled).
     uint64_t periodicDumpCycles() const noexcept { return config_.counters.periodic_dump_cycles; }
+
+    /// True only when periodic counter records have an enabled consumer.
+    /// The configuration is immutable while a simulation is running, so this
+    /// control-plane query needs no synchronization.
+    bool periodicCounterSnapshotsEnabled() const noexcept {
+        if (!enabled_ || !config_.counters.enabled || config_.counters.periodic_dump_cycles == 0) {
+            return false;
+        }
+        const bool timeline_counters = config_.timeline.enabled && config_.timeline.counters;
+        return config_.counters.csv_output || timeline_counters;
+    }
 
     bool dumpOnShutdown() const noexcept { return config_.counters.dump_on_shutdown; }
 
