@@ -561,9 +561,44 @@ private:
 
     /// Test-only white-box access for test_lookahead_floor_progress.
     friend struct LookaheadFloorTestAccess;
+    /// Test-only white-box access for test_predecessor_cycle_cache.
+    friend struct PredecessorCycleCacheTestAccess;
 
-    bool clusterCanAdvance_(size_t cluster, uint64_t cycle, BlockedClusterInfo& blocker) const;
-    uint64_t computeIdleClusterTarget_(size_t cluster, uint64_t cycle, uint64_t end_cycle) const;
+    /// Worker-private lower bounds for predecessor progress. Each cache lives
+    /// for one worker invocation and needs no atomic synchronization of its own.
+    /// ThreadProgress is release-published and never decreases, so a value read
+    /// with acquire remains a valid lower bound for all later dependency checks
+    /// on that worker. The extra slot is reserved for the synthetic lookahead
+    /// floor dependency (pred_id == thread_progress_count_).
+    struct alignas(64) WorkerPredecessorCycleCache {
+        explicit WorkerPredecessorCycleCache(size_t num_clusters)
+            : observed_cycles(num_clusters + 1, 0) {}
+
+        uint64_t* data() noexcept { return observed_cycles.data(); }
+
+        std::vector<uint64_t> observed_cycles;
+    };
+
+    /// Return a predecessor-progress lower bound sufficient for `needed` when
+    /// possible. A cache hit deliberately does not load the remote atomic. On a
+    /// miss, a real cluster dependency's acquire pairs with the predecessor's
+    /// release publication and replaces the worker-local lower bound. The floor
+    /// slot is only a gating hint and carries no model data. Cluster progress is
+    /// monotonic, so dynamic ownership migration needs no cache invalidation.
+    static uint64_t observePredecessorCycle_(const ResolvedDep& dep, uint64_t needed,
+                                             uint64_t* observed_cycles) noexcept {
+        uint64_t observed = observed_cycles[dep.pred_id];
+        if (observed >= needed) return observed;
+
+        observed = dep.progress_ptr->load(std::memory_order_acquire);
+        observed_cycles[dep.pred_id] = observed;
+        return observed;
+    }
+
+    bool clusterCanAdvance_(size_t cluster, uint64_t cycle, BlockedClusterInfo& blocker,
+                            uint64_t* predecessor_cache) const;
+    uint64_t computeIdleClusterTarget_(size_t cluster, uint64_t cycle, uint64_t end_cycle,
+                                       uint64_t* predecessor_cache) const;
     void advanceClusterIdle_(size_t cluster, uint64_t delta);
     void recordClusterIdle_(size_t thread_idx, size_t cluster, uint64_t cycle, uint64_t delta,
                             SchedulerTimelineTrace::TimePoint begin,

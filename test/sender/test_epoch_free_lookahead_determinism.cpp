@@ -21,7 +21,9 @@
 // sequential reference bit-for-bit across worker counts and across a
 // max_lookahead sweep (including 1, the tightest gate), AND that it actually
 // engaged (epochFreeRunCount() > 0) rather than silently falling back to the
-// barrier path.
+// barrier path. This also provides scheduler-level coverage for the
+// worker-local predecessor-progress cache in both the fixed-layout and dynamic
+// EpochFree driver; test_predecessor_cycle_cache.cpp owns its direct semantics.
 
 #include <cstdint>
 #include <iostream>

@@ -214,6 +214,16 @@ slices indicate spin-wait time on predecessor cluster progress atomics; sparse
 or non-overlapping `unit` slices indicate poor stream packing or insufficient
 lookahead.
 
+EpochFree workers cache acquired predecessor cycles as private monotonic lower
+bounds. This reduces coherence traffic only when a cached value already covers
+the next dependency check—for example, with useful edge delay or when several
+local clusters share a predecessor. Tight delay-0/delay-1 edges that advance in
+lockstep can still miss the cache and poll the remote progress line. The cache
+also does not eliminate genuine dependency waits, so long `cluster dependency`
+slices should still be addressed through placement, lookahead, or topology
+changes. Use system profilers' cache-coherence views together with the timeline
+to distinguish remote-line traffic from unavoidable simulated dependencies.
+
 ### Tune Lookahead Headroom
 
 Epoch-free lookahead is the default scheduler path. Tune
