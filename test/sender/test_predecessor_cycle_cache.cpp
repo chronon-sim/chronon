@@ -31,12 +31,22 @@ struct CacheObservations {
     uint64_t floor_second_refresh;
 };
 
+struct MaskedObservations {
+    bool first_ready;
+    bool second_ready;
+    uint64_t hit_lane_cache;
+    uint64_t ready_miss_lane_cache;
+    uint64_t blocked_miss_lane_cache;
+    size_t blocked_predecessor;
+    uint64_t blocked_deficit;
+};
+
 // Befriended by TickSimulation so the optimization's hot-path helper can be
 // tested deterministically without adding production instrumentation or counters.
 struct PredecessorCycleCacheTestAccess {
     static CacheObservations exercise() {
         TickSimulation::WorkerPredecessorCycleCache cache(/*num_clusters=*/2);
-        uint64_t* const cycles = cache.data();
+        auto* const cycles = cache.data();
 
         std::atomic<uint64_t> pred0{10};
         std::atomic<uint64_t> pred1{40};
@@ -71,6 +81,45 @@ struct PredecessorCycleCacheTestAccess {
         result.floor_hit = TickSimulation::observePredecessorCycle_(floor_dep, 6, cycles);
         result.floor_second_refresh =
             TickSimulation::observePredecessorCycle_(floor_dep, 8, cycles);
+
+        return result;
+    }
+
+    static MaskedObservations exerciseMaskedClusterCheck() {
+        TickSimulationConfig config;
+        config.num_threads = 1;
+        TickSimulation sim(config);
+        sim.thread_progress_count_ = 4;
+        sim.thread_resolved_deps_.resize(1);
+
+        std::atomic<uint64_t> pred0{100};
+        std::atomic<uint64_t> pred1{9};
+        std::atomic<uint64_t> pred2{6};
+        std::atomic<uint64_t> pred3{100};
+        sim.thread_resolved_deps_[0] = {
+            {&pred0, /*min_delay=*/1, /*pred_id=*/0},
+            {&pred1, /*min_delay=*/2, /*pred_id=*/1},
+            {&pred2, /*min_delay=*/3, /*pred_id=*/2},
+            {&pred3, /*min_delay=*/4, /*pred_id=*/3},
+        };
+
+        TickSimulation::WorkerPredecessorCycleCache cache(/*num_clusters=*/4);
+        auto* const cycles = cache.data();
+        cycles[0] = 10;  // Satisfies needed=10; must not refresh remote 100.
+        cycles[3] = 7;   // Four dependencies keep this test on the mask path.
+
+        BlockedClusterInfo first_blocker{};
+        MaskedObservations result{};
+        result.first_ready = sim.clusterCanAdvance_(0, 10, first_blocker, cycles);
+        result.hit_lane_cache = cycles[0];
+        result.ready_miss_lane_cache = cycles[1];
+        result.blocked_miss_lane_cache = cycles[2];
+        result.blocked_predecessor = first_blocker.pred_cluster;
+        result.blocked_deficit = first_blocker.deficit;
+
+        pred2.store(8, std::memory_order_release);
+        BlockedClusterInfo second_blocker{};
+        result.second_ready = sim.clusterCanAdvance_(0, 10, second_blocker, cycles);
         return result;
     }
 };
@@ -109,6 +158,15 @@ int main() {
     check(result.floor_refresh == 7, "synthetic floor uses its reserved cache slot");
     check(result.floor_hit == 7, "sufficient floor lower bound skips the newer floor value");
     check(result.floor_second_refresh == 9, "insufficient floor slot refreshes independently");
+
+    const auto masked = PredecessorCycleCacheTestAccess::exerciseMaskedClusterCheck();
+    check(!masked.first_ready, "masked check reports an insufficient miss lane");
+    check(masked.hit_lane_cache == 10, "masked hit lane does not acquire newer remote progress");
+    check(masked.ready_miss_lane_cache == 9, "masked ready miss lane refreshes its cache slot");
+    check(masked.blocked_miss_lane_cache == 6, "masked blocked miss lane refreshes its cache slot");
+    check(masked.blocked_predecessor == 2, "masked slow lanes preserve blocker identity");
+    check(masked.blocked_deficit == 2, "masked slow lanes preserve blocker deficit");
+    check(masked.second_ready, "masked check advances after the blocked lane catches up");
 
     std::cout << "\n" << (failures == 0 ? "ALL PASSED" : "FAILED") << "\n";
     return failures == 0 ? 0 : 1;

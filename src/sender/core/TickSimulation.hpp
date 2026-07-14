@@ -597,6 +597,13 @@ private:
 
     bool clusterCanAdvance_(size_t cluster, uint64_t cycle, BlockedClusterInfo& blocker,
                             uint64_t* predecessor_cache) const;
+    [[gnu::noinline]] bool refreshPredecessorMisses_(size_t cluster, uint64_t cycle,
+                                                     BlockedClusterInfo& blocker,
+                                                     uint64_t* predecessor_cache,
+                                                     uint64_t refresh_mask) const;
+    [[gnu::noinline]] bool clusterCanAdvanceScalarSlow_(size_t cluster, uint64_t cycle,
+                                                        BlockedClusterInfo& blocker,
+                                                        uint64_t* predecessor_cache) const;
     uint64_t computeIdleClusterTarget_(size_t cluster, uint64_t cycle, uint64_t end_cycle,
                                        uint64_t* predecessor_cache) const;
     void advanceClusterIdle_(size_t cluster, uint64_t delta);
