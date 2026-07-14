@@ -131,6 +131,9 @@ struct ThreadCrossDep {
 struct ResolvedDep {
     std::atomic<uint64_t>* progress_ptr;
     uint32_t min_delay;
+    /// Stable predecessor cluster index, also used as the worker-local cache
+    /// index. Real dependencies use [0, num_clusters); the synthetic
+    /// lookahead-floor dependency uses the reserved num_clusters slot.
     size_t pred_id = 0;
 };
 

@@ -657,6 +657,10 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
     const bool trace_waits = timeline_trace_.traceWaits();
     const size_t num_clusters = dynamic_runtime_cluster_count_;
     std::vector<size_t> owned_clusters;
+    // Cluster ids and progress slots remain stable across ownership migration,
+    // so this worker-private cache can span the entire EpochFree invocation.
+    WorkerPredecessorCycleCache predecessor_cache(thread_progress_count_);
+    uint64_t* const predecessor_cycles = predecessor_cache.data();
     std::vector<uint64_t> priority_blocker_ns(num_clusters, 0);
     std::vector<double> priority_cost_ns(num_clusters, 0.0);
     uint64_t seen_generation = 0;
@@ -768,7 +772,7 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
             }
 
             BlockedClusterInfo candidate{};
-            if (!clusterCanAdvance_(cluster, cycle, candidate)) {
+            if (!clusterCanAdvance_(cluster, cycle, candidate, predecessor_cycles)) {
                 if (candidate.deficit > blocker.deficit) {
                     blocker = candidate;
                 }
@@ -776,7 +780,8 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
                 continue;
             }
 
-            uint64_t idle_target = computeIdleClusterTarget_(cluster, cycle, end_cycle);
+            uint64_t idle_target =
+                computeIdleClusterTarget_(cluster, cycle, end_cycle, predecessor_cycles);
             if (idle_target > cycle) {
                 const bool cluster_has_mpsc =
                     clusterHasMPSCConnections(cluster_unit_ptrs_[cluster]);
@@ -791,7 +796,7 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
                 uint64_t reached_cycle = idle_target;
                 if (!cluster_has_mpsc) {
                     const uint64_t refreshed_target =
-                        computeIdleClusterTarget_(cluster, cycle, idle_target);
+                        computeIdleClusterTarget_(cluster, cycle, idle_target, predecessor_cycles);
                     if (refreshed_target < idle_target) {
                         reached_cycle = refreshed_target;
                         for (auto* unit : cluster_unit_ptrs_[cluster]) {
@@ -868,7 +873,7 @@ void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_
                     continue;
                 }
                 BlockedClusterInfo ignored{};
-                if (clusterCanAdvance_(cluster, cycle, ignored)) {
+                if (clusterCanAdvance_(cluster, cycle, ignored, predecessor_cycles)) {
                     if (migration_blocks_cluster(cluster, cycle)) {
                         continue;
                     }

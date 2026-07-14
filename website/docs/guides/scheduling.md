@@ -303,6 +303,16 @@ holds, Chronon uses the epoch-free dynamic driver and commits whole-cluster
 migrations only at scheduler fence points. If the epoch-free gate is rejected,
 the dynamic path falls back to the explicit per-epoch driver.
 
+Each EpochFree worker keeps a private shadow of the last acquired progress value
+for every predecessor cluster. Cluster progress is release-published and
+monotonic. Therefore, when the shadow already reaches the cycle required by a
+dependency, the worker can reuse that lower bound without reading the
+predecessor's frequently-written atomic cache line. When it is insufficient,
+the worker performs an acquire load and updates its shadow. The synthetic
+lookahead floor has a separate reserved slot. Dynamic migration needs no cache
+invalidation because cluster ids and their progress slots remain stable and the
+published cycle never moves backward.
+
 **When it engages.** The dispatch gate keeps the per-epoch barrier path unless
 *all* of the following hold; otherwise it transparently falls back (no result
 change):
@@ -346,10 +356,12 @@ for the desired run-ahead.
 In progress-based lookahead mode, each tight-coupling cluster publishes its
 completed cycle in a cache-line-aligned progress atomic. A worker stream scans
 the clusters assigned to it and executes any cluster whose direct predecessor
-clusters have reached the required cycle. If no local cluster is ready, the
-stream spins until one becomes ready. The scheduler timeline records that time
-as `cluster dependency` events and includes the blocking predecessor cluster in
-the event detail.
+clusters have reached the required cycle. The worker-local progress shadow
+described above avoids a remote atomic load when a prior observation already
+proves readiness; it does not relax the dependency or predict future progress.
+If no local cluster is ready, the stream spins until one becomes ready. The
+scheduler timeline records that time as `cluster dependency` events and includes
+the blocking predecessor cluster in the event detail.
 
 This keeps delay=0 groups atomic while allowing independent clusters assigned
 to the same stream to advance out of order. Dynamic rebalance, when enabled,
