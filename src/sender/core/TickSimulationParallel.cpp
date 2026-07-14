@@ -30,6 +30,7 @@
 
 #include "../../chronon/CpuPause.hpp"
 #include "TickSimulation.hpp"
+#include "TickSimulationCycleUtils.hpp"
 #include "sender/schedule/SchedulerTimelineStyle.hpp"
 
 namespace chronon::sender {
@@ -56,23 +57,6 @@ bool clusterHasMPSCConnections(const std::vector<TickableUnit*>& units) noexcept
 }
 
 }  // namespace
-
-TickSimulation::ThreadTraceCpuPoint TickSimulation::threadTraceCpuPoint_() noexcept {
-    ThreadTraceCpuPoint point{};
-#if defined(CLOCK_THREAD_CPUTIME_ID)
-    timespec ts{};
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
-        point.cpu_time_ns =
-            static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ull + static_cast<uint64_t>(ts.tv_nsec);
-    }
-#endif
-#if defined(__linux__)
-    static thread_local uint32_t cached_tid = static_cast<uint32_t>(::syscall(SYS_gettid));
-    point.tid = cached_tid;
-    point.cpu = ::sched_getcpu();
-#endif
-    return point;
-}
 
 // ---------------------------------------------------------------------------
 // MPSC producer progress wiring
@@ -246,23 +230,6 @@ void TickSimulation::initProgressSync() {
     }
 }
 
-void TickSimulation::initTimelineTraceScratch_() {
-    thread_trace_points_.clear();
-    thread_trace_cpu_points_.clear();
-    if (!timeline_trace_.traceUnits() || thread_units_.empty()) return;
-
-    thread_trace_points_.resize(thread_units_.size());
-    if (timeline_trace_.traceThreadCpuTime()) {
-        thread_trace_cpu_points_.resize(thread_units_.size());
-    }
-    for (size_t t = 0; t < thread_units_.size(); ++t) {
-        thread_trace_points_[t].resize(thread_units_[t].size() + 1);
-        if (!thread_trace_cpu_points_.empty()) {
-            thread_trace_cpu_points_[t].resize(thread_units_[t].size() + 1);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Progress-based parallel execution
 // ---------------------------------------------------------------------------
@@ -279,21 +246,31 @@ void TickSimulation::executeEpochProgressBased(uint64_t epoch_cycles) {
     }
 
     auto token = stop_source_->get_token();
+    auto& obs_mgr = observe::ObservationManager::instance();
+    const bool push_periodic_counters = obs_mgr.periodicCounterSnapshotsEnabled();
+    const uint64_t counter_period = push_periodic_counters ? obs_mgr.periodicDumpCycles() : 0;
 
     auto sched = pool_.get_scheduler();
-    auto work = stdexec::bulk(stdexec::just(), stdexec::par, thread_units_.size(),
-                              [this, end_cycle, token](std::size_t thread_idx) {
-                                  // The try-catch is NOT for exception
-                                  // capture (stdexec handles that natively);
-                                  // it solely requests stop so other threads
-                                  // exit their dependency spin-waits.
-                                  try {
-                                      executeThreadEpoch_(thread_idx, end_cycle, token);
-                                  } catch (...) {
-                                      stop_source_->request_stop();
-                                      throw;
-                                  }
-                              });
+    auto work =
+        stdexec::bulk(stdexec::just(), stdexec::par, thread_units_.size(),
+                      [this, start_cycle, end_cycle, push_periodic_counters, counter_period,
+                       token](std::size_t thread_idx) {
+                          // The try-catch is NOT for exception
+                          // capture (stdexec handles that natively);
+                          // it solely requests stop so other threads
+                          // exit their dependency spin-waits.
+                          try {
+                              if (push_periodic_counters) {
+                                  executeThreadEpochWithPeriodicCounters_(
+                                      thread_idx, end_cycle, start_cycle, counter_period, token);
+                              } else {
+                                  executeThreadEpoch_(thread_idx, end_cycle, token);
+                              }
+                          } catch (...) {
+                              stop_source_->request_stop();
+                              throw;
+                          }
+                      });
 
     auto scheduled_work = stdexec::starts_on(sched, std::move(work));
     stdexec::sync_wait(std::move(scheduled_work));
@@ -334,10 +311,14 @@ uint64_t TickSimulation::executeRunProgressBased(uint64_t total_cycles) {
     const uint64_t run_start =
         thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
     const uint64_t run_target = saturatingCycleAdd(run_start, total_cycles);
+    auto& obs_mgr = observe::ObservationManager::instance();
+    const bool push_periodic_counters = obs_mgr.periodicCounterSnapshotsEnabled();
+    const uint64_t counter_period = push_periodic_counters ? obs_mgr.periodicDumpCycles() : 0;
 
     // Shared with the barrier completion. Written only in the completion (one
     // thread, peers parked) or before launch; the barrier supplies the
     // happens-before, so no atomics are needed.
+    uint64_t epoch_start = run_start;
     uint64_t epoch_end = run_start + std::min<uint64_t>(config_.epoch_size, total_cycles);
     bool run_done = false;
     std::exception_ptr captured;
@@ -357,6 +338,7 @@ uint64_t TickSimulation::executeRunProgressBased(uint64_t total_cycles) {
         }
         const uint64_t next_cycles = std::min<uint64_t>(config_.epoch_size, run_target - epoch_end);
         lookahead_floor_.store(epoch_end, std::memory_order_relaxed);
+        epoch_start = epoch_end;
         epoch_end += next_cycles;
     };
 
@@ -366,9 +348,15 @@ uint64_t TickSimulation::executeRunProgressBased(uint64_t total_cycles) {
         stdexec::bulk(stdexec::just(), stdexec::par, nthreads, [&, token](std::size_t thread_idx) {
             const std::vector<size_t>& my_units = thread_units_[thread_idx];
             for (;;) {
-                const uint64_t end = epoch_end;  // published by init / prior barrier
+                const uint64_t start = epoch_start;  // published by init / prior barrier
+                const uint64_t end = epoch_end;      // published by init / prior barrier
                 try {
-                    executeThreadEpoch_(thread_idx, end, token);
+                    if (push_periodic_counters) {
+                        executeThreadEpochWithPeriodicCounters_(thread_idx, end, start,
+                                                                counter_period, token);
+                    } else {
+                        executeThreadEpoch_(thread_idx, end, token);
+                    }
                 } catch (...) {
                     // Capture once and request stop, but still fall through to the
                     // barrier so no peer deadlocks waiting on this worker.
@@ -474,6 +462,9 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
     const uint64_t run_start =
         thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
     const uint64_t run_target = saturatingCycleAdd(run_start, total_cycles);
+    auto& obs_mgr = observe::ObservationManager::instance();
+    const bool push_periodic_counters = obs_mgr.periodicCounterSnapshotsEnabled();
+    const uint64_t counter_period = push_periodic_counters ? obs_mgr.periodicDumpCycles() : 0;
 
     // Single run-spanning window: no per-epoch barrier. Run-ahead is bounded
     // solely by the lookahead_floor_ + max_lookahead_cycles synthetic dep
@@ -498,7 +489,12 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
             // captures the first exception and requests stop so peers leave their
             // dependency spin-waits; sync_wait below is the sole join.
             try {
-                executeThreadEpoch_(thread_idx, run_target, token);
+                if (push_periodic_counters) {
+                    executeThreadEpochWithPeriodicCounters_(thread_idx, run_target, run_start,
+                                                            counter_period, token);
+                } else {
+                    executeThreadEpoch_(thread_idx, run_target, token);
+                }
             } catch (...) {
                 if (!captured_set.test_and_set(std::memory_order_relaxed)) {
                     captured = std::current_exception();
@@ -536,8 +532,10 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
 // Per-thread epoch driver
 // ---------------------------------------------------------------------------
 
-void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
-                                         stdexec::inplace_stop_token token) {
+template <bool PushPeriodicCounters>
+void TickSimulation::executeThreadEpochImpl_(size_t thread_idx, uint64_t end_cycle,
+                                             uint64_t run_start, uint64_t period,
+                                             stdexec::inplace_stop_token token) {
     const auto& clusters = thread_clusters_[thread_idx];
     const bool trace_units = timeline_trace_.traceUnits();
     // This cache spans the worker invocation (the entire run in EpochFree mode),
@@ -545,6 +543,12 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
     WorkerPredecessorCycleCache predecessor_cache(thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
     const bool trace_waits = timeline_trace_.traceWaits();
+    observe::ThreadContext* counter_producer = nullptr;
+    uint64_t next_counter_cycle = UINT64_MAX;
+    if constexpr (PushPeriodicCounters) {
+        counter_producer = observe::ObservationManager::instance().periodicCounterProducer();
+        next_counter_cycle = detail::nextPeriodicCycle(run_start, period);
+    }
 
     while (true) {
         bool all_done = true;
@@ -617,6 +621,27 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
             made_progress = true;
         }
 
+        if constexpr (PushPeriodicCounters) {
+            // One predictable check per worker sweep, never per counter
+            // increment. The first owned cluster is the sampling clock; other
+            // clusters may differ by up to the configured lookahead window.
+            if (counter_producer && next_counter_cycle <= end_cycle && !clusters.empty()) {
+                const uint64_t observed =
+                    thread_progress_array_[clusters.front()].completed_cycle.load(
+                        std::memory_order_relaxed);
+                while (OBSERVE_UNLIKELY(observed >= next_counter_cycle &&
+                                        next_counter_cycle <= end_cycle)) {
+                    const bool pushed =
+                        observe::ObservationManager::instance().pushPeriodicCounterSnapshots(
+                            next_counter_cycle, clusters, *counter_producer);
+                    if (!pushed) break;
+                    const uint64_t prior_cycle = next_counter_cycle;
+                    next_counter_cycle = detail::nextPeriodicCycle(next_counter_cycle, period);
+                    if (next_counter_cycle <= prior_cycle) break;
+                }
+            }
+        }
+
         if (all_done || token.stop_requested()) return;
         if (made_progress) {
             // A worker advancing one cluster while another is stuck at the
@@ -675,6 +700,17 @@ void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
                 wait_begin, wait_end, formatBlockerDetail_(blocker));
         }
     }
+}
+
+void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
+                                         stdexec::inplace_stop_token token) {
+    executeThreadEpochImpl_<false>(thread_idx, end_cycle, 0, 0, token);
+}
+
+void TickSimulation::executeThreadEpochWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
+                                                             uint64_t run_start, uint64_t period,
+                                                             stdexec::inplace_stop_token token) {
+    executeThreadEpochImpl_<true>(thread_idx, end_cycle, run_start, period, token);
 }
 
 // ---------------------------------------------------------------------------
@@ -849,40 +885,6 @@ std::string TickSimulation::formatBlockerDetail_(const BlockedClusterInfo& block
            " delay=" + std::to_string(blocker.delay);
 }
 
-void TickSimulation::recordUnitDuration_(size_t thread_idx, std::string_view category,
-                                         std::string_view name, uint64_t cycle,
-                                         SchedulerTimelineTrace::TimePoint begin,
-                                         SchedulerTimelineTrace::TimePoint end,
-                                         std::string_view detail, bool include_thread_cpu_time,
-                                         ThreadTraceCpuPoint cpu_begin,
-                                         ThreadTraceCpuPoint cpu_end) {
-    if (!include_thread_cpu_time) {
-        timeline_trace_.recordDuration(thread_idx, category, name, cycle, begin, end, detail);
-        return;
-    }
-
-    const uint64_t wall_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
-    const uint64_t thread_cpu_ns = cpu_end.cpu_time_ns >= cpu_begin.cpu_time_ns
-                                       ? cpu_end.cpu_time_ns - cpu_begin.cpu_time_ns
-                                       : 0;
-    const uint64_t wall_cpu_gap_ns = wall_ns > thread_cpu_ns ? wall_ns - thread_cpu_ns : 0;
-
-    std::string enriched;
-    if (!detail.empty()) {
-        enriched.assign(detail);
-        enriched.push_back(' ');
-    }
-    enriched += "wall_ns=" + std::to_string(wall_ns);
-    enriched += " thread_cpu_ns=" + std::to_string(thread_cpu_ns);
-    enriched += " wall_cpu_gap_ns=" + std::to_string(wall_cpu_gap_ns);
-    enriched += " tid=" + std::to_string(cpu_begin.tid);
-    enriched += " cpu_begin=" + std::to_string(cpu_begin.cpu);
-    enriched += " cpu_end=" + std::to_string(cpu_end.cpu);
-
-    timeline_trace_.recordDuration(thread_idx, category, name, cycle, begin, end, enriched);
-}
-
 void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, uint64_t cycle,
                                              bool trace_units) {
     auto* const* units = cluster_unit_ptrs_[cluster].data();
@@ -946,25 +948,6 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
     } else {
         for (size_t u = 0; u < num_units; ++u) {
             executeUnitCycle_(units[u], cycle);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// MPSC InPort collection
-// ---------------------------------------------------------------------------
-
-void TickSimulation::collectMPSCInPorts_() {
-    mpsc_inports_.clear();
-    std::unordered_map<void*, bool> seen;
-    for (auto* conn : connections_) {
-        if (!conn->hasThreadQueueId()) continue;
-        void* port_ptr = conn->destPortPtr();
-        if (!port_ptr) continue;
-        IArbitratablePort* arb = conn->registerOnDestMPSC();
-        if (!arb) continue;
-        if (seen.emplace(port_ptr, true).second) {
-            mpsc_inports_.push_back(arb);
         }
     }
 }

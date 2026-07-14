@@ -242,7 +242,7 @@ int SimulationApp::run(int argc, char* argv[]) {
                     std::cout << "Dumping final counter snapshots at cycle "
                               << result.cycles_executed << "...\n";
                 }
-                obs_mgr.dumpCounterSnapshots(result.cycles_executed);
+                obs_mgr.dumpFinalCounterSnapshot(result.cycles_executed);
             }
 
             obs_mgr.stopBackend();

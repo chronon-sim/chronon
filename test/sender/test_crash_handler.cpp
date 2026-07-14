@@ -475,8 +475,8 @@ void test_observer_emergency_flush_on_exception() {
         // Explicitly enable the info log category on this context
         ctx->filter().enableCategory(category::LOG_INFO);
 
-        // Initialize simulation first so setStopToken() runs before the
-        // backend thread starts (avoids TSAN race on stop_token_).
+        // Initialize the simulation before starting observation so all unit
+        // contexts and scheduler state are ready before the backend consumes.
         sim.initialize();
 
         // Start backend

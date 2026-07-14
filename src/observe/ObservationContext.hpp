@@ -260,6 +260,8 @@ public:
 
     void setThreadId(uint32_t id) noexcept { thread_id_ = id; }
     uint32_t threadId() const noexcept { return thread_id_; }
+    void setCounterOwnerId(size_t id) noexcept { counter_owner_id_ = id; }
+    size_t counterOwnerId() const noexcept { return counter_owner_id_; }
     const std::string& unitName() const noexcept { return unit_name_; }
     uint16_t sourceId() const noexcept { return source_id_; }
 
@@ -688,6 +690,7 @@ private:
     ObservationQueue* queue_ = nullptr;  ///< Used for counter snapshots and lookahead commits.
     CycleProvider cycle_provider_;
     uint32_t thread_id_ = 0;
+    size_t counter_owner_id_ = SIZE_MAX;
     std::string unit_name_;
     uint16_t source_id_ = 0;
 

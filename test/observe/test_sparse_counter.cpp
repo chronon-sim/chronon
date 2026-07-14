@@ -144,7 +144,7 @@ void test_counter_registration() {
     assert(ctx->counters().getUnchecked(id0).get() == 10);
     assert(ctx->counters().getUnchecked(id1).get() == 20);
 
-    // Note: Skip dumpCounterSnapshots as it can hang without backend running
+    // Note: Skip dumpFinalCounterSnapshot as it can hang without backend running
 
     // Cleanup
     ObservationManager::instance().shutdown();

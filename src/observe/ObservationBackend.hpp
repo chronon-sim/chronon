@@ -104,11 +104,10 @@ public:
     void stop() noexcept;
 
     /**
-     * @brief Hook a stop token for unified stop propagation.
+     * @brief Set an optional observation-lifetime stop token.
      *
-     * The backend installs a stop_callback that sets should_stop_ and wakes
-     * the worker when stop is requested externally (simulation termination,
-     * exception). PRECONDITION: must be called before start().
+     * Do not pass the simulation worker token: final records are submitted
+     * after workers terminate. PRECONDITION: must be called before start().
      */
     void setStopToken(stdexec::inplace_stop_token token) noexcept { stop_token_ = token; }
 

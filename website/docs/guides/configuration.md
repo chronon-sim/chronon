@@ -227,6 +227,15 @@ simulation:
         - pattern: "flush"
 ```
 
+`periodic_dump_cycles` never splits or pauses a run. Every execution mode uses
+the same owner-based push path: sequential and barrier schedulers publish at
+their exact cycle boundary, while lookahead workers publish counters owned by
+their scheduler clusters when local progress crosses the boundary. Records go
+to the producer's lock-free SPSC observation queue. The CSV cycle is the
+nominal boundary; lookahead workers may be sampled within one configured
+run-ahead window of one another. When periodic counters are disabled, separate
+worker template instances compile the checks out of the execution loop.
+
 ### Output Files
 
 | File | Contents |
