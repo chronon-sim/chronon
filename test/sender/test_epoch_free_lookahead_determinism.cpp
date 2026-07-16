@@ -531,8 +531,8 @@ std::set<uint64_t> readCounterCycles(const std::filesystem::path& csv) {
     return cycles;
 }
 
-std::vector<uint64_t> readCounterColumn(const std::filesystem::path& csv,
-                                        const std::string& column) {
+[[maybe_unused]] std::vector<uint64_t> readCounterColumn(const std::filesystem::path& csv,
+                                                         const std::string& column) {
     std::ifstream input(csv);
     std::string line;
     if (!std::getline(input, line)) return {};
@@ -570,6 +570,7 @@ std::vector<uint64_t> readCounterColumn(const std::filesystem::path& csv,
     return values;
 }
 
+#if CHRONON_ENABLE_COUNTER_UPDATES
 void verify_all_scheduler_modes_use_spsc_periodic_snapshots(unsigned hw) {
     namespace fs = std::filesystem;
     struct Mode {
@@ -836,6 +837,7 @@ void verify_periodic_snapshots_follow_dynamic_migration(unsigned hw) {
     manager.reset();
     fs::remove_all(output);
 }
+#endif
 
 void verify_disabled_counters_add_no_boundaries(unsigned hw) {
     if (hw < 2) return;
@@ -943,10 +945,12 @@ int main() {
     verify_run_until_termination_uses_epoch_free(hw);
     verify_run_until_termination_default_max_after_warmup(hw);
     verify_run_until_termination_accounts_nonzero_worker(hw);
+#if CHRONON_ENABLE_COUNTER_UPDATES
     verify_all_scheduler_modes_use_spsc_periodic_snapshots(hw);
     verify_epoch_free_pushes_periodic_snapshots_without_reentry(hw, false);
     verify_epoch_free_pushes_periodic_snapshots_without_reentry(hw, true);
     verify_periodic_snapshots_follow_dynamic_migration(hw);
+#endif
     verify_disabled_counters_add_no_boundaries(hw);
     verify_final_snapshot_survives_worker_termination(hw);
 

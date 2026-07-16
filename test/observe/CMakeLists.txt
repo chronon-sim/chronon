@@ -35,6 +35,27 @@ add_test(
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
 
+if(NOT CHRONON_ENABLE_COUNTER_UPDATES)
+    add_executable(test_counter_updates_disabled
+        test_counter_updates_disabled.cpp
+    )
+    target_include_directories(test_counter_updates_disabled PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_counter_updates_disabled
+        chronon::core
+        chronon_observe
+        chronon_compile_options
+    )
+    target_compile_features(test_counter_updates_disabled PRIVATE cxx_std_20)
+    add_dependencies(regress test_counter_updates_disabled)
+    add_test(
+        NAME counter_updates_disabled_test
+        COMMAND test_counter_updates_disabled
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+endif()
+
 # ==============================================================================
 # Sparse Counter Architecture Test
 # ==============================================================================

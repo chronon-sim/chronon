@@ -60,6 +60,12 @@ target_link_libraries(chronon_observe PUBLIC Threads::Threads)
 
 target_compile_features(chronon_observe PUBLIC cxx_std_20)
 
+if(CHRONON_ENABLE_COUNTER_UPDATES)
+    target_compile_definitions(chronon_observe PUBLIC CHRONON_ENABLE_COUNTER_UPDATES=1)
+else()
+    target_compile_definitions(chronon_observe PUBLIC CHRONON_ENABLE_COUNTER_UPDATES=0)
+endif()
+
 # =============================================================================
 # Compiler Flags (warnings, -Werror, sanitizers via centralized target)
 # =============================================================================

@@ -32,6 +32,8 @@ namespace chronon::observe {
  * Use this for aggregate metrics that may also need timestamped samples.
  * add()/operator++/operator+= update the aggregate counter only; mark() updates
  * the counter and emits a first-class timeline instant.
+ * Aggregate updates are compiled out when CHRONON_ENABLE_COUNTER_UPDATES is 0;
+ * mark() still emits its timeline event.
  *
  * @code
  *   EventCounter uart_tx_{this, "chars_tx", "Characters transmitted", "chars"};

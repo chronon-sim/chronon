@@ -20,6 +20,10 @@
 #include "ObservationContext.hpp"
 #include "Types.hpp"
 
+#ifndef CHRONON_ENABLE_COUNTER_UPDATES
+#define CHRONON_ENABLE_COUNTER_UPDATES 1
+#endif
+
 namespace chronon::observe {
 
 // Forward declaration
@@ -91,16 +95,22 @@ public:
     ~Counter() = default;
 
     [[gnu::always_inline]] Counter& operator++() noexcept {
+#if CHRONON_ENABLE_COUNTER_UPDATES
         if (registered_ && ctx_) {
             ctx_->count(id_, 1);
         }
+#endif
         return *this;
     }
 
     [[gnu::always_inline]] Counter& operator+=(uint64_t delta) noexcept {
+#if CHRONON_ENABLE_COUNTER_UPDATES
         if (registered_ && ctx_) {
             ctx_->count(id_, delta);
         }
+#else
+        (void)delta;
+#endif
         return *this;
     }
 
