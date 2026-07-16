@@ -35,7 +35,7 @@ struct TaggedMsg {
     int payload;
 };
 
-void test_delayed_cancel_drops_message() {
+[[maybe_unused]] void test_delayed_cancel_drops_message() {
     std::cout << "Testing delayed cancel drops message... ";
 
     TestUnit prod("prod");
@@ -56,7 +56,7 @@ void test_delayed_cancel_drops_message() {
     std::cout << "PASSED\n";
 }
 
-void test_delayed_cancel_only_affects_prior_epoch() {
+[[maybe_unused]] void test_delayed_cancel_only_affects_prior_epoch() {
     std::cout << "Testing delayed cancel keeps new epoch... ";
 
     TestUnit prod("prod");
@@ -84,7 +84,7 @@ void test_delayed_cancel_only_affects_prior_epoch() {
     std::cout << "PASSED\n";
 }
 
-void test_fanout_cancel_drops_all() {
+[[maybe_unused]] void test_fanout_cancel_drops_all() {
     std::cout << "Testing fanout cancel drops all... ";
 
     TestUnit prod("prod");
@@ -108,7 +108,7 @@ void test_fanout_cancel_drops_all() {
     std::cout << "PASSED\n";
 }
 
-void test_delay0_cancel_before_receive() {
+[[maybe_unused]] void test_delay0_cancel_before_receive() {
     std::cout << "Testing delay=0 cancel before receive... ";
 
     TestUnit prod("prod");
@@ -284,7 +284,7 @@ void test_inport_selective_cancel_reset() {
     std::cout << "PASSED\n";
 }
 
-void test_inport_selective_cancel_with_epoch_cancel() {
+[[maybe_unused]] void test_inport_selective_cancel_with_epoch_cancel() {
     std::cout << "Testing InPort selective + epoch cancel interaction... ";
 
     TestUnit prod("prod");
@@ -435,16 +435,23 @@ void test_inport_selective_cancel_mpsc_thread_queues() {
 int main() {
     std::cout << "=== Port Flush/Cancel Tests ===\n\n";
 
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
     test_delayed_cancel_drops_message();
     test_delayed_cancel_only_affects_prior_epoch();
     test_fanout_cancel_drops_all();
     test_delay0_cancel_before_receive();
+#else
+    static_assert(sizeof(detail::PortEnvelope<uint64_t>) == 32,
+                  "non-cancelable envelope should omit epoch pointer and snapshot");
+#endif
     test_inport_flush_drops_future_messages();
     test_inport_selective_cancel_basic();
     test_inport_selective_cancel_monotonic_watermark();
     test_inport_selective_cancel_younger_than();
     test_inport_selective_cancel_reset();
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
     test_inport_selective_cancel_with_epoch_cancel();
+#endif
     test_inport_selective_cancel_scoped_to_inflight();
     test_inport_selective_cancel_mismatched_keyfn_is_noop();
     test_inport_selective_cancel_mpsc_thread_queues();

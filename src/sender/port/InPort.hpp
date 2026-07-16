@@ -265,9 +265,14 @@ public:
         if (!multi_producer_queue_raw_) {
             return false;
         }
-        StoredMessage msg{.data = std::move(data),
-                          .cancel_epoch = cancel_epoch,
-                          .epoch_snapshot = epoch_snapshot};
+        StoredMessage msg{.data = std::move(data)};
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+        msg.cancel_epoch = cancel_epoch;
+        msg.epoch_snapshot = epoch_snapshot;
+#else
+        (void)cancel_epoch;
+        (void)epoch_snapshot;
+#endif
         msg.enqueue_cycle = enqueue_cycle;
         if (policy_ == PortPolicy::LegacyFastPath) {
             stampReceiverGeneration_(msg);
@@ -289,9 +294,14 @@ public:
      */
     bool enqueueCancelable(T data, uint64_t arrive_cycle, const std::atomic<uint64_t>* cancel_epoch,
                            uint64_t epoch_snapshot, uint32_t sender_id = 0) {
-        StoredMessage msg{.data = std::move(data),
-                          .cancel_epoch = cancel_epoch,
-                          .epoch_snapshot = epoch_snapshot};
+        StoredMessage msg{.data = std::move(data)};
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+        msg.cancel_epoch = cancel_epoch;
+        msg.epoch_snapshot = epoch_snapshot;
+#else
+        (void)cancel_epoch;
+        (void)epoch_snapshot;
+#endif
         msg.enqueue_cycle = 0;
         msg.sender_id = sender_id;
         return enqueueStored_(std::move(msg), arrive_cycle);
@@ -307,9 +317,14 @@ public:
     bool enqueueCancelable(T data, uint64_t arrive_cycle, const std::atomic<uint64_t>* cancel_epoch,
                            uint64_t epoch_snapshot, uint64_t enqueue_cycle,
                            uint32_t sender_id = 0) {
-        StoredMessage msg{.data = std::move(data),
-                          .cancel_epoch = cancel_epoch,
-                          .epoch_snapshot = epoch_snapshot};
+        StoredMessage msg{.data = std::move(data)};
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+        msg.cancel_epoch = cancel_epoch;
+        msg.epoch_snapshot = epoch_snapshot;
+#else
+        (void)cancel_epoch;
+        (void)epoch_snapshot;
+#endif
         msg.enqueue_cycle = enqueue_cycle;
         msg.sender_id = sender_id;
         return enqueueStored_(std::move(msg), arrive_cycle);

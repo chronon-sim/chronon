@@ -45,6 +45,13 @@ target_include_directories(chronon
 # C++20 required
 target_compile_features(chronon PUBLIC cxx_std_20)
 
+# Port templates are instantiated by downstream models, so this definition
+# must be PUBLIC. The default remains the fully compatible cancellation path;
+# models that prove they never call OutPort::cancelInFlight may opt out to
+# remove the sender-side epoch acquire and two envelope fields.
+target_compile_definitions(chronon PUBLIC
+    CHRONON_ENABLE_OUTPORT_CANCELLATION=$<BOOL:${CHRONON_ENABLE_OUTPORT_CANCELLATION}>)
+
 # Link stdexec for sender/receiver support
 target_link_libraries(chronon PUBLIC STDEXEC::stdexec)
 
