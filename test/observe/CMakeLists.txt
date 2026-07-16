@@ -129,27 +129,38 @@ add_test(
 # Counter Units Test
 # ==============================================================================
 
-add_executable(test_counter_units
-    test_counter_units.cpp
-)
+if(CHRONON_ENABLE_OUTPORT_CANCELLATION)
+    add_executable(test_counter_units
+        test_counter_units.cpp
+    )
+
+    target_include_directories(test_counter_units PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/examples
+    )
+
+    target_link_libraries(test_counter_units
+        chronon::core
+        chronon_observe
+        chronon_compile_options
+    )
+
+    target_compile_features(test_counter_units PRIVATE cxx_std_20)
+    add_dependencies(regress test_counter_units)
+
+    add_test(
+        NAME counter_units_test
+        COMMAND test_counter_units
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+endif()
 
 add_executable(test_observation_hardening
     test_observation_hardening.cpp
 )
 
-target_include_directories(test_counter_units PRIVATE
-    ${PROJECT_SOURCE_DIR}/src
-    ${PROJECT_SOURCE_DIR}/examples
-)
-
 target_include_directories(test_observation_hardening PRIVATE
     ${PROJECT_SOURCE_DIR}/src
-)
-
-target_link_libraries(test_counter_units
-    chronon::core
-    chronon_observe
-    chronon_compile_options
 )
 
 target_link_libraries(test_observation_hardening
@@ -159,19 +170,8 @@ target_link_libraries(test_observation_hardening
     ZLIB::ZLIB
 )
 
-target_compile_features(test_counter_units PRIVATE cxx_std_20)
 target_compile_features(test_observation_hardening PRIVATE cxx_std_20)
-
-# Add to regress target
-add_dependencies(regress test_counter_units)
 add_dependencies(regress test_observation_hardening)
-
-# Add test
-add_test(
-    NAME counter_units_test
-    COMMAND test_counter_units
-    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-)
 
 add_test(
     NAME observation_hardening_test

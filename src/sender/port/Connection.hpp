@@ -8,6 +8,10 @@
 
 #pragma once
 
+#ifndef CHRONON_ENABLE_OUTPORT_CANCELLATION
+#define CHRONON_ENABLE_OUTPORT_CANCELLATION 1
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -229,7 +233,9 @@ public:
             ++pushes_this_cycle_;
             return true;
         }
-        uint64_t epoch_snapshot = cancel_epoch_.load(std::memory_order_acquire);
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+        const uint64_t epoch_snapshot = cancel_epoch_.load(std::memory_order_acquire);
+#endif
         const uint64_t arrive_cycle = send_cycle + delay_;
         // enqueue_cycle = sender's localCycle at push time. For StageSelective
         // predicates this is the basis of the "was this in flight at flush?"
@@ -247,8 +253,12 @@ public:
             if (edge_cap != InPort<T>::UNLIMITED_CAPACITY && stagingSize_() >= edge_cap) {
                 return false;  // staging full -> producer sees back-pressure
             }
-            if (!stagingTryPush_(
-                    Staged{std::move(data), arrive_cycle, send_cycle, epoch_snapshot})) {
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+            Staged staged{std::move(data), arrive_cycle, send_cycle, epoch_snapshot};
+#else
+            Staged staged{std::move(data), arrive_cycle, send_cycle};
+#endif
+            if (!stagingTryPush_(std::move(staged))) {
                 // Ring physically full (should be rare: ring is sized >= user cap).
                 return false;
             }
@@ -266,8 +276,13 @@ public:
         if (!hasDestinationAdmissionSlot_(send_cycle)) {
             return false;
         }
-        const bool ok = to_->enqueueCancelable(std::move(data), arrive_cycle, &cancel_epoch_,
-                                               epoch_snapshot, send_cycle, conn_id_);
+        const bool ok = to_->enqueueCancelable(std::move(data), arrive_cycle,
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+                                               &cancel_epoch_, epoch_snapshot,
+#else
+                                               nullptr, 0,
+#endif
+                                               send_cycle, conn_id_);
         if (ok) {
             ++pushes_this_cycle_;
             wakeUnitAt(destination(), arrive_cycle);
@@ -287,8 +302,10 @@ public:
      * docs/mpsc-atomic-publish.md.
      */
     void cancelInFlight() noexcept override {
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
         if (dependency_only_transport_) return;
         cancel_epoch_.fetch_add(1, std::memory_order_acq_rel);
+#endif
     }
 
     /**
@@ -323,7 +340,9 @@ private:
             return 0;
         }
         size_t admitted = 0;
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
         const uint64_t cur_epoch = cancel_epoch_.load(std::memory_order_acquire);
+#endif
         while (admitted < budget) {
             Staged* front = stagingPeekFront_();
             if (!front) break;  // staging empty (observed head == tail under acquire)
@@ -334,11 +353,13 @@ private:
                 // stop here — they too are not yet safe to admit.
                 break;
             }
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
             if (front->epoch_snapshot != cur_epoch) {
                 // Staged before a cancelInFlight -> drop without forwarding.
                 stagingPopFront_();
                 continue;
             }
+#endif
             if (!transferToSharedQueue_(*front)) {
                 break;  // physical ring of destination is full (rare)
             }
@@ -657,7 +678,9 @@ private:
         T data;
         uint64_t arrive_cycle;
         uint64_t enqueue_cycle;
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
         uint64_t epoch_snapshot;
+#endif
     };
 
     void configureStagingRing_(size_t requested_usable) {
@@ -682,9 +705,14 @@ private:
         if (!to_->canPushToThreadQueue(thread_queue_id_)) {
             return false;
         }
-        return to_->pushToThreadQueueCancelable(
-            thread_queue_id_, std::move(entry.data), entry.arrive_cycle, &cancel_epoch_,
-            entry.epoch_snapshot, entry.enqueue_cycle, conn_id_);
+        return to_->pushToThreadQueueCancelable(thread_queue_id_, std::move(entry.data),
+                                                entry.arrive_cycle,
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+                                                &cancel_epoch_, entry.epoch_snapshot,
+#else
+                                                nullptr, 0,
+#endif
+                                                entry.enqueue_cycle, conn_id_);
     }
 
     OutPort<T>* from_;
@@ -793,7 +821,9 @@ private:
     /// Cancellation epoch for sender-side flush/squash. Each message is
     /// stamped with the epoch value at send time. If the epoch changes
     /// before the receiver consumes it, the message is dropped.
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
     std::atomic<uint64_t> cancel_epoch_{0};
+#endif
     /// Finite producer run-ahead supported by a model-owned external
     /// transport. SIZE_MAX retains the legacy unbounded dependency-only edge.
     size_t dependency_only_headroom_ = std::numeric_limits<size_t>::max();

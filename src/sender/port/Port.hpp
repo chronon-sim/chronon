@@ -8,6 +8,10 @@
 
 #pragma once
 
+#ifndef CHRONON_ENABLE_OUTPORT_CANCELLATION
+#define CHRONON_ENABLE_OUTPORT_CANCELLATION 1
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -90,8 +94,10 @@ namespace detail {
 template <typename T>
 struct PortEnvelope {
     T data;
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
     const std::atomic<uint64_t>* cancel_epoch = nullptr;  ///< nullptr => not cancelable
     uint64_t epoch_snapshot = 0;
+#endif
     uint64_t receiver_generation_snapshot = 0;
     /// Producer's localCycle at push time (arrive_cycle - delay). Used by
     /// StageSelective predicates to decide whether a message was in-flight
@@ -105,10 +111,14 @@ struct PortEnvelope {
 
 template <typename T>
 [[nodiscard]] inline bool isCanceled(const PortEnvelope<T>& msg) noexcept {
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
     if (msg.cancel_epoch &&
         msg.cancel_epoch->load(std::memory_order_acquire) != msg.epoch_snapshot) {
         return true;
     }
+#else
+    (void)msg;
+#endif
     return false;
 }
 

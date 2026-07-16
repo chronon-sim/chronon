@@ -266,6 +266,7 @@ void test_set_per_cycle_capacity_runtime() {
     std::cout << "PASSED\n";
 }
 
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
 void test_cancel_does_not_reset_counter() {
     std::cout << "Testing cancelInFlight does not reset per-cycle counter... ";
 
@@ -289,6 +290,7 @@ void test_cancel_does_not_reset_counter() {
 
     std::cout << "PASSED\n";
 }
+#endif
 
 void test_query_methods() {
     std::cout << "Testing sentThisCycle and remainingThisCycle... ";
@@ -524,7 +526,9 @@ int main() {
     test_fanout_send_is_all_or_none_for_const_payload();
     test_fanout_send_is_all_or_none_for_rvalue_payload();
     test_set_per_cycle_capacity_runtime();
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
     test_cancel_does_not_reset_counter();
+#endif
     test_query_methods();
     test_connection_and_receive_convenience_methods();
     test_capacity_one_rate_one_special_case_requires_delay_one();

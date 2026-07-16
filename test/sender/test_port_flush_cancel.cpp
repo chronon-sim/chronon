@@ -35,6 +35,7 @@ struct TaggedMsg {
     int payload;
 };
 
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
 void test_delayed_cancel_drops_message() {
     std::cout << "Testing delayed cancel drops message... ";
 
@@ -126,6 +127,7 @@ void test_delay0_cancel_before_receive() {
 
     std::cout << "PASSED\n";
 }
+#endif
 
 void test_inport_flush_drops_future_messages() {
     std::cout << "Testing InPort flush drops future messages... ";
@@ -284,6 +286,7 @@ void test_inport_selective_cancel_reset() {
     std::cout << "PASSED\n";
 }
 
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
 void test_inport_selective_cancel_with_epoch_cancel() {
     std::cout << "Testing InPort selective + epoch cancel interaction... ";
 
@@ -326,6 +329,7 @@ void test_inport_selective_cancel_with_epoch_cancel() {
 
     std::cout << "PASSED\n";
 }
+#endif
 
 void test_inport_selective_cancel_scoped_to_inflight() {
     std::cout << "Testing InPort selective cancel scoped to in-flight... ";
@@ -435,16 +439,23 @@ void test_inport_selective_cancel_mpsc_thread_queues() {
 int main() {
     std::cout << "=== Port Flush/Cancel Tests ===\n\n";
 
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
     test_delayed_cancel_drops_message();
     test_delayed_cancel_only_affects_prior_epoch();
     test_fanout_cancel_drops_all();
     test_delay0_cancel_before_receive();
+#else
+    static_assert(sizeof(detail::PortEnvelope<uint64_t>) == 32,
+                  "non-cancelable envelope should omit epoch pointer and snapshot");
+#endif
     test_inport_flush_drops_future_messages();
     test_inport_selective_cancel_basic();
     test_inport_selective_cancel_monotonic_watermark();
     test_inport_selective_cancel_younger_than();
     test_inport_selective_cancel_reset();
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
     test_inport_selective_cancel_with_epoch_cancel();
+#endif
     test_inport_selective_cancel_scoped_to_inflight();
     test_inport_selective_cancel_mismatched_keyfn_is_noop();
     test_inport_selective_cancel_mpsc_thread_queues();

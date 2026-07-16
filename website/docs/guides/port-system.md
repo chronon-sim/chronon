@@ -197,6 +197,27 @@ void InPort<T>::cancelOutsideInclusive(MinK min_keep, MaxK max_keep);
 
 **Delay-0 caveat:** For zero-delay (INLINE) connections, messages are delivered in the same cycle they are sent. Selective cancel still works but the window between send and receive is very small — cancel must occur before `tryReceive()` on the same cycle.
 
+## Build-Time Non-Cancelable OutPort Path
+
+Models that never call `OutPort::cancelInFlight()` can configure Chronon with:
+
+```bash
+cmake -S . -B build -DCHRONON_ENABLE_OUTPORT_CANCELLATION=OFF
+```
+
+The default is `ON` and preserves full cancellation semantics. `OFF` is an
+explicit whole-build contract: `cancelInFlight()` becomes a no-op, the sender
+path omits its cancellation-epoch acquire, MPSC staging omits the epoch stamp,
+and `PortEnvelope` omits the cancellation pointer and snapshot. Receiver-side
+`InPort` selective cancellation remains available.
+
+Do not disable the option merely because cancellation is rare. It is safe only
+after auditing the complete model and every linked component for
+`cancelInFlight()` calls. Chronon's bundled CPU pipeline examples, their flush
+validation test, and their counter-metadata test are therefore not built when
+this option is `OFF`; those models rely on sender-side cancellation for correct
+flush semantics.
+
 ## Shared Delay-One Broadcast Fabric
 
 `DelayOneBroadcastFabric<T, P, C>` is an explicit specialization for a complete
