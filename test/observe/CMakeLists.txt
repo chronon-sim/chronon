@@ -90,6 +90,7 @@ add_test(
 # Counter Integration Test
 # ==============================================================================
 
+if(CHRONON_ENABLE_COUNTER_UPDATES)
 add_executable(test_counter_integration
     test_counter_integration.cpp
 )
@@ -145,6 +146,7 @@ add_test(
     COMMAND test_local_counter
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
+endif()
 
 # ==============================================================================
 # Counter Units Test
