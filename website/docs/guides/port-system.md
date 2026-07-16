@@ -196,6 +196,43 @@ void InPort<T>::cancelOutsideInclusive(MinK min_keep, MaxK max_keep);
 
 **Delay-0 caveat:** For zero-delay (INLINE) connections, messages are delivered in the same cycle they are sent. Selective cancel still works but the window between send and receive is very small — cancel must occur before `tryReceive()` on the same cycle.
 
+## Shared Delay-One Broadcast Fabric
+
+`DelayOneBroadcastFabric<T, P, C>` is an explicit specialization for a complete
+`P`-producer by `C`-consumer, delay-one broadcast bus. It stores each producer
+payload once per source cycle and lets all consumers replay it in stable
+producer-id and send order. The declared ports remain dependency edges, while
+their physical queues are disabled after topology validation.
+
+```cpp
+using WakeupBus = DelayOneBroadcastFabric<Wakeup, 10, 11, 512, 8>;
+
+WakeupBus bus;
+bus.bindProducer(0, producer0.out_wakeup);
+bus.bindConsumer(0, consumer0.in_wakeup);
+// Bind every stable producer and consumer id after graph construction.
+bus.sealPortTopology();
+
+// Producer tick at cycle S:
+if (producer0.out_wakeup.sendImmediate(wakeup)) {
+    bus.publish(0, producer0.localCycle(), wakeup);
+}
+
+// Consumer tick at cycle S+1 (must be called once per local cycle):
+bus.consume(0, consumer0.localCycle(), process_wakeup);
+```
+
+The fabric deliberately does not emulate bounded destination queues,
+receiver-side selective cancellation, or `OutPort::cancelInFlight()`. Use it
+only when the model has proved those operations are absent and every bound edge
+has delay one. `publish()` preserves the normal delay-one consumer wakeup, so
+activity-scheduled units may jump over empty cycles; they must call `consume()`
+on every tick in which they run. `sealPortTopology()` validates the complete
+delay-one fanout before changing any connection to dependency-only transport
+and exposes the finite ring depth as scheduler headroom. When necessary, the
+lookahead scheduler adds reverse dependencies that prevent a producer from
+wrapping an unread bucket.
+
 ## Usage Pattern
 
 ```cpp

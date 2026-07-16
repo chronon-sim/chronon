@@ -24,6 +24,7 @@
 #include "core/Unit.hpp"
 #include "factory/SenderFactory.hpp"
 #include "port/Connection.hpp"
+#include "port/DelayOneBroadcastFabric.hpp"
 #include "port/InPort.hpp"
 #include "port/OutPort.hpp"
 #include "port/Port.hpp"
