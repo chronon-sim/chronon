@@ -178,8 +178,9 @@ void InPort<T>::cancelOutsideInclusive(MinK min_keep, MaxK max_keep);
 - `watermark` — lower/upper threshold used by the selected API
 
 **Semantics:**
-- **Monotonic watermark**: calling with a lower value than a previous call is a no-op
-- **Monotonic bounds**: `cancelOlderThan` only raises the lower bound; `cancelYoungerThan` only lowers the upper bound
+- **Legacy monotonic bounds**: `LegacyFastPath` raises only the lower bound and lowers only the upper bound for its current in-flight generation
+- **Timestamp-scoped range**: `StageSelective` installs a receiver-only `{flush_cycle, min_keep, max_keep}` predicate. Same-cycle calls intersect their ranges; messages enqueued at or after the flush cycle are unaffected
+- **Fixed-delay ordering**: `StageSelective` predicate retirement relies on monotonic enqueue cycles and is intended for fixed-delay stage-register ports
 - **InPort state**: receiver-side bounds are tracked per input port
 - **Single extractor per InPort**: first `KeyFn` set on an input port is retained; mismatched extractors are ignored
 - **Low overhead when unused**: receive path does one extractor-pointer load and exits immediately when selective cancellation is not configured

@@ -48,6 +48,7 @@ struct TaggedMsg {
     int payload = 0;
 
     static uint64_t getKey(const TaggedMsg& m) { return m.key; }
+    static uint64_t getPayload(const TaggedMsg& m) { return static_cast<uint64_t>(m.payload); }
 };
 
 // Test A: basic flush cancellation semantic
@@ -229,6 +230,98 @@ void test_sender_filter_removal() {
     std::cout << "PASSED\n";
 }
 
+// Test E: both selective directions share the timestamp-scoped receiver path.
+// Messages produced before receiver cycle 5 are kept only in [100, 200]. A
+// message produced at cycle 5 is post-flush and must survive regardless of key.
+void test_range_flush_semantic() {
+    std::cout << "Testing StageSelective range flush semantic... ";
+
+    TestUnit prod("prod");
+    TestUnit cons("cons");
+
+    OutPort<TaggedMsg> out{&prod, "out", 16};
+    InPort<TaggedMsg> in{&cons, "in", 64, PortPolicy::StageSelective};
+    out.connect(&in, /*delay=*/1);
+
+    prod.setCycle(4);
+    EXPECT(out.send(TaggedMsg{.key = 50}), "push old-low");
+    EXPECT(out.send(TaggedMsg{.key = 100}), "push lower-bound");
+    EXPECT(out.send(TaggedMsg{.key = 150}), "push in-range");
+    EXPECT(out.send(TaggedMsg{.key = 200}), "push upper-bound");
+    EXPECT(out.send(TaggedMsg{.key = 250}), "push old-high");
+
+    cons.setCycle(5);
+    in.cancelOutsideInclusive<&TaggedMsg::getKey>(uint64_t{100}, uint64_t{200});
+
+    prod.setCycle(5);
+    EXPECT(out.send(TaggedMsg{.key = 1}), "push post-flush");
+
+    cons.setCycle(6);
+    const auto values = in.receiveAll(6);
+    EXPECT(values.size() == 4, "range flush should keep two bounds, middle, and fresh message");
+    EXPECT(values[0].key == 100, "lower bound must survive");
+    EXPECT(values[1].key == 150, "middle key must survive");
+    EXPECT(values[2].key == 200, "upper bound must survive");
+    EXPECT(values[3].key == 1, "post-flush message must survive");
+
+    std::cout << "PASSED\n";
+}
+
+// Test F: cancelOlderThan alone no longer falls back to legacy generation
+// filtering. It is scoped by enqueue_cycle just like cancelYoungerThan.
+void test_older_than_timestamp_scope() {
+    std::cout << "Testing StageSelective older-than timestamp scope... ";
+
+    TestUnit prod("prod");
+    TestUnit cons("cons");
+
+    OutPort<TaggedMsg> out{&prod, "out", 8};
+    InPort<TaggedMsg> in{&cons, "in", 16, PortPolicy::StageSelective};
+    out.connect(&in, /*delay=*/1);
+
+    prod.setCycle(7);
+    EXPECT(out.send(TaggedMsg{.key = 10}), "push old low");
+    EXPECT(out.send(TaggedMsg{.key = 20}), "push old bound");
+
+    cons.setCycle(8);
+    in.cancelOlderThan<&TaggedMsg::getKey>(uint64_t{20});
+
+    prod.setCycle(8);
+    EXPECT(out.send(TaggedMsg{.key = 1}), "push fresh low");
+
+    cons.setCycle(9);
+    const auto values = in.receiveAll(9);
+    EXPECT(values.size() == 2, "old low must be canceled while bound and fresh low survive");
+    EXPECT(values[0].key == 20, "older-than is inclusive at the keep boundary");
+    EXPECT(values[1].key == 1, "fresh low key must not be canceled by old flush");
+
+    std::cout << "PASSED\n";
+}
+
+void test_mismatched_extractor_does_not_install_predicate() {
+    std::cout << "Testing StageSelective mismatched extractor rejection... ";
+
+    TestUnit prod("prod");
+    TestUnit cons("cons");
+
+    OutPort<TaggedMsg> out{&prod, "out", 4};
+    InPort<TaggedMsg> in{&cons, "in", 8, PortPolicy::StageSelective};
+    out.connect(&in, /*delay=*/1);
+
+    prod.setCycle(2);
+    EXPECT(out.send(TaggedMsg{.key = 10, .payload = 100}), "push message");
+
+    cons.setCycle(3);
+    in.cancelYoungerThan<&TaggedMsg::getKey>(uint64_t{20});
+    in.cancelOlderThan<&TaggedMsg::getPayload>(uint64_t{200});
+
+    const auto value = in.tryReceive(3);
+    EXPECT(value.has_value(), "mismatched extractor must not install a lower-bound predicate");
+    EXPECT(value->key == 10, "original key predicate must remain authoritative");
+
+    std::cout << "PASSED\n";
+}
+
 }  // namespace
 
 int main() {
@@ -236,6 +329,9 @@ int main() {
     test_overlapping_flush_predicates();
     test_retirement_boundary();
     test_sender_filter_removal();
+    test_range_flush_semantic();
+    test_older_than_timestamp_scope();
+    test_mismatched_extractor_does_not_install_predicate();
     std::cout << "All StageSelective port tests passed.\n";
     return 0;
 }
