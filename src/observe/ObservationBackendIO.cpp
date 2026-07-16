@@ -776,6 +776,39 @@ void ObservationBackend::setDerivedCounterDefs(std::vector<DerivedCounterDef> de
     derived_counter_defs_ = std::move(defs);
 }
 
+void ObservationBackend::setCounterSnapshotPlans(std::vector<CounterSnapshotPlanMetadata> plans) {
+    counter_snapshot_plans_ = std::move(plans);
+}
+
+void ObservationBackend::prepareCounterSnapshotPlans_() {
+    counter_snapshot_column_indices_.clear();
+    counter_snapshot_column_indices_.resize(counter_snapshot_plans_.size());
+
+    for (size_t plan_id = 0; plan_id < counter_snapshot_plans_.size(); ++plan_id) {
+        const auto& entries = counter_snapshot_plans_[plan_id].entries;
+        auto& columns = counter_snapshot_column_indices_[plan_id];
+        columns.reserve(entries.size());
+        for (const auto& entry : entries) {
+            std::string key;
+            key.reserve(entry.unit_name.size() + 1 + entry.counter_name.size());
+            key.append(entry.unit_name);
+            key.push_back('.');
+            key.append(entry.counter_name);
+            auto [it, inserted] = counter_col_index_.try_emplace(key, counter_columns_.size());
+            if (inserted) counter_columns_.push_back(std::move(key));
+            columns.push_back(it->second);
+        }
+    }
+
+    if (config_.enable_counter_csv && config_.counter_csv_format == CounterCsvFormat::Pivoted &&
+        !counter_columns_.empty()) {
+        resolveDerivedCounters_();
+        writeCounterCsvHeader_();
+        current_counter_row_.assign(counter_columns_.size(), 0);
+        counter_csv_streaming_ = true;
+    }
+}
+
 void ObservationBackend::resolveDerivedCounters_() {
     resolved_derived_.clear();
 

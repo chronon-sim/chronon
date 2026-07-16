@@ -52,6 +52,39 @@ Chronon supports up to 64 observation producer threads in one process. If that
 pool is exhausted, periodic counter execution fails explicitly instead of
 silently omitting owner rows.
 
+Counter names and output-column mappings are registered once during simulation
+initialization. At a dump boundary, a worker normally sends one metadata-indexed
+value batch per scheduler owner (bounded chunks for very large plans) and resets
+those counters in the same pass. Repeated unit/counter strings never enter the
+worker queue. CSV formatting and Perfetto serialization remain asynchronous in
+the observation backend, so periodic
+output adds no branch, atomic operation, or buffer switch to `add()`/`++`.
+
+### Periodic Counter Profiling
+
+The standalone benchmark isolates the update path, snapshot scheduling and
+queueing, and the CSV/Perfetto sinks:
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \
+  -DCHRONON_BUILD_BENCHMARKS=ON
+cmake --build build-release --target chronon_counter_periodic_benchmark -j
+
+# One configuration
+./build-release/benchmark/chronon_counter_periodic_benchmark \
+  --mode snapshot-only --counters 256 --threads 8 \
+  --period 1000 --cycles 1000000
+
+# Controlled sweep; emits CSV
+./scripts/profile_periodic_counters.py \
+  --counters 16,64,256 --threads 1,4,8 --periods 100,1000,10000
+```
+
+Modes are `updates-off` (theoretical upper bound), `updates-only`,
+`snapshot-only`, `csv`, `perfetto`, and `full`. Reported fields include
+simulation throughput, snapshot CPU time, queue bytes/drops, and output
+bandwidth.
+
 **Long format** (`csv_format: long`):
 One row per (cycle, unit, counter, value) — traditional streaming format:
 
