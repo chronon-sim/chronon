@@ -264,6 +264,20 @@ void test_self_loop() {
     std::cout << "PASSED\n";
 }
 
+void requireIrredundant(size_t clusters, const std::vector<reduction::Edge>& retained) {
+    for (size_t removed_index = 0; removed_index < retained.size(); ++removed_index) {
+        std::vector<reduction::Edge> without_candidate;
+        without_candidate.reserve(retained.size() - 1);
+        for (size_t i = 0; i < retained.size(); ++i) {
+            if (i != removed_index) without_candidate.push_back(retained[i]);
+        }
+
+        const auto alternate = reduction::closure(clusters, without_candidate);
+        const auto& candidate = retained[removed_index];
+        REQUIRE(alternate[candidate.dependent][candidate.predecessor] > candidate.delay);
+    }
+}
+
 void test_weighted_reduction_respects_delay_constraints() {
     std::cout << "Testing weighted dependency reduction constraints... ";
 
@@ -277,6 +291,22 @@ void test_weighted_reduction_respects_delay_constraints() {
     REQUIRE(result.fan_in_before == std::vector<size_t>({3, 1, 0, 1}));
     REQUIRE(result.fan_in_after == std::vector<size_t>({2, 1, 0, 1}));
     REQUIRE(reduction::closure(4, edges) == reduction::closure(4, result.retained));
+
+    std::cout << "PASSED\n";
+}
+
+void test_weighted_reduction_removes_same_source_zero_delay_shortcut() {
+    std::cout << "Testing weighted dependency reduction zero-delay shortcut... ";
+
+    const std::vector<reduction::Edge> edges = {
+        {0, 1, 0},
+        {0, 2, 0},
+        {1, 2, 0},
+    };
+    const auto result = reduction::reduce(3, edges);
+    REQUIRE(result.retained == std::vector<reduction::Edge>({{0, 1, 0}, {1, 2, 0}}));
+    REQUIRE(result.removed == std::vector<reduction::Edge>({{0, 2, 0}}));
+    requireIrredundant(3, result.retained);
 
     std::cout << "PASSED\n";
 }
@@ -381,6 +411,7 @@ void test_weighted_reduction_random_closure_equivalence() {
         REQUIRE(reduction::closure(clusters, edges) ==
                 reduction::closure(clusters, result.retained));
         REQUIRE(result.retained.size() + result.removed.size() == edges.size());
+        requireIrredundant(clusters, result.retained);
     }
 
     std::cout << "PASSED\n";
@@ -400,6 +431,7 @@ int main() {
     test_multiple_cycles();
     test_self_loop();
     test_weighted_reduction_respects_delay_constraints();
+    test_weighted_reduction_removes_same_source_zero_delay_shortcut();
     test_weighted_reduction_does_not_batch_remove_mutual_witnesses();
     test_weighted_reduction_uses_saturating_distance();
     test_weighted_reduction_rejects_invalid_edges();
