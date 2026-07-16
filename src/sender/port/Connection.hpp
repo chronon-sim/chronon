@@ -346,7 +346,7 @@ private:
 
     [[gnu::noinline]] size_t arbitrateConsumerCycleDirect(
         size_t budget, uint64_t consumer_cycle, const std::atomic<uint64_t>* producer_progress) {
-        if (!producer_progress || !stagingPeekFront_()) return 0;
+        if (!producer_progress) return 0;
         const uint64_t producer_completed = producer_progress->load(std::memory_order_acquire);
         if (producer_completed == 0 || consumer_cycle < delay_) return 0;
         const uint64_t bound = std::min<uint64_t>(producer_completed - 1, consumer_cycle - delay_);
