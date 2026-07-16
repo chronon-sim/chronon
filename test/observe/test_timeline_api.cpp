@@ -41,6 +41,8 @@ using namespace pftrace_test;
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
 
+void test_timeline_event_producer_gate();
+
 namespace {
 
 inline const auto LANE_CAT = Category<"lane_cat", "Timeline API test category">{};
@@ -762,29 +764,6 @@ void test_disabled_pipeline_skips_track_registration() {
 
     CHECK(TimelineTrackRegistry::instance().size() == tracks_before);
 
-    std::cout << "PASSED\n";
-}
-
-void test_timeline_event_producer_gate() {
-    std::cout << "Testing timeline event producer gate... ";
-    ObservationQueue queue(256 * 1024);
-    ObservationContext ctx(&queue, []() { return 0ULL; }, 0, "fetch", 1);
-    ctx.enableCategory(category::TRACE | LANE_CAT.mask());
-    ctx.setTraceChannelEnabled(false);
-    const size_t tracks_before = TimelineTrackRegistry::instance().size();
-    TestUnit unit;
-    unit.setObservationContext(&ctx);
-    CHECK(!unit.mshr.isRegistered() && !unit.occ.isRegistered());
-    CHECK(TimelineTrackRegistry::instance().size() == tracks_before);
-    unit.cycle = 20;
-    CHECK(!unit.mshr.begin(0, LANE_CAT, "disabled"_ev, flow(7), arg<"addr">(0x100ULL)));
-    CHECK(!unit.mshr.end(0));
-    unit.cycle = 22;
-    CHECK(!unit.port.instant(0, LANE_CAT, "disabled_instant"_ev));
-    CHECK(!unit.occ.sample(3));
-    CHECK(unit.cycle_reads == 0);
-    const auto& trace_stats = ctx.observationStats().get<ObservationChannel::Trace>();
-    CHECK(trace_stats.emitted == 0 && trace_stats.dropped == 0);
     std::cout << "PASSED\n";
 }
 

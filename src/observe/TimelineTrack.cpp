@@ -32,13 +32,24 @@ TimelineTrackBase::TimelineTrackBase(ObservableUnit* owner, std::string_view nam
 }
 
 void TimelineTrackBase::onContextAttached(ObservationContext* ctx) {
-    if (registered_ || !ctx || !ctx->timelineProducerEnabled()) {
+    if (registered_ || !ctx) {
         return;
     }
     ctx_ = ctx;
+    tryRegister_();
+}
+
+bool TimelineTrackBase::tryRegister_() {
+    if (registered_) {
+        return true;
+    }
+    if (!ctx_ || !ctx_->timelineProducerEnabled()) {
+        return false;
+    }
     track_id_ = TimelineTrackRegistry::instance().registerTrack(
-        {name_, unit_, ctx->sourceId(), lanes_, kind_});
+        {name_, unit_, ctx_->sourceId(), lanes_, kind_});
     registered_ = track_id_ != 0;
+    return registered_;
 }
 
 void TimelineTrackBase::stampCycle_() noexcept {

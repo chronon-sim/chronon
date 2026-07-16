@@ -60,6 +60,9 @@ private:
     void onContextAttached(ObservationContext* ctx);
 
 protected:
+    /// Register a cached context on first enabled use after a disabled attach.
+    bool tryRegister_();
+
     /// Stamps the owner's cycle into the context (same as ObservableUnit::trace).
     void stampCycle_() noexcept;
 
@@ -121,7 +124,8 @@ public:
 
     /// Close the (this lane, @p slot) span at the current cycle.
     bool end(uint16_t slot) noexcept {
-        if (!registered_ || !ctx_->timelineProducerEnabled() || !ctx_->filter().anyEnabled()) {
+        if (!ctx_ || !ctx_->timelineProducerEnabled() || (!registered_ && !tryRegister_()) ||
+            !ctx_->filter().anyEnabled()) {
             return false;
         }
         stampCycle_();  // Ends skip temporal filters; the cycle only stamps the record.
@@ -146,7 +150,7 @@ private:
         static_assert(MAX_ITEMS - FLOW_ITEMS <= MAX_TIMELINE_ARGS,
                       "too many typed timeline args (max 8)");
 
-        if (!registered_ || !ctx_->timelineProducerEnabled()) {
+        if (!ctx_ || !ctx_->timelineProducerEnabled() || (!registered_ && !tryRegister_())) {
             return false;
         }
         // Stamp the owner's cycle BEFORE the filter check: temporal filters
@@ -189,7 +193,7 @@ public:
 
     template <typename Cat>
     bool sample(Cat category, int64_t value) noexcept {
-        if (!registered_ || !ctx_->timelineProducerEnabled()) {
+        if (!ctx_ || !ctx_->timelineProducerEnabled() || (!registered_ && !tryRegister_())) {
             return false;
         }
         stampCycle_();  // Before the filter check: temporal filters read the current cycle.
