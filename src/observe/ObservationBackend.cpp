@@ -48,7 +48,6 @@ void ObservationBackend::start() {
     }
 
     initializeOutputDir_();
-    prepareCounterSnapshotPlans_();
 
     if (config_.enable_reordering) {
         ReorderBuffer::Config rb_config;
@@ -599,57 +598,112 @@ void ObservationBackend::processEvent_(const ObservationQueue::RecordHeader* hea
         case ObservationQueue::EventType::COUNTER_SNAPSHOT: {
             const bool want_timeline =
                 config_.timeline_counters && perfetto_writer_ && perfetto_writer_->isOpen();
-            if (!config_.enable_counter_csv && !want_timeline) break;
+            if (config_.enable_counter_csv || want_timeline) {
+                if (data_size >= 20) {
+                    size_t offset = 0;
+                    uint64_t cycle = 0;
+                    std::memcpy(&cycle, data + offset, 8);
+                    offset += 8;
 
-            if ((header->flags & COUNTER_SNAPSHOT_BATCH_FLAG) != 0) {
-                if (data_size < sizeof(CounterSnapshotBatchHeader)) break;
-                CounterSnapshotBatchHeader batch{};
-                std::memcpy(&batch, data, sizeof(batch));
-                if (batch.plan_id >= counter_snapshot_plans_.size() ||
-                    batch.plan_id >= counter_snapshot_column_indices_.size()) {
-                    break;
-                }
-                const auto& metadata = counter_snapshot_plans_[batch.plan_id].entries;
-                if (batch.count != metadata.size() ||
-                    data_size < sizeof(batch) + metadata.size() * sizeof(uint64_t)) {
-                    break;
-                }
-                const auto& columns = counter_snapshot_column_indices_[batch.plan_id];
-                const std::byte* values = data + sizeof(batch);
-                for (size_t i = 0; i < metadata.size(); ++i) {
-                    uint64_t value = 0;
-                    std::memcpy(&value, values + i * sizeof(value), sizeof(value));
-                    processCounterSample_(batch.cycle, metadata[i].unit_name,
-                                          metadata[i].counter_name, value, want_timeline,
-                                          columns[i]);
-                }
-            } else if (data_size >= 20) {
-                size_t offset = 0;
-                uint64_t cycle = 0;
-                std::memcpy(&cycle, data + offset, 8);
-                offset += 8;
-
-                uint16_t unit_name_length = 0;
-                std::memcpy(&unit_name_length, data + offset, 2);
-                offset += 2;
-
-                if (data_size >= offset + unit_name_length + 10) {
-                    std::string_view unit_name(reinterpret_cast<const char*>(data + offset),
-                                               unit_name_length);
-                    offset += unit_name_length;
-
-                    uint16_t counter_name_length = 0;
-                    std::memcpy(&counter_name_length, data + offset, 2);
+                    uint16_t unit_name_length = 0;
+                    std::memcpy(&unit_name_length, data + offset, 2);
                     offset += 2;
 
-                    if (data_size >= offset + counter_name_length + 8) {
-                        std::string_view counter_name(reinterpret_cast<const char*>(data + offset),
-                                                      counter_name_length);
-                        offset += counter_name_length;
+                    if (data_size >= offset + unit_name_length + 10) {
+                        std::string_view unit_name(reinterpret_cast<const char*>(data + offset),
+                                                   unit_name_length);
+                        offset += unit_name_length;
 
-                        uint64_t value = 0;
-                        std::memcpy(&value, data + offset, 8);
-                        processCounterSample_(cycle, unit_name, counter_name, value, want_timeline);
+                        uint16_t counter_name_length = 0;
+                        std::memcpy(&counter_name_length, data + offset, 2);
+                        offset += 2;
+
+                        if (data_size >= offset + counter_name_length + 8) {
+                            std::string_view counter_name(
+                                reinterpret_cast<const char*>(data + offset), counter_name_length);
+                            offset += counter_name_length;
+
+                            uint64_t value = 0;
+                            std::memcpy(&value, data + offset, 8);
+
+                            if (want_timeline) {
+                                writeCounterToTimeline_(cycle, unit_name, counter_name, value);
+                            }
+
+                            if (!config_.enable_counter_csv) {
+                                // Timeline-only: skip the CSV paths below.
+                            } else if (config_.counter_csv_format == CounterCsvFormat::Pivoted) {
+                                std::string key;
+                                key.reserve(unit_name.size() + 1 + counter_name.size());
+                                key.append(unit_name);
+                                key.push_back('.');
+                                key.append(counter_name);
+
+                                if (!counter_csv_streaming_) {
+                                    if (counter_first_cycle_ == UINT64_MAX) {
+                                        counter_first_cycle_ = cycle;
+                                    }
+                                    if (cycle == counter_first_cycle_) {
+                                        counter_first_batch_.emplace_back(std::move(key), value);
+                                    } else {
+                                        finalizeCounterColumns_();
+                                        writeCounterCsvHeader_();
+                                        current_counter_row_.assign(counter_columns_.size(), 0);
+                                        for (const auto& [k, v] : counter_first_batch_) {
+                                            auto it = counter_col_index_.find(k);
+                                            if (it != counter_col_index_.end()) {
+                                                current_counter_row_[it->second] = v;
+                                            }
+                                        }
+                                        flushCounterRow_(counter_first_cycle_);
+                                        counter_first_batch_.clear();
+                                        counter_first_batch_.shrink_to_fit();
+                                        counter_csv_streaming_ = true;
+                                        current_counter_cycle_ = cycle;
+                                        current_counter_row_.assign(counter_columns_.size(), 0);
+                                        auto it = counter_col_index_.find(key);
+                                        if (it != counter_col_index_.end()) {
+                                            current_counter_row_[it->second] = value;
+                                        }
+                                    }
+                                } else {
+                                    if (cycle != current_counter_cycle_) {
+                                        flushCounterRow_(current_counter_cycle_);
+                                        current_counter_cycle_ = cycle;
+                                        current_counter_row_.assign(counter_columns_.size(), 0);
+                                    }
+                                    auto it = counter_col_index_.find(key);
+                                    if (it != counter_col_index_.end()) {
+                                        current_counter_row_[it->second] = value;
+                                    }
+                                }
+                            } else if (counter_file_.is_open()) {
+                                fmt::format_to(std::back_inserter(counter_buffer_), "{},{},{},{}\n",
+                                               cycle, unit_name, counter_name, value);
+
+                                local_bytes_written_ +=
+                                    unit_name.length() + counter_name.length() + 30;
+
+                                if (!derived_counter_defs_.empty()) {
+                                    if (long_current_cycle_ != UINT64_MAX &&
+                                        cycle != long_current_cycle_) {
+                                        emitLongDerivedValues_(long_current_cycle_);
+                                        long_cycle_values_.clear();
+                                    }
+                                    long_current_cycle_ = cycle;
+                                    std::string long_key;
+                                    long_key.reserve(unit_name.size() + 1 + counter_name.size());
+                                    long_key.append(unit_name);
+                                    long_key.push_back('.');
+                                    long_key.append(counter_name);
+                                    long_cycle_values_[std::move(long_key)] = value;
+                                }
+
+                                if (counter_buffer_.size() >= COUNTER_BUFFER_FLUSH_SIZE) {
+                                    flushCounterBuffer_();
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -732,84 +786,6 @@ void ObservationBackend::processEvent_(const ObservationQueue::RecordHeader* hea
             // Handled in drainQueue_
             break;
     }
-}
-
-void ObservationBackend::processCounterSample_(uint64_t cycle, std::string_view unit_name,
-                                               std::string_view counter_name, uint64_t value,
-                                               bool want_timeline, size_t column_index) {
-    if (want_timeline) {
-        writeCounterToTimeline_(cycle, unit_name, counter_name, value);
-    }
-
-    if (!config_.enable_counter_csv) return;
-
-    if (config_.counter_csv_format == CounterCsvFormat::Pivoted) {
-        std::string key;
-        if (column_index == SIZE_MAX) {
-            key.reserve(unit_name.size() + 1 + counter_name.size());
-            key.append(unit_name);
-            key.push_back('.');
-            key.append(counter_name);
-        }
-
-        if (!counter_csv_streaming_) {
-            if (counter_first_cycle_ == UINT64_MAX) counter_first_cycle_ = cycle;
-            if (cycle == counter_first_cycle_) {
-                counter_first_batch_.emplace_back(std::move(key), value);
-                return;
-            }
-
-            finalizeCounterColumns_();
-            writeCounterCsvHeader_();
-            current_counter_row_.assign(counter_columns_.size(), 0);
-            for (const auto& [first_key, first_value] : counter_first_batch_) {
-                auto it = counter_col_index_.find(first_key);
-                if (it != counter_col_index_.end()) current_counter_row_[it->second] = first_value;
-            }
-            flushCounterRow_(counter_first_cycle_);
-            counter_first_batch_.clear();
-            counter_first_batch_.shrink_to_fit();
-            counter_csv_streaming_ = true;
-            current_counter_cycle_ = cycle;
-            current_counter_row_.assign(counter_columns_.size(), 0);
-        } else if (current_counter_cycle_ == UINT64_MAX) {
-            current_counter_cycle_ = cycle;
-        } else if (cycle != current_counter_cycle_) {
-            flushCounterRow_(current_counter_cycle_);
-            current_counter_cycle_ = cycle;
-            current_counter_row_.assign(counter_columns_.size(), 0);
-        }
-
-        if (column_index == SIZE_MAX) {
-            auto it = counter_col_index_.find(key);
-            if (it != counter_col_index_.end()) column_index = it->second;
-        }
-        if (column_index < current_counter_row_.size()) {
-            current_counter_row_[column_index] = value;
-        }
-        return;
-    }
-
-    if (!counter_file_.is_open()) return;
-    fmt::format_to(std::back_inserter(counter_buffer_), "{},{},{},{}\n", cycle, unit_name,
-                   counter_name, value);
-    local_bytes_written_ += unit_name.length() + counter_name.length() + 30;
-
-    if (!derived_counter_defs_.empty()) {
-        if (long_current_cycle_ != UINT64_MAX && cycle != long_current_cycle_) {
-            emitLongDerivedValues_(long_current_cycle_);
-            long_cycle_values_.clear();
-        }
-        long_current_cycle_ = cycle;
-        std::string long_key;
-        long_key.reserve(unit_name.size() + 1 + counter_name.size());
-        long_key.append(unit_name);
-        long_key.push_back('.');
-        long_key.append(counter_name);
-        long_cycle_values_[std::move(long_key)] = value;
-    }
-
-    if (counter_buffer_.size() >= COUNTER_BUFFER_FLUSH_SIZE) flushCounterBuffer_();
 }
 
 void ObservationBackend::processStructuredTrace_(const std::byte* data, size_t data_size) {

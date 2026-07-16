@@ -82,7 +82,6 @@ endif()
 
 # Options
 option(CHRONON_BUILD_TESTS "Build Chronon tests" ON)
-option(CHRONON_BUILD_BENCHMARKS "Build standalone Chronon profiling benchmarks" OFF)
 option(CHRONON_INSTALL "Generate install/export rules (requires exportable deps)" OFF)
 
 # Centralized compile options (warnings, -Werror, sanitizers, clang-tidy)
@@ -200,10 +199,6 @@ if(CHRONON_BUILD_TESTS)
     add_subdirectory(examples)
 endif()
 
-if(CHRONON_BUILD_BENCHMARKS)
-    add_subdirectory(benchmark)
-endif()
-
 # Summary
 message(STATUS "")
 message(STATUS "Chronon Configuration Summary:")
@@ -212,7 +207,6 @@ message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ Standard: C++${CMAKE_CXX_STANDARD}")
 message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "  Build Tests/Examples: ${CHRONON_BUILD_TESTS}")
-message(STATUS "  Build Benchmarks: ${CHRONON_BUILD_BENCHMARKS}")
 message(STATUS "  Werror: ${CHRONON_ENABLE_WERROR}")
 message(STATUS "  ASan+UBSan: ${CHRONON_ENABLE_ASAN}")
 message(STATUS "  TSan: ${CHRONON_ENABLE_TSAN}")

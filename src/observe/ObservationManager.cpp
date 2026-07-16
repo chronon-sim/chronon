@@ -204,7 +204,6 @@ void ObservationManager::startBackend() {
     if (!derived_defs.empty()) {
         backend_->setDerivedCounterDefs(derived_defs);
     }
-    backend_->setCounterSnapshotPlans(counter_registry_.snapshotPlans());
 
     if (!backend_->isRunning()) {
         backend_->start();

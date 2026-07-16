@@ -74,7 +74,6 @@ public:
      */
     Connection<T>* connect(InPort<T>* to, uint32_t delay) {
         auto conn = std::make_unique<Connection<T>>(this, to, delay);
-        conn->setDependencyOnlyTransport(dependency_only_transport_);
         auto* ptr = conn.get();
         connections_.push_back(std::move(conn));
         return ptr;
@@ -100,9 +99,7 @@ public:
         }
 
         bool result;
-        if (dependency_only_transport_) {
-            result = true;
-        } else if (connections_.size() == 1) {
+        if (connections_.size() == 1) {
             result = connections_[0]->transfer(T{data}, getCurrentCycle());
         } else {
             // Multi-connection fanout: preflight every destination before
@@ -143,9 +140,7 @@ public:
         }
 
         bool result;
-        if (dependency_only_transport_) {
-            result = true;
-        } else if (connections_.size() == 1) {
+        if (connections_.size() == 1) {
             result = connections_[0]->transfer(std::move(data), getCurrentCycle());
         } else {
             // Multi-connection fanout: preflight before mutating any queue
@@ -192,7 +187,6 @@ public:
             updateCycleCounter_();
             if (sent_this_cycle_ >= per_cycle_capacity_) return false;
         }
-        if (dependency_only_transport_) return true;
         for (const auto& conn : connections_) {
             if (!conn->canTransfer()) {
                 return false;
@@ -208,7 +202,6 @@ public:
      * enqueued at destination ports will be dropped on receive.
      */
     void cancelInFlight() {
-        if (dependency_only_transport_) return;
         for (auto& conn : connections_) {
             conn->cancelInFlight();
         }
@@ -217,19 +210,6 @@ public:
     const std::vector<std::unique_ptr<Connection<T>>>& connections() const { return connections_; }
     bool isConnected() const { return !connections_.empty(); }
     size_t connectionCount() const { return connections_.size(); }
-
-    /// Disable physical payload transport while retaining all connections as
-    /// scheduler dependency edges. Configure this before simulation
-    /// initialization. send()/canSend() still enforce the OutPort's per-cycle
-    /// capacity without walking the fanout.
-    void setDependencyOnlyTransport(bool enabled = true) noexcept {
-        dependency_only_transport_ = enabled;
-        for (auto& conn : connections_) {
-            conn->setDependencyOnlyTransport(enabled);
-        }
-    }
-
-    bool dependencyOnlyTransport() const noexcept { return dependency_only_transport_; }
 
     /// Find the first connection targeting @p to, or nullptr if not connected.
     Connection<T>* connectionTo(const InPort<T>* to) noexcept {
@@ -303,7 +283,6 @@ private:
     size_t per_cycle_capacity_ = 1;
     mutable size_t sent_this_cycle_ = 0;
     mutable uint64_t last_counted_cycle_ = 0;
-    bool dependency_only_transport_ = false;
 };
 
 template <typename T>

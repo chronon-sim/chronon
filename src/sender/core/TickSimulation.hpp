@@ -295,11 +295,6 @@ public:
         has_precomputed_costs_ = true;
     }
 
-    /// Preserve topology-stable multi-producer admission even for a fixed
-    /// thread assignment. Configure before initialize() when an out-of-band
-    /// transport replaces physical connection fanout.
-    void forceStableConnectionQueues() noexcept { force_stable_connection_queues_ = true; }
-
 private:
     enum class ExecutionMode {
         Sequential,
@@ -841,7 +836,6 @@ private:
     std::vector<double> precomputed_unit_costs_;
     PlatformMetrics precomputed_platform_metrics_{};
     bool has_precomputed_costs_ = false;
-    bool force_stable_connection_queues_ = false;
 
     struct alignas(64) ThreadSamplingState {
         std::vector<uint64_t> tick_times;

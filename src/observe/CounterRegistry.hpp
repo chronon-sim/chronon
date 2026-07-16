@@ -17,7 +17,6 @@
 #include <vector>
 
 #include "Counter.hpp"
-#include "CounterSnapshot.hpp"
 #include "DerivedCounter.hpp"
 #include "Types.hpp"
 
@@ -79,15 +78,11 @@ public:
                                     uint64_t period) const noexcept;
 
     const std::vector<DerivedCounterDef>& derivedDefs() const noexcept { return derived_defs_; }
-    const std::vector<CounterSnapshotPlanMetadata>& snapshotPlans() const noexcept {
-        return snapshot_plan_metadata_;
-    }
 
     void clear() {
         counters_.clear();
         derived_defs_.clear();
         owner_snapshot_plans_.clear();
-        snapshot_plan_metadata_.clear();
     }
 
 private:
@@ -96,20 +91,13 @@ private:
         std::string counter_name;
         SimpleCounter* counter = nullptr;
         const uint64_t* scalar = nullptr;
+        size_t aligned_size = 0;
 
         uint64_t value() const noexcept { return counter ? counter->get() : *scalar; }
     };
 
     struct OwnerSnapshotPlan {
-        struct Batch {
-            uint32_t plan_id = 0;
-            size_t entry_begin = 0;
-            size_t entry_count = 0;
-            size_t record_size = 0;
-        };
-
         std::vector<OwnerSnapshotEntry> entries;
-        std::vector<Batch> batches;
         size_t total_size = 0;
         // Lock-free migration deduplication; counter storage itself remains
         // single-writer under the scheduler's cluster execution claim.
@@ -123,7 +111,6 @@ private:
     std::unordered_map<CounterKey, SimpleCounter*, CounterKeyHash> counters_;
     std::vector<DerivedCounterDef> derived_defs_;
     std::vector<OwnerSnapshotPlan> owner_snapshot_plans_;
-    std::vector<CounterSnapshotPlanMetadata> snapshot_plan_metadata_;
 };
 
 }  // namespace chronon::observe

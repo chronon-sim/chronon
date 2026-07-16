@@ -661,59 +661,6 @@ void test_counter_group_does_not_collide_with_child_unit() {
     std::cout << "PASSED\n";
 }
 
-void test_periodic_counter_snapshot_is_metadata_indexed_batch() {
-    std::cout << "Testing periodic counters use one metadata-indexed batch... ";
-
-    ObservationQueue shared(64 * 1024);
-    std::vector<std::unique_ptr<ObservationContext>> contexts;
-    auto ctx =
-        std::make_unique<ObservationContext>(&shared, []() { return 9ULL; }, 0, "batch_unit");
-    ctx->setCounterOwnerId(0);
-    const CounterId first = ctx->counters().addCounter("first");
-    const CounterId second = ctx->counters().addCounter("second");
-    ctx->counters().getUnchecked(first).increment(3);
-    ctx->counters().getUnchecked(second).increment(7);
-    auto* raw = ctx.get();
-    contexts.push_back(std::move(ctx));
-
-    CounterRegistry registry;
-    registry.reregisterAll(contexts);
-    CHECK(registry.snapshotPlans().size() == 1);
-    CHECK(registry.snapshotPlans()[0].entries.size() == 2);
-
-    ThreadContext producer(63, 64 * 1024);
-    const size_t owner = 0;
-    CHECK(registry.pushOwnerSnapshots(10, std::span<const size_t>(&owner, 1), producer));
-
-    auto& queue = producer.queue();
-    std::byte* ptr = queue.prepareRead();
-    CHECK(ptr != nullptr);
-    const auto* record = reinterpret_cast<const ObservationQueue::RecordHeader*>(ptr);
-    CHECK(record->type == ObservationQueue::EventType::COUNTER_SNAPSHOT);
-    CHECK((record->flags & COUNTER_SNAPSHOT_BATCH_FLAG) != 0);
-    CHECK(record->total_size == sizeof(ObservationQueue::RecordHeader) +
-                                    sizeof(CounterSnapshotBatchHeader) + 2 * sizeof(uint64_t));
-
-    CounterSnapshotBatchHeader batch{};
-    const std::byte* data = ptr + sizeof(ObservationQueue::RecordHeader);
-    std::memcpy(&batch, data, sizeof(batch));
-    CHECK(batch.cycle == 10);
-    CHECK(batch.plan_id == 0);
-    CHECK(batch.count == 2);
-    uint64_t values[2]{};
-    std::memcpy(values, data + sizeof(batch), sizeof(values));
-    CHECK(values[0] == 3);
-    CHECK(values[1] == 7);
-
-    queue.finishRead(record->total_size);
-    queue.forceCommitRead();
-    CHECK(queue.prepareRead() == nullptr);
-    CHECK(raw->counters().getUnchecked(first).get() == 0);
-    CHECK(raw->counters().getUnchecked(second).get() == 0);
-
-    std::cout << "PASSED\n";
-}
-
 void test_pipeline_slice_name_cache_is_bounded() {
     std::cout << "Testing pipeline slice name cache bound... ";
 
@@ -755,7 +702,6 @@ int main() {
     test_spin_wait_exits_when_wakeup_is_removed();
     test_timeline_restart_redeclares_tracks();
     test_counter_group_does_not_collide_with_child_unit();
-    test_periodic_counter_snapshot_is_metadata_indexed_batch();
     test_pipeline_slice_name_cache_is_bounded();
 
     std::cout << "\n=== Observation hardening tests PASSED ===\n";

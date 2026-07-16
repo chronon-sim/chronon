@@ -618,7 +618,6 @@ void TickSimulation::optimizeAllQueuesForSingleThread() {
     // multi-thread scheduler.
     std::unordered_map<void*, std::vector<ConnectionBase*>> port_to_connections;
     for (auto* conn : connections_) {
-        if (conn->dependencyOnlyTransport()) continue;
         void* key = conn->destPortPtr();
         port_to_connections[key].push_back(conn);
     }
@@ -664,11 +663,6 @@ void TickSimulation::optimizeConnectionQueuesForThreads() {
         return;
     }
 
-    if (force_stable_connection_queues_) {
-        optimizeConnectionQueuesForDynamicRebalance_();
-        return;
-    }
-
     if (config_.enable_dynamic_rebalance) {
         optimizeConnectionQueuesForDynamicRebalance_();
         return;
@@ -691,7 +685,6 @@ void TickSimulation::optimizeConnectionQueuesForThreads() {
     // separately to determine SPSC vs MPSC.
     std::unordered_map<void*, std::vector<ConnectionBase*>> port_to_connections;
     for (auto* conn : connections_) {
-        if (conn->dependencyOnlyTransport()) continue;
         void* key = conn->destPortPtr();
         port_to_connections[key].push_back(conn);
     }
@@ -792,7 +785,6 @@ void TickSimulation::optimizeConnectionQueuesForThreads() {
 void TickSimulation::optimizeConnectionQueuesForDynamicRebalance_() {
     std::unordered_map<void*, std::vector<ConnectionBase*>> port_to_connections;
     for (auto* conn : connections_) {
-        if (conn->dependencyOnlyTransport()) continue;
         void* key = conn->destPortPtr();
         port_to_connections[key].push_back(conn);
     }

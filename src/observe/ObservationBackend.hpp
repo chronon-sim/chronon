@@ -32,7 +32,6 @@
 #include <stdexec/stop_token.hpp>
 #pragma GCC diagnostic pop
 
-#include "CounterSnapshot.hpp"
 #include "DerivedCounter.hpp"
 #include "FormatRegistry.hpp"
 #include "ObservationQueue.hpp"
@@ -142,10 +141,6 @@ public:
     /// column indices once raw counter columns are finalized.
     void setDerivedCounterDefs(std::vector<DerivedCounterDef> defs);
 
-    /// Register immutable counter names once; periodic records then carry only values.
-    /// PRECONDITION: called before start().
-    void setCounterSnapshotPlans(std::vector<CounterSnapshotPlanMetadata> plans);
-
     void setSourceNameLookup(std::function<std::string_view(uint16_t)> lookup) noexcept {
         source_name_lookup_ = std::move(lookup);
         // Pre-populate a flat cache so the hot path avoids std::function dispatch.
@@ -203,10 +198,6 @@ private:
     void ioWorkerLoop_();
     void waitForAsyncIO_();
     void processEvent_(const ObservationQueue::RecordHeader* header, const std::byte* data);
-    void processCounterSample_(uint64_t cycle, std::string_view unit_name,
-                               std::string_view counter_name, uint64_t value, bool want_timeline,
-                               size_t column_index = SIZE_MAX);
-    void prepareCounterSnapshotPlans_();
     void processStructuredTrace_(const std::byte* data, size_t data_size);
     void processStructuredLog_(const std::byte* data, size_t data_size);
     std::string reconstructMessage_(const FormatInfo& fmt_info, const StructuredRecord* rec,
@@ -404,9 +395,6 @@ private:
     std::vector<uint64_t> current_counter_row_;
     std::vector<std::pair<std::string, uint64_t>> counter_first_batch_;
     uint64_t counter_first_cycle_ = UINT64_MAX;
-
-    std::vector<CounterSnapshotPlanMetadata> counter_snapshot_plans_;
-    std::vector<std::vector<size_t>> counter_snapshot_column_indices_;
 
     std::vector<DerivedCounterDef> derived_counter_defs_;
 

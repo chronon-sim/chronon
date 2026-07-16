@@ -473,44 +473,6 @@ void test_capacity_one_rate_one_spsc_reconstructs_cycle_start_min_arrival() {
     std::cout << "PASSED\n";
 }
 
-void test_dependency_only_transport_preserves_rate_without_queueing() {
-    std::cout << "Testing dependency-only transport... ";
-
-    TestUnit prod("prod");
-    TestUnit cons0("cons0");
-    TestUnit cons1("cons1");
-    OutPort<int> out{&prod, "out", 2};
-    InPort<int> in0{&cons0, "in0", 1};
-    InPort<int> in1{&cons1, "in1", 1};
-    auto* conn0 = out.connect(&in0, 1);
-    auto* conn1 = out.connect(&in1, 1);
-
-    out.setDependencyOnlyTransport();
-    require(out.dependencyOnlyTransport(), "OutPort did not retain dependency-only mode");
-    require(conn0->dependencyOnlyTransport() && conn1->dependencyOnlyTransport(),
-            "fanout connections did not retain dependency-only mode");
-    require(conn0->crossThreadHeadroom() == std::numeric_limits<size_t>::max(),
-            "dependency-only edge exposed physical queue headroom");
-
-    conn0->optimizeForMPSC();
-    require(!conn0->hasThreadQueueId(), "dependency-only edge entered MPSC transport");
-
-    prod.setCycle(7);
-    require(out.canSend() && out.send(11), "first dependency-only send failed");
-    require(out.canSend() && out.send(12), "second dependency-only send failed");
-    require(!out.canSend() && !out.send(13), "dependency-only send ignored OutPort cycle capacity");
-    require(!in0.hasMessages() && !in1.hasMessages(),
-            "dependency-only send enqueued a physical payload");
-
-    prod.setCycle(8);
-    require(out.canSend() && out.send(14),
-            "dependency-only capacity did not reset on the next cycle");
-    require(!in0.hasMessages() && !in1.hasMessages(),
-            "dependency-only next-cycle send enqueued a physical payload");
-
-    std::cout << "PASSED\n";
-}
-
 }  // namespace
 
 int main() {
@@ -530,7 +492,6 @@ int main() {
     test_capacity_one_rate_one_special_case_requires_delay_one();
     test_capacity_one_rate_one_delay_one_backpressures_after_missed_drain();
     test_capacity_one_rate_one_spsc_reconstructs_cycle_start_min_arrival();
-    test_dependency_only_transport_preserves_rate_without_queueing();
 
     std::cout << "\n=== All OutPort Per-Cycle Capacity tests PASSED ===\n";
     return 0;
