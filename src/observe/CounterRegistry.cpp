@@ -55,6 +55,15 @@ constexpr CategoryMask observationStatsCategory(ObservationChannel channel) noex
     return category::NONE;
 }
 
+bool shouldSnapshotObservationStats(const ObservationContext& ctx,
+                                    ObservationChannel channel) noexcept {
+    // Category-less span ends are emitted on the Trace channel whenever any
+    // observation category is enabled, so Trace stats are not gated solely by
+    // the trace/user masks.
+    if (channel == ObservationChannel::Trace && ctx.filter().anyEnabled()) return true;
+    return ctx.filter().shouldObserve(observationStatsCategory(channel));
+}
+
 constexpr size_t batchRecordSize(size_t entry_count) noexcept {
     return sizeof(ObservationQueue::RecordHeader) + sizeof(CounterSnapshotBatchHeader) +
            entry_count * sizeof(uint64_t);
@@ -80,7 +89,7 @@ void forEachSnapshotEntry(ObservationContext& ctx, Callback&& callback) {
     const auto& stats = ctx.observationStats();
     for (size_t i = 0; i < num_channels; ++i) {
         const auto channel = static_cast<ObservationChannel>(i);
-        if (!ctx.filter().shouldObserve(observationStatsCategory(channel))) continue;
+        if (!shouldSnapshotObservationStats(ctx, channel)) continue;
         const auto& channel_stats = stats.get(channel);
         const std::string prefix = std::string("obs_") + ObservationStats::channelName(channel);
         callback(ctx.unitName(), prefix + "_emitted", nullptr, &channel_stats.emitted);

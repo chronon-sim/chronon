@@ -732,6 +732,9 @@ void test_pivoted_csv_preserves_unowned_final_counter_columns() {
     auto unowned =
         std::make_unique<ObservationContext>(&shared, []() { return 10ULL; }, 0, "unowned");
     unowned->enableCategory(category::LOG_INFO);
+    CHECK(unowned->timelineEvent(category::NONE, TimelineEventKind::SpanEnd, /*track_id=*/1,
+                                 /*slot=*/0, /*name_id=*/0, /*payload=*/0, nullptr, 0));
+    CHECK(unowned->observationStats().get<ObservationChannel::Trace>().emitted == 1);
     const CounterId final_only = unowned->counters().addCounter("final_only");
     unowned->counters().getUnchecked(final_only).increment(7);
     contexts.push_back(std::move(unowned));
@@ -739,7 +742,7 @@ void test_pivoted_csv_preserves_unowned_final_counter_columns() {
     CounterRegistry registry;
     registry.reregisterAll(contexts);
     CHECK(registry.snapshotPlans().size() == 1);
-    CHECK(registry.counterColumns().size() == 4);
+    CHECK(registry.counterColumns().size() == 6);
 
     ObservationBackend::Config config;
     config.output_dir = out_dir;
@@ -764,6 +767,8 @@ void test_pivoted_csv_preserves_unowned_final_counter_columns() {
     CHECK(static_cast<bool>(std::getline(csv, row)));
     CHECK(header.find("owned.periodic") != std::string::npos);
     CHECK(header.find("unowned.final_only") != std::string::npos);
+    CHECK(header.find("unowned.obs_trace_emitted") != std::string::npos);
+    CHECK(header.find("unowned.obs_trace_dropped") != std::string::npos);
     CHECK(header.find("unowned.obs_info_emitted") != std::string::npos);
     CHECK(header.find("unowned.obs_info_dropped") != std::string::npos);
     CHECK(row.starts_with("10,"));
