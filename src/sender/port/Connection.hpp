@@ -296,7 +296,7 @@ public:
      * lookahead epoch-end flush).
      */
     size_t arbitrateAdmitErased(size_t budget) override {
-        return arbitrateAdmitBoundedErased(budget, std::numeric_limits<uint64_t>::max());
+        return arbitrateAdmitBoundedDirect(budget, std::numeric_limits<uint64_t>::max());
     }
 
     /**
@@ -308,6 +308,13 @@ public:
      * finished writing are admitted this tick.
      */
     size_t arbitrateAdmitBoundedErased(size_t budget, uint64_t max_send_cycle) override {
+        return arbitrateAdmitBoundedDirect(budget, max_send_cycle);
+    }
+
+private:
+    friend class InPort<T>;
+
+    [[gnu::noinline]] size_t arbitrateAdmitBoundedDirect(size_t budget, uint64_t max_send_cycle) {
         if (thread_queue_id_ == SIZE_MAX) {
             return 0;
         }
@@ -337,6 +344,16 @@ public:
         return admitted;
     }
 
+    [[gnu::noinline]] size_t arbitrateConsumerCycleDirect(
+        size_t budget, uint64_t consumer_cycle, const std::atomic<uint64_t>* producer_progress) {
+        if (!producer_progress) return 0;
+        const uint64_t producer_completed = producer_progress->load(std::memory_order_acquire);
+        if (producer_completed == 0 || consumer_cycle < delay_) return 0;
+        const uint64_t bound = std::min<uint64_t>(producer_completed - 1, consumer_cycle - delay_);
+        return arbitrateAdmitBoundedDirect(budget, bound);
+    }
+
+public:
     std::optional<uint64_t> minStagedArrivalCycle() const override {
         if (thread_queue_id_ == SIZE_MAX) {
             return std::nullopt;
