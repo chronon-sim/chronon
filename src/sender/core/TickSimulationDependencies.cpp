@@ -11,11 +11,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <unordered_map>
 #include <vector>
 
 #include "TickSimulation.hpp"
+#include "sender/schedule/WeightedDependencyReduction.hpp"
 
 namespace chronon::sender {
 
@@ -44,6 +46,13 @@ bool hasZeroDelayCycle(
         if (state[c] == VisitState::Unvisited && dfs(dfs, c)) return true;
     }
     return false;
+}
+
+bool transitiveDependencyPruneEnabled() noexcept {
+    const char* value = std::getenv("CHRONON_EXPERIMENTAL_TRANSITIVE_DEP_PRUNE");
+    // Pruning is the feature-branch default. An exact zero retains the legacy
+    // dependency graph for A/B testing without requiring a second binary.
+    return value == nullptr || value[0] != '0' || value[1] != '\0';
 }
 
 }  // namespace
@@ -92,11 +101,34 @@ void TickSimulation::buildCrossThreadDependencies() {
         }
     }
 
+    // Execution-mode selection must use the original pair-minimum graph. A
+    // reduction must never hide a zero-delay cycle and enable lookahead.
     has_zero_delay_cross_thread_cycle_ = hasZeroDelayCycle(min_delay);
 
-    for (size_t c = 0; c < num_clusters; ++c) {
-        for (auto& [src_cluster, delay] : min_delay[c]) {
-            thread_cross_deps_temp_[c].push_back({src_cluster, delay});
+    if (transitiveDependencyPruneEnabled()) {
+        std::vector<weighted_dependency_reduction::Edge> edges;
+        for (size_t cluster = 0; cluster < num_clusters; ++cluster) {
+            edges.reserve(edges.size() + min_delay[cluster].size());
+            for (const auto& [pred_cluster, delay] : min_delay[cluster]) {
+                edges.push_back({cluster, pred_cluster, delay});
+            }
+        }
+
+        const auto reduction = weighted_dependency_reduction::reduce(num_clusters, edges);
+        for (const auto& edge : reduction.retained) {
+            thread_cross_deps_temp_[edge.dependent].push_back(
+                {edge.predecessor, static_cast<uint32_t>(edge.delay)});
+        }
+
+        if (observe_ctx_) {
+            observe::log_info<"Transitive dependency pruning: {} -> {} cluster dependencies">(
+                observe_ctx_, edges.size(), reduction.retained.size());
+        }
+    } else {
+        for (size_t c = 0; c < num_clusters; ++c) {
+            for (const auto& [src_cluster, delay] : min_delay[c]) {
+                thread_cross_deps_temp_[c].push_back({src_cluster, delay});
+            }
         }
     }
 }
