@@ -216,6 +216,11 @@ void test_dependency_only_headroom_adds_reverse_edge_only_when_tighter() {
     CHECK(global_floor_suffices.size() == 1);
     CHECK(global_floor_suffices[0].delay == 1);
 
+    const auto floor_disabled =
+        buildDependencyOnlyHeadroomGraph(/*headroom=*/512, /*max_lookahead=*/0);
+    CHECK(floor_disabled.size() == 2);
+    CHECK(floor_disabled[0].delay == 511 || floor_disabled[1].delay == 511);
+
     std::cout << "PASSED\n";
 }
 
