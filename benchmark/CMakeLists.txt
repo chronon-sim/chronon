@@ -44,3 +44,18 @@ target_link_libraries(chronon_direct_spsc_benchmark PRIVATE
 )
 
 target_compile_features(chronon_direct_spsc_benchmark PRIVATE cxx_std_20)
+
+add_executable(chronon_typed_mpsc_dispatch_benchmark
+    typed_mpsc_dispatch_benchmark.cpp
+)
+
+target_include_directories(chronon_typed_mpsc_dispatch_benchmark PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_link_libraries(chronon_typed_mpsc_dispatch_benchmark PRIVATE
+    chronon::core
+    chronon_compile_options
+)
+
+target_compile_features(chronon_typed_mpsc_dispatch_benchmark PRIVATE cxx_std_20)

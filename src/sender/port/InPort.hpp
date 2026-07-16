@@ -12,6 +12,7 @@
 #include <concepts>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -30,6 +31,11 @@
 namespace chronon::sender {
 
 namespace detail {
+
+inline bool experimentalTypedMPSCConsumerDispatchEnabled() noexcept {
+    const char* value = std::getenv("CHRONON_EXPERIMENTAL_TYPED_MPSC_CONSUMER_DISPATCH");
+    return value == nullptr || value[0] != '0' || value[1] != '\0';
+}
 
 template <auto KeyFn, typename T>
 concept SelectiveCancelKeyFn = requires(const T& data) {
@@ -73,6 +79,8 @@ public:
         : PortBase(owner, std::move(name)),
           capacity_(capacity),
           policy_(policy),
+          typed_mpsc_consumer_dispatch_enabled_(
+              detail::experimentalTypedMPSCConsumerDispatchEnabled()),
           queue_(std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity)) {
         reserveScratch_();
         installAutoRegistration_();
@@ -83,6 +91,8 @@ public:
         : PortBase(owner, std::move(name)),
           capacity_(UNLIMITED_CAPACITY),
           policy_(policy),
+          typed_mpsc_consumer_dispatch_enabled_(
+              detail::experimentalTypedMPSCConsumerDispatchEnabled()),
           queue_(std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(UNLIMITED_CAPACITY)) {
         reserveScratch_();
         installAutoRegistration_();
@@ -436,6 +446,15 @@ public:
         if (!mpsc_conn_progress_.empty()) {
             constexpr size_t kUnlimitedBudget = std::numeric_limits<size_t>::max();
             const uint64_t k = getCurrentCycle();
+            if (typed_mpsc_consumer_dispatch_enabled_) {
+                for (size_t i = 0; i < mpsc_connections_.size(); ++i) {
+                    const std::atomic<uint64_t>* p = mpsc_conn_progress_[i];
+                    if (!p) continue;
+                    auto* conn = static_cast<Connection<T>*>(mpsc_connections_[i]);
+                    (void)conn->arbitrateConsumerCycleDirect(kUnlimitedBudget, k, p);
+                }
+                return;
+            }
             for (size_t i = 0; i < mpsc_connections_.size(); ++i) {
                 const std::atomic<uint64_t>* p = mpsc_conn_progress_[i];
                 if (!p) continue;  // unresolved producer (covered by epoch-end flush)
@@ -872,6 +891,7 @@ private:
 
     size_t capacity_;
     PortPolicy policy_ = PortPolicy::LegacyFastPath;
+    const bool typed_mpsc_consumer_dispatch_enabled_ = false;
     std::unique_ptr<IMessageQueue<StoredMessage>> queue_;
     DirectSPSCQueueAdapter<StoredMessage>* direct_spsc_queue_raw_ = nullptr;
     MultiProducerQueueAdapter<StoredMessage>* multi_producer_queue_raw_ =
