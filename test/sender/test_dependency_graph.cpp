@@ -11,11 +11,20 @@
 // Unit tests for DependencyGraph and graph algorithms
 
 #include <cassert>
+#include <cstdint>
 #include <iostream>
+#include <limits>
+#include <random>
+#include <stdexcept>
+#include <vector>
 
+#include "../TestAssertions.hpp"
+#include "sender/schedule/WeightedDependencyReduction.hpp"
 #include "sender/util/Graph.hpp"
 
 using namespace chronon::sender;
+
+namespace reduction = chronon::sender::weighted_dependency_reduction;
 
 void test_directed_graph_basic() {
     std::cout << "Testing DirectedGraph basic... ";
@@ -255,6 +264,128 @@ void test_self_loop() {
     std::cout << "PASSED\n";
 }
 
+void test_weighted_reduction_respects_delay_constraints() {
+    std::cout << "Testing weighted dependency reduction constraints... ";
+
+    const std::vector<reduction::Edge> edges = {
+        {0, 1, 2}, {1, 2, 3}, {0, 2, 5},  // Equal-delay alternate path: removable.
+        {0, 3, 4}, {3, 2, 2},             // Delay 6 alternate path: insufficient.
+    };
+    const auto result = reduction::reduce(4, edges);
+    REQUIRE((result.removed == std::vector<reduction::Edge>{{0, 2, 5}}));
+    REQUIRE(result.retained.size() == 4);
+    REQUIRE(result.fan_in_before == std::vector<size_t>({3, 1, 0, 1}));
+    REQUIRE(result.fan_in_after == std::vector<size_t>({2, 1, 0, 1}));
+    REQUIRE(reduction::closure(4, edges) == reduction::closure(4, result.retained));
+
+    std::cout << "PASSED\n";
+}
+
+void test_weighted_reduction_does_not_batch_remove_mutual_witnesses() {
+    std::cout << "Testing weighted dependency reduction mutual witnesses... ";
+
+    // The first two constraints initially witness each other through the
+    // zero-delay 1<->2 cycle. Sequential removal may remove one, never both.
+    const std::vector<reduction::Edge> edges = {
+        {0, 1, 1},
+        {0, 2, 1},
+        {1, 2, 0},
+        {2, 1, 0},
+    };
+    const auto result = reduction::reduce(3, edges);
+    REQUIRE((result.removed == std::vector<reduction::Edge>{{0, 1, 1}}));
+    REQUIRE(result.retained == std::vector<reduction::Edge>({{0, 2, 1}, {1, 2, 0}, {2, 1, 0}}));
+    REQUIRE(reduction::closure(3, edges) == reduction::closure(3, result.retained));
+
+    std::cout << "PASSED\n";
+}
+
+void test_weighted_reduction_uses_saturating_distance() {
+    std::cout << "Testing weighted dependency reduction overflow handling... ";
+
+    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
+    REQUIRE(reduction::saturatingDistanceAdd(max - 3, 4) == max);
+    REQUIRE(reduction::saturatingDistanceAdd(max - 3, 3) == max);
+    REQUIRE(reduction::saturatingDistanceAdd(7, 9) == 16);
+
+    const std::vector<reduction::Edge> edges = {
+        {0, 1, max - 4},
+        {1, 2, 10},
+        {0, 2, max - 1},
+    };
+    const auto result = reduction::reduce(3, edges);
+    REQUIRE(result.removed.empty());
+    REQUIRE(result.retained.size() == edges.size());
+
+    std::cout << "PASSED\n";
+}
+
+void test_weighted_reduction_rejects_invalid_edges() {
+    std::cout << "Testing weighted dependency reduction input validation... ";
+
+    bool out_of_range_rejected = false;
+    try {
+        const std::vector<reduction::Edge> edges = {{0, 3, 1}};
+        (void)reduction::reduce(3, edges);
+    } catch (const std::out_of_range&) {
+        out_of_range_rejected = true;
+    }
+    REQUIRE(out_of_range_rejected);
+
+    bool self_edge_rejected = false;
+    try {
+        const std::vector<reduction::Edge> edges = {{1, 1, 0}};
+        (void)reduction::reduce(3, edges);
+    } catch (const std::invalid_argument&) {
+        self_edge_rejected = true;
+    }
+    REQUIRE(self_edge_rejected);
+
+    std::cout << "PASSED\n";
+}
+
+void test_weighted_reduction_is_deterministic_and_pair_minimal() {
+    std::cout << "Testing weighted dependency reduction ordering/pair-min... ";
+
+    const std::vector<reduction::Edge> first = {
+        {0, 2, 7}, {2, 3, 1}, {0, 1, 2}, {1, 3, 2}, {0, 3, 9}, {0, 2, 3},
+    };
+    const std::vector<reduction::Edge> reversed(first.rbegin(), first.rend());
+    const auto a = reduction::reduce(4, first);
+    const auto b = reduction::reduce(4, reversed);
+    REQUIRE(a.retained == b.retained);
+    REQUIRE(a.removed == b.removed);
+    REQUIRE(a.fan_in_before == b.fan_in_before);
+    REQUIRE(a.fan_in_after == b.fan_in_after);
+    REQUIRE(a.fan_in_before[0] == 3);
+    REQUIRE(reduction::closure(4, first) == reduction::closure(4, a.retained));
+
+    std::cout << "PASSED\n";
+}
+
+void test_weighted_reduction_random_closure_equivalence() {
+    std::cout << "Testing weighted dependency reduction random closures... ";
+
+    std::mt19937_64 rng(0x8d4e'13c2'79a5'6b01ULL);
+    for (size_t iteration = 0; iteration < 500; ++iteration) {
+        const size_t clusters = 2 + static_cast<size_t>(rng() % 7);
+        std::vector<reduction::Edge> edges;
+        for (size_t dependent = 0; dependent < clusters; ++dependent) {
+            for (size_t predecessor = 0; predecessor < clusters; ++predecessor) {
+                if (dependent == predecessor || rng() % 100 >= 45) continue;
+                edges.push_back({dependent, predecessor, rng() % 21});
+            }
+        }
+
+        const auto result = reduction::reduce(clusters, edges);
+        REQUIRE(reduction::closure(clusters, edges) ==
+                reduction::closure(clusters, result.retained));
+        REQUIRE(result.retained.size() + result.removed.size() == edges.size());
+    }
+
+    std::cout << "PASSED\n";
+}
+
 int main() {
     std::cout << "=== DependencyGraph Tests ===\n\n";
 
@@ -268,6 +399,12 @@ int main() {
     test_independent_subgraphs();
     test_multiple_cycles();
     test_self_loop();
+    test_weighted_reduction_respects_delay_constraints();
+    test_weighted_reduction_does_not_batch_remove_mutual_witnesses();
+    test_weighted_reduction_uses_saturating_distance();
+    test_weighted_reduction_rejects_invalid_edges();
+    test_weighted_reduction_is_deterministic_and_pair_minimal();
+    test_weighted_reduction_random_closure_equivalence();
 
     std::cout << "\n=== All DependencyGraph tests PASSED ===\n";
     return 0;

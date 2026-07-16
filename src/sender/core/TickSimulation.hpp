@@ -615,6 +615,8 @@ private:
     friend struct LookaheadFloorTestAccess;
     /// Test-only white-box access for test_predecessor_cycle_cache.
     friend struct PredecessorCycleCacheTestAccess;
+    /// Test-only white-box access for transitive dependency pruning.
+    friend struct TransitiveDependencyPruneTestAccess;
 
     /// Worker-private lower bounds for predecessor progress. Each cache lives
     /// for one worker invocation and needs no atomic synchronization of its own.

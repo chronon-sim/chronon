@@ -16,3 +16,17 @@ target_link_libraries(chronon_counter_periodic_benchmark PRIVATE
 )
 
 target_compile_features(chronon_counter_periodic_benchmark PRIVATE cxx_std_20)
+
+add_executable(chronon_weighted_dependency_reduction_benchmark
+    weighted_dependency_reduction_benchmark.cpp
+)
+
+target_include_directories(chronon_weighted_dependency_reduction_benchmark PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_link_libraries(chronon_weighted_dependency_reduction_benchmark PRIVATE
+    chronon_compile_options
+)
+
+target_compile_features(chronon_weighted_dependency_reduction_benchmark PRIVATE cxx_std_20)
