@@ -26,6 +26,7 @@
 #include "../sender/core/Unit.hpp"
 #include "../sender/factory/SenderFactory.hpp"
 #include "../sender/port/Connection.hpp"
+#include "../sender/port/DelayOneBroadcastFabric.hpp"
 #include "../sender/port/Port.hpp"
 #include "../sender/port/PortDirectory.hpp"
 #include "../sender/util/PipelinePhase.hpp"
@@ -70,6 +71,7 @@ using FactoryRegistry = sender::factory::SenderFactoryRegistry;
 
 // --- Port ---
 using sender::Connection;
+using sender::DelayOneBroadcastFabric;
 using sender::InPort;
 using sender::OutPort;
 using sender::PortBase;

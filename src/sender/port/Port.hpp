@@ -73,10 +73,10 @@ inline bool stageTracePortMatches_(const std::string& name) noexcept {
  *   mode; new code that needs strong cancellation guarantees should use
  *   StageSelective.
  *
- * - StageSelective: optimized for delay=1 stage-register ports with selective
+ * - StageSelective: optimized for fixed-delay stage-register ports with selective
  *   cancellation. Each message carries `enqueue_cycle` (producer's localCycle
  *   at push time). cancelYoungerThan(key) installs a StagePredicate
- *   {flush_cycle = receiver localCycle, max_keep = key}; predicates are
+ *   {flush_cycle = receiver localCycle, min_keep, max_keep}; predicates are
  *   stored in a small fixed-size slot array and retired when the receiver
  *   advances past flush_cycle. The sender side does NOT consult receiver
  *   state — the filter is applied receiver-side only on pop. This eliminates
@@ -123,11 +123,12 @@ template <typename T>
 }
 
 /**
- * StagePredicate - A single live "cancel everything younger than max_keep that
- * was enqueued before flush_cycle" rule.
+ * StagePredicate - A single live "keep only [min_keep, max_keep] among messages
+ * enqueued before flush_cycle" rule.
  */
 struct StagePredicate {
     uint64_t flush_cycle = 0;
+    uint64_t min_keep = 0;
     uint64_t max_keep = 0;
 };
 
@@ -159,19 +160,23 @@ struct InPortStageCancelState {
     /// High-water mark tracking for diagnostics (CHRONON_STAGE_TRACE).
     size_t high_water = 0;
 
-    void install(uint64_t flush_cycle, uint64_t max_keep) {
+    void install(uint64_t flush_cycle, uint64_t min_keep, uint64_t max_keep) {
         // Merge same-cycle installs — a single flush broadcast fans out to
-        // multiple cancel calls per tick; collapse them into one slot and
-        // take the stricter max_keep.
+        // multiple cancel calls per tick. Collapse them into one slot and
+        // intersect the keep ranges, preserving both older-than and
+        // younger-than constraints without a second predicate walk.
         for (auto& p : slots) {
             if (p.flush_cycle == flush_cycle) {
+                if (min_keep > p.min_keep) {
+                    p.min_keep = min_keep;
+                }
                 if (max_keep < p.max_keep) {
                     p.max_keep = max_keep;
                 }
                 return;
             }
         }
-        slots.push_back({flush_cycle, max_keep});
+        slots.push_back({flush_cycle, min_keep, max_keep});
         if (slots.size() > high_water) {
             high_water = slots.size();
         }
@@ -193,7 +198,7 @@ struct InPortStageCancelState {
                 slots.pop_back();
                 continue;
             }
-            if (key > p.max_keep) {
+            if (key < p.min_keep || key > p.max_keep) {
                 cancel = true;
             }
             ++i;

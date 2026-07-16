@@ -178,8 +178,9 @@ void InPort<T>::cancelOutsideInclusive(MinK min_keep, MaxK max_keep);
 - `watermark` — lower/upper threshold used by the selected API
 
 **Semantics:**
-- **Monotonic watermark**: calling with a lower value than a previous call is a no-op
-- **Monotonic bounds**: `cancelOlderThan` only raises the lower bound; `cancelYoungerThan` only lowers the upper bound
+- **Legacy monotonic bounds**: `LegacyFastPath` raises only the lower bound and lowers only the upper bound for its current in-flight generation
+- **Timestamp-scoped range**: `StageSelective` installs a receiver-only `{flush_cycle, min_keep, max_keep}` predicate. Same-cycle calls intersect their ranges; messages enqueued at or after the flush cycle are unaffected
+- **Fixed-delay ordering**: `StageSelective` predicate retirement relies on monotonic enqueue cycles and is intended for fixed-delay stage-register ports
 - **InPort state**: receiver-side bounds are tracked per input port
 - **Single extractor per InPort**: first `KeyFn` set on an input port is retained; mismatched extractors are ignored
 - **Low overhead when unused**: receive path does one extractor-pointer load and exits immediately when selective cancellation is not configured
@@ -213,6 +214,43 @@ and `PortEnvelope` omits the cancellation pointer and snapshot. Receiver-side
 Do not disable the option merely because cancellation is rare. It is safe only
 after auditing the complete model and every linked component for
 `cancelInFlight()` calls.
+
+## Shared Delay-One Broadcast Fabric
+
+`DelayOneBroadcastFabric<T, P, C>` is an explicit specialization for a complete
+`P`-producer by `C`-consumer, delay-one broadcast bus. It stores each producer
+payload once per source cycle and lets all consumers replay it in stable
+producer-id and send order. The declared ports remain dependency edges, while
+their physical queues are disabled after topology validation.
+
+```cpp
+using WakeupBus = DelayOneBroadcastFabric<Wakeup, 10, 11, 512, 8>;
+
+WakeupBus bus;
+bus.bindProducer(0, producer0.out_wakeup);
+bus.bindConsumer(0, consumer0.in_wakeup);
+// Bind every stable producer and consumer id after graph construction.
+bus.sealPortTopology();
+
+// Producer tick at cycle S:
+if (producer0.out_wakeup.sendImmediate(wakeup)) {
+    bus.publish(0, producer0.localCycle(), wakeup);
+}
+
+// Consumer tick at cycle S+1 (must be called once per local cycle):
+bus.consume(0, consumer0.localCycle(), process_wakeup);
+```
+
+The fabric deliberately does not emulate bounded destination queues,
+receiver-side selective cancellation, or `OutPort::cancelInFlight()`. Use it
+only when the model has proved those operations are absent and every bound edge
+has delay one. `publish()` preserves the normal delay-one consumer wakeup, so
+activity-scheduled units may jump over empty cycles; they must call `consume()`
+on every tick in which they run. `sealPortTopology()` validates the complete
+delay-one fanout before changing any connection to dependency-only transport
+and exposes the finite ring depth as scheduler headroom. When necessary, the
+lookahead scheduler adds reverse dependencies that prevent a producer from
+wrapping an unread bucket.
 
 ## Usage Pattern
 
