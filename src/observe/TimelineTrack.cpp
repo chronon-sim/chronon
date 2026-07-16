@@ -32,7 +32,7 @@ TimelineTrackBase::TimelineTrackBase(ObservableUnit* owner, std::string_view nam
 }
 
 void TimelineTrackBase::onContextAttached(ObservationContext* ctx) {
-    if (registered_ || !ctx) {
+    if (registered_ || !ctx || !ctx->timelineProducerEnabled()) {
         return;
     }
     ctx_ = ctx;

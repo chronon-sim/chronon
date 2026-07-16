@@ -770,22 +770,21 @@ void test_timeline_event_producer_gate() {
     ObservationQueue queue(256 * 1024);
     ObservationContext ctx(&queue, []() { return 0ULL; }, 0, "fetch", 1);
     ctx.enableCategory(category::TRACE | LANE_CAT.mask());
+    ctx.setTraceChannelEnabled(false);
+    const size_t tracks_before = TimelineTrackRegistry::instance().size();
     TestUnit unit;
     unit.setObservationContext(&ctx);
-    CHECK(ctx.timelineProducerEnabled());
-    ctx.setTraceChannelEnabled(false);
-    CHECK(!ctx.timelineProducerEnabled());
+    CHECK(!unit.mshr.isRegistered() && !unit.occ.isRegistered());
+    CHECK(TimelineTrackRegistry::instance().size() == tracks_before);
     unit.cycle = 20;
     CHECK(!unit.mshr.begin(0, LANE_CAT, "disabled"_ev, flow(7), arg<"addr">(0x100ULL)));
-    unit.cycle = 21;
     CHECK(!unit.mshr.end(0));
     unit.cycle = 22;
     CHECK(!unit.port.instant(0, LANE_CAT, "disabled_instant"_ev));
     CHECK(!unit.occ.sample(3));
     CHECK(unit.cycle_reads == 0);
     const auto& trace_stats = ctx.observationStats().get<ObservationChannel::Trace>();
-    CHECK(trace_stats.emitted == 0);
-    CHECK(trace_stats.dropped == 0);
+    CHECK(trace_stats.emitted == 0 && trace_stats.dropped == 0);
     std::cout << "PASSED\n";
 }
 
