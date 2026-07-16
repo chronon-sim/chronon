@@ -110,11 +110,38 @@ inline std::vector<uint64_t> shortestDistances(size_t num_clusters, const std::v
     return distance;
 }
 
+inline uint64_t shortestDistance(size_t num_clusters, const std::vector<Edge>& edges,
+                                 const std::vector<std::vector<size_t>>& adjacency,
+                                 const std::vector<bool>& active, size_t source, size_t target) {
+    using QueueEntry = std::pair<uint64_t, size_t>;
+    std::priority_queue<QueueEntry, std::vector<QueueEntry>, std::greater<QueueEntry>> ready;
+    std::vector<uint64_t> distance(num_clusters, kInfiniteDistance);
+    distance[source] = 0;
+    ready.emplace(0, source);
+
+    while (!ready.empty()) {
+        const auto [current_distance, cluster] = ready.top();
+        ready.pop();
+        if (current_distance != distance[cluster]) continue;
+        if (cluster == target) return current_distance;
+
+        for (size_t edge_index : adjacency[cluster]) {
+            if (!active[edge_index]) continue;
+            const Edge& edge = edges[edge_index];
+            const uint64_t candidate = saturatingDistanceAdd(current_distance, edge.delay);
+            if (candidate >= distance[edge.predecessor]) continue;
+            distance[edge.predecessor] = candidate;
+            ready.emplace(candidate, edge.predecessor);
+        }
+    }
+    return kInfiniteDistance;
+}
+
 }  // namespace detail
 
 /// Greedily remove progress constraints implied by an alternate path of equal
-/// or smaller total delay. Each dependent cluster uses one incremental
-/// shortest-path scan rather than restarting Dijkstra for every candidate.
+/// or smaller total delay. Candidates are processed in stable order, so an
+/// edge removed earlier can never serve as the witness for a later removal.
 inline Result reduce(size_t num_clusters, std::span<const Edge> input) {
     const std::vector<Edge> edges = detail::normalizePairMinimumEdges(num_clusters, input);
     const auto adjacency = detail::buildAdjacency(num_clusters, edges);
@@ -129,65 +156,12 @@ inline Result reduce(size_t num_clusters, std::span<const Edge> input) {
         ++result.fan_in_before[edge.dependent];
     }
 
-    using QueueEntry = std::pair<uint64_t, size_t>;
-    size_t group_begin = 0;
-    while (group_begin < edges.size()) {
-        const size_t source = edges[group_begin].dependent;
-        size_t group_end = group_begin + 1;
-        while (group_end < edges.size() && edges[group_end].dependent == source) {
-            ++group_end;
-        }
-
-        // A path witnessing a direct source edge can be chosen without
-        // revisiting source, so exclude the whole source group and seed only
-        // the direct edges retained during this scan.
-        for (size_t i = group_begin; i < group_end; ++i) active[i] = false;
-
-        std::vector<size_t> candidates;
-        candidates.reserve(group_end - group_begin);
-        for (size_t i = group_begin; i < group_end; ++i) candidates.push_back(i);
-        std::sort(candidates.begin(), candidates.end(), [&](size_t lhs, size_t rhs) {
-            if (edges[lhs].delay != edges[rhs].delay) {
-                return edges[lhs].delay < edges[rhs].delay;
-            }
-            // For equal delays, prefer the later normalized edge. This makes
-            // zero-delay mutual witnesses deterministic without batch removal.
-            return lhs > rhs;
-        });
-
-        std::vector<uint64_t> distance(num_clusters, kInfiniteDistance);
-        std::priority_queue<QueueEntry, std::vector<QueueEntry>, std::greater<QueueEntry>> ready;
-        distance[source] = 0;
-        ready.emplace(0, source);
-
-        auto settleThrough = [&](uint64_t limit) {
-            while (!ready.empty() && ready.top().first <= limit) {
-                const auto [current_distance, cluster] = ready.top();
-                ready.pop();
-                if (current_distance != distance[cluster]) continue;
-
-                for (size_t edge_index : adjacency[cluster]) {
-                    if (!active[edge_index]) continue;
-                    const Edge& edge = edges[edge_index];
-                    const uint64_t next = saturatingDistanceAdd(current_distance, edge.delay);
-                    if (next >= distance[edge.predecessor]) continue;
-                    distance[edge.predecessor] = next;
-                    ready.emplace(next, edge.predecessor);
-                }
-            }
-        };
-
-        for (size_t edge_index : candidates) {
-            const Edge& candidate = edges[edge_index];
-            settleThrough(candidate.delay);
-            if (distance[candidate.predecessor] <= candidate.delay) continue;
-
-            active[edge_index] = true;
-            distance[candidate.predecessor] = candidate.delay;
-            ready.emplace(candidate.delay, candidate.predecessor);
-        }
-
-        group_begin = group_end;
+    for (size_t i = 0; i < edges.size(); ++i) {
+        const Edge& candidate = edges[i];
+        active[i] = false;
+        const uint64_t alternate = detail::shortestDistance(
+            num_clusters, edges, adjacency, active, candidate.dependent, candidate.predecessor);
+        if (alternate > candidate.delay) active[i] = true;
     }
 
     for (size_t i = 0; i < edges.size(); ++i) {
