@@ -780,23 +780,35 @@ void ObservationBackend::setCounterSnapshotPlans(std::vector<CounterSnapshotPlan
     counter_snapshot_plans_ = std::move(plans);
 }
 
+void ObservationBackend::setCounterColumns(std::vector<CounterSnapshotEntryMetadata> columns) {
+    counter_column_metadata_ = std::move(columns);
+}
+
 void ObservationBackend::prepareCounterSnapshotPlans_() {
     counter_snapshot_column_indices_.clear();
     counter_snapshot_column_indices_.resize(counter_snapshot_plans_.size());
+
+    auto register_column = [this](const CounterSnapshotEntryMetadata& entry) {
+        std::string key;
+        key.reserve(entry.unit_name.size() + 1 + entry.counter_name.size());
+        key.append(entry.unit_name);
+        key.push_back('.');
+        key.append(entry.counter_name);
+        auto [it, inserted] = counter_col_index_.try_emplace(key, counter_columns_.size());
+        if (inserted) counter_columns_.push_back(std::move(key));
+        return it->second;
+    };
+
+    for (const auto& entry : counter_column_metadata_) {
+        (void)register_column(entry);
+    }
 
     for (size_t plan_id = 0; plan_id < counter_snapshot_plans_.size(); ++plan_id) {
         const auto& entries = counter_snapshot_plans_[plan_id].entries;
         auto& columns = counter_snapshot_column_indices_[plan_id];
         columns.reserve(entries.size());
         for (const auto& entry : entries) {
-            std::string key;
-            key.reserve(entry.unit_name.size() + 1 + entry.counter_name.size());
-            key.append(entry.unit_name);
-            key.push_back('.');
-            key.append(entry.counter_name);
-            auto [it, inserted] = counter_col_index_.try_emplace(key, counter_columns_.size());
-            if (inserted) counter_columns_.push_back(std::move(key));
-            columns.push_back(it->second);
+            columns.push_back(register_column(entry));
         }
     }
 

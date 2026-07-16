@@ -774,6 +774,69 @@ void test_periodic_counter_snapshot_is_metadata_indexed_batch() {
     std::cout << "PASSED\n";
 }
 
+void test_pivoted_csv_preserves_unowned_final_counter_columns() {
+    std::cout << "Testing pivoted CSV preserves unowned final counter columns... ";
+
+    const std::string out_dir = "/tmp/chronon_unowned_final_counter";
+    std::filesystem::remove_all(out_dir);
+
+    ObservationQueue shared(64 * 1024);
+    std::vector<std::unique_ptr<ObservationContext>> contexts;
+
+    auto owned = std::make_unique<ObservationContext>(&shared, []() { return 10ULL; }, 0, "owned");
+    owned->setCounterOwnerId(0);
+    const CounterId periodic = owned->counters().addCounter("periodic");
+    owned->counters().getUnchecked(periodic).increment(3);
+    contexts.push_back(std::move(owned));
+
+    auto unowned =
+        std::make_unique<ObservationContext>(&shared, []() { return 10ULL; }, 0, "unowned");
+    unowned->enableCategory(category::LOG_INFO);
+    CHECK(unowned->timelineEvent(category::NONE, TimelineEventKind::SpanEnd, /*track_id=*/1,
+                                 /*slot=*/0, /*name_id=*/0, /*payload=*/0, nullptr, 0));
+    CHECK(unowned->observationStats().get<ObservationChannel::Trace>().emitted == 1);
+    const CounterId final_only = unowned->counters().addCounter("final_only");
+    unowned->counters().getUnchecked(final_only).increment(7);
+    contexts.push_back(std::move(unowned));
+
+    CounterRegistry registry;
+    registry.reregisterAll(contexts);
+    CHECK(registry.snapshotPlans().size() == 1);
+    CHECK(registry.counterColumns().size() == 6);
+
+    ObservationBackend::Config config;
+    config.output_dir = out_dir;
+    config.enable_counter_csv = true;
+    config.counter_csv_format = CounterCsvFormat::Pivoted;
+    config.enable_reordering = false;
+    config.timeline_enabled = false;
+
+    ObservationBackend backend(shared, config);
+    backend.setCounterColumns(registry.counterColumns());
+    backend.setCounterSnapshotPlans(registry.snapshotPlans());
+    backend.start();
+    const auto csv_path = backend.outputDir() / "counters.csv";
+
+    registry.dumpFinalSnapshot(10, &shared, contexts);
+    backend.stop();
+
+    std::ifstream csv(csv_path);
+    std::string header;
+    std::string row;
+    CHECK(static_cast<bool>(std::getline(csv, header)));
+    CHECK(static_cast<bool>(std::getline(csv, row)));
+    CHECK(header.find("owned.periodic") != std::string::npos);
+    CHECK(header.find("unowned.final_only") != std::string::npos);
+    CHECK(header.find("unowned.obs_trace_emitted") != std::string::npos);
+    CHECK(header.find("unowned.obs_trace_dropped") != std::string::npos);
+    CHECK(header.find("unowned.obs_info_emitted") != std::string::npos);
+    CHECK(header.find("unowned.obs_info_dropped") != std::string::npos);
+    CHECK(row.starts_with("10,"));
+
+    std::filesystem::remove_all(out_dir);
+    std::cout << "PASSED\n";
+}
+
 void test_pipeline_slice_name_cache_is_bounded() {
     std::cout << "Testing pipeline slice name cache bound... ";
 
@@ -817,6 +880,7 @@ int main() {
     test_timeline_restart_redeclares_tracks();
     test_counter_group_does_not_collide_with_child_unit();
     test_periodic_counter_snapshot_is_metadata_indexed_batch();
+    test_pivoted_csv_preserves_unowned_final_counter_columns();
     test_pipeline_slice_name_cache_is_bounded();
 
     std::cout << "\n=== Observation hardening tests PASSED ===\n";
