@@ -169,12 +169,18 @@ void test_trace_channel_config_disables_timeline_producer() {
     assert(!ctx->traceChannelEnabled());
     assert(ctx->timelineEventsEnabled());
 
-    ctx->enableCategory(category::TRACE);
+    assert(!ctx->filter().shouldObserve(category::TRACE));
     assert(!ctx->shouldTrace(category::TRACE));
     assert(
         !ctx->timelineEvent(category::TRACE, TimelineEventKind::Instant, 1, 0, 0, 0, nullptr, 0));
     assert(ctx->observationStats().get<ObservationChannel::Trace>().emitted == 0);
     assert(ctx->observationStats().get<ObservationChannel::Trace>().dropped == 0);
+
+    ctx->setTraceChannelEnabled(true);
+    assert(ctx->traceChannelEnabled());
+    assert(ctx->timelineProducerEnabled());
+    assert(ctx->filter().shouldObserve(category::TRACE));
+    assert(ctx->shouldTrace(category::TRACE));
 
     mgr.shutdown();
     mgr.reset();

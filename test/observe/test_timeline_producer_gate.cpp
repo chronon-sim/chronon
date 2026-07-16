@@ -45,8 +45,10 @@ void test_timeline_event_producer_gate() {
     const size_t tracks_before = TimelineTrackRegistry::instance().size();
     GateTestUnit unit;
     unit.setObservationContext(&ctx);
-    CHECK(!unit.lane.isRegistered() && !unit.counter.isRegistered());
-    CHECK(TimelineTrackRegistry::instance().size() == tracks_before);
+    CHECK(unit.lane.isRegistered() && unit.counter.isRegistered());
+    CHECK(unit.lane.trackId() == tracks_before + 1);
+    CHECK(unit.counter.trackId() == tracks_before + 2);
+    CHECK(TimelineTrackRegistry::instance().size() == tracks_before + 2);
     unit.cycle = 20;
     CHECK(!unit.lane.instant(0, GATE_CAT, "disabled"_ev));
     CHECK(!unit.lane.end(0));
@@ -57,12 +59,12 @@ void test_timeline_event_producer_gate() {
 
     ctx.setLookaheadMode(true);
     ctx.setTraceChannelEnabled(true);
-    CHECK(TimelineTrackRegistry::instance().size() == tracks_before);
+    CHECK(ctx.filter().shouldObserve(category::TRACE));
+    CHECK(TimelineTrackRegistry::instance().size() == tracks_before + 2);
     unit.cycle = 24;
-    CHECK(unit.lane.instant(0, GATE_CAT, "enabled_later"_ev) && unit.lane.isRegistered());
-    CHECK(TimelineTrackRegistry::instance().size() == tracks_before + 1);
+    CHECK(unit.lane.instant(0, GATE_CAT, "enabled_later"_ev));
     unit.cycle = 25;
-    CHECK(unit.counter.sample(3) && unit.counter.isRegistered());
+    CHECK(unit.counter.sample(3));
     CHECK(TimelineTrackRegistry::instance().size() == tracks_before + 2);
     CHECK(unit.cycle_reads == 2 && trace_stats.emitted == 2 && trace_stats.dropped == 0);
     ctx.rollbackEpoch();

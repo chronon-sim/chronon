@@ -89,7 +89,14 @@ public:
     void setCountersEnabled(bool enabled) noexcept { counters_enabled_ = enabled; }
 
     bool traceChannelEnabled() const noexcept { return trace_channel_enabled_; }
-    void setTraceChannelEnabled(bool enabled) noexcept { trace_channel_enabled_ = enabled; }
+    void setTraceChannelEnabled(bool enabled) noexcept {
+        trace_channel_enabled_ = enabled;
+        if (enabled) {
+            filter_.enableCategory(category::TRACE);
+        } else {
+            filter_.disableCategory(category::TRACE);
+        }
+    }
 
     bool timelineEventsEnabled() const noexcept { return timeline_events_enabled_; }
     void setTimelineEventsEnabled(bool enabled) noexcept { timeline_events_enabled_ = enabled; }
