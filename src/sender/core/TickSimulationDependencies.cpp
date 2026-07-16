@@ -107,8 +107,10 @@ void TickSimulation::buildCrossThreadDependencies() {
 
     if (transitiveDependencyPruneEnabled()) {
         std::vector<weighted_dependency_reduction::Edge> edges;
+        size_t total_edges = 0;
+        for (const auto& dependencies : min_delay) total_edges += dependencies.size();
+        edges.reserve(total_edges);
         for (size_t cluster = 0; cluster < num_clusters; ++cluster) {
-            edges.reserve(edges.size() + min_delay[cluster].size());
             for (const auto& [pred_cluster, delay] : min_delay[cluster]) {
                 edges.push_back({cluster, pred_cluster, delay});
             }
