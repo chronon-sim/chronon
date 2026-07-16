@@ -82,12 +82,16 @@ public:
     const std::vector<CounterSnapshotPlanMetadata>& snapshotPlans() const noexcept {
         return snapshot_plan_metadata_;
     }
+    const std::vector<CounterSnapshotEntryMetadata>& counterColumns() const noexcept {
+        return counter_column_metadata_;
+    }
 
     void clear() {
         counters_.clear();
         derived_defs_.clear();
         owner_snapshot_plans_.clear();
         snapshot_plan_metadata_.clear();
+        counter_column_metadata_.clear();
     }
 
 private:
@@ -124,6 +128,7 @@ private:
     std::vector<DerivedCounterDef> derived_defs_;
     std::vector<OwnerSnapshotPlan> owner_snapshot_plans_;
     std::vector<CounterSnapshotPlanMetadata> snapshot_plan_metadata_;
+    std::vector<CounterSnapshotEntryMetadata> counter_column_metadata_;
 };
 
 }  // namespace chronon::observe

@@ -66,6 +66,28 @@ constexpr size_t maxBatchEntries() noexcept {
            sizeof(uint64_t);
 }
 
+template <typename Callback>
+void forEachSnapshotEntry(ObservationContext& ctx, Callback&& callback) {
+    auto& counters = ctx.counters().counters();
+    for (size_t i = 0; i < counters.size(); ++i) {
+        const auto id = makeCounterId(static_cast<uint32_t>(i));
+        const auto& info = ctx.counters().info(id);
+        if (info.name.empty()) continue;
+        callback(ctx.unitName(), info.name, &counters[i], nullptr);
+    }
+
+    constexpr size_t num_channels = static_cast<size_t>(ObservationChannel::NumChannels);
+    const auto& stats = ctx.observationStats();
+    for (size_t i = 0; i < num_channels; ++i) {
+        const auto channel = static_cast<ObservationChannel>(i);
+        if (!ctx.filter().shouldObserve(observationStatsCategory(channel))) continue;
+        const auto& channel_stats = stats.get(channel);
+        const std::string prefix = std::string("obs_") + ObservationStats::channelName(channel);
+        callback(ctx.unitName(), prefix + "_emitted", nullptr, &channel_stats.emitted);
+        callback(ctx.unitName(), prefix + "_dropped", nullptr, &channel_stats.dropped);
+    }
+}
+
 }  // namespace
 
 void CounterRegistry::rebuildOwnerSnapshotPlans_(
@@ -81,35 +103,23 @@ void CounterRegistry::rebuildOwnerSnapshotPlans_(
 
     owner_snapshot_plans_.clear();
     snapshot_plan_metadata_.clear();
-    if (!has_owner) return;
-    owner_snapshot_plans_.resize(max_owner + 1);
+    counter_column_metadata_.clear();
+    if (has_owner) owner_snapshot_plans_.resize(max_owner + 1);
 
     for (const auto& ctx : contexts) {
-        if (!ctx || ctx->counterOwnerId() == SIZE_MAX) continue;
-        auto& plan = owner_snapshot_plans_[ctx->counterOwnerId()];
-        auto& counters = ctx->counters().counters();
-        for (size_t i = 0; i < counters.size(); ++i) {
-            const auto id = makeCounterId(static_cast<uint32_t>(i));
-            const auto& info = ctx->counters().info(id);
-            if (info.name.empty()) continue;
-            plan.entries.push_back({ctx->unitName(), info.name, &counters[i], nullptr});
+        if (!ctx) continue;
+        OwnerSnapshotPlan* owner_plan = nullptr;
+        if (ctx->counterOwnerId() != SIZE_MAX) {
+            owner_plan = &owner_snapshot_plans_[ctx->counterOwnerId()];
         }
-
-        constexpr size_t num_channels = static_cast<size_t>(ObservationChannel::NumChannels);
-        const auto& stats = ctx->observationStats();
-        for (size_t i = 0; i < num_channels; ++i) {
-            const auto channel = static_cast<ObservationChannel>(i);
-            if (!ctx->filter().shouldObserve(observationStatsCategory(channel))) continue;
-            const auto& channel_stats = stats.get(channel);
-            const std::string prefix = std::string("obs_") + ObservationStats::channelName(channel);
-            const std::string emitted_name = prefix + "_emitted";
-            plan.entries.push_back(
-                {ctx->unitName(), emitted_name, nullptr, &channel_stats.emitted});
-
-            const std::string dropped_name = prefix + "_dropped";
-            plan.entries.push_back(
-                {ctx->unitName(), dropped_name, nullptr, &channel_stats.dropped});
-        }
+        forEachSnapshotEntry(
+            *ctx, [&](const std::string& unit_name, const std::string& counter_name,
+                      SimpleCounter* counter, const uint64_t* scalar) {
+                counter_column_metadata_.push_back({unit_name, counter_name});
+                if (owner_plan) {
+                    owner_plan->entries.push_back({unit_name, counter_name, counter, scalar});
+                }
+            });
     }
 
     // Split only to respect RecordHeader::total_size. Normal owner plans fit

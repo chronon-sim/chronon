@@ -146,6 +146,11 @@ public:
     /// PRECONDITION: called before start().
     void setCounterSnapshotPlans(std::vector<CounterSnapshotPlanMetadata> plans);
 
+    /// Register the complete raw counter schema, including contexts that only
+    /// contribute legacy/final snapshots and therefore have no periodic plan.
+    /// PRECONDITION: called before start().
+    void setCounterColumns(std::vector<CounterSnapshotEntryMetadata> columns);
+
     void setSourceNameLookup(std::function<std::string_view(uint16_t)> lookup) noexcept {
         source_name_lookup_ = std::move(lookup);
         // Pre-populate a flat cache so the hot path avoids std::function dispatch.
@@ -407,6 +412,7 @@ private:
 
     std::vector<CounterSnapshotPlanMetadata> counter_snapshot_plans_;
     std::vector<std::vector<size_t>> counter_snapshot_column_indices_;
+    std::vector<CounterSnapshotEntryMetadata> counter_column_metadata_;
 
     std::vector<DerivedCounterDef> derived_counter_defs_;
 
