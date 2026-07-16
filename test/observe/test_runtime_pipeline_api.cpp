@@ -25,7 +25,11 @@ inline const auto PIPE_CAT = Category<"runtime_pipe_cat", "Runtime pipeline API 
 
 struct TestUnit : public ObservableUnit {
     uint64_t cycle = 0;
-    uint64_t getObserveCycle() const noexcept override { return cycle; }
+    mutable uint64_t cycle_reads = 0;
+    uint64_t getObserveCycle() const noexcept override {
+        ++cycle_reads;
+        return cycle;
+    }
 };
 
 const DecodedTrack* childTrack(const DecodedTrace& trace, std::string_view name,
@@ -118,13 +122,29 @@ void test_disabled_runtime_pipe_skips_track_registration() {
 
     ObservationQueue queue(256 * 1024);
     ObservationContext ctx(&queue, []() { return 0ULL; }, 0, "fetch", 1);
+    ctx.enableCategory(category::TRACE | PIPE_CAT.mask());
     TestUnit unit;
     unit.setObservationContext(&ctx);
 
-    const size_t tracks_before = TimelineTrackRegistry::instance().size();
-    unit.pipeStage<"DISABLED_RT">(2, PIPE_CAT, 1);
-    unit.pipeStageHex<"DISABLED_RT_HEX">(3, PIPE_CAT, 2);
-    CHECK(TimelineTrackRegistry::instance().size() == tracks_before);
+    auto exercise_disabled_producers = [&]() {
+        unit.cycle_reads = 0;
+        ctx.setCurrentCycleValue(0xdef);
+        const size_t tracks_before = TimelineTrackRegistry::instance().size();
+        unit.pipeStage<"DISABLED_RT">(2, PIPE_CAT, 1);
+        unit.pipeStageHex<"DISABLED_RT_HEX">(3, PIPE_CAT, 2);
+        unit.pipeStage<"DISABLED_RT_SLOW">(17, PIPE_CAT, 3);
+        chronon::observe::pipeStage<"DIRECT_DISABLED_RT">(&ctx, 4, PIPE_CAT, 4);
+        chronon::observe::pipeStageHex<"DIRECT_DISABLED_RT_HEX">(&ctx, 18, PIPE_CAT, 5);
+        CHECK(unit.cycle_reads == 0);
+        CHECK(ctx.currentCycle() == 0xdef);
+        CHECK(TimelineTrackRegistry::instance().size() == tracks_before);
+    };
+
+    ctx.setTraceChannelEnabled(false);
+    exercise_disabled_producers();
+    ctx.setTraceChannelEnabled(true);
+    ctx.setTimelineEventsEnabled(false);
+    exercise_disabled_producers();
 
     std::cout << "PASSED\n";
 }

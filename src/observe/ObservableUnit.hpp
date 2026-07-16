@@ -159,7 +159,7 @@ public:
      */
     template <uint16_t Pipe, uint16_t Stage, typename Cat, typename... Items>
     void pipe(Cat category, uint64_t id, Items&&... items) {
-        if (observe_ctx_) {
+        if (observe_ctx_ && observe_ctx_->timelineProducerEnabled()) {
             observe_ctx_->setCurrentCycleValue(getObserveCycle());
             chronon::observe::pipe<Pipe, Stage>(observe_ctx_, category, id,
                                                 std::forward<Items>(items)...);
@@ -168,7 +168,7 @@ public:
 
     template <uint16_t Pipe, FixedString Stage, typename Cat, typename... Items>
     void pipeStage(Cat category, uint64_t id, Items&&... items) {
-        if (observe_ctx_) {
+        if (observe_ctx_ && observe_ctx_->timelineProducerEnabled()) {
             observe_ctx_->setCurrentCycleValue(getObserveCycle());
             chronon::observe::pipeStage<Pipe, Stage>(observe_ctx_, category, id,
                                                      std::forward<Items>(items)...);
@@ -177,7 +177,7 @@ public:
 
     template <uint16_t Pipe, FixedString Stage, typename Cat, typename... Items>
     void pipeStageHex(Cat category, uint64_t id, Items&&... items) {
-        if (observe_ctx_) {
+        if (observe_ctx_ && observe_ctx_->timelineProducerEnabled()) {
             observe_ctx_->setCurrentCycleValue(getObserveCycle());
             chronon::observe::pipeStageHex<Pipe, Stage>(observe_ctx_, category, id,
                                                         std::forward<Items>(items)...);
@@ -186,7 +186,7 @@ public:
 
     template <FixedString Stage, typename Cat, typename... Items>
     void pipeStage(uint16_t pipe, Cat category, uint64_t id, Items&&... items) {
-        if (observe_ctx_) {
+        if (observe_ctx_ && observe_ctx_->timelineProducerEnabled()) {
             observe_ctx_->setCurrentCycleValue(getObserveCycle());
             chronon::observe::pipeStage<Stage>(observe_ctx_, pipe, category, id,
                                                std::forward<Items>(items)...);
@@ -195,7 +195,7 @@ public:
 
     template <FixedString Stage, typename Cat, typename... Items>
     void pipeStageHex(uint16_t pipe, Cat category, uint64_t id, Items&&... items) {
-        if (observe_ctx_) {
+        if (observe_ctx_ && observe_ctx_->timelineProducerEnabled()) {
             observe_ctx_->setCurrentCycleValue(getObserveCycle());
             chronon::observe::pipeStageHex<Stage>(observe_ctx_, pipe, category, id,
                                                   std::forward<Items>(items)...);

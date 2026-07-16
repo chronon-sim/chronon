@@ -54,7 +54,11 @@ struct TestUnit : public ObservableUnit {
     TimelineCapacity member_capacity{this, "member_capacity", "entries"};
 
     uint64_t cycle = 0;
-    uint64_t getObserveCycle() const noexcept override { return cycle; }
+    mutable uint64_t cycle_reads = 0;
+    uint64_t getObserveCycle() const noexcept override {
+        ++cycle_reads;
+        return cycle;
+    }
 };
 
 /// Events on @p track_uuid, in file order.
@@ -763,29 +767,25 @@ void test_disabled_pipeline_skips_track_registration() {
 
 void test_timeline_event_producer_gate() {
     std::cout << "Testing timeline event producer gate... ";
-
     ObservationQueue queue(256 * 1024);
     ObservationContext ctx(&queue, []() { return 0ULL; }, 0, "fetch", 1);
     ctx.enableCategory(category::TRACE | LANE_CAT.mask());
-
     TestUnit unit;
     unit.setObservationContext(&ctx);
-
-    CHECK(ctx.timelineEventsEnabled());
-    ctx.setTimelineEventsEnabled(false);
-    CHECK(!ctx.timelineEventsEnabled());
-
+    CHECK(ctx.timelineProducerEnabled());
+    ctx.setTraceChannelEnabled(false);
+    CHECK(!ctx.timelineProducerEnabled());
     unit.cycle = 20;
     CHECK(!unit.mshr.begin(0, LANE_CAT, "disabled"_ev, flow(7), arg<"addr">(0x100ULL)));
     unit.cycle = 21;
     CHECK(!unit.mshr.end(0));
     unit.cycle = 22;
     CHECK(!unit.port.instant(0, LANE_CAT, "disabled_instant"_ev));
-
+    CHECK(!unit.occ.sample(3));
+    CHECK(unit.cycle_reads == 0);
     const auto& trace_stats = ctx.observationStats().get<ObservationChannel::Trace>();
     CHECK(trace_stats.emitted == 0);
     CHECK(trace_stats.dropped == 0);
-
     std::cout << "PASSED\n";
 }
 
