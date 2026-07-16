@@ -94,7 +94,11 @@ void TickSimulation::buildCrossThreadDependencies() {
         add_dep(dst_cluster, src_cluster, conn->delay());
 
         const size_t headroom = conn->crossThreadHeadroom();
-        if (headroom != std::numeric_limits<size_t>::max() && headroom > 0) {
+        // The global lookahead floor already bounds producer run-ahead when
+        // the transport can retain more cycles than max_lookahead. Install a
+        // reverse edge only for the tighter per-connection constraint.
+        if (headroom != std::numeric_limits<size_t>::max() && headroom > 0 &&
+            headroom <= config_.max_lookahead_cycles) {
             const uint64_t safe_cap = static_cast<uint64_t>(headroom - 1);
             const auto delay = static_cast<uint32_t>(std::min<uint64_t>(safe_cap, UINT32_MAX));
             add_dep(src_cluster, dst_cluster, delay);

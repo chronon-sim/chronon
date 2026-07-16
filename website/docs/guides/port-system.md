@@ -228,7 +228,10 @@ only when the model has proved those operations are absent and every bound edge
 has delay one. `publish()` preserves the normal delay-one consumer wakeup, so
 activity-scheduled units may jump over empty cycles; they must call `consume()`
 on every tick in which they run. `sealPortTopology()` validates the complete
-delay-one fanout before changing any connection to dependency-only transport.
+delay-one fanout before changing any connection to dependency-only transport
+and exposes the finite ring depth as scheduler headroom. When necessary, the
+lookahead scheduler adds reverse dependencies that prevent a producer from
+wrapping an unread bucket.
 
 ## Usage Pattern
 

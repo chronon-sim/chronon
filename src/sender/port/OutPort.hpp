@@ -74,7 +74,7 @@ public:
      */
     Connection<T>* connect(InPort<T>* to, uint32_t delay) {
         auto conn = std::make_unique<Connection<T>>(this, to, delay);
-        conn->setDependencyOnlyTransport(dependency_only_transport_);
+        conn->setDependencyOnlyTransport(dependency_only_transport_, dependency_only_headroom_);
         auto* ptr = conn.get();
         connections_.push_back(std::move(conn));
         return ptr;
@@ -221,11 +221,16 @@ public:
     /// Disable physical payload transport while retaining all connections as
     /// scheduler dependency edges. Configure this before simulation
     /// initialization. send()/canSend() still enforce the OutPort's per-cycle
-    /// capacity without walking the fanout.
-    void setDependencyOnlyTransport(bool enabled = true) noexcept {
+    /// capacity without walking the fanout. A finite cross_thread_headroom is
+    /// exported through every connection for scheduler reverse dependencies.
+    void setDependencyOnlyTransport(
+        bool enabled = true,
+        size_t cross_thread_headroom = std::numeric_limits<size_t>::max()) noexcept {
         dependency_only_transport_ = enabled;
+        dependency_only_headroom_ =
+            enabled ? cross_thread_headroom : std::numeric_limits<size_t>::max();
         for (auto& conn : connections_) {
-            conn->setDependencyOnlyTransport(enabled);
+            conn->setDependencyOnlyTransport(enabled, dependency_only_headroom_);
         }
     }
 
@@ -304,6 +309,7 @@ private:
     mutable size_t sent_this_cycle_ = 0;
     mutable uint64_t last_counted_cycle_ = 0;
     bool dependency_only_transport_ = false;
+    size_t dependency_only_headroom_ = std::numeric_limits<size_t>::max();
 };
 
 template <typename T>

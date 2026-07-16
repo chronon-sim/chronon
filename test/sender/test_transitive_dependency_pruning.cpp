@@ -94,6 +94,9 @@ std::vector<reduction::Edge> buildConstraintGraph(const char* prune_value,
     config.num_threads = 2;
     config.enable_weighted_partitioning = false;
     config.enable_dynamic_rebalance = false;
+    // Exceed the default lock-free ring headroom so this test continues to
+    // exercise pruning of necessary reverse capacity constraints.
+    config.max_lookahead_cycles = 5000;
     TickSimulation sim(config);
     auto* a = sim.createUnit<PassUnit>("a");
     auto* b = sim.createUnit<PassUnit>("b");
@@ -145,6 +148,24 @@ ZeroCycleSnapshot buildHeadroomZeroCycleGraph(const char* prune_value) {
     return {snapshotDependencies(sim), TransitiveDependencyPruneTestAccess::hasZeroDelayCycle(sim)};
 }
 
+std::vector<reduction::Edge> buildDependencyOnlyHeadroomGraph(size_t headroom,
+                                                              uint32_t max_lookahead) {
+    ScopedEnvironmentVariable prune("CHRONON_EXPERIMENTAL_TRANSITIVE_DEP_PRUNE", "0");
+
+    TickSimulationConfig config;
+    config.num_threads = 2;
+    config.enable_weighted_partitioning = false;
+    config.enable_dynamic_rebalance = false;
+    config.max_lookahead_cycles = max_lookahead;
+    TickSimulation sim(config);
+    auto* producer = sim.createUnit<PassUnit>("producer");
+    auto* consumer = sim.createUnit<PassUnit>("consumer");
+    sim.connect(producer->out, consumer->in, 1);
+    producer->out.setDependencyOnlyTransport(true, headroom);
+    sim.initialize();
+    return snapshotDependencies(sim);
+}
+
 void test_runtime_prunes_only_transitively_implied_constraints() {
     std::cout << "Testing runtime transitive dependency pruning... ";
 
@@ -183,11 +204,27 @@ void test_pruning_does_not_hide_headroom_zero_delay_cycle() {
     std::cout << "PASSED\n";
 }
 
+void test_dependency_only_headroom_adds_reverse_edge_only_when_tighter() {
+    std::cout << "Testing dependency-only headroom constraint selection... ";
+
+    const auto tighter = buildDependencyOnlyHeadroomGraph(/*headroom=*/8, /*max_lookahead=*/100);
+    CHECK(tighter.size() == 2);
+    CHECK(tighter[0].delay == 7 || tighter[1].delay == 7);
+
+    const auto global_floor_suffices =
+        buildDependencyOnlyHeadroomGraph(/*headroom=*/512, /*max_lookahead=*/100);
+    CHECK(global_floor_suffices.size() == 1);
+    CHECK(global_floor_suffices[0].delay == 1);
+
+    std::cout << "PASSED\n";
+}
+
 }  // namespace
 
 int main() {
     test_runtime_prunes_only_transitively_implied_constraints();
     test_pruning_does_not_hide_headroom_zero_delay_cycle();
+    test_dependency_only_headroom_adds_reverse_edge_only_when_tighter();
     std::cout << "All transitive dependency pruning tests passed!\n";
     return 0;
 }

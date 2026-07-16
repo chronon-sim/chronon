@@ -47,7 +47,11 @@ public:
     /// Keep this edge in the scheduler dependency graph without transporting
     /// payloads. Intended for model-owned shared fabrics that carry data once
     /// while declared connections continue to describe ordering and delay.
-    virtual void setDependencyOnlyTransport(bool enabled) noexcept = 0;
+    /// A finite cross_thread_headroom lets the scheduler constrain producer
+    /// run-ahead to the external transport's storage.
+    virtual void setDependencyOnlyTransport(
+        bool enabled,
+        size_t cross_thread_headroom = std::numeric_limits<size_t>::max()) noexcept = 0;
     virtual bool dependencyOnlyTransport() const noexcept = 0;
 
     /**
@@ -399,8 +403,12 @@ public:
     void* destPortPtr() const noexcept override { return static_cast<void*>(to_); }
     IArbitratablePort* registerOnDestMPSC() override;
 
-    void setDependencyOnlyTransport(bool enabled) noexcept override {
+    void setDependencyOnlyTransport(
+        bool enabled,
+        size_t cross_thread_headroom = std::numeric_limits<size_t>::max()) noexcept override {
         dependency_only_transport_ = enabled;
+        dependency_only_headroom_ =
+            enabled ? cross_thread_headroom : std::numeric_limits<size_t>::max();
         if (enabled) {
             thread_queue_id_ = SIZE_MAX;
         }
@@ -461,7 +469,7 @@ public:
     }
 
     bool ensureEpochFreeHeadroom(uint32_t max_lookahead_cycles) override {
-        if (dependency_only_transport_) return true;
+        if (dependency_only_transport_) return dependency_only_headroom_ > 0;
         if (crossThreadHeadroom() > 0) return true;
         if (edgeAdmissionCapacity_() != InPort<T>::UNLIMITED_CAPACITY) {
             return false;
@@ -499,7 +507,7 @@ public:
     }
 
     size_t crossThreadHeadroom() const noexcept override {
-        if (dependency_only_transport_) return SIZE_MAX;
+        if (dependency_only_transport_) return dependency_only_headroom_;
         // Identify the bounded cross-thread buffer this connection fills:
         //   MPSC (thread_queue_id_ set) -> the per-connection staging ring,
         //   SPSC (lock-free ring)       -> the InPort's lock-free queue (finite
@@ -786,6 +794,9 @@ private:
     /// stamped with the epoch value at send time. If the epoch changes
     /// before the receiver consumes it, the message is dropped.
     std::atomic<uint64_t> cancel_epoch_{0};
+    /// Finite producer run-ahead supported by a model-owned external
+    /// transport. SIZE_MAX retains the legacy unbounded dependency-only edge.
+    size_t dependency_only_headroom_ = std::numeric_limits<size_t>::max();
 };
 
 }  // namespace chronon::sender

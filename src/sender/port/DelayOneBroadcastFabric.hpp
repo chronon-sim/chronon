@@ -139,7 +139,11 @@ public:
         }
 
         for (auto* out : producer_ports_) {
-            out->setDependencyOnlyTransport(true);
+            // One bucket is retained per source cycle. Reporting RingDepth as
+            // connection headroom makes the scheduler install a reverse
+            // dependency with RingDepth-1 cycles of producer slack whenever
+            // the global lookahead could otherwise wrap the shared ring.
+            out->setDependencyOnlyTransport(true, RingDepth);
         }
         sealed_ = true;
     }

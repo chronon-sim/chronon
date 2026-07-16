@@ -167,6 +167,8 @@ void test_port_topology_binding() {
     for (const auto& connection : out0.connections()) {
         EXPECT(connection->dependencyOnlyTransport(),
                "every bound connection must stop transporting payloads");
+        EXPECT(connection->crossThreadHeadroom() == Fabric::RING_DEPTH,
+               "dependency edge must expose finite shared-ring headroom");
     }
 
     c0.sleepForever();

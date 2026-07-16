@@ -10,7 +10,8 @@ entries.
 The API is intentionally opt-in and validates the full `P x C`, delay-one
 topology before mutating any connection. Publication preserves delay-one port
 wakeups; consumers drain on every scheduled tick and may jump over idle cycles.
-Bounded queue semantics, selective cancellation, and
+The declared dependency edges expose the finite cycle-ring headroom to bound
+producer run-ahead. Bounded queue semantics, selective cancellation, and
 `OutPort::cancelInFlight()` are outside the specialization.
 
 ## Clean Nucleus A/B
@@ -26,8 +27,8 @@ Bounded queue semantics, selective cancellation, and
 
 | Workload | Queue mean | Fabric mean | Wall-time reduction | Throughput gain |
 |---|---:|---:|---:|---:|
-| Dhrystone O3 GCC 12 | 3433.6 ms | 2980.4 ms | 13.20% | 15.21% |
-| CoreMark O2 GCC 13.2 | 6008.8 ms | 5575.4 ms | 7.21% | 7.77% |
+| Dhrystone O3 GCC 12 | 3432.2 ms | 3158.8 ms | 7.97% | 8.66% |
+| CoreMark O2 GCC 13.2 | 6416.8 ms | 5907.8 ms | 7.93% | 8.62% |
 
 Dhrystone completed at 409,668 cycles with the full benchmark variable
 validation on every run. CoreMark completed at 1,139,377 cycles with
@@ -36,8 +37,9 @@ had identical output and cycle count with the fabric on and off; its existing
 section-49 failure was present in both modes and is not attributed to this
 change.
 
-These figures were remeasured after preserving delay-one consumer wakeups in
-the shared transport.
+These figures were remeasured after preserving delay-one consumer wakeups and
+exporting finite ring headroom to the scheduler. Reverse capacity dependencies
+are added only when that headroom is tighter than the global lookahead floor.
 
 ## Verification
 
