@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -22,6 +24,15 @@
 #include <vector>
 
 namespace chronon::sender {
+
+namespace queue_detail {
+
+inline bool experimentalDirectSPSCEnabled() noexcept {
+    const char* value = std::getenv("CHRONON_EXPERIMENTAL_DIRECT_SPSC");
+    return value == nullptr || value[0] != '0' || value[1] != '\0';
+}
+
+}  // namespace queue_detail
 
 struct LockFreeQueueAdapterTestAccess;
 
@@ -604,6 +615,7 @@ private:
     mutable size_t popped_before_front_ = 0;
 };
 
+#include "DirectSPSCQueueAdapter.hpp"
 /**
  * MultiProducerQueueAdapter - Lock-free MPSC via independent SPSC queues.
  *
