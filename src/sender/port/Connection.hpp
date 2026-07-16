@@ -44,6 +44,12 @@ public:
     virtual Unit* destination() const noexcept = 0;
     virtual void* destPortPtr() const noexcept = 0;
 
+    /// Keep this edge in the scheduler dependency graph without transporting
+    /// payloads. Intended for model-owned shared fabrics that carry data once
+    /// while declared connections continue to describe ordering and delay.
+    virtual void setDependencyOnlyTransport(bool enabled) noexcept = 0;
+    virtual bool dependencyOnlyTransport() const noexcept = 0;
+
     /**
      * Optimize destination port for same-thread access.
      *
@@ -211,9 +217,16 @@ public:
      * @return true if transfer succeeded, false if destination full (back pressure)
      */
     bool transfer(T data, uint64_t send_cycle) {
+        maybeResetPushesCycle_(send_cycle);
+        if (dependency_only_transport_) {
+            if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
+                return false;
+            }
+            ++pushes_this_cycle_;
+            return true;
+        }
         uint64_t epoch_snapshot = cancel_epoch_.load(std::memory_order_acquire);
         const uint64_t arrive_cycle = send_cycle + delay_;
-        maybeResetPushesCycle_(send_cycle);
         // enqueue_cycle = sender's localCycle at push time. For StageSelective
         // predicates this is the basis of the "was this in flight at flush?"
         // decision. For LegacyFastPath policy ports the field is set but ignored.
@@ -270,6 +283,7 @@ public:
      * docs/mpsc-atomic-publish.md.
      */
     void cancelInFlight() noexcept override {
+        if (dependency_only_transport_) return;
         cancel_epoch_.fetch_add(1, std::memory_order_acq_rel);
     }
 
@@ -336,6 +350,11 @@ public:
 
     /// True if the destination can accept data (back-pressure preflight).
     bool canTransfer() const {
+        if (dependency_only_transport_) {
+            const uint64_t send_cycle = from_->getCurrentCycle();
+            maybeResetPushesCycle_(send_cycle);
+            return pushes_this_cycle_ < edgeCycleRateLimit_();
+        }
         // MPSC path: producer sees back-pressure only when its own staging
         // ring is full (bounded by the destination InPort's user_cap).
         // Admission into the shared queue is performed by the InPort arbiter
@@ -363,7 +382,17 @@ public:
     void* destPortPtr() const noexcept override { return static_cast<void*>(to_); }
     IArbitratablePort* registerOnDestMPSC() override;
 
+    void setDependencyOnlyTransport(bool enabled) noexcept override {
+        dependency_only_transport_ = enabled;
+        if (enabled) {
+            thread_queue_id_ = SIZE_MAX;
+        }
+    }
+
+    bool dependencyOnlyTransport() const noexcept override { return dependency_only_transport_; }
+
     void optimizeForSameThread() override {
+        if (dependency_only_transport_) return;
         thread_queue_id_ = SIZE_MAX;
         if (registered_capacity_.has_value()) {
             to_->setCapacity(*registered_capacity_);
@@ -372,6 +401,7 @@ public:
     }
 
     void optimizeForSPSC() override {
+        if (dependency_only_transport_) return;
         thread_queue_id_ = SIZE_MAX;
         if (registered_capacity_.has_value()) {
             to_->setCapacity(*registered_capacity_);
@@ -382,6 +412,7 @@ public:
     }
 
     void optimizeForMPSC() override {
+        if (dependency_only_transport_) return;
         // Size the SPSC staging ring now that to_->capacity() is finalized.
         // The producer back-pressures on stagingSize() >= to_->capacity(),
         // so the physical ring only needs room for the user cap plus one
@@ -413,6 +444,7 @@ public:
     }
 
     bool ensureEpochFreeHeadroom(uint32_t max_lookahead_cycles) override {
+        if (dependency_only_transport_) return true;
         if (crossThreadHeadroom() > 0) return true;
         if (edgeAdmissionCapacity_() != InPort<T>::UNLIMITED_CAPACITY) {
             return false;
@@ -435,14 +467,22 @@ public:
     }
 
     size_t registerProducerThread(size_t thread_id) override {
+        if (dependency_only_transport_) return SIZE_MAX;
         return to_->registerProducerThread(thread_id);
     }
 
-    void setThreadQueueId(size_t queue_id) override { thread_queue_id_ = queue_id; }
+    void setThreadQueueId(size_t queue_id) override {
+        if (!dependency_only_transport_) {
+            thread_queue_id_ = queue_id;
+        }
+    }
 
-    bool hasThreadQueueId() const noexcept override { return thread_queue_id_ != SIZE_MAX; }
+    bool hasThreadQueueId() const noexcept override {
+        return !dependency_only_transport_ && thread_queue_id_ != SIZE_MAX;
+    }
 
     size_t crossThreadHeadroom() const noexcept override {
+        if (dependency_only_transport_) return SIZE_MAX;
         // Identify the bounded cross-thread buffer this connection fills:
         //   MPSC (thread_queue_id_ set) -> the per-connection staging ring,
         //   SPSC (lock-free ring)       -> the InPort's lock-free queue (finite
@@ -625,6 +665,7 @@ private:
     OutPort<T>* from_;
     InPort<T>* to_;
     uint32_t delay_;
+    bool dependency_only_transport_ = false;
     std::optional<size_t> registered_capacity_;
     std::optional<size_t> registered_rate_;
     size_t thread_queue_id_ = SIZE_MAX;  ///< SIZE_MAX means not in MPSC mode
