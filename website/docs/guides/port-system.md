@@ -225,8 +225,10 @@ bus.consume(0, consumer0.localCycle(), process_wakeup);
 The fabric deliberately does not emulate bounded destination queues,
 receiver-side selective cancellation, or `OutPort::cancelInFlight()`. Use it
 only when the model has proved those operations are absent and every bound edge
-has delay one. `sealPortTopology()` validates the complete delay-one fanout
-before changing any connection to dependency-only transport.
+has delay one. `publish()` preserves the normal delay-one consumer wakeup, so
+activity-scheduled units may jump over empty cycles; they must call `consume()`
+on every tick in which they run. `sealPortTopology()` validates the complete
+delay-one fanout before changing any connection to dependency-only transport.
 
 ## Usage Pattern
 

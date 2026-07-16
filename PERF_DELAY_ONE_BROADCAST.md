@@ -8,8 +8,9 @@ connections remain scheduler dependencies but stop carrying duplicate queue
 entries.
 
 The API is intentionally opt-in and validates the full `P x C`, delay-one
-topology before mutating any connection. Consumers must drain once per local
-cycle. Bounded queue semantics, selective cancellation, and
+topology before mutating any connection. Publication preserves delay-one port
+wakeups; consumers drain on every scheduled tick and may jump over idle cycles.
+Bounded queue semantics, selective cancellation, and
 `OutPort::cancelInFlight()` are outside the specialization.
 
 ## Clean Nucleus A/B
@@ -25,8 +26,8 @@ cycle. Bounded queue semantics, selective cancellation, and
 
 | Workload | Queue mean | Fabric mean | Wall-time reduction | Throughput gain |
 |---|---:|---:|---:|---:|
-| Dhrystone O3 GCC 12 | 3491.6 ms | 3131.6 ms | 10.31% | 11.50% |
-| CoreMark O2 GCC 13.2 | 6099.8 ms | 5673.8 ms | 6.98% | 7.51% |
+| Dhrystone O3 GCC 12 | 3433.6 ms | 2980.4 ms | 13.20% | 15.21% |
+| CoreMark O2 GCC 13.2 | 6008.8 ms | 5575.4 ms | 7.21% | 7.77% |
 
 Dhrystone completed at 409,668 cycles with the full benchmark variable
 validation on every run. CoreMark completed at 1,139,377 cycles with
@@ -35,10 +36,13 @@ had identical output and cycle count with the fabric on and off; its existing
 section-49 failure was present in both modes and is not attributed to this
 change.
 
+These figures were remeasured after preserving delay-one consumer wakeups in
+the shared transport.
+
 ## Verification
 
 - Complete Chronon Release build
 - Complete Chronon test suite: 43/43 passed
 - Focused ordering, sparse-cycle, topology rejection, ring reuse, slow-consumer,
-  skipped-cycle, and release/acquire concurrency coverage
+  activity wakeup, global cycle guards, and release/acquire concurrency coverage
 - Clean Nucleus Dhrystone and CoreMark output/cycle equivalence

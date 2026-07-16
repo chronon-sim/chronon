@@ -72,27 +72,42 @@ void test_stable_replay_order_and_sparse_cycles() {
     std::cout << "PASSED\n";
 }
 
-void test_skipped_consumer_cycle_is_rejected() {
-    std::cout << "Testing delay-one broadcast skipped-cycle rejection... ";
+void test_consumer_cycle_guards_and_idle_fast_forward() {
+    std::cout << "Testing delay-one broadcast consumer cycle guards... ";
 
     Fabric fabric;
+    fabric.consume(0, 5, [](const Message&) {});
+    EXPECT(fabric.consumedExclusive(0) == 5,
+           "an activity-scheduled consumer may fast-forward across empty cycles");
+    fabric.consume(0, 5, [](const Message&) {});
+
     bool rejected = false;
     try {
-        fabric.consume(0, 2, [](const Message&) {});
-    } catch (const std::logic_error&) {
-        rejected = true;
-    }
-    EXPECT(rejected, "a consumer must not silently skip an unread source cycle");
-
-    fabric.consume(0, 1, [](const Message&) {});
-    fabric.consume(0, 2, [](const Message&) {});
-    rejected = false;
-    try {
-        fabric.consume(0, 1, [](const Message&) {});
+        fabric.consume(0, 4, [](const Message&) {});
     } catch (const std::logic_error&) {
         rejected = true;
     }
     EXPECT(rejected, "a consumer must not move its published cursor backwards");
+
+    std::cout << "PASSED\n";
+}
+
+void test_producer_cycle_is_globally_monotonic() {
+    std::cout << "Testing delay-one broadcast producer cycle guard... ";
+
+    Fabric fabric;
+    fabric.publish(0, 10, Message{0, 0, 10});
+    fabric.publish(0, 10, Message{0, 1, 10});
+
+    bool rejected = false;
+    try {
+        // Cycles 9 and 10 map to different empty ring slots, so this covers
+        // global monotonicity rather than the existing slot-reuse guard.
+        fabric.publish(0, 9, Message{0, 0, 9});
+    } catch (const std::logic_error&) {
+        rejected = true;
+    }
+    EXPECT(rejected, "a producer must reject a globally backwards cycle");
 
     std::cout << "PASSED\n";
 }
@@ -153,6 +168,12 @@ void test_port_topology_binding() {
         EXPECT(connection->dependencyOnlyTransport(),
                "every bound connection must stop transporting payloads");
     }
+
+    c0.sleepForever();
+    c1.sleepForever();
+    fabric.publish(0, 7, Message{0, 0, 7});
+    EXPECT(c0.nextActiveCycle() == 8 && c1.nextActiveCycle() == 8,
+           "fabric publication must preserve delay-one port wakeups");
 
     std::cout << "PASSED\n";
 }
@@ -250,7 +271,8 @@ void test_release_acquire_publication() {
 
 int main() {
     test_stable_replay_order_and_sparse_cycles();
-    test_skipped_consumer_cycle_is_rejected();
+    test_consumer_cycle_guards_and_idle_fast_forward();
+    test_producer_cycle_is_globally_monotonic();
     test_ring_reuse_and_slow_consumer_guard();
     test_port_topology_binding();
     test_bad_topology_is_atomic();

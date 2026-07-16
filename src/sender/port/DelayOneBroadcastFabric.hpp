@@ -37,8 +37,9 @@ namespace chronon::sender {
  * This intentionally is not a drop-in general queue:
  *
  * - every bound connection must have delay=1;
- * - every consumer must call consume() once per local cycle and drain the
- *   callback synchronously;
+ * - every consumer must call consume() on each scheduled tick and drain the
+ *   callback synchronously; publish() preserves normal port wakeups, and
+ *   forward cycle gaps are treated as activity-scheduled empty cycles;
  * - model-visible bounded capacity, InPort selective cancellation and
  *   OutPort::cancelInFlight() are outside this transport's contract.
  *
@@ -174,10 +175,11 @@ public:
         if (consumer_cycle < consumed_exclusive) {
             throw std::logic_error("broadcast consumer cycle moved backwards");
         }
-        if (consumer_cycle != consumed_exclusive + 1) {
-            throw std::logic_error("broadcast consumer skipped a source cycle");
-        }
 
+        // A sleeping/interval consumer may legitimately jump over cycles in
+        // which no payload was published. publish() schedules a port wake for
+        // every non-empty source cycle, so a consumer that calls consume() on
+        // each scheduled tick cannot skip an eventful cycle.
         const uint64_t send_cycle = consumer_cycle - 1;
         for (size_t producer = 0; producer < ProducerCount; ++producer) {
             const auto& bucket = producers_[producer].buckets[send_cycle & (RingDepth - 1)];
@@ -210,6 +212,7 @@ private:
         std::array<Bucket, RingDepth> buckets{};
         // Refreshed only on ring reuse, not on the per-message hot path.
         uint64_t reuse_safe_exclusive = 0;
+        uint64_t last_published_cycle = EMPTY_CYCLE;
     };
 
     struct alignas(64) ConsumerCursor {
@@ -238,6 +241,9 @@ private:
         }
 
         auto& lane = producers_[producer];
+        if (lane.last_published_cycle != EMPTY_CYCLE && send_cycle < lane.last_published_cycle) {
+            throw std::logic_error("broadcast producer cycle moved backwards");
+        }
         auto& bucket = lane.buckets[send_cycle & (RingDepth - 1)];
         const uint64_t old_cycle = bucket.published_cycle.load(std::memory_order_relaxed);
         const bool first_message_for_cycle = old_cycle != send_cycle;
@@ -258,6 +264,14 @@ private:
         bucket.messages[bucket.count] = std::forward<U>(value);
         ++bucket.count;
         bucket.published_cycle.store(send_cycle, std::memory_order_release);
+        if (first_message_for_cycle) {
+            lane.last_published_cycle = send_cycle;
+            if (sealed_) {
+                for (auto* consumer_port : consumer_ports_) {
+                    wakeUnitAt(consumer_port->owner(), send_cycle + 1);
+                }
+            }
+        }
     }
 
     void ensureOverwriteSafe_(ProducerLane& lane, uint64_t old_cycle) {
