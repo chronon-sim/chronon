@@ -117,6 +117,7 @@ void ObservationManager::applyConfigToContext(ObservationContext& ctx,
     auto unified_config = config_.getUnifiedLoggingConfig(unit_name);
 
     ctx.setCountersEnabled(counters_config.enabled);
+    ctx.setTraceChannelEnabled(unified_config.enabled && unified_config.trace_channel.enabled);
     ctx.setTimelineEventsEnabled(config_.timeline.enabled);
     configureUnified(ctx, unified_config);
 }

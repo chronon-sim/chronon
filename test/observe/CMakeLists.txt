@@ -215,6 +215,7 @@ add_test(
 
 add_executable(test_timeline_api
     test_timeline_api.cpp
+    test_timeline_producer_gate.cpp
 )
 
 target_include_directories(test_timeline_api PRIVATE

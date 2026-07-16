@@ -37,7 +37,7 @@ void TimelineTrackBase::onContextAttached(ObservationContext* ctx) {
     }
     ctx_ = ctx;
     track_id_ = TimelineTrackRegistry::instance().registerTrack(
-        {name_, unit_, ctx->sourceId(), lanes_, kind_});
+        {name_, unit_, ctx_->sourceId(), lanes_, kind_});
     registered_ = track_id_ != 0;
 }
 

@@ -60,7 +60,7 @@ struct CounterTrack {
 template <typename Site>
 uint32_t resolveTrack(ObservationContext* ctx, TimelineTrackInfo::Kind kind, uint16_t lanes,
                       std::string_view unit = {}) {
-    if (!ctx) {
+    if (!ctx || !ctx->timelineProducerEnabled()) {
         return 0;
     }
     return timeline_detail::resolveTrackForSource<Site>(ctx->sourceId(), kind, lanes, unit);
@@ -69,9 +69,8 @@ uint32_t resolveTrack(ObservationContext* ctx, TimelineTrackInfo::Kind kind, uin
 template <typename Unit>
 ObservationContext* contextFor(Unit& unit) {
     ObservationContext* ctx = unit.observationContext();
-    if (ctx) {
-        ctx->setCurrentCycleValue(unit.getObserveCycle());
-    }
+    if (!ctx || !ctx->timelineProducerEnabled()) return nullptr;
+    ctx->setCurrentCycleValue(unit.getObserveCycle());
     return ctx;
 }
 
@@ -206,6 +205,7 @@ void emitCapacitySamples(ObservationContext* ctx, CategoryMask category, Used us
 template <FixedString Name, typename Unit, typename Cat, typename... Items>
 inline void emitUnitEvent(Unit& unit, Cat category, Items&&... items) {
     auto* ctx = contextFor(unit);
+    if (!ctx) return;
     using Track = EventTrack;
     const uint32_t track_id = resolveTrack<Track>(ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
     timeline_detail::emitEventWithItems(
@@ -216,6 +216,7 @@ inline void emitUnitEvent(Unit& unit, Cat category, Items&&... items) {
 template <FixedString Track, typename Unit, typename Cat, typename... Items>
 inline void emitUnitInstant(Unit& unit, Cat category, EventNameRef name, Items&&... items) {
     auto* ctx = contextFor(unit);
+    if (!ctx) return;
     using Site = NamedLaneTrack<Track>;
     const uint32_t track_id = resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
     timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
@@ -226,6 +227,7 @@ inline void emitUnitInstant(Unit& unit, Cat category, EventNameRef name, Items&&
 template <FixedString Track, typename Unit, typename Cat, typename... Items>
 inline void emitUnitSpanBegin(Unit& unit, Cat category, EventNameRef name, Items&&... items) {
     auto* ctx = contextFor(unit);
+    if (!ctx) return;
     using Site = NamedLaneTrack<Track>;
     const uint32_t track_id = resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
     timeline_detail::emitEventWithItems(ctx, static_cast<CategoryMask>(category),
@@ -237,6 +239,7 @@ template <FixedString Track, typename Unit, typename Cat, typename... Items>
 inline void emitUnitSpanBegin(Unit& unit, uint16_t slot, Cat category, EventNameRef name,
                               Items&&... items) {
     auto* ctx = contextFor(unit);
+    if (!ctx) return;
     using Site = NamedLaneTrack<Track, true>;
     const uint32_t track_id = resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Lane,
                                                  std::numeric_limits<uint16_t>::max());
@@ -248,6 +251,7 @@ inline void emitUnitSpanBegin(Unit& unit, uint16_t slot, Cat category, EventName
 template <FixedString Track, typename Unit>
 inline void emitUnitSpanEnd(Unit& unit) {
     auto* ctx = contextFor(unit);
+    if (!ctx) return;
     using Site = NamedLaneTrack<Track>;
     const uint32_t track_id = resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Lane, /*lanes=*/1);
     if (ctx && track_id != 0) {
@@ -259,6 +263,7 @@ inline void emitUnitSpanEnd(Unit& unit) {
 template <FixedString Track, typename Unit>
 inline void emitUnitSpanEnd(Unit& unit, uint16_t slot) {
     auto* ctx = contextFor(unit);
+    if (!ctx) return;
     using Site = NamedLaneTrack<Track, true>;
     const uint32_t track_id = resolveTrack<Site>(ctx, TimelineTrackInfo::Kind::Lane,
                                                  std::numeric_limits<uint16_t>::max());
@@ -271,6 +276,7 @@ inline void emitUnitSpanEnd(Unit& unit, uint16_t slot) {
 template <FixedString Name, typename Unit, typename T>
 inline void emitUnitGauge(Unit& unit, CategoryMask category, T value, std::string_view unit_name) {
     auto* ctx = contextFor(unit);
+    if (!ctx) return;
     emitNamedCounterSample<Name>(ctx, category, value, unit_name);
 }
 
@@ -278,6 +284,7 @@ template <FixedString Name, typename Unit, typename Used, typename Capacity>
 inline void emitUnitCapacity(Unit& unit, CategoryMask category, Used used, Capacity total,
                              std::string_view unit_name) {
     auto* ctx = contextFor(unit);
+    if (!ctx) return;
     emitCapacitySamples<Name>(ctx, category, used, total, unit_name);
 }
 

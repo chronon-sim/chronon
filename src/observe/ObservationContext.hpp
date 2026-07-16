@@ -88,13 +88,28 @@ public:
     bool countersEnabled() const noexcept { return counters_enabled_; }
     void setCountersEnabled(bool enabled) noexcept { counters_enabled_ = enabled; }
 
+    bool traceChannelEnabled() const noexcept { return trace_channel_enabled_; }
+    void setTraceChannelEnabled(bool enabled) noexcept {
+        trace_channel_enabled_ = enabled;
+        if (enabled) {
+            filter_.enableCategory(category::TRACE);
+        } else {
+            filter_.disableCategory(category::TRACE);
+        }
+    }
+
     bool timelineEventsEnabled() const noexcept { return timeline_events_enabled_; }
     void setTimelineEventsEnabled(bool enabled) noexcept { timeline_events_enabled_ = enabled; }
+
+    [[gnu::always_inline]] bool timelineProducerEnabled() const noexcept {
+        return trace_channel_enabled_ && timeline_events_enabled_;
+    }
 
     FixedCounterStorage& counters() noexcept { return counters_; }
     const FixedCounterStorage& counters() const noexcept { return counters_; }
 
     [[gnu::always_inline]] bool shouldTrace(CategoryMask category) const noexcept {
+        if (OBSERVE_UNLIKELY(!trace_channel_enabled_)) return false;
         return filter_.shouldObserve(category | category::TRACE, currentCycle());
     }
 
@@ -297,7 +312,7 @@ public:
 
     [[gnu::always_inline]] bool shouldEmitTimelineEvent(CategoryMask category,
                                                         TimelineEventKind kind) const noexcept {
-        if (OBSERVE_UNLIKELY(!timeline_events_enabled_)) {
+        if (OBSERVE_UNLIKELY(!timelineProducerEnabled())) {
             return false;
         }
 
@@ -696,6 +711,7 @@ private:
 
     FixedCounterStorage counters_{"unit"};
     bool counters_enabled_ = true;
+    bool trace_channel_enabled_ = true;
     bool timeline_events_enabled_ = true;
 
     std::vector<DerivedCounterDef> derived_counter_defs_;

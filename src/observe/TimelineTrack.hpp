@@ -121,7 +121,8 @@ public:
 
     /// Close the (this lane, @p slot) span at the current cycle.
     bool end(uint16_t slot) noexcept {
-        if (!registered_ || !ctx_->filter().anyEnabled()) {
+        if (!ctx_ || !ctx_->timelineProducerEnabled() || !registered_ ||
+            !ctx_->filter().anyEnabled()) {
             return false;
         }
         stampCycle_();  // Ends skip temporal filters; the cycle only stamps the record.
@@ -146,7 +147,7 @@ private:
         static_assert(MAX_ITEMS - FLOW_ITEMS <= MAX_TIMELINE_ARGS,
                       "too many typed timeline args (max 8)");
 
-        if (!registered_) {
+        if (!ctx_ || !ctx_->timelineProducerEnabled() || !registered_) {
             return false;
         }
         // Stamp the owner's cycle BEFORE the filter check: temporal filters
@@ -189,7 +190,7 @@ public:
 
     template <typename Cat>
     bool sample(Cat category, int64_t value) noexcept {
-        if (!registered_) {
+        if (!ctx_ || !ctx_->timelineProducerEnabled() || !registered_) {
             return false;
         }
         stampCycle_();  // Before the filter check: temporal filters read the current cycle.

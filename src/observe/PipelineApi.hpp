@@ -165,7 +165,7 @@ template <FixedString Stage, typename Cat, typename... Items>
 inline void emitRuntimePipelineSlice(ObservationContext* ctx, uint16_t pipe, Cat category,
                                      uint8_t flags, uint64_t id, Items&&... items) {
     const CategoryMask cat_mask = static_cast<CategoryMask>(category);
-    if (!ctx || !ctx->shouldTrace(cat_mask)) {
+    if (!ctx || !ctx->timelineProducerEnabled() || !ctx->shouldTrace(cat_mask)) {
         return;
     }
     const uint32_t track_id = resolveRuntimePipelineTrack<Stage>(ctx, pipe);
@@ -200,7 +200,7 @@ private:
     void stageWithFlags_(ObservationContext* ctx, Cat category, uint8_t flags, uint64_t id,
                          Items&&... items) const {
         const CategoryMask cat_mask = static_cast<CategoryMask>(category);
-        if (!ctx || !ctx->shouldTrace(cat_mask)) {
+        if (!ctx || !ctx->timelineProducerEnabled() || !ctx->shouldTrace(cat_mask)) {
             return;
         }
         const uint32_t track_id = pipeline_detail::resolvePipelineTrack<Site>(ctx);

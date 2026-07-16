@@ -151,6 +151,66 @@ void test_timeline_disabled_config_disables_producer() {
     std::cout << "PASSED\n";
 }
 
+void test_trace_channel_config_disables_timeline_producer() {
+    std::cout << "Testing trace channel config disables timeline producer... ";
+
+    auto& mgr = ObservationManager::instance();
+    mgr.reset();
+
+    auto cfg = makeEnabledConfig("/tmp/chronon_obs_trace_channel_disabled");
+    cfg.timeline.enabled = true;
+    cfg.unified_logging.enabled = true;
+    cfg.unified_logging.trace_channel.enabled = false;
+    mgr.initialize(cfg);
+
+    ObservationContext* ctx =
+        mgr.createContextForUnit("trace_channel_disabled", []() { return 0ULL; });
+    assert(ctx != nullptr);
+    assert(!ctx->traceChannelEnabled());
+    assert(ctx->timelineEventsEnabled());
+
+    assert(!ctx->filter().shouldObserve(category::TRACE));
+    assert(!ctx->shouldTrace(category::TRACE));
+    assert(
+        !ctx->timelineEvent(category::TRACE, TimelineEventKind::Instant, 1, 0, 0, 0, nullptr, 0));
+    assert(ctx->observationStats().get<ObservationChannel::Trace>().emitted == 0);
+    assert(ctx->observationStats().get<ObservationChannel::Trace>().dropped == 0);
+
+    ctx->setTraceChannelEnabled(true);
+    assert(ctx->traceChannelEnabled());
+    assert(ctx->timelineProducerEnabled());
+    assert(ctx->filter().shouldObserve(category::TRACE));
+    assert(ctx->shouldTrace(category::TRACE));
+
+    mgr.shutdown();
+    mgr.reset();
+    std::filesystem::remove_all(cfg.output_dir);
+
+    ObservationQueue queue(1024);
+    ObservationContext manual(&queue, []() { return 0ULL; }, 0, "manual", 1);
+    manual.enableCategory(category::TRACE);
+    assert(manual.traceChannelEnabled());
+    assert(manual.shouldTrace(category::TRACE));
+
+    cfg = makeEnabledConfig("/tmp/chronon_obs_trace_channel_enabled");
+    cfg.timeline.enabled = true;
+    cfg.unified_logging.enabled = true;
+    cfg.unified_logging.trace_channel.enabled = true;
+    mgr.initialize(cfg);
+
+    ctx = mgr.createContextForUnit("trace_channel_enabled", []() { return 0ULL; });
+    assert(ctx != nullptr);
+    assert(ctx->traceChannelEnabled());
+    assert(ctx->timelineProducerEnabled());
+    assert(ctx->shouldTrace(category::TRACE));
+
+    mgr.shutdown();
+    mgr.reset();
+    std::filesystem::remove_all(cfg.output_dir);
+
+    std::cout << "PASSED\n";
+}
+
 void test_reorder_buffer_force_flush() {
     std::cout << "Testing reorder buffer force flush behavior... ";
 
@@ -748,6 +808,7 @@ int main() {
     test_reinitialize_without_deadlock();
     test_source_registry_freezes_after_backend_start();
     test_timeline_disabled_config_disables_producer();
+    test_trace_channel_config_disables_timeline_producer();
     test_reorder_buffer_force_flush();
     test_lookahead_structured_args_commit_and_rollback();
     test_no_drops_under_pressure_debug();
