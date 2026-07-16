@@ -122,6 +122,7 @@ public:
      */
     void useSingleThreadQueue() {
         multi_producer_queue_raw_ = nullptr;
+        direct_spsc_queue_raw_ = nullptr;
         lock_free_queue_ = false;
         queue_ = std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity_);
     }
@@ -130,6 +131,7 @@ public:
     /// single producer). The ring is finite even for an unlimited-capacity port,
     /// so the epoch-free gate must bound producer run-ahead against capacity().
     bool usesLockFreeQueue() const noexcept { return lock_free_queue_; }
+    bool usesExperimentalDirectSPSC() const noexcept { return direct_spsc_queue_raw_ != nullptr; }
 
     /**
      * Switch to lock-free SPSC queue.
@@ -141,6 +143,14 @@ public:
     void useLockFreeQueue(size_t min_usable_capacity = 0) {
         multi_producer_queue_raw_ = nullptr;
         lock_free_queue_ = true;
+        if (queue_detail::experimentalDirectSPSCEnabled()) {
+            auto direct = std::make_unique<DirectSPSCQueueAdapter<StoredMessage>>(
+                capacity_, min_usable_capacity);
+            direct_spsc_queue_raw_ = direct.get();
+            queue_ = std::move(direct);
+            return;
+        }
+        direct_spsc_queue_raw_ = nullptr;
         queue_ =
             std::make_unique<LockFreeQueueAdapter<StoredMessage>>(capacity_, min_usable_capacity);
     }
@@ -159,6 +169,7 @@ public:
                 min_per_thread_usable_capacity);
             return;
         }
+        direct_spsc_queue_raw_ = nullptr;
         lock_free_queue_ = false;
         auto mpq = std::make_unique<MultiProducerQueueAdapter<StoredMessage>>(
             capacity_, min_per_thread_usable_capacity);
@@ -517,6 +528,20 @@ public:
      * @return The message if available, std::nullopt otherwise
      */
     std::optional<T> tryReceive(uint64_t current_cycle) {
+        if (direct_spsc_queue_raw_) {
+            while (true) {
+                StoredMessage* msg = direct_spsc_queue_raw_->peekReady(current_cycle);
+                if (!msg) return std::nullopt;
+                if (detail::isCanceled(*msg) || isReceiverCanceled_(*msg)) {
+                    direct_spsc_queue_raw_->consumePeeked(current_cycle);
+                    continue;
+                }
+                std::optional<T> result{std::in_place, std::move(msg->data)};
+                direct_spsc_queue_raw_->consumePeeked(current_cycle);
+                return result;
+            }
+        }
+
         while (true) {
             auto msg = queue_->tryPop(current_cycle);
             if (!msg.has_value()) {
@@ -733,6 +758,9 @@ private:
             return true;
         }
 
+        if (direct_spsc_queue_raw_) {
+            return direct_spsc_queue_raw_->pushDirect(std::move(msg), arrive_cycle);
+        }
         return queue_->push(std::move(msg), arrive_cycle);
     }
 
@@ -845,6 +873,7 @@ private:
     size_t capacity_;
     PortPolicy policy_ = PortPolicy::LegacyFastPath;
     std::unique_ptr<IMessageQueue<StoredMessage>> queue_;
+    DirectSPSCQueueAdapter<StoredMessage>* direct_spsc_queue_raw_ = nullptr;
     MultiProducerQueueAdapter<StoredMessage>* multi_producer_queue_raw_ =
         nullptr;                    ///< Non-owning ptr for MPSC access
     bool lock_free_queue_ = false;  ///< True iff queue_ is the lock-free SPSC ring

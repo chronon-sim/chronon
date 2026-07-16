@@ -259,6 +259,154 @@ void test_lock_free_adapter_retires_all_admission_histories() {
     std::cout << "PASSED\n";
 }
 
+void test_direct_spsc_adapter_differential_semantics() {
+    std::cout << "Testing DirectSPSCQueueAdapter differential semantics... ";
+
+    for (const size_t capacity : {size_t{1}, size_t{2}, size_t{16}, size_t{4097}}) {
+        LockFreeQueueAdapter<int> legacy(capacity);
+        DirectSPSCQueueAdapter<int> direct(capacity);
+
+        auto check_state = [&](uint64_t cycle) {
+            CHECK(legacy.empty() == direct.empty());
+            CHECK(legacy.full() == direct.full());
+            CHECK(legacy.size() == direct.size());
+            CHECK(legacy.capacity() == direct.capacity());
+            CHECK(legacy.storageCapacity() == direct.storageCapacity());
+            CHECK(legacy.available() == direct.available());
+            CHECK(legacy.hasReady(cycle) == direct.hasReady(cycle));
+            CHECK(legacy.minArrivalCycle() == direct.minArrivalCycle());
+            CHECK(legacy.admissionOccupancy(cycle) == direct.admissionOccupancy(cycle));
+            CHECK(legacy.admissionMinArrivalCycle(cycle) == direct.admissionMinArrivalCycle(cycle));
+        };
+
+        auto push_both = [&](int value, uint64_t arrive_cycle) {
+            const bool legacy_ok = legacy.push(value, arrive_cycle);
+            const bool direct_ok = direct.pushDirect(std::move(value), arrive_cycle);
+            CHECK(legacy_ok == direct_ok);
+        };
+
+        auto pop_both = [&](uint64_t cycle) {
+            auto legacy_value = legacy.tryPop(cycle);
+            auto direct_value = direct.tryPop(cycle);
+            CHECK(legacy_value == direct_value);
+            return direct_value;
+        };
+
+        check_state(0);
+        push_both(10, 2);
+        push_both(20, 4);
+        check_state(1);
+        CHECK(!pop_both(1).has_value());
+
+        auto first = pop_both(2);
+        CHECK(first.has_value() && *first == 10);
+        // A same-cycle pop is still architecturally occupied and contributes
+        // its arrival to the registered-edge admission floor.
+        CHECK(direct.admissionOccupancy(2) == 2);
+        CHECK(direct.admissionMinArrivalCycle(2).value() == 2);
+        check_state(2);
+
+        CHECK(direct.admissionOccupancy(3) == 1);
+        CHECK(direct.admissionMinArrivalCycle(3).value() == 4);
+        check_state(3);
+
+        auto second = pop_both(4);
+        CHECK(second.has_value() && *second == 20);
+        CHECK(direct.admissionOccupancy(4) == 1);
+        CHECK(direct.admissionMinArrivalCycle(4).value() == 4);
+        check_state(4);
+        CHECK(direct.admissionOccupancy(5) == 0);
+        CHECK(!direct.admissionMinArrivalCycle(5).has_value());
+        check_state(5);
+
+        push_both(30, 8);
+        check_state(6);
+        legacy.clear();
+        direct.clear();
+        check_state(6);
+        CHECK(direct.empty());
+        CHECK(direct.admissionOccupancy(6) == 0);
+
+        push_both(40, 9);
+        check_state(9);
+        auto after_clear = pop_both(9);
+        CHECK(after_clear.has_value() && *after_clear == 40);
+        check_state(10);
+
+        legacy.setCapacity(capacity + 1);
+        direct.setCapacity(capacity + 1);
+        check_state(11);
+    }
+
+    std::cout << "PASSED\n";
+}
+
+void test_direct_spsc_adapter_wraparound_and_backpressure() {
+    std::cout << "Testing DirectSPSCQueueAdapter wraparound/backpressure... ";
+
+    LockFreeQueueAdapter<int> legacy(1);
+    DirectSPSCQueueAdapter<int> direct(1);
+    constexpr uint64_t kRounds = 2 * LockFreeMessageQueue<int>::CAPACITY + 17;
+
+    for (uint64_t cycle = 0; cycle < kRounds; ++cycle) {
+        CHECK(legacy.push(static_cast<int>(cycle), cycle));
+        int value = static_cast<int>(cycle);
+        CHECK(direct.pushDirect(std::move(value), cycle));
+        CHECK(legacy.full() == direct.full());
+        CHECK(direct.full());
+        CHECK(direct.available() == 0);
+
+        auto legacy_value = legacy.tryPop(cycle);
+        auto direct_value = direct.tryPop(cycle);
+        CHECK(legacy_value == direct_value);
+        CHECK(direct_value.has_value() && *direct_value == static_cast<int>(cycle));
+        CHECK(legacy.admissionOccupancy(cycle) == direct.admissionOccupancy(cycle));
+        CHECK(direct.admissionOccupancy(cycle) == 1);
+        CHECK(legacy.admissionMinArrivalCycle(cycle) == direct.admissionMinArrivalCycle(cycle));
+        CHECK(direct.admissionMinArrivalCycle(cycle).value() == cycle);
+        CHECK(legacy.admissionOccupancy(cycle + 1) == direct.admissionOccupancy(cycle + 1));
+        CHECK(direct.admissionOccupancy(cycle + 1) == 0);
+    }
+
+    CHECK(direct.empty());
+    std::cout << "PASSED\n";
+}
+
+void test_direct_spsc_consume_ready_discard_path() {
+    std::cout << "Testing DirectSPSCQueueAdapter consume/discard path... ";
+
+    DirectSPSCQueueAdapter<int> queue(2);
+    int value = 77;
+    CHECK(queue.pushDirect(std::move(value), 5));
+
+    bool visited = false;
+    CHECK(!queue.consumeReady(4, [&](int&) { visited = true; }));
+    CHECK(!visited);
+    CHECK(queue.consumeReady(5, [&](int& payload) {
+        CHECK(payload == 77);
+        visited = true;  // Cancellation-style discard: deliberately do not move it.
+    }));
+    CHECK(visited);
+    CHECK(queue.empty());
+    CHECK(queue.admissionOccupancy(5) == 1);
+    CHECK(queue.admissionMinArrivalCycle(5).value() == 5);
+    CHECK(queue.admissionOccupancy(6) == 0);
+    CHECK(!queue.admissionMinArrivalCycle(6).has_value());
+
+    value = 88;
+    CHECK(queue.pushDirect(std::move(value), 8));
+    CHECK(queue.peekReady(7) == nullptr);
+    int* peeked = queue.peekReady(8);
+    CHECK(peeked != nullptr && *peeked == 88);
+    CHECK(!queue.empty());  // peek must not publish admission credit or head movement
+    queue.consumePeeked(8);
+    CHECK(queue.empty());
+    CHECK(queue.admissionOccupancy(8) == 1);
+    CHECK(queue.admissionOccupancy(9) == 0);
+
+    std::cout << "PASSED\n";
+}
+
 int main() {
     std::cout << "=== Registered Queue Tests ===\n\n";
 
@@ -271,6 +419,9 @@ int main() {
     test_capacity_tracking();
     test_lock_free_queue_basic();
     test_lock_free_adapter_retires_all_admission_histories();
+    test_direct_spsc_adapter_differential_semantics();
+    test_direct_spsc_adapter_wraparound_and_backpressure();
+    test_direct_spsc_consume_ready_discard_path();
 
     std::cout << "\nAll registered queue tests PASSED!\n";
     return 0;
