@@ -646,18 +646,17 @@ public:
         requires detail::SelectiveCancelKeyFn<KeyFn, T>
     void cancelOlderThan(K watermark) {
         if (policy_ != PortPolicy::LegacyFastPath) {
-            // StageSelective semantics target "younger than" only (the
-            // dominant flush direction in the OOO pipeline). cancelOlderThan
-            // on a StageSelective port is currently unsupported and would
-            // require a second predicate slot direction. Fall through to
-            // legacy path (it's still functionally correct, just not the
-            // fast path) so callers that occasionally use it keep working.
-            (void)configureReceiverSelectiveExtractorAndScope_<KeyFn>();
+            // StageSelective: install the lower half of a timestamp-scoped
+            // keep range. A same-cycle cancelYoungerThan call intersects with
+            // this predicate in-place, so cancelOutsideInclusive remains one
+            // receiver-side predicate and never adds a sender-side atomic read.
+            if (!configureReceiverSelectiveExtractorAndScope_<KeyFn>()) {
+                return;
+            }
+            const uint64_t cycle = getCurrentCycle();
             const uint64_t threshold = static_cast<uint64_t>(watermark);
-            auto cur = receiver_min_keep_key_.load(std::memory_order_relaxed);
-            while (cur < threshold &&
-                   !receiver_min_keep_key_.compare_exchange_weak(
-                       cur, threshold, std::memory_order_release, std::memory_order_relaxed));
+            stage_state_.install(cycle, threshold, std::numeric_limits<uint64_t>::max());
+            traceStageInstall_(cycle);
             return;
         }
         if (!configureReceiverSelectiveExtractorAndScope_<KeyFn>()) {
@@ -685,17 +684,13 @@ public:
             // effect, but its generation/scope mutations are harmless under
             // StageSelective (they are simply ignored by the StageSelective
             // path of isReceiverCanceled_).
-            (void)configureReceiverSelectiveExtractorAndScope_<KeyFn>();
+            if (!configureReceiverSelectiveExtractorAndScope_<KeyFn>()) {
+                return;
+            }
             const uint64_t cycle = getCurrentCycle();
             const uint64_t thr = static_cast<uint64_t>(watermark);
-            stage_state_.install(cycle, thr);
-            if (stageTraceEnabled_() && stageTracePortMatches_(name_)) {
-                std::fprintf(stderr,
-                             "[STAGE] install port=%s cycle=%lu max_keep=%lu live=%zu hwm=%zu\n",
-                             name_.c_str(), static_cast<unsigned long>(cycle),
-                             static_cast<unsigned long>(thr), stage_state_.active_slot_count(),
-                             stage_state_.high_water);
-            }
+            stage_state_.install(cycle, 0, thr);
+            traceStageInstall_(cycle);
             return;
         }
         if (!configureReceiverSelectiveExtractorAndScope_<KeyFn>()) {
@@ -744,6 +739,25 @@ public:
 
 private:
     uint64_t getCurrentCycle() const;
+
+    void traceStageInstall_(uint64_t cycle) const noexcept {
+        if (!stageTraceEnabled_() || !stageTracePortMatches_(name_)) {
+            return;
+        }
+        uint64_t min_keep = 0;
+        uint64_t max_keep = std::numeric_limits<uint64_t>::max();
+        for (const auto& predicate : stage_state_.slots) {
+            if (predicate.flush_cycle == cycle) {
+                min_keep = predicate.min_keep;
+                max_keep = predicate.max_keep;
+                break;
+            }
+        }
+        std::fprintf(stderr, "[STAGE] install port=%s cycle=%lu keep=[%lu,%lu] live=%zu hwm=%zu\n",
+                     name_.c_str(), static_cast<unsigned long>(cycle),
+                     static_cast<unsigned long>(min_keep), static_cast<unsigned long>(max_keep),
+                     stage_state_.active_slot_count(), stage_state_.high_water);
+    }
 
     /// Effective backpressure bound = user-set capacity, but never larger
     /// than the underlying ring's physical capacity (overflow protection).
@@ -847,8 +861,9 @@ private:
                 int off = 0;
                 for (size_t i = 0; i < stage_state_.slots.size() && off < 400; ++i) {
                     off += std::snprintf(
-                        slots_buf + off, sizeof(slots_buf) - off, " s%zu{fc=%lu,mk=%lu}", i,
+                        slots_buf + off, sizeof(slots_buf) - off, " s%zu{fc=%lu,keep=[%lu,%lu]}", i,
                         static_cast<unsigned long>(stage_state_.slots[i].flush_cycle),
+                        static_cast<unsigned long>(stage_state_.slots[i].min_keep),
                         static_cast<unsigned long>(stage_state_.slots[i].max_keep));
                 }
                 if (off == 0) {
