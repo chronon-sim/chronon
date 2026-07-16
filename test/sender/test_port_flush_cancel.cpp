@@ -35,7 +35,8 @@ struct TaggedMsg {
     int payload;
 };
 
-[[maybe_unused]] void test_delayed_cancel_drops_message() {
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+void test_delayed_cancel_drops_message() {
     std::cout << "Testing delayed cancel drops message... ";
 
     TestUnit prod("prod");
@@ -56,7 +57,7 @@ struct TaggedMsg {
     std::cout << "PASSED\n";
 }
 
-[[maybe_unused]] void test_delayed_cancel_only_affects_prior_epoch() {
+void test_delayed_cancel_only_affects_prior_epoch() {
     std::cout << "Testing delayed cancel keeps new epoch... ";
 
     TestUnit prod("prod");
@@ -84,7 +85,7 @@ struct TaggedMsg {
     std::cout << "PASSED\n";
 }
 
-[[maybe_unused]] void test_fanout_cancel_drops_all() {
+void test_fanout_cancel_drops_all() {
     std::cout << "Testing fanout cancel drops all... ";
 
     TestUnit prod("prod");
@@ -108,7 +109,7 @@ struct TaggedMsg {
     std::cout << "PASSED\n";
 }
 
-[[maybe_unused]] void test_delay0_cancel_before_receive() {
+void test_delay0_cancel_before_receive() {
     std::cout << "Testing delay=0 cancel before receive... ";
 
     TestUnit prod("prod");
@@ -126,6 +127,7 @@ struct TaggedMsg {
 
     std::cout << "PASSED\n";
 }
+#endif
 
 void test_inport_flush_drops_future_messages() {
     std::cout << "Testing InPort flush drops future messages... ";
@@ -284,7 +286,8 @@ void test_inport_selective_cancel_reset() {
     std::cout << "PASSED\n";
 }
 
-[[maybe_unused]] void test_inport_selective_cancel_with_epoch_cancel() {
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+void test_inport_selective_cancel_with_epoch_cancel() {
     std::cout << "Testing InPort selective + epoch cancel interaction... ";
 
     TestUnit prod("prod");
@@ -326,6 +329,7 @@ void test_inport_selective_cancel_reset() {
 
     std::cout << "PASSED\n";
 }
+#endif
 
 void test_inport_selective_cancel_scoped_to_inflight() {
     std::cout << "Testing InPort selective cancel scoped to in-flight... ";

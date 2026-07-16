@@ -10,6 +10,12 @@ never call `OutPort::cancelInFlight()` may set it to `OFF`, which removes:
 - the cancellation pointer and epoch snapshot in every `PortEnvelope`;
 - the receiver/arbiter epoch checks.
 
+The bundled CPU pipeline examples and tests that instantiate that model are
+excluded from `OFF` builds because their flush implementation calls
+`cancelInFlight()`. Cancellation-specific unit-test sections are also compiled
+only in `ON` builds; receiver-side flush and selective-cancellation coverage
+remains enabled in both configurations.
+
 `PortEnvelope<uint64_t>` is 48 bytes with cancellation enabled and 32 bytes
 when disabled. Receiver-side selective cancellation remains available. Exact
 OutPort cancellation is intentionally not reimplemented with a cycle timestamp
@@ -36,8 +42,8 @@ between the two builds.
 
 ## Verification
 
-- Complete Release build and test suite with cancellation `ON`: 42/42 passed
-- Complete Release build and test suite with cancellation `OFF`: 42/42 passed
+- Complete Release build and test suite with cancellation `ON`: 44/44 passed
+- Contract-valid Release build and test suite with cancellation `OFF`: 42/42 passed
 - Cancellation-specific tests run only for the supported `ON` contract
 - Envelope-size assertion and all receiver-side selective-cancellation tests
   run in the `OFF` configuration

@@ -213,7 +213,10 @@ and `PortEnvelope` omits the cancellation pointer and snapshot. Receiver-side
 
 Do not disable the option merely because cancellation is rare. It is safe only
 after auditing the complete model and every linked component for
-`cancelInFlight()` calls.
+`cancelInFlight()` calls. Chronon's bundled CPU pipeline examples, their flush
+validation test, and their counter-metadata test are therefore not built when
+this option is `OFF`; those models rely on sender-side cancellation for correct
+flush semantics.
 
 ## Shared Delay-One Broadcast Fabric
 
