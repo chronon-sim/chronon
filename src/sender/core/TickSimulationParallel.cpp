@@ -8,8 +8,7 @@
 
 /// @file
 /// TickSimulation parallel runtime: progress-based epoch execution,
-/// cross-thread dependency spin-waits, MPSC arbitration helpers,
-/// and progress-sync initialization.
+/// cross-thread dependency spin-waits, and progress-sync initialization.
 
 #include <barrier>
 #include <bit>
@@ -45,24 +44,13 @@ uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
     return delta > max - base ? max : base + delta;
 }
 
-bool clusterHasMPSCConnections(const std::vector<TickableUnit*>& units) noexcept {
-    for (const auto* unit : units) {
-        for (const auto* port : unit->ports()) {
-            if (port->hasMPSCConnections()) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // MPSC producer progress wiring
 // ---------------------------------------------------------------------------
 
-void TickSimulation::installMPSCProducerProgress_() {
+void TickSimulation::installMultiProducerProgress_() {
     if (!thread_progress_array_ || thread_progress_count_ == 0) return;
 
     std::unordered_map<Unit*, size_t> unit_to_cluster;
@@ -72,25 +60,8 @@ void TickSimulation::installMPSCProducerProgress_() {
         }
     }
 
-    std::unordered_map<void*, std::vector<size_t>> port_to_src_clusters;
-    for (auto* conn : connections_) {
-        if (!conn->hasThreadQueueId()) continue;
-        Unit* src = conn->source();
-        if (!src) continue;
-        auto src_it = unit_to_cluster.find(src);
-        if (src_it == unit_to_cluster.end()) continue;
-        void* port_key = conn->destPortPtr();
-        if (!port_key) continue;
-        auto& vec = port_to_src_clusters[port_key];
-        if (std::find(vec.begin(), vec.end(), src_it->second) == vec.end()) {
-            vec.push_back(src_it->second);
-        }
-    }
-
-    // Per-connection producer progress: each producer Unit -> its cluster's
-    // completed_cycle atomic. The InPort uses this to drain each MPSC
-    // connection up to its OWN producer's progress (heterogeneous-delay
-    // correctness), rather than the min across producers.
+    // Per-connection producer progress proves that every direct lane is covered
+    // by the epoch-free scheduler's dependency protocol.
     std::unordered_map<Unit*, const std::atomic<uint64_t>*> src_to_progress;
     src_to_progress.reserve(unit_to_cluster.size());
     for (const auto& [unit, cluster] : unit_to_cluster) {
@@ -99,19 +70,8 @@ void TickSimulation::installMPSCProducerProgress_() {
         }
     }
 
-    for (IArbitratablePort* arb : mpsc_inports_) {
-        void* key = arb->arbitratablePortKey();
-        auto it = port_to_src_clusters.find(key);
-        if (it == port_to_src_clusters.end()) continue;
-        std::vector<const std::atomic<uint64_t>*> ptrs;
-        ptrs.reserve(it->second.size());
-        for (size_t c : it->second) {
-            if (c < thread_progress_count_) {
-                ptrs.push_back(&thread_progress_array_[c].completed_cycle);
-            }
-        }
-        arb->setArbitrationProgressPointers(std::move(ptrs));
-        arb->setArbitrationConnProgress(src_to_progress);
+    for (IMultiProducerPort* port : multi_producer_ports_) {
+        port->setProducerProgress(src_to_progress);
     }
 }
 
@@ -275,20 +235,6 @@ void TickSimulation::executeEpochProgressBased(uint64_t epoch_cycles) {
     auto scheduled_work = stdexec::starts_on(sched, std::move(work));
     stdexec::sync_wait(std::move(scheduled_work));
 
-    // Epoch-end flush (R8 in docs/mpsc-atomic-publish.md). Every thread
-    // has published end_cycle-1 just before exiting, so the final cycle's
-    // staging entries may not have been arbitrated. Run the main-thread
-    // arbiter once unbounded so tail entries are committed.
-    if (timeline_trace_.traceArbitration()) {
-        auto arb_begin = SchedulerTimelineTrace::Clock::now();
-        arbitrateAllMPSCPorts_();
-        auto arb_end = SchedulerTimelineTrace::Clock::now();
-        timeline_trace_.recordDuration(timeline_trace_.schedulerStream(), "scheduler",
-                                       "epoch-end mpsc arbitration", end_cycle, arb_begin, arb_end);
-    } else {
-        arbitrateAllMPSCPorts_();
-    }
-
     for (size_t i = 0; i < units_.size(); ++i) {
         unit_progress_[i].store(unit_ptrs_[i]->localCycle(), std::memory_order_release);
     }
@@ -327,11 +273,8 @@ uint64_t TickSimulation::executeRunProgressBased(uint64_t total_cycles) {
     lookahead_floor_.store(run_start, std::memory_order_relaxed);
 
     // Serial epoch tail, run once when all workers have arrived. Must be nothrow
-    // (std::barrier completion contract). The MPSC flush is ordered by the queue
-    // atomics, not the barrier; progress is published per-worker below, so this
-    // never reads a peer's plain localCycle.
+    // (std::barrier completion contract).
     auto on_epoch_complete = [&]() noexcept {
-        arbitrateAllMPSCPorts_();
         if (epoch_end >= run_target || token.stop_requested()) {
             run_done = true;
             return;
@@ -384,9 +327,9 @@ uint64_t TickSimulation::executeRunProgressBased(uint64_t total_cycles) {
     return completedCyclesForRun_(run_start, run_target);
 }
 
-bool TickSimulation::allMPSCPortsHaveConnProgress_() const noexcept {
-    for (const IArbitratablePort* p : mpsc_inports_) {
-        if (!p->mpscConnProgressFullyResolved()) return false;
+bool TickSimulation::allMultiProducerPortsHaveProgress_() const noexcept {
+    for (const IMultiProducerPort* p : multi_producer_ports_) {
+        if (!p->producerProgressFullyResolved()) return false;
     }
     return true;
 }
@@ -507,13 +450,6 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
 
     if (captured) std::rethrow_exception(captured);
 
-    // Single final MPSC flush. Every worker has published its final progress and
-    // exited, so the consumer-driven drains (which admit up to
-    // producer_completed-1) may leave the run's last staged entries
-    // unarbitrated; commit them once here. Mirrors the epoch-end flush in
-    // executeEpochProgressBased, but runs once per run instead of per epoch.
-    arbitrateAllMPSCPorts_();
-
     if (timeline_trace_.traceEpochs()) {
         auto run_end = SchedulerTimelineTrace::Clock::now();
         timeline_trace_.recordDuration(timeline_trace_.schedulerStream(), "scheduler",
@@ -572,37 +508,22 @@ void TickSimulation::executeThreadEpochImpl_(size_t thread_idx, uint64_t end_cyc
             uint64_t idle_target =
                 computeIdleClusterTarget_(cluster, cycle, end_cycle, predecessor_cycles);
             if (idle_target > cycle) {
-                const bool cluster_has_mpsc =
-                    clusterHasMPSCConnections(cluster_unit_ptrs_[cluster]);
-                if (cluster_has_mpsc) {
-                    // MPSC-owning idle units drain staging queues during
-                    // advanceIdleTick(), so their idle advance has observable
-                    // queue/back-pressure side effects and cannot be safely
-                    // rolled back after a refreshed wake. Keep those clusters
-                    // interruptible by advancing one idle cycle at a time; any
-                    // future explicit wakeAt(A) observed during this step is
-                    // picked up by the next scheduler iteration before the
-                    // cluster can publish progress past A.
-                    idle_target = std::min(idle_target, cycle + 1);
-                }
                 SchedulerTimelineTrace::TimePoint idle_begin{};
                 if (trace_units) {
                     idle_begin = SchedulerTimelineTrace::Clock::now();
                 }
                 advanceClusterIdle_(cluster, idle_target - cycle);
                 uint64_t reached_cycle = idle_target;
-                if (!cluster_has_mpsc) {
-                    const uint64_t refreshed_target =
-                        computeIdleClusterTarget_(cluster, cycle, idle_target, predecessor_cycles);
-                    // A cross-thread wakeAt() may lower next_active_cycle_ while
-                    // this worker is in the bulk idle path. Re-sample before
-                    // publishing completed_cycle so peers never observe an idle
-                    // hop past an already-visible wake.
-                    if (refreshed_target < idle_target) {
-                        reached_cycle = refreshed_target;
-                        for (auto* unit : cluster_unit_ptrs_[cluster]) {
-                            unit->setLocalCycle(reached_cycle);
-                        }
+                const uint64_t refreshed_target =
+                    computeIdleClusterTarget_(cluster, cycle, idle_target, predecessor_cycles);
+                // A cross-thread wakeAt() may lower next_active_cycle_ while
+                // this worker is in the bulk idle path. Re-sample before
+                // publishing completed_cycle so peers never observe an idle
+                // hop past an already-visible wake.
+                if (refreshed_target < idle_target) {
+                    reached_cycle = refreshed_target;
+                    for (auto* unit : cluster_unit_ptrs_[cluster]) {
+                        unit->setLocalCycle(reached_cycle);
                     }
                 }
                 if (trace_units) {

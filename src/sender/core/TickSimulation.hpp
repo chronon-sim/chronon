@@ -144,12 +144,9 @@ public:
 
     void initialize();
 
-    /// Resolve the producer-cluster completed_cycle atomics for each MPSC
-    /// InPort. Lookahead-only; under Sequential/Barrier the producer-
-    /// progress set stays empty and arbitrateMPSCConsumerDriven() degrades
-    /// to an unbounded drain (correct because those modes only call the
-    /// consumer-driven hook after a global sync point).
-    void installMPSCProducerProgress_();
+    /// Resolve one producer-cluster completed-cycle atomic for each direct
+    /// MPSC lane. Complete coverage is required by epoch-free lookahead.
+    void installMultiProducerProgress_();
 
     /// Run for the specified cycles. Internally dispatches to parallel or
     /// sequential execution based on cluster analysis.
@@ -254,15 +251,19 @@ public:
     /// Test/bench introspection for the enable_epoch_free_lookahead A/B knob.
     uint64_t epochFreeRunCount() const noexcept { return epoch_free_run_count_; }
 
-    /// Total dropped staged pushes across all MPSC InPorts (full physical ring).
-    /// Nonzero means the lookahead window outran the staging capacity — a
+    /// Total direct-lane pushes rejected by a full physical ring.
+    /// Nonzero means the lookahead window outran transport capacity — a
     /// correctness failure. The epoch-free A/B watchdog (see
     /// enable_epoch_free_lookahead). Always 0 for the barrier/sequential paths.
-    uint64_t totalStagingOverflowEvents() const noexcept {
+    uint64_t totalTransportOverflowEvents() const noexcept {
         uint64_t total = 0;
-        for (const IArbitratablePort* p : mpsc_inports_) total += p->stagingOverflowEvents();
+        for (const IMultiProducerPort* p : multi_producer_ports_) {
+            total += p->transportOverflowEvents();
+        }
         return total;
     }
+
+    uint64_t totalStagingOverflowEvents() const noexcept { return totalTransportOverflowEvents(); }
 
     /// Used by observation async I/O.
     exec::static_thread_pool& pool() noexcept { return pool_; }
@@ -399,7 +400,6 @@ private:
                                           });
                 auto scheduled = stdexec::starts_on(sched, std::move(work));
                 stdexec::sync_wait(std::move(scheduled));
-                arbitrateAllMPSCPorts_();
                 push_counter_boundary(cycle + 1);
             }
             return;
@@ -446,15 +446,6 @@ private:
                 });
             auto scheduled = stdexec::starts_on(sched, std::move(work));
             stdexec::sync_wait(std::move(scheduled));
-            if (timeline_trace_.traceArbitration()) {
-                auto begin = SchedulerTimelineTrace::Clock::now();
-                arbitrateAllMPSCPorts_();
-                auto end = SchedulerTimelineTrace::Clock::now();
-                timeline_trace_.recordDuration(timeline_trace_.schedulerStream(), "scheduler",
-                                               "mpsc arbitration", cycle, begin, end);
-            } else {
-                arbitrateAllMPSCPorts_();
-            }
             push_counter_boundary(cycle + 1);
         }
     }
@@ -551,11 +542,10 @@ private:
     /**
      * Epoch-free variant of executeRunProgressBased: one bulk launch, one
      * run-spanning window, NO per-epoch barrier. Each worker drives its
-     * clusters straight to run_target; run-ahead is bounded only by the
-     * lookahead_floor_ + max_lookahead_cycles synthetic dep (refreshed lazily
-     * on the slow path), and MPSC delivery is the per-connection consumer-driven
-     * drain plus a single arbitrateAllMPSCPorts_() flush after the workers join.
-     * Selected by runParallel() only when allMPSCPortsHaveConnProgress_() and
+     * clusters straight to run_target; run-ahead is bounded by the
+     * lookahead_floor_ + max_lookahead_cycles synthetic dependency (refreshed
+     * lazily on the slow path). Direct MPSC lanes need no epoch-end flush.
+     * Selected by runParallel() only when allMultiProducerPortsHaveProgress_() and
      * max_lookahead_cycles > 0. Returns cycles actually executed.
      */
     uint64_t executeRunEpochFree_(uint64_t total_cycles);
@@ -567,10 +557,9 @@ private:
     /// advances current_cycle_ far enough to cover the observed stop point.
     uint64_t completedCyclesForRun_(uint64_t run_start, uint64_t run_target) const noexcept;
 
-    /// True iff every MPSC InPort has fully resolved per-connection producer
-    /// progress, so the consumer-driven drain needs no per-epoch central flush.
+    /// True iff every direct MPSC lane has a resolved producer-progress source.
     /// Precondition for executeRunEpochFree_ (see enable_epoch_free_lookahead).
-    bool allMPSCPortsHaveConnProgress_() const noexcept;
+    bool allMultiProducerPortsHaveProgress_() const noexcept;
 
     /// Grow registered lock-free buffers where the model declares enough edge
     /// rate to prove epoch-free headroom. Returns the number of connections
@@ -695,26 +684,12 @@ private:
     void flushDynamicSchedulerMarkers_();
 
     /**
-     * Drive cycle-boundary MPSC arbitration on every registered InPort.
-     *
-     * Called after every scheduler sync point. The InPort arbiter drains
-     * each Connection's staging deque in topology-stable conn_id order,
-     * making admission independent of wall-clock push ordering across
-     * worker threads. `mpsc_inports_` preserves port-registration order.
-     */
-    [[gnu::always_inline]] inline void arbitrateAllMPSCPorts_() noexcept {
-        for (auto* p : mpsc_inports_) {
-            p->arbitrateMPSC();
-        }
-    }
-
-    /**
      * Collect MPSC-mode InPorts from `connections_`. Iterates in
      * registration order, filters by MPSC flag, registers each on its
      * InPort (which sorts by conn_id internally), and maintains
-     * `mpsc_inports_` deduplicated in first-seen order.
+     * `multi_producer_ports_` deduplicated in first-seen order.
      */
-    void collectMPSCInPorts_();
+    void collectMultiProducerPorts_();
 
     /// Rethrow the current exception as TickException. Wraps non-
     /// TickException throwables with unknown unit context.
@@ -747,10 +722,9 @@ private:
     /// Pointers only — Connections are owned by their OutPort.
     std::vector<ConnectionBase*> connections_;
 
-    /// Flat, deduplicated list of InPorts with at least one MPSC
-    /// connection, populated after optimizeConnectionQueuesForThreads() in
-    /// initialize(). Walked at every cycle boundary.
-    std::vector<IArbitratablePort*> mpsc_inports_;
+    /// Flat, deduplicated list of InPorts with at least one direct MPSC lane.
+    /// Used for initialization-time progress coverage and overflow diagnostics.
+    std::vector<IMultiProducerPort*> multi_producer_ports_;
 
     DependencyGraph dep_graph_;
     TightCouplingResult clusters_;

@@ -39,6 +39,7 @@ struct SchedulerTimelineTraceConfig {
     bool trace_units = true;
     bool trace_waits = true;
     bool trace_epochs = true;
+    /// Deprecated compatibility field. Direct MPSC lanes need no scheduler arbitration.
     bool trace_arbitration = true;
     /// When enabled, unit slices append per-thread CPU time diagnostics to detail.
     bool trace_thread_cpu_time = false;
@@ -65,7 +66,6 @@ public:
         trace_units_ = config_.enabled && config_.trace_units;
         trace_waits_ = config_.enabled && config_.trace_waits;
         trace_epochs_ = config_.enabled && config_.trace_epochs;
-        trace_arbitration_ = config_.enabled && config_.trace_arbitration;
         trace_thread_cpu_time_ =
             config_.enabled && config_.trace_units && config_.trace_thread_cpu_time;
         written_ = false;
@@ -77,7 +77,10 @@ public:
     bool traceUnits() const noexcept { return trace_units_; }
     bool traceWaits() const noexcept { return trace_waits_; }
     bool traceEpochs() const noexcept { return trace_epochs_; }
-    bool traceArbitration() const noexcept { return trace_arbitration_; }
+    [[deprecated("direct MPSC lanes emit no arbitration spans")]]
+    bool traceArbitration() const noexcept {
+        return false;
+    }
     bool traceThreadCpuTime() const noexcept { return trace_thread_cpu_time_; }
 
     void start(const std::vector<std::vector<size_t>>& thread_units,
@@ -238,7 +241,6 @@ private:
     bool trace_units_ = false;
     bool trace_waits_ = false;
     bool trace_epochs_ = false;
-    bool trace_arbitration_ = false;
     bool trace_thread_cpu_time_ = false;
     bool started_ = false;
     bool written_ = false;

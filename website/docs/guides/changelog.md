@@ -4,6 +4,25 @@ sidebar_label: "Changelog"
 
 # Changelog
 
+## 2026-07-17 - Direct-Lane Port Transport
+
+Chronon's MPSC transport now publishes each `Connection` directly into a
+dedicated SPSC lane. The receiver performs a deterministic
+`(arrive_cycle, connection_id, lane_id)` merge; sparse fan-in uses sharded
+notifications and a consumer-owned frontier. This removes Connection staging,
+the second envelope copy, scheduler arbitration passes, and arbitration trace
+events. The `trace_arbitration` field remains as a deprecated compatibility
+setting.
+
+SPSC rings use monotonic tickets, every physical slot, cache-line-separated
+producer/consumer publications, and compact bounded storage. Finite-capacity
+lanes preserve simulated-cycle admission credit independently of host-time
+queue occupancy. `InPort::tryReceiveFiltered` adds allocation-free,
+receiver-owned filtering; rejected ready messages are permanently consumed.
+
+See [Port Transport Architecture](mpsc-atomic-publish.md) for the concurrency
+contract, validation, benchmark results, and research basis.
+
 ## 2026-06-11 - Epoch-Free Lookahead
 
 ### New Feature

@@ -13,7 +13,6 @@
 #include "TickSimulation.hpp"
 
 #include <algorithm>
-#include <cstdlib>
 #include <exception>
 #include <numeric>
 #include <set>
@@ -21,7 +20,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 
 #include "../../observe/ObservableUnit.hpp"
 #include "TickSimulationCycleUtils.hpp"
@@ -110,9 +108,9 @@ void TickSimulation::initialize() {
     std::iota(counter_owner_ids_.begin(), counter_owner_ids_.end(), size_t{0});
 
     // Any connection still carrying a thread_queue_id after queue
-    // optimization is genuinely MPSC; record its InPort for the per-cycle
-    // arbiter.
-    collectMPSCInPorts_();
+    // optimization is genuinely MPSC; record its InPort for progress coverage
+    // and transport-overflow diagnostics.
+    collectMultiProducerPorts_();
 
     const size_t progress_size = units_.size();
     unit_progress_ = std::make_unique<std::atomic<uint64_t>[]>(progress_size);
@@ -125,7 +123,7 @@ void TickSimulation::initialize() {
     if (config_.enable_lookahead && shouldUseParallelExecution_() && has_thread_assignment_ &&
         !thread_units_.empty()) {
         initProgressSync();
-        installMPSCProducerProgress_();
+        installMultiProducerProgress_();
     }
 
     timeline_trace_.start(thread_units_, unit_ptrs_);
@@ -330,7 +328,6 @@ uint64_t TickSimulation::runSequentialImpl_(uint64_t num_cycles) {
             for (auto* unit : unit_ptrs_) {
                 executeUnitCycle_(unit, unit->localCycle());
             }
-            arbitrateAllMPSCPorts_();
             if constexpr (PushPeriodicCounters) {
                 const uint64_t completed_cycle = current_cycle_ + i + 1;
                 if (counter_producer && next_counter_cycle <= run_target &&
@@ -387,7 +384,7 @@ bool TickSimulation::persistentLookaheadEligible_() const {
 
 bool TickSimulation::epochFreeLookaheadEligible_() const {
     return persistentLookaheadEligible_() && config_.enable_epoch_free_lookahead &&
-           config_.max_lookahead_cycles > 0 && allMPSCPortsHaveConnProgress_() &&
+           config_.max_lookahead_cycles > 0 && allMultiProducerPortsHaveProgress_() &&
            crossThreadHeadroomAllowsEpochFree_();
 }
 
@@ -401,7 +398,7 @@ std::string TickSimulation::epochFreeVetoReason_() const {
     if (config_.max_lookahead_cycles == 0) {
         return "max_lookahead_cycles=0";
     }
-    if (!allMPSCPortsHaveConnProgress_()) {
+    if (!allMultiProducerPortsHaveProgress_()) {
         return "MPSC producer progress unresolved";
     }
     if (!crossThreadHeadroomAllowsEpochFree_()) {
@@ -445,7 +442,7 @@ uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
                 "(reason={}, max_lookahead={}, mpsc_progress_full={}, headroom={}); using "
                 "deprecated per-epoch lookahead fallback">(
                 observe_ctx_, reason.c_str(), config_.max_lookahead_cycles,
-                allMPSCPortsHaveConnProgress_(), crossThreadHeadroomLimit_());
+                allMultiProducerPortsHaveProgress_(), crossThreadHeadroomLimit_());
             epoch_free_veto_logged_ = true;
         }
         if (epoch_free) {
@@ -618,92 +615,9 @@ PartitionResult TickSimulation::runRebalanceSolver_(const PartitionInput& input)
 // Queue optimization
 // ---------------------------------------------------------------------------
 
-size_t TickSimulation::optimizeTransparentBroadcasts_() {
-    const char* enabled = std::getenv("CHRONON_EXPERIMENTAL_TRANSPARENT_BROADCAST");
-    if (enabled && enabled[0] == '0' && enabled[1] == '\0') {
-        return 0;
-    }
-    if (connections_.empty()) return 0;
-
-    // Optimize whole connected Port components, never isolated edges. This
-    // guarantees that an InPort cannot end up merging a shared lane with a
-    // conventional queue and that fallback remains all-or-nothing.
-    std::unordered_map<void*, size_t> source_nodes;
-    std::unordered_map<void*, size_t> destination_nodes;
-    std::vector<size_t> parent;
-
-    auto add_node = [&](auto& nodes, void* key) {
-        auto [it, inserted] = nodes.try_emplace(key, parent.size());
-        if (inserted) parent.push_back(it->second);
-        return it->second;
-    };
-    auto find_root = [&](size_t node) {
-        size_t root = node;
-        while (parent[root] != root) root = parent[root];
-        while (parent[node] != node) {
-            const size_t next = parent[node];
-            parent[node] = root;
-            node = next;
-        }
-        return root;
-    };
-    auto unite = [&](size_t lhs, size_t rhs) {
-        lhs = find_root(lhs);
-        rhs = find_root(rhs);
-        if (lhs != rhs) parent[rhs] = lhs;
-    };
-
-    for (auto* connection : connections_) {
-        const size_t source = add_node(source_nodes, connection->sourcePortPtr());
-        const size_t destination = add_node(destination_nodes, connection->destPortPtr());
-        unite(source, destination);
-    }
-
-    std::unordered_map<size_t, std::vector<ConnectionBase*>> components;
-    for (auto* connection : connections_) {
-        const size_t node = source_nodes.at(connection->sourcePortPtr());
-        components[find_root(node)].push_back(connection);
-    }
-
-    constexpr size_t kMinimumFanout = 4;
-    constexpr size_t kHeadroomCycles = 512;
-    size_t optimized_connections = 0;
-
-    for (auto& [root, component] : components) {
-        (void)root;
-        std::unordered_map<void*, size_t> source_degrees;
-        bool eligible = true;
-        for (auto* connection : component) {
-            ++source_degrees[connection->sourcePortPtr()];
-            if (!connection->transparentBroadcastEligible(kHeadroomCycles)) {
-                eligible = false;
-            }
-        }
-        for (const auto& [source, degree] : source_degrees) {
-            (void)source;
-            if (degree < kMinimumFanout) {
-                eligible = false;
-            }
-        }
-        if (!eligible) continue;
-
-        std::unordered_set<void*> enabled_sources;
-        for (auto* connection : component) {
-            if (!enabled_sources.insert(connection->sourcePortPtr()).second) continue;
-            if (!connection->enableTransparentBroadcastForSource(kHeadroomCycles)) {
-                throw std::logic_error("transparent broadcast component failed to initialize");
-            }
-        }
-        optimized_connections += component.size();
-    }
-    return optimized_connections;
-}
-
 void TickSimulation::optimizeAllQueuesForSingleThread() {
-    // Detect multi-producer fan-in even in single-thread execution -- ports
-    // fed by multiple Connections still need MPSC-style staging +
-    // arbitration so admission order is deterministic and matches the
-    // multi-thread scheduler.
+    // Detect multi-producer fan-in even in single-thread execution. Independent
+    // topology-keyed lanes keep merge order identical to multi-thread runs.
     std::unordered_map<void*, std::vector<ConnectionBase*>> port_to_connections;
     for (auto* conn : connections_) {
         if (conn->dependencyOnlyTransport()) continue;
@@ -718,14 +632,13 @@ void TickSimulation::optimizeAllQueuesForSingleThread() {
             conns[0]->optimizeForSameThread();
             continue;
         }
-        // Multi-producer fan-in: route through MPSC + arbiter so the
-        // cycle-boundary admission order is determined by conn_id, not by
-        // tick-loop producer ordering.
+        // Multi-producer fan-in: one direct lane per Connection; the receiver
+        // merges by arrival cycle and stable conn_id.
         for (auto* conn : conns) {
             conn->optimizeForMPSC();
         }
         // Synthesize a producer key per connection (conn_id + 1), so each
-        // registered edge gets its own MPSC staging ring.
+        // registered edge gets its own direct SPSC lane.
         for (auto* conn : conns) {
             const size_t pseudo_thread_id = static_cast<size_t>(conn->connId()) + 1;
             const size_t queue_id = conn->registerProducerThread(pseudo_thread_id);
@@ -814,9 +727,8 @@ void TickSimulation::optimizeConnectionQueuesForThreads() {
                 same_thread_count += 1;
             } else {
                 // Multi-producer fan-in (even on one thread): route through
-                // MPSC so the cycle-boundary arbiter produces a topology-
-                // stable admission order matching the multi-thread case
-                // byte-for-byte.
+                // direct lanes so receiver-side merge order remains topology-
+                // stable and matches the multi-thread case byte-for-byte.
                 for (auto* conn : conns) {
                     conn->optimizeForMPSC();
                 }
@@ -897,7 +809,7 @@ void TickSimulation::optimizeConnectionQueuesForDynamicRebalance_() {
             // future-cycle messages still pending.
             conns[0]->optimizeForSPSC();
         } else {
-            // Multi-producer fan-in remains topology-keyed: one staging ring
+            // Multi-producer fan-in remains topology-keyed: one direct lane
             // per Connection, ordered by stable conn_id.
             for (auto* conn : conns) {
                 conn->optimizeForMPSC();

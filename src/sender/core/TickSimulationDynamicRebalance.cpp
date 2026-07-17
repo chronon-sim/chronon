@@ -46,17 +46,6 @@ uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
     return delta > max - base ? max : base + delta;
 }
 
-bool clusterHasMPSCConnections(const std::vector<TickableUnit*>& units) noexcept {
-    for (const auto* unit : units) {
-        for (const auto* port : unit->ports()) {
-            if (port->hasMPSCConnections()) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 }  // namespace
 
 void TickSimulation::recordClusterTickSample_(size_t cluster, uint64_t ticks, bool active) {
@@ -640,7 +629,6 @@ uint64_t TickSimulation::executeRunEpochFreeDynamic_(uint64_t total_cycles) {
 
     if (captured) std::rethrow_exception(captured);
 
-    arbitrateAllMPSCPorts_();
     flushDynamicSchedulerMarkers_();
 
     if (timeline_trace_.traceEpochs()) {
@@ -797,25 +785,18 @@ void TickSimulation::executeThreadEpochDynamicImpl_(size_t thread_idx, uint64_t 
             uint64_t idle_target =
                 computeIdleClusterTarget_(cluster, cycle, end_cycle, predecessor_cycles);
             if (idle_target > cycle) {
-                const bool cluster_has_mpsc =
-                    clusterHasMPSCConnections(cluster_unit_ptrs_[cluster]);
-                if (cluster_has_mpsc) {
-                    idle_target = std::min(idle_target, cycle + 1);
-                }
                 SchedulerTimelineTrace::TimePoint idle_begin{};
                 if (trace_units) {
                     idle_begin = SchedulerTimelineTrace::Clock::now();
                 }
                 advanceClusterIdle_(cluster, idle_target - cycle);
                 uint64_t reached_cycle = idle_target;
-                if (!cluster_has_mpsc) {
-                    const uint64_t refreshed_target =
-                        computeIdleClusterTarget_(cluster, cycle, idle_target, predecessor_cycles);
-                    if (refreshed_target < idle_target) {
-                        reached_cycle = refreshed_target;
-                        for (auto* unit : cluster_unit_ptrs_[cluster]) {
-                            unit->setLocalCycle(reached_cycle);
-                        }
+                const uint64_t refreshed_target =
+                    computeIdleClusterTarget_(cluster, cycle, idle_target, predecessor_cycles);
+                if (refreshed_target < idle_target) {
+                    reached_cycle = refreshed_target;
+                    for (auto* unit : cluster_unit_ptrs_[cluster]) {
+                        unit->setLocalCycle(reached_cycle);
                     }
                 }
                 if (trace_units) {

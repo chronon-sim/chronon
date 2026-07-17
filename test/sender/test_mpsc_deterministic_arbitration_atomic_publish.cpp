@@ -8,8 +8,7 @@
 
 // test_mpsc_deterministic_arbitration_atomic_publish.cpp
 //
-// Determinism regression test for MPSC InPorts under the lookahead scheduler
-// (consumer-tick-driven arbitration; see docs/mpsc-atomic-publish.md).
+// Determinism regression test for direct-lane MPSC InPorts under lookahead.
 //
 // Topology: 3 producer TickableUnits, each on its own worker thread, each
 // sending 2 messages/tick for 100 ticks, fanning into a single consumer
@@ -17,10 +16,9 @@
 //
 // Parameter sweep: num_workers in {1, 2, 3, 4, 6, 8} x 5 repeats each.
 // num_workers=1 exercises the Sequential fallback: TickSimulation disables
-// enable_parallel when num_workers < 2, so the lookahead path is replaced
-// by the per-cycle sequential loop and arbitration runs via the main-thread
-// arbitrateAllMPSCPorts_() path. Including it in the sweep pins the total
-// cycle count to be identical with the parallel cases.
+// enable_parallel when num_workers < 2, so the lookahead path is replaced by
+// the per-cycle sequential loop. Including it pins the total cycle count to be
+// identical with the parallel cases.
 //
 // Expectations:
 //   - All 30 runs produce the same (arrive_cycle, producer_id, sequence) trace.
@@ -136,7 +134,7 @@ RunResult runOnce(size_t num_workers, uint64_t producer_ticks, size_t user_cap) 
     cfg.enable_lookahead = true;
     cfg.epoch_size = 64;
     // Disable weighted partitioning so thread assignment is pure round-robin.
-    // This test exercises MPSC arbitration determinism, not partitioning
+    // This test exercises direct-lane MPSC ordering, not partitioning
     // quality. The default uniform-cost partitioner may assign producers and
     // consumer sub-optimally for some num_workers values, causing throughput
     // backpressure that is correct but violates this test's "all 200 sent"

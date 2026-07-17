@@ -48,14 +48,15 @@ int main() {
     input.setArbitrationConnProgress(progress_map);
 
     const auto begin = std::chrono::steady_clock::now();
+    uint64_t checksum = 0;
     for (uint64_t cycle = 0; cycle < iterations; ++cycle) {
         consumer.setCycle(cycle);
-        input.arbitrateMPSCConsumerDriven();
+        if (auto value = input.tryReceive(cycle)) checksum += *value;
     }
     const auto end = std::chrono::steady_clock::now();
     const double ns = std::chrono::duration<double, std::nano>(end - begin).count() /
                       static_cast<double>(iterations);
-    std::cout << "typed=" << chronon::sender::detail::experimentalTypedMPSCConsumerDispatchEnabled()
-              << std::fixed << std::setprecision(2) << " empty-fanin=" << connections
-              << " ns/arbitration=" << ns << '\n';
+    std::cout << "direct-lanes=1" << std::fixed << std::setprecision(2)
+              << " empty-fanin=" << connections << " ns/receive=" << ns << " checksum=" << checksum
+              << '\n';
 }

@@ -809,7 +809,7 @@ bool TickSimulation::performRebalance_() {
     buildCrossThreadDependencies();
 
     initProgressSync();
-    installMPSCProducerProgress_();
+    installMultiProducerProgress_();
     initTimelineTraceScratch_();
 
     thread_sampling_.resize(num_threads);

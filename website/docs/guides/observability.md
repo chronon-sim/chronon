@@ -178,7 +178,7 @@ The timeline contains:
   at counter dump cycles and nested under each unit's collapsible `counters`
   subgroup (`unit.counters.counter_name`).
 - **Scheduler execution timeline** — when enabled, wall-clock
-  unit/wait/epoch/arbitration slices under a "Chronon Scheduler" process
+  unit/wait/epoch slices under a "Chronon Scheduler" process
   group, with one lane per worker stream plus a `scheduler` lane. Slices
   carry `cycle` and `detail` debug annotations. See
   [Scheduler Timeline Trace](scheduler-timeline.md).

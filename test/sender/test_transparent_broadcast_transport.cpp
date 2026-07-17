@@ -12,6 +12,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -143,6 +144,14 @@ void testAutomaticSelectionAndPortSemantics() {
               "consumer InPort did not switch to shared replay");
         check(!consumer->in.hasData(0), "delay-one payload became visible in the send cycle");
     }
+    bool reconfiguration_rejected = false;
+    try {
+        bus.consumers[0]->in.useSingleThreadQueue();
+    } catch (const std::logic_error&) {
+        reconfiguration_rejected = true;
+    }
+    check(reconfiguration_rejected,
+          "queue reconfiguration silently detached an active shared transport");
 
     check(bus.producers[1]->out.send(90), "pre-cancel producer 1 send failed");
     bus.consumers[0]->in.cancelYoungerThan<&valueKey>(50);
@@ -152,6 +161,14 @@ void testAutomaticSelectionAndPortSemantics() {
     bus.producers[0]->out.cancelInFlight();
     check(bus.producers[0]->out.send(11), "post-cancel producer 0 send failed");
 
+    check(!bus.consumers[0]->in.hasData(0),
+          "shared queue facade exposed a future payload as ready");
+    check(bus.consumers[0]->in.hasData(1), "shared queue facade did not expose a ready payload");
+    check(bus.consumers[0]->in.queuedMessageCount() == 3,
+          "shared queue facade did not retire sender-canceled payloads");
+    check(bus.consumers[0]->in.capacity() == InPort<uint64_t>::UNLIMITED_CAPACITY &&
+              bus.consumers[0]->in.available() == InPort<uint64_t>::UNLIMITED_CAPACITY,
+          "shared queue facade introduced model-visible backpressure");
     check(bus.consumers[0]->in.minArrivalCycle() == 1,
           "shared transport reported the wrong earliest arrival");
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
@@ -169,6 +186,10 @@ void testAutomaticSelectionAndPortSemantics() {
     check(buffered == other_expected, "receiveAllBuffered differs from queue transport");
     check(drainTryReceive(bus.consumers[3]->in, 1) == other_expected,
           "shared replay was destructive across consumers");
+    for (auto* consumer : bus.consumers) {
+        check(consumer->in.queuedMessageCount() == 0,
+              "shared queue facade retained a drained payload");
+    }
 
     check(bus.producers[0]->out.send(12), "flush test send failed");
     bus.consumers[3]->in.flush();
@@ -177,6 +198,46 @@ void testAutomaticSelectionAndPortSemantics() {
               "flush on one consumer affected another consumer cursor");
     }
     check(!bus.consumers[3]->in.hasData(1), "flush did not drop future shared payloads");
+    check(bus.consumers[3]->in.queuedMessageCount() == 0,
+          "flush did not clear the shared queue facade");
+}
+
+void testReceiverFilterIsCursorLocal() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto* producer = simulation.createUnit<PassiveProducer>("producer");
+    std::array<PassiveConsumer*, 4> consumers{};
+    for (size_t i = 0; i < consumers.size(); ++i) {
+        consumers[i] = simulation.createUnit<PassiveConsumer>("consumer" + std::to_string(i));
+        simulation.connect(producer->out, consumers[i]->in, 1);
+    }
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == consumers.size(),
+          "filter test did not select transparent broadcast");
+    for (uint64_t value = 1; value <= 4; ++value) {
+        check(producer->out.send(value), "shared filter test send failed");
+    }
+
+    size_t inspected = 0;
+    auto keep_even = [&](const uint64_t& value) noexcept {
+        ++inspected;
+        return (value & 1U) == 0;
+    };
+    check(consumers[0]->in.tryReceiveFiltered(1, keep_even) == std::optional<uint64_t>{2},
+          "shared receiver filter did not skip its first rejected payload");
+    check(consumers[0]->in.tryReceiveFiltered(1, keep_even) == std::optional<uint64_t>{4},
+          "shared receiver filter changed accepted-payload order");
+    check(!consumers[0]->in.tryReceiveFiltered(1, keep_even).has_value(),
+          "shared receiver filter left a ready payload behind");
+    check(inspected == 4, "shared receiver filter inspected a payload more than once");
+
+    const std::vector<uint64_t> all_values{1, 2, 3, 4};
+    check(consumers[1]->in.receiveAll(1) == all_values,
+          "filtering one shared cursor destructively changed another consumer");
+    check(consumers[2]->in.receiveAll(1) == all_values,
+          "shared cursor replay diverged after another consumer filtered");
 }
 
 void testUnsafeComponentsFallBackAtomically() {
@@ -454,7 +515,6 @@ void testEnvironmentOptOut() {
           "environment opt-out left an OutPort on shared transport");
     check(bus.producers[0]->out.send(42), "opt-out fallback send failed");
     for (auto* consumer : bus.consumers) {
-        consumer->in.arbitrateMPSCConsumerDriven();
         check(consumer->in.tryReceive(1) == std::optional<uint64_t>{42},
               "opt-out fallback changed Port delivery");
     }
@@ -466,6 +526,7 @@ void testEnvironmentOptOut() {
 
 int main() {
     testAutomaticSelectionAndPortSemantics();
+    testReceiverFilterIsCursorLocal();
     testUnsafeComponentsFallBackAtomically();
     testOversizedRateFallsBackAtomically();
     testInitializedQueueFallsBackAtomically();

@@ -18,6 +18,7 @@
 #include <iostream>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "chronon/Chronon.hpp"
 
@@ -322,6 +323,50 @@ void test_mismatched_extractor_does_not_install_predicate() {
     std::cout << "PASSED\n";
 }
 
+// Fixed-delay MPSC fan-in is a supported StageSelective topology. Exercise the
+// active-frontier merge (32 lanes), receiver-only filtering, and the
+// post-flush retirement boundary together rather than only through the
+// single-thread queue backend.
+void test_fixed_delay_mpsc_frontier_flush() {
+    std::cout << "Testing StageSelective fixed-delay MPSC frontier flush... ";
+
+    TestUnit cons("cons");
+    InPort<TaggedMsg> in{&cons, "in", 64, PortPolicy::StageSelective};
+    in.useMultiProducerQueue(/*min_per_thread_usable_capacity=*/4);
+
+    std::vector<size_t> lanes;
+    for (size_t i = 0; i < MultiProducerQueueAdapter<TaggedMsg>::kFrontierLaneThreshold; ++i) {
+        const size_t lane = in.registerProducerThread(100 + i);
+        EXPECT(lane != SIZE_MAX, "register StageSelective MPSC lane");
+        lanes.push_back(lane);
+    }
+
+    // All old messages model the same fixed delay: enqueue cycle 4, arrival 5.
+    EXPECT(in.pushToThreadQueue(lanes[31], TaggedMsg{.key = 10}, 5, 4, 31), "push old low");
+    EXPECT(in.pushToThreadQueue(lanes[0], TaggedMsg{.key = 50}, 5, 4, 0), "push old keep");
+    EXPECT(in.pushToThreadQueue(lanes[1], TaggedMsg{.key = 90}, 5, 4, 1), "push old high");
+
+    cons.setCycle(5);
+    in.cancelOutsideInclusive<&TaggedMsg::getKey>(uint64_t{20}, uint64_t{80});
+    // StageSelective reset is deliberately a no-op: compatibility call sites
+    // must not erase a live flush predicate before in-flight traffic drains.
+    in.resetSelectiveCancellation();
+
+    auto old_survivor = in.tryReceive(5);
+    EXPECT(old_survivor.has_value() && old_survivor->key == 50,
+           "frontier merge must retain the in-range old message");
+    EXPECT(!in.tryReceive(5).has_value(), "out-of-range old messages must be canceled");
+
+    // Same fixed delay, first post-flush enqueue. It survives regardless of
+    // key and retires the old predicate only after all cycle-4 entries drained.
+    EXPECT(in.pushToThreadQueue(lanes[2], TaggedMsg{.key = 1}, 6, 5, 2), "push fresh low");
+    auto fresh = in.tryReceive(6);
+    EXPECT(fresh.has_value() && fresh->key == 1, "post-flush MPSC message must survive");
+    EXPECT(!in.tryReceive(6).has_value(), "MPSC StageSelective queue must be empty after drain");
+
+    std::cout << "PASSED\n";
+}
+
 }  // namespace
 
 int main() {
@@ -332,6 +377,7 @@ int main() {
     test_range_flush_semantic();
     test_older_than_timestamp_scope();
     test_mismatched_extractor_does_not_install_predicate();
+    test_fixed_delay_mpsc_frontier_flush();
     std::cout << "All StageSelective port tests passed.\n";
     return 0;
 }

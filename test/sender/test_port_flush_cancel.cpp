@@ -12,7 +12,10 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "chronon/Chronon.hpp"
@@ -21,6 +24,10 @@ using namespace chronon;
 using namespace chronon::sender;
 
 namespace {
+
+void require(bool condition, const char* message) {
+    if (!condition) throw std::runtime_error(message);
+}
 
 class TestUnit : public Unit {
 public:
@@ -399,25 +406,49 @@ void test_inport_selective_cancel_mismatched_keyfn_is_noop() {
 }
 
 void test_inport_selective_cancel_mpsc_thread_queues() {
-    std::cout << "Testing InPort selective cancel on MPSC thread queues... ";
+    std::cout << "Testing future-arrival selective cancel through MPSC connections... ";
 
+    TestUnit prod0("prod0");
+    TestUnit prod1("prod1");
     TestUnit cons("cons");
+    OutPort<TaggedMsg> out0{&prod0, "out0", 4};
+    OutPort<TaggedMsg> out1{&prod1, "out1", 4};
     InPort<TaggedMsg> in{&cons, "in", 64};
-    in.useMultiProducerQueue();
+    auto* conn0 = out0.connect(&in, 5);
+    auto* conn1 = out1.connect(&in, 5);
 
-    [[maybe_unused]] const size_t q0 = in.registerProducerThread(0);
-    [[maybe_unused]] const size_t q1 = in.registerProducerThread(1);
-    assert(q0 != SIZE_MAX);
-    assert(q1 != SIZE_MAX);
+    conn0->setConnId(10);
+    conn1->setConnId(20);
+    conn0->optimizeForMPSC();
+    conn1->optimizeForMPSC();
+    const size_t lane0 = conn0->registerProducerThread(100);
+    const size_t lane1 = conn1->registerProducerThread(200);
+    require(lane0 != SIZE_MAX && lane1 != SIZE_MAX && lane0 != lane1,
+            "failed to register direct MPSC lanes");
+    conn0->setThreadQueueId(lane0);
+    conn1->setThreadQueueId(lane1);
+    require(conn0->registerOnDestMPSC() != nullptr && conn1->registerOnDestMPSC() != nullptr,
+            "failed to register MPSC connections on the destination");
+    require(in.isMultiProducerMode(), "test did not select the direct MPSC transport");
 
-    // Existing in-flight messages (generation 0).
-    assert(in.pushToThreadQueue(q0, TaggedMsg{.id = 10, .seq = 10, .payload = 0}, 5));
-    assert(in.pushToThreadQueue(q1, TaggedMsg{.id = 30, .seq = 30, .payload = 0}, 5));
+    // Already-published messages are in flight even though delay=5 keeps them
+    // invisible until cycle 5. This scope must match the ordinary queue path.
+    prod0.setCycle(0);
+    prod1.setCycle(0);
+    require(out0.send(TaggedMsg{.id = 10, .seq = 10, .payload = 0}),
+            "failed to publish old low-key MPSC message");
+    require(out1.send(TaggedMsg{.id = 30, .seq = 30, .payload = 0}),
+            "failed to publish old retained MPSC message");
 
     in.cancelOlderThan<&TaggedMsg::id>(static_cast<uint64_t>(20));
 
-    // New message should be in generation 1 and not filtered by prior scope.
-    assert(in.pushToThreadQueue(q0, TaggedMsg{.id = 15, .seq = 15, .payload = 0}, 6));
+    // Messages published after the cancellation enter the next generation.
+    prod0.setCycle(1);
+    prod1.setCycle(1);
+    require(out0.send(TaggedMsg{.id = 15, .seq = 15, .payload = 0}),
+            "failed to publish new low-key MPSC message");
+    require(out1.send(TaggedMsg{.id = 25, .seq = 25, .payload = 0}),
+            "failed to publish new retained MPSC message");
 
     std::vector<uint64_t> cycle5_ids;
     for (int i = 0; i < 10; ++i) {
@@ -426,13 +457,170 @@ void test_inport_selective_cancel_mpsc_thread_queues() {
     assert(cycle5_ids.size() == 1);
     assert(cycle5_ids[0] == 30);
 
-    [[maybe_unused]] auto msg = in.tryReceive(6);
-    assert(msg.has_value());
-    assert(msg->id == 15);
+    auto first_new = in.tryReceive(6);
+    auto second_new = in.tryReceive(6);
+    assert(first_new.has_value() && first_new->id == 15);
+    assert(second_new.has_value() && second_new->id == 25);
     assert(!in.tryReceive(6).has_value());
 
     std::cout << "PASSED\n";
 }
+
+void test_receiver_filter_cancels_rejected_messages() {
+    std::cout << "Testing receiver filter cancels rejected messages... ";
+
+    TestUnit prod("prod");
+    TestUnit cons("cons");
+    OutPort<int> out{&prod, "out", 8};
+    InPort<int> in{&cons, "in", 16};
+    out.connect(&in, 1);
+
+    prod.setCycle(0);
+    for (int value = 1; value <= 6; ++value) {
+        require(out.send(value), "failed to seed receiver-filter test");
+    }
+
+    size_t inspected = 0;
+    auto keep_even = [&](const int& value) noexcept {
+        ++inspected;
+        return (value & 1) == 0;
+    };
+    for (int expected : {2, 4, 6}) {
+        auto value = in.tryReceiveFiltered(1, keep_even);
+        require(value.has_value() && *value == expected,
+                "receiver filter changed accepted-message order");
+    }
+    require(!in.tryReceiveFiltered(1, keep_even).has_value(),
+            "receiver filter left a ready message behind");
+    require(inspected == 6, "receiver filter did not inspect every ready message exactly once");
+    require(in.queuedMessageCount() == 0,
+            "receiver filter did not permanently consume rejected messages");
+
+    std::cout << "PASSED\n";
+}
+
+void test_receiver_filter_direct_spsc_path() {
+    std::cout << "Testing receiver filter on direct SPSC backend... ";
+
+    const char* previous = std::getenv("CHRONON_EXPERIMENTAL_DIRECT_SPSC");
+    const std::string previous_value = previous ? previous : "";
+    const bool had_previous = previous != nullptr;
+    unsetenv("CHRONON_EXPERIMENTAL_DIRECT_SPSC");
+
+    TestUnit prod("prod");
+    TestUnit cons("cons");
+    OutPort<int> out{&prod, "out", 8};
+    InPort<int> in{&cons, "in", 16};
+    out.connect(&in, 1);
+    in.useLockFreeQueue();
+    require(in.usesDirectSPSC(), "production-default direct SPSC backend was not selected");
+
+    prod.setCycle(0);
+    for (int value = 1; value <= 6; ++value) {
+        require(out.send(value), "failed to seed direct-SPSC receiver-filter test");
+    }
+
+    size_t inspected = 0;
+    auto keep_even = [&](const int& value) noexcept {
+        ++inspected;
+        return (value & 1) == 0;
+    };
+    for (int expected : {2, 4, 6}) {
+        auto value = in.tryReceiveFiltered(1, keep_even);
+        require(value.has_value() && *value == expected,
+                "direct SPSC receiver filter changed accepted-message order");
+    }
+    require(!in.tryReceiveFiltered(1, keep_even).has_value(),
+            "direct SPSC receiver filter left a ready message behind");
+    require(inspected == 6, "direct SPSC filter did not inspect each message exactly once");
+    require(in.queuedMessageCount() == 0, "direct SPSC filter did not consume rejected messages");
+
+    if (had_previous) {
+        setenv("CHRONON_EXPERIMENTAL_DIRECT_SPSC", previous_value.c_str(), 1);
+    } else {
+        unsetenv("CHRONON_EXPERIMENTAL_DIRECT_SPSC");
+    }
+
+    std::cout << "PASSED\n";
+}
+
+void test_receiver_filter_preserves_mpsc_order() {
+    std::cout << "Testing receiver filter preserves MPSC order... ";
+
+    TestUnit cons("cons");
+    InPort<int> in{&cons, "in", 16};
+    in.useMultiProducerQueue();
+    const size_t q0 = in.registerProducerThread(1);
+    const size_t q1 = in.registerProducerThread(2);
+
+    require(in.pushToThreadQueue(q1, 3, 5, 0, 20), "failed to seed MPSC lane 1");
+    require(in.pushToThreadQueue(q0, 1, 5, 0, 10), "failed to seed MPSC lane 0 head");
+    require(in.pushToThreadQueue(q0, 2, 6, 1, 10), "failed to seed MPSC lane 0 tail");
+
+    auto keep_not_one = [](const int& value) noexcept { return value != 1; };
+    auto first = in.tryReceiveFiltered(5, keep_not_one);
+    require(first.has_value() && *first == 3,
+            "receiver filter did not preserve same-cycle MPSC order");
+    auto second = in.tryReceiveFiltered(6, keep_not_one);
+    require(second.has_value() && *second == 2,
+            "receiver filter did not preserve the next-cycle lane head");
+    require(!in.tryReceiveFiltered(6, keep_not_one).has_value(),
+            "receiver filter left an unexpected MPSC message");
+
+    std::cout << "PASSED\n";
+}
+
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+void test_outport_cancel_isolated_between_mpsc_lanes() {
+    std::cout << "Testing OutPort cancellation isolation across MPSC lanes... ";
+
+    TestUnit prod0("prod0");
+    TestUnit prod1("prod1");
+    TestUnit cons("cons");
+    OutPort<int> out0{&prod0, "out0", 4};
+    OutPort<int> out1{&prod1, "out1", 4};
+    InPort<int> in{&cons, "in", 16};
+    auto* conn0 = out0.connect(&in, 2);
+    auto* conn1 = out1.connect(&in, 2);
+
+    conn0->setConnId(10);
+    conn1->setConnId(20);
+    conn0->optimizeForMPSC();
+    conn1->optimizeForMPSC();
+    const size_t lane0 = conn0->registerProducerThread(101);
+    const size_t lane1 = conn1->registerProducerThread(202);
+    require(lane0 != SIZE_MAX && lane1 != SIZE_MAX && lane0 != lane1,
+            "failed to register independent MPSC lanes");
+    conn0->setThreadQueueId(lane0);
+    conn1->setThreadQueueId(lane1);
+
+    prod0.setCycle(0);
+    prod1.setCycle(0);
+    require(out0.send(100), "failed to send cancelable lane-0 message");
+    require(out1.send(200), "failed to send lane-1 control message");
+    out0.cancelInFlight();
+
+    prod0.setCycle(1);
+    prod1.setCycle(1);
+    require(out0.send(101), "failed to send post-cancel lane-0 message");
+    require(out1.send(201), "failed to send second lane-1 control message");
+
+    auto cycle2 = in.tryReceive(2);
+    require(cycle2.has_value() && *cycle2 == 200,
+            "canceling one OutPort discarded or reordered another producer lane");
+    require(!in.tryReceive(2).has_value(), "canceled MPSC entry remained observable");
+
+    auto first_cycle3 = in.tryReceive(3);
+    auto second_cycle3 = in.tryReceive(3);
+    require(first_cycle3.has_value() && *first_cycle3 == 101,
+            "post-cancel epoch did not survive on its producer lane");
+    require(second_cycle3.has_value() && *second_cycle3 == 201,
+            "MPSC sender-id order changed after lazy cancellation");
+    require(!in.tryReceive(3).has_value(), "unexpected MPSC message remained after drain");
+
+    std::cout << "PASSED\n";
+}
+#endif
 
 }  // namespace
 
@@ -459,6 +647,12 @@ int main() {
     test_inport_selective_cancel_scoped_to_inflight();
     test_inport_selective_cancel_mismatched_keyfn_is_noop();
     test_inport_selective_cancel_mpsc_thread_queues();
+    test_receiver_filter_cancels_rejected_messages();
+    test_receiver_filter_direct_spsc_path();
+    test_receiver_filter_preserves_mpsc_order();
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+    test_outport_cancel_isolated_between_mpsc_lanes();
+#endif
 
     std::cout << "\n=== All Port Flush/Cancel tests PASSED ===\n";
     return 0;

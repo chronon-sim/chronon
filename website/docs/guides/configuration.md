@@ -257,13 +257,12 @@ with a warning. Categories still control enable/disable and temporal filters.
 ### Scheduler Timeline Trace
 
 The scheduler timeline records Chronon scheduler streams, unit tick slices,
-lazy idle fast-path slices, cross-thread spin waits, epoch spans, and MPSC
-arbitration slices. It is part
+lazy idle fast-path slices, cross-thread spin waits, and epoch spans. It is part
 of the unified Perfetto timeline: when the observation backend runs with a
 timeline sink, the scheduler slices merge into `timeline.pftrace` under a
 "Chronon Scheduler" process group, with one lane per worker stream (`stream 0`,
-`stream 1`, ...) plus a `scheduler` lane for epoch, rebalance, and MPSC
-arbitration spans. Slices carry `cycle` and `detail` debug annotations.
+`stream 1`, ...) plus a `scheduler` lane for epoch and rebalance spans. Slices
+carry `cycle` and `detail` debug annotations.
 
 ```yaml
 simulation:
@@ -277,7 +276,6 @@ simulation:
         trace_units: true
         trace_waits: true
         trace_epochs: true
-        trace_arbitration: true
         min_duration_ns: 0
 ```
 
@@ -289,7 +287,7 @@ simulation:
 | `trace_units` | Record each unit tick as a duration slice. |
 | `trace_waits` | Record spin waits on predecessor cluster progress atomics. |
 | `trace_epochs` | Record progress-epoch spans on the scheduler lane. |
-| `trace_arbitration` | Record MPSC arbitration spans on the scheduler lane. |
+| `trace_arbitration` | Deprecated compatibility field; direct MPSC lanes perform no scheduler arbitration. |
 | `min_duration_ns` | Drop events below this duration. |
 
 The old top-level `simulation.timeline_trace:` key is deprecated; it is still

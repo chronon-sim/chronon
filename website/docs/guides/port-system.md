@@ -8,6 +8,9 @@ sidebar_label: "Port System"
 
 Ports provide type-safe communication between units with timestamped message queues for deterministic delivery. The connection delay determines latency; the queue type is automatically selected based on thread topology during simulation initialization.
 
+For the queue layout, memory-ordering contract, deterministic fan-in proof, and
+performance rationale, see [Port Transport Architecture](mpsc-atomic-publish.md).
+
 **Internal optimization:** The framework uses different queue implementations as an internal optimization:
 - **delay=0**: Same-cycle delivery (0-cycle latency), may use direct delivery
 - **delay>0**: Queued delivery with N-cycle latency, queue type selected based on thread topology
@@ -89,6 +92,10 @@ public:
     // Receive data at current cycle
     std::optional<T> tryReceive(uint64_t current_cycle);
 
+    // Permanently consume ready messages rejected by a noexcept receiver predicate
+    template<class Filter>
+    std::optional<T> tryReceiveFiltered(uint64_t current_cycle, Filter&& filter);
+
     // Receive all available messages
     std::vector<T> receiveAll(uint64_t current_cycle);
     std::vector<T> receiveAll();  // Uses owner->localCycle()
@@ -132,7 +139,7 @@ sim.connect(producer->out, consumer->in, 0);
 // Queue type selected automatically based on thread topology:
 // - SingleThreadMessageQueue: Both on same thread
 // - LockFreeQueueAdapter: Cross-thread SPSC (single producer)
-// - MultiProducerQueueAdapter: Cross-thread MPSC (multiple producers)
+// - MultiProducerQueueAdapter: direct SPSC lane per Connection + receiver merge
 sim.connect(producer->out, consumer->in, 5);
 
 // Cancellation / flush (CPU squash / pipeline flush)
@@ -145,6 +152,18 @@ consumer->in.flush();
 ## Selective Cancellation
 
 Selective cancellation is available on **InPort** (receiver-side). It allows fine-grained key-based filtering of in-flight messages without dropping everything.
+
+For one-shot arbitrary filtering, `tryReceiveFiltered(cycle, predicate)` scans
+ready messages in deterministic delivery order and permanently consumes every
+message for which the `noexcept` predicate returns `false`. The predicate is
+inlined—no `std::function` or allocation is introduced:
+
+```cpp
+auto current_epoch = [epoch](const Message& message) noexcept {
+    return message.epoch == epoch;
+};
+auto message = in.tryReceiveFiltered(localCycle(), current_epoch);
+```
 
 `cancelOlderThan<KeyFn>(watermark)` selectively drops in-flight messages where `KeyFn(msg) < watermark`, without affecting newer messages.
 
@@ -207,8 +226,8 @@ cmake -S . -B build -DCHRONON_ENABLE_OUTPORT_CANCELLATION=OFF
 
 The default is `ON` and preserves full cancellation semantics. `OFF` is an
 explicit whole-build contract: `cancelInFlight()` becomes a no-op, the sender
-path omits its cancellation-epoch acquire, MPSC staging omits the epoch stamp,
-and `PortEnvelope` omits the cancellation pointer and snapshot. Receiver-side
+path omits its cancellation-epoch acquire, direct MPSC lane envelopes omit the
+epoch stamp, and `PortEnvelope` omits the cancellation pointer and snapshot. Receiver-side
 `InPort` selective cancellation remains available.
 
 Do not disable the option merely because cancellation is rare. It is safe only
@@ -218,7 +237,27 @@ validation test, and their counter-metadata test are therefore not built when
 this option is `OFF`; those models rely on sender-side cancellation for correct
 flush semantics.
 
-## Shared Delay-One Broadcast Fabric
+## Automatic Shared Delay-One Broadcast
+
+Normal `OutPort`/`InPort` graphs automatically use a shared data plane when an
+entire connected Port component is safe for the optimization: every source has
+at least four destinations, every edge has delay one, payloads are copyable,
+destinations are unbounded, and no registered edge capacity or rate changes the
+admission contract. Selection is all-or-nothing for the component.
+
+`SharedBroadcastTransport` stores each source payload once and gives every
+destination connection an independent cache-line-aligned cursor. On the receive
+side, `SharedBroadcastQueueAdapter` exposes those cursors through the same
+`IMessageQueue` contract as SPSC and MPSC transports. Consequently `hasData`,
+`minArrivalCycle`, `tryReceiveFiltered`, receiver cancellation, bulk receive,
+queue statistics, and `flush` all use the normal `InPort` control plane. A slow
+or flushed consumer changes only its own cursor and cannot destroy another
+consumer's replay.
+
+This optimization is transparent to models. Set
+`CHRONON_EXPERIMENTAL_TRANSPARENT_BROADCAST=0` only for A/B diagnosis.
+
+## Explicit Shared Delay-One Broadcast Fabric
 
 `DelayOneBroadcastFabric<T, P, C>` is an explicit specialization for a complete
 `P`-producer by `C`-consumer, delay-one broadcast bus. It stores each producer
@@ -254,6 +293,10 @@ delay-one fanout before changing any connection to dependency-only transport
 and exposes the finite ring depth as scheduler headroom. When necessary, the
 lookahead scheduler adds reverse dependencies that prevent a producer from
 wrapping an unread bucket.
+
+For new models, prefer normal Ports and their automatic shared transport. The
+explicit fabric remains available for existing code that intentionally owns a
+fixed compile-time ring and calls `publish()`/`consume()` itself.
 
 ## Usage Pattern
 
@@ -308,7 +351,7 @@ The framework auto-selects queue type based on thread topology during simulation
 |------------|-------------------|----------------|----------|
 | `SingleThreadMessageQueue` | Producer and consumer on same thread | Direct queue access | Zero |
 | `LockFreeQueueAdapter` | Cross-thread, single producer (SPSC) | Lock-free ring buffer with atomics | Near-zero |
-| `MultiProducerQueueAdapter` | Cross-thread, multiple producers (MPSC) | Per-producer SPSC rings + merge | Near-zero |
+| `MultiProducerQueueAdapter` | Multiple Connections into one InPort | Direct per-Connection SPSC lanes + deterministic frontier | Near-zero |
 
 **Manual queue type selection:**
 
@@ -330,8 +373,10 @@ consumer->in.useMultiProducerQueue();
 
 **MPSC mode:**
 
-For MPSC destinations, producer threads register dedicated per-thread queues during
-simulation initialization. Each producer thread gets its own queue ID:
+For MPSC destinations, initialization assigns one dedicated lane to every
+`Connection` (the legacy API calls the stable connection key a `thread_id`).
+These low-level methods are intended for framework initialization and tests;
+normal models use `OutPort::send()` and `InPort::tryReceive()`:
 
 ```cpp
 // During initialization, each producer thread registers
@@ -343,16 +388,16 @@ if (consumer->in.canAcceptOnThreadQueue(queue_id)) {
 }
 ```
 
-The consumer polls all per-producer queues and merges messages in arrival-cycle order.
-For bounded `InPort` capacities, Chronon sizes both the per-connection MPSC
-staging ring and the downstream per-producer lock-free ring to cover the declared
-capacity. Unlimited-capacity ports keep a bounded default physical ring, so a
-model that needs large cross-thread burst tolerance should prefer an explicit
-bounded capacity. Back pressure is checked per queue:
-`canAcceptOnThreadQueue(queue_id, pending)` checks the per-producer cycle budget
-plus the specific producer queue's physical capacity. `isFull()`,
-`canAcceptFromProducer()`, and the old `canAcceptThreadQueue*()` names remain as
-deprecated compatibility aliases.
+The producer publishes the envelope directly into that lane; there is no
+Connection staging queue, payload copy, or scheduler arbitration pass. The
+consumer merges lane heads by `(arrive_cycle, stable_connection_id, lane_id)`.
+Small fan-in uses a direct scan; large fan-in uses sharded activity
+notifications and a consumer-owned min-heap.
+
+Bounded lanes allocate the smallest sufficient power-of-two payload ring.
+Unlimited model-visible ports retain bounded physical storage. Physical
+storage, simulated-cycle admission credit, and per-cycle edge rate are separate
+checks; a same-cycle host pop never nondeterministically reopens model capacity.
 
 ## Per-Cycle Capacity (OutPort Bandwidth Limiting)
 
@@ -424,10 +469,10 @@ void tick() override {
 **Notes:**
 - `send()` remains non-blocking. It returns `false` when the destination
   queue (or per-thread MPSC queue) is full.
-- Lock-free SPSC/MPSC queues use ring buffers with one reserved slot; effective
-  storable capacity is `N-1`. For bounded ports, the physical ring is rounded up
-  at initialization so the declared `InPort` capacity is storable. For unlimited
-  ports, the physical lock-free ring remains bounded by the default ring size.
+- Lock-free SPSC/MPSC queues use monotonic absolute tickets and power-of-two
+  masking. Every physical slot is usable; no sentinel slot is reserved. Bounded
+  rings are rounded up at initialization. Unlimited model-visible ports still
+  have bounded physical storage protected by scheduler headroom.
 
 **MPSC back pressure behavior:**
 
@@ -443,11 +488,11 @@ if (in_port.canAcceptOnThreadQueue(queue_id)) {
 }
 ```
 
-Each producer connection has its own staging ring, and the MPSC adapter has a
-per-producer lock-free queue sized from the destination port capacity. One
-producer filling its queue does not block other producers until the consumer
-polls and drains queues. The consumer processes all per-producer queues in
-arrival-cycle order with a stable connection-id tiebreak.
+Each producer connection owns one direct SPSC lane. One producer filling its
+lane does not contend on a global enqueue tail or block unrelated lanes. The
+consumer processes heads in arrival-cycle order with a stable connection-id
+tiebreak. Receiver-side filters run after deterministic selection and
+permanently consume rejected messages.
 
 ## Multiple Connections
 

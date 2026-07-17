@@ -4,7 +4,7 @@
 //
 // Registered queue tests. Chronon ports model clocked edge buffers; the
 // scheduler uses single-thread storage, SPSC rings, or topology-stable MPSC
-// staging.
+// direct lanes.
 
 #include <iostream>
 #include <mutex>
