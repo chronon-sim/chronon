@@ -179,6 +179,44 @@ void testAutomaticSelectionAndPortSemantics() {
     check(!bus.consumers[3]->in.hasData(1), "flush did not drop future shared payloads");
 }
 
+void testReceiverFilterIsCursorLocal() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto* producer = simulation.createUnit<PassiveProducer>("producer");
+    std::array<PassiveConsumer*, 4> consumers{};
+    for (size_t i = 0; i < consumers.size(); ++i) {
+        consumers[i] = simulation.createUnit<PassiveConsumer>("consumer" + std::to_string(i));
+        simulation.connect(producer->out, consumers[i]->in, 1);
+    }
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == consumers.size(),
+          "filter test did not select transparent broadcast");
+    for (uint64_t value = 1; value <= 4; ++value) {
+        check(producer->out.send(value), "shared filter test send failed");
+    }
+
+    size_t inspected = 0;
+    auto keep_even = [&](const uint64_t& value) noexcept {
+        ++inspected;
+        return (value & 1U) == 0;
+    };
+    check(consumers[0]->in.tryReceiveFiltered(1, keep_even) == std::optional<uint64_t>{2},
+          "shared receiver filter did not skip its first rejected payload");
+    check(consumers[0]->in.tryReceiveFiltered(1, keep_even) == std::optional<uint64_t>{4},
+          "shared receiver filter changed accepted-payload order");
+    check(!consumers[0]->in.tryReceiveFiltered(1, keep_even).has_value(),
+          "shared receiver filter left a ready payload behind");
+    check(inspected == 4, "shared receiver filter inspected a payload more than once");
+
+    const std::vector<uint64_t> all_values{1, 2, 3, 4};
+    check(consumers[1]->in.receiveAll(1) == all_values,
+          "filtering one shared cursor destructively changed another consumer");
+    check(consumers[2]->in.receiveAll(1) == all_values,
+          "shared cursor replay diverged after another consumer filtered");
+}
+
 void testUnsafeComponentsFallBackAtomically() {
     TickSimulationConfig config;
     config.enable_parallel = false;
@@ -454,7 +492,6 @@ void testEnvironmentOptOut() {
           "environment opt-out left an OutPort on shared transport");
     check(bus.producers[0]->out.send(42), "opt-out fallback send failed");
     for (auto* consumer : bus.consumers) {
-        consumer->in.arbitrateMPSCConsumerDriven();
         check(consumer->in.tryReceive(1) == std::optional<uint64_t>{42},
               "opt-out fallback changed Port delivery");
     }
@@ -466,6 +503,7 @@ void testEnvironmentOptOut() {
 
 int main() {
     testAutomaticSelectionAndPortSemantics();
+    testReceiverFilterIsCursorLocal();
     testUnsafeComponentsFallBackAtomically();
     testOversizedRateFallsBackAtomically();
     testInitializedQueueFallsBackAtomically();

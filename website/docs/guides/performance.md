@@ -191,7 +191,6 @@ simulation:
         trace_units: true
         trace_waits: true
         trace_epochs: true
-        trace_arbitration: true
 ```
 
 CLI override example:
@@ -264,7 +263,7 @@ frequent migrations.
 ./examples/cpu_pipeline_yaml_example config.yaml --param simulation.max_lookahead_cycles=256
 ```
 
-When the staging-capacity gate is satisfied, `enable_epoch_free_lookahead`
+When the transport-headroom gate is satisfied, `enable_epoch_free_lookahead`
 (default on) removes the per-epoch barrier entirely instead of just widening it:
 run-ahead is then bounded only by dependency progress and
 `max_lookahead_cycles`. If the gate rejects the topology, Chronon falls back to
@@ -272,7 +271,7 @@ the deprecated per-epoch path. Treat that fallback warning as a topology or
 capacity issue to fix before the fallback is removed. Dynamic rebalance remains
 opt-in and can run on the epoch-free dynamic driver when its gate holds; see
 [Epoch-Free Lookahead](scheduling.md) for the
-conditions and MPSC requirements.
+conditions and direct-lane MPSC requirements.
 
 Notes:
 - In single-thread mode, Chronon uses a per-cycle fast path to avoid lookahead bookkeeping overhead.

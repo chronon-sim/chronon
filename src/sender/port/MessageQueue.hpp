@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
@@ -27,7 +28,10 @@ namespace chronon::sender {
 
 namespace queue_detail {
 
-inline bool experimentalDirectSPSCEnabled() noexcept {
+inline bool directSPSCEnabled() noexcept {
+    // Compatibility kill switch retained for A/B diagnosis. The direct ring
+    // is the production default; only the exact value "0" selects the legacy
+    // adapter.
     const char* value = std::getenv("CHRONON_EXPERIMENTAL_DIRECT_SPSC");
     return value == nullptr || value[0] != '0' || value[1] != '\0';
 }
@@ -46,11 +50,11 @@ template <typename T>
 class LockFreeMessageQueue {
 public:
     static constexpr size_t CAPACITY = 4096;
-    static constexpr size_t USABLE_CAPACITY = CAPACITY - 1;
+    static constexpr size_t USABLE_CAPACITY = CAPACITY;
 
     explicit LockFreeMessageQueue(size_t physical_capacity = CAPACITY)
         : capacity_(roundUpPhysicalCapacity_(physical_capacity)),
-          usable_capacity_(capacity_ - 1),
+          usable_capacity_(capacity_),
           buffer_(capacity_),
           head_(0),
           cached_tail_(0),
@@ -61,10 +65,26 @@ public:
         if (user_capacity == std::numeric_limits<size_t>::max()) {
             return CAPACITY;
         }
-        if (user_capacity == std::numeric_limits<size_t>::max() - 1) {
+        return roundUpPhysicalCapacity_(std::max(CAPACITY, user_capacity));
+    }
+
+    /** Smallest power-of-two ring that can hold @p usable_capacity entries. */
+    static size_t physicalCapacityForMinimumUsable(size_t usable_capacity) {
+        if (usable_capacity == std::numeric_limits<size_t>::max()) {
             throw std::length_error("LockFreeMessageQueue requested capacity is too large");
         }
-        return roundUpPhysicalCapacity_(std::max(CAPACITY, user_capacity + 1));
+        return roundUpPhysicalCapacity_(usable_capacity);
+    }
+
+    /** Select compact storage for bounded edges and the default for unbounded ones. */
+    static size_t physicalCapacityForConfiguration(size_t user_capacity,
+                                                   size_t min_usable_capacity) {
+        size_t requested = min_usable_capacity;
+        if (user_capacity != std::numeric_limits<size_t>::max()) {
+            requested = std::max(requested, user_capacity);
+        }
+        return requested == 0 ? physicalCapacityForUserCapacity(0)
+                              : physicalCapacityForMinimumUsable(std::max(requested, size_t{2}));
     }
 
     /**
@@ -79,19 +99,20 @@ public:
      */
     bool tryPush(T data, uint64_t arrive_cycle, uint32_t sender_id = 0) {
         size_t tail = tail_.load(std::memory_order_relaxed);
-        size_t next = (tail + 1) % capacity_;
 
         // Re-read the consumer's head_ (a cross-core load) only when the cached
         // copy says full; a stale cached_head_ is conservative (looks more full).
-        if (next == cached_head_) {
+        // Absolute tickets avoid modulo ABA, make occupancy one subtraction,
+        // and allow every physical slot to be used (no sentinel slot).
+        if (tail - cached_head_ >= usable_capacity_) {
             cached_head_ = head_.load(std::memory_order_acquire);
-            if (next == cached_head_) {
+            if (tail - cached_head_ >= usable_capacity_) {
                 return false;
             }
         }
 
-        buffer_[tail] = {std::move(data), arrive_cycle, sender_id};
-        tail_.store(next, std::memory_order_release);
+        buffer_[tail & (capacity_ - 1)] = {std::move(data), arrive_cycle, sender_id};
+        tail_.store(tail + 1, std::memory_order_release);
         return true;
     }
 
@@ -117,14 +138,15 @@ public:
         }
 
         // Check if head message is ready
-        if (buffer_[head].arrive_cycle > current_cycle) {
+        Entry& entry = buffer_[head & (capacity_ - 1)];
+        if (entry.arrive_cycle > current_cycle) {
             return std::nullopt;
         }
 
-        const uint64_t arrive_cycle = buffer_[head].arrive_cycle;
-        T data = std::move(buffer_[head].data);
+        const uint64_t arrive_cycle = entry.arrive_cycle;
+        T data = std::move(entry.data);
         before_release(arrive_cycle);
-        head_.store((head + 1) % capacity_, std::memory_order_release);
+        head_.store(head + 1, std::memory_order_release);
         after_release(arrive_cycle);
         return data;
     }
@@ -147,7 +169,7 @@ public:
         if (head == tail_.load(std::memory_order_acquire)) {
             return std::nullopt;
         }
-        return buffer_[head].arrive_cycle;
+        return buffer_[head & (capacity_ - 1)].arrive_cycle;
     }
 
     /**
@@ -159,7 +181,8 @@ public:
         if (head == tail_.load(std::memory_order_acquire)) {
             return std::nullopt;
         }
-        return std::make_pair(buffer_[head].arrive_cycle, buffer_[head].sender_id);
+        const Entry& entry = buffer_[head & (capacity_ - 1)];
+        return std::make_pair(entry.arrive_cycle, entry.sender_id);
     }
 
     bool empty() const {
@@ -169,10 +192,7 @@ public:
     size_t size() const noexcept {
         size_t head = head_.load(std::memory_order_acquire);
         size_t tail = tail_.load(std::memory_order_acquire);
-        if (tail >= head) {
-            return tail - head;
-        }
-        return capacity_ - (head - tail);
+        return tail - head;
     }
 
     bool full() const noexcept { return size() >= usable_capacity_; }
@@ -466,14 +486,12 @@ using SingleThreadQueueAdapter = QueueAdapterImpl<T, SingleThreadMessageQueue<T>
  * between one producer thread and one consumer thread.
  */
 template <typename T>
-class LockFreeQueueAdapter : public IMessageQueue<T> {
+class LockFreeQueueAdapter final : public IMessageQueue<T> {
 public:
     explicit LockFreeQueueAdapter(size_t capacity = LockFreeMessageQueue<T>::USABLE_CAPACITY,
                                   size_t min_usable_capacity = 0)
-        : queue_(LockFreeMessageQueue<T>::physicalCapacityForUserCapacity(
-              capacity == std::numeric_limits<size_t>::max()
-                  ? min_usable_capacity
-                  : std::max(capacity, min_usable_capacity))),
+        : queue_(LockFreeMessageQueue<T>::physicalCapacityForConfiguration(capacity,
+                                                                           min_usable_capacity)),
           user_capacity_(capacity == std::numeric_limits<size_t>::max()
                              ? queue_.usableCapacity()
                              : std::min(capacity, queue_.usableCapacity())) {}
@@ -616,292 +634,6 @@ private:
 };
 
 #include "DirectSPSCQueueAdapter.hpp"
-/**
- * MultiProducerQueueAdapter - Lock-free MPSC via independent SPSC queues.
- *
- * Chronon's scheduler registers one producer key per Connection, so each
- * registered edge has a dedicated staging queue into the consumer. This is
- * thread-safe because no two producers push the same physical queue, and the
- * consumer pops via a k-way merge keyed on (arrive_cycle, sender_id) for
- * deterministic, simulated-time-ordered delivery.
- *
- * Use when multiple threads write to the same InPort.
- *
- * Ordering guarantees:
- * - Primary key: arrive_cycle (lowest first).
- * - Tiebreak key: queue_id (lowest first). queue_id is assigned by
- *   MultiProducerQueueAdapter::addProducerThread in the order producer
- *   threads are discovered during TickSimulation::optimizeConnectionQueuesForThreads,
- *   which iterates a std::set<size_t>. This makes ordering reproducible run-to-run
- *   for a fixed num_workers. Chronon's scheduler registers one queue per
- *   Connection and passes the stable conn_id as sender_id, so same-cycle ties
- *   remain topology-stable across thread placements.
- *
- * Correctness prerequisite:
- * - Each per-connection LockFreeMessageQueue must be pushed with non-decreasing
- *   arrive_cycle (i.e., producer pushes arrive_cycle = X + const_delay where X
- *   is monotonically advancing). This holds for any TickableUnit whose push
- *   site is `OutPort::send(data)` with fixed delay — the standard pattern.
- *   Mixed-delay producers must not route through MultiProducerQueueAdapter.
- */
-template <typename T>
-class MultiProducerQueueAdapter : public IMessageQueue<T> {
-public:
-    /**
-     * Construct an MPSC adapter with an initial user-visible capacity.
-     *
-     * The per-connection physical LockFreeMessageQueue ring capacity is chosen
-     * at construction from the bounded user capacity. user_capacity_ is a
-     * *soft* aggregate gate consulted by capacity()/full(); it is only
-     * honored by the arbiter/canAccept layer before admitting a push. The
-     * push path itself (pushFromThread) does NOT enforce user_capacity_ —
-     * enforcing it there would reintroduce a wall-clock race where two
-     * producer queues racing against each other could both see size < cap
-     * and both succeed even though their joint push exceeds the soft cap.
-     *
-     * If the user does not override capacity explicitly, we still want
-     * full() to never fire for a well-sized system, so the default
-     * behaves like the legacy physical aggregate (effectively unlimited
-     * for typical configurations).
-     */
-    explicit MultiProducerQueueAdapter(size_t capacity = std::numeric_limits<size_t>::max(),
-                                       size_t min_per_thread_usable_capacity = 0)
-        : per_thread_queue_capacity_(LockFreeMessageQueue<T>::physicalCapacityForUserCapacity(
-              capacity == std::numeric_limits<size_t>::max()
-                  ? min_per_thread_usable_capacity
-                  : std::max(capacity, min_per_thread_usable_capacity))),
-          user_capacity_(capacity) {}
-
-    void ensurePerThreadUsableCapacity(size_t min_usable_capacity) {
-        if (min_usable_capacity == std::numeric_limits<size_t>::max()) {
-            throw std::length_error("MultiProducerQueueAdapter per-thread capacity is too large");
-        }
-        const size_t requested =
-            LockFreeMessageQueue<T>::physicalCapacityForUserCapacity(min_usable_capacity);
-        if (requested <= per_thread_queue_capacity_) {
-            return;
-        }
-        if (!thread_queues_.empty()) {
-            for (const auto& queue : thread_queues_) {
-                if (!queue->empty()) {
-                    throw std::length_error(
-                        "Cannot grow MultiProducerQueueAdapter while producer queues contain data");
-                }
-            }
-            per_thread_queue_capacity_ = requested;
-            for (auto& queue : thread_queues_) {
-                queue = std::make_unique<LockFreeMessageQueue<T>>(per_thread_queue_capacity_);
-            }
-            return;
-        }
-        per_thread_queue_capacity_ = requested;
-    }
-
-    /**
-     * Register a stable producer key and create its queue.
-     *
-     * @param thread_id Stable producer key. Chronon passes conn_id + 1 here.
-     * @return Queue ID for this producer key (used in pushFromThread)
-     */
-    size_t addProducerThread(size_t thread_id) {
-        auto existing = thread_to_queue_id_.find(thread_id);
-        if (existing != thread_to_queue_id_.end()) {
-            return existing->second;
-        }
-
-        size_t id = thread_queues_.size();
-        thread_queues_.push_back(
-            std::make_unique<LockFreeMessageQueue<T>>(per_thread_queue_capacity_));
-        thread_to_queue_id_[thread_id] = id;
-        return id;
-    }
-
-    /**
-     * Get the queue ID for a given thread.
-     */
-    size_t getQueueIdForThread(size_t thread_id) const {
-        auto it = thread_to_queue_id_.find(thread_id);
-        if (it != thread_to_queue_id_.end()) {
-            return it->second;
-        }
-        return SIZE_MAX;  // Not found
-    }
-
-    bool fullForThread(size_t queue_id) const {
-        if (queue_id >= thread_queues_.size()) {
-            return true;
-        }
-        return thread_queues_[queue_id]->full();
-    }
-
-    /**
-     * Push using thread's queue ID.
-     *
-     * Thread-safe: each thread has its own queue.
-     * Multiple units on same thread share same queue - OK because they run sequentially.
-     */
-    bool pushFromThread(size_t queue_id, T data, uint64_t arrive_cycle, uint32_t sender_id = 0) {
-        if (queue_id >= thread_queues_.size()) {
-            return false;
-        }
-        const bool ok = thread_queues_[queue_id]->tryPush(std::move(data), arrive_cycle, sender_id);
-        if (!ok) {
-            // Physical SPSC ring full: the entry is dropped, which corrupts the
-            // run. Under epoch-free lookahead a producer can run up to
-            // max_lookahead_cycles ahead of a lagging consumer, so this counter
-            // is the staging-overflow watchdog (each connection writes its own
-            // queue_id, hence atomic). Relaxed: rare path, read after join.
-            staging_overflow_events_.fetch_add(1, std::memory_order_relaxed);
-        }
-        return ok;
-    }
-
-    /// Count of dropped pushes due to a full physical staging ring. Nonzero
-    /// means the lookahead window outran the configured ring capacity — a
-    /// correctness failure, surfaced for the epoch-free A/B watchdog.
-    uint64_t stagingOverflowEvents() const noexcept {
-        return staging_overflow_events_.load(std::memory_order_relaxed);
-    }
-
-    // IMessageQueue interface - consumer polls all producer queues.
-
-    bool push(T data, uint64_t arrive_cycle) override {
-        // Default push to first queue (should use pushFromThread for MPSC)
-        if (thread_queues_.empty()) {
-            return false;
-        }
-        return thread_queues_[0]->tryPush(std::move(data), arrive_cycle);
-    }
-
-    std::optional<T> tryPop(uint64_t current_cycle) override {
-        if (thread_queues_.empty()) {
-            return std::nullopt;
-        }
-        // K-way merge keyed on (arrive_cycle, sender_id). sender_id is the
-        // producer Connection's stable conn_id (assigned at setup in
-        // connection-registration order), so tiebreak is independent of
-        // partition / thread-to-queue mapping — same order for any
-        // num_workers. Fallback: when sender_id is 0 everywhere (e.g. tests
-        // that call pushFromThread without sender_id), this reduces to the
-        // earlier queue_id-based behavior via strict '<' below.
-        size_t best = SIZE_MAX;
-        uint64_t best_ac = UINT64_MAX;
-        uint32_t best_sid = UINT32_MAX;
-        for (size_t i = 0; i < thread_queues_.size(); ++i) {
-            auto head = thread_queues_[i]->peekHead();
-            if (!head.has_value() || head->first > current_cycle) continue;
-            const uint64_t ac = head->first;
-            const uint32_t sid = head->second;
-            if (ac < best_ac || (ac == best_ac && sid < best_sid)) {
-                best_ac = ac;
-                best_sid = sid;
-                best = i;
-            }
-        }
-        if (best == SIZE_MAX) return std::nullopt;
-        return thread_queues_[best]->tryPop(current_cycle);
-    }
-
-    std::vector<T> popAll(uint64_t current_cycle) override {
-        std::vector<T> result;
-        popAllInto(result, current_cycle);
-        return result;
-    }
-
-    void popAllInto(std::vector<T>& out, uint64_t current_cycle) override {
-        out.clear();
-        while (auto v = tryPop(current_cycle)) {
-            out.push_back(std::move(*v));
-        }
-    }
-
-    bool hasReady(uint64_t current_cycle) const override {
-        for (auto& q : thread_queues_) {
-            auto min = q->minArrivalCycle();
-            if (min.has_value() && *min <= current_cycle) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    std::optional<uint64_t> minArrivalCycle() const override {
-        std::optional<uint64_t> min;
-        for (auto& q : thread_queues_) {
-            auto cycle = q->minArrivalCycle();
-            if (cycle.has_value()) {
-                if (!min.has_value() || *cycle < *min) {
-                    min = cycle;
-                }
-            }
-        }
-        return min;
-    }
-
-    bool empty() const override {
-        for (auto& q : thread_queues_) {
-            if (!q->empty()) return false;
-        }
-        return true;
-    }
-
-    bool full() const override {
-        if (thread_queues_.empty()) {
-            return true;
-        }
-        // Soft user cap takes precedence over physical ring aggregate.
-        // full() is consulted by the arbiter / canAccept path to decide
-        // whether to admit a new push.
-        return size() >= user_capacity_;
-    }
-
-    size_t size() const override {
-        size_t total = 0;
-        for (const auto& q : thread_queues_) {
-            total += q->size();
-        }
-        return total;
-    }
-
-    size_t capacity() const noexcept override { return user_capacity_; }
-    size_t storageCapacity() const noexcept override { return perThreadUsableCapacity_(); }
-
-    size_t available() const override {
-        const size_t sz = size();
-        return sz < user_capacity_ ? user_capacity_ - sz : 0;
-    }
-
-    /**
-     * Set the soft user-visible capacity.
-     *
-     * Per-producer physical ring capacity is unchanged. Only the soft
-     * aggregate gate is updated. pushFromThread() still does NOT enforce
-     * this cap — per-producer ring fullness (fullForThread()) continues to
-     * govern push failure on the push path to avoid wall-clock races
-     * between producer threads. The MPSC arbiter consults full() before
-     * admitting a message.
-     */
-    void setCapacity(size_t cap) override {
-        if (cap != std::numeric_limits<size_t>::max() && cap > perThreadUsableCapacity_()) {
-            ensurePerThreadUsableCapacity(cap);
-        }
-        user_capacity_ = cap;
-    }
-
-    void clear() override {
-        for (auto& q : thread_queues_) {
-            q->clear();
-        }
-    }
-
-private:
-    size_t perThreadUsableCapacity_() const noexcept { return per_thread_queue_capacity_ - 1; }
-
-    std::vector<std::unique_ptr<LockFreeMessageQueue<T>>> thread_queues_;
-    std::unordered_map<size_t, size_t> thread_to_queue_id_;  // thread_id -> queue_id
-    size_t per_thread_queue_capacity_;
-    size_t user_capacity_;  // Soft aggregate cap consulted by arbiter/full().
-    std::atomic<uint64_t> staging_overflow_events_{0};  // full-ring drops (watchdog)
-};
+#include "MultiProducerQueueAdapter.hpp"
 
 }  // namespace chronon::sender

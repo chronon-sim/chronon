@@ -94,7 +94,7 @@ struct AllocationProbe {
 
     AllocationProbe() {
         if (fail_on_default) {
-            throw std::runtime_error("unexpected staging ring allocation");
+            throw std::runtime_error("unexpected direct-lane allocation");
         }
     }
 };
@@ -222,9 +222,7 @@ void test_tick_simulation_mpsc_delivery() {
     config.num_threads = 2;
     config.enable_parallel = true;
     config.enable_lookahead = true;
-    // Consumer-tick-driven MPSC arbitration drains staging inside each
-    // receiver tick; end-of-epoch flush via arbitrateAllMPSCPorts_
-    // handles any tail entries not picked up this epoch.
+    // Direct MPSC lanes are published by producers and merged on receive.
     config.epoch_size = 4;
 
     TickSimulation sim(config);
@@ -263,8 +261,8 @@ void test_tick_simulation_mpsc_delivery() {
     std::cout << "PASSED\n";
 }
 
-void test_mpsc_staging_tracks_large_user_capacity() {
-    std::cout << "Testing MPSC staging tracks large user capacity... ";
+void test_mpsc_lane_tracks_large_user_capacity() {
+    std::cout << "Testing MPSC lane tracks large user capacity... ";
 
     constexpr size_t kUserCapacity = 8192;
 
@@ -294,7 +292,6 @@ void test_mpsc_staging_tracks_large_user_capacity() {
     require(!out.canSend(), "canSend() accepted beyond user capacity");
     require(!out.send(99999), "send() accepted beyond user capacity");
 
-    in.arbitrateMPSC();
     size_t received = 0;
     while (auto value = in.tryReceive(1)) {
         require(*value == static_cast<int>(received), "MPSC delivery order changed");
@@ -334,7 +331,6 @@ void test_registered_mpsc_capacity_sizes_destination_queue() {
     require(!out.canSend(), "registered MPSC capacity accepted beyond edge capacity");
     require(!out.send(99999), "registered MPSC send accepted beyond edge capacity");
 
-    in.arbitrateMPSC();
     size_t received = 0;
     while (auto value = in.tryReceive(1)) {
         require(*value == static_cast<int>(received), "registered MPSC delivery order changed");
@@ -363,7 +359,7 @@ void test_mpsc_epoch_free_headroom_respects_user_capacity() {
     require(conn->registerOnDestMPSC() != nullptr, "MPSC destination registration failed");
 
     require(conn->crossThreadHeadroom() == 1,
-            "MPSC headroom ignored the bounded staging admission capacity");
+            "MPSC headroom ignored the bounded lane admission capacity");
     require(conn->ensureEpochFreeHeadroom(8), "MPSC headroom rejected bounded zero-slack capacity");
 
     std::cout << "PASSED\n";
@@ -389,8 +385,7 @@ void test_mpsc_epoch_free_headroom_sizes_destination_queue() {
 
     require(conn->crossThreadHeadroom() == 0,
             "high-rate MPSC edge unexpectedly had enough default destination headroom");
-    require(conn->ensureEpochFreeHeadroom(2),
-            "MPSC headroom did not grow destination and staging rings together");
+    require(conn->ensureEpochFreeHeadroom(2), "MPSC headroom did not grow direct-lane storage");
     require(conn->crossThreadHeadroom() > 1,
             "MPSC headroom still insufficient after destination ring growth");
 
@@ -400,7 +395,6 @@ void test_mpsc_epoch_free_headroom_sizes_destination_queue() {
         require(out.send(static_cast<int>(i)), "high-rate MPSC send failed after headroom growth");
     }
 
-    in.arbitrateMPSC();
     size_t received = 0;
     while (auto value = in.tryReceive(1)) {
         require(*value == static_cast<int>(received), "grown MPSC destination order changed");
@@ -504,7 +498,6 @@ void test_registered_capacity_only_does_not_throttle_rate() {
     require(!out.canSend(), "source rate did not cap capacity-only edge");
     require(!out.send(4), "source rate allowed extra capacity-only send");
 
-    in.arbitrateMPSC();
     for (int value = 0; value < 4; ++value) {
         auto received = in.tryReceive(1);
         require(received.has_value() && *received == value, "capacity-only edge delivery changed");
@@ -537,7 +530,6 @@ void test_registered_edge_rate_throttles_mpsc_pushes() {
     require(!out.canSend(), "registered rate allowed second same-cycle MPSC preflight");
     require(!out.send(2), "registered rate allowed second same-cycle MPSC send");
 
-    in.arbitrateMPSC();
     auto first = in.tryReceive(1);
     require(first.has_value() && *first == 1, "MPSC registered-rate delivery changed");
     require(!in.tryReceive(1).has_value(), "MPSC registered-rate throttle delivered extra data");
@@ -627,8 +619,8 @@ void test_spsc_epoch_free_headroom_respects_registered_capacity() {
     std::cout << "PASSED\n";
 }
 
-void test_idle_advance_drains_mpsc_staging() {
-    std::cout << "Testing idle advance drains MPSC staging... ";
+void test_idle_advance_preserves_direct_mpsc_lane() {
+    std::cout << "Testing idle advance preserves direct MPSC lane... ";
 
     ManualUnit prod("prod");
     IdleMPSCReceiverUnit cons("cons");
@@ -644,12 +636,13 @@ void test_idle_advance_drains_mpsc_staging() {
 
     prod.setCycle(0);
     require(out.send(42), "MPSC send failed before idle drain");
-    require(cons.in.queuedMessageCount() == 0, "message bypassed MPSC staging unexpectedly");
+    require(cons.in.queuedMessageCount() == 1, "direct MPSC lane did not publish the message");
+    require(!cons.in.tryReceive(0).has_value(), "arrival-cycle gate was bypassed");
 
     cons.advanceIdleTick(3);
 
     require(cons.localCycle() == 3, "idle advance did not update receiver cycle");
-    require(cons.in.queuedMessageCount() == 1, "idle advance did not drain MPSC staging");
+    require(cons.in.queuedMessageCount() == 1, "idle advance lost the direct-lane message");
     auto value = cons.in.tryReceive(3);
     require(value.has_value(), "drained MPSC message was not visible after idle advance");
     require(*value == 42, "drained MPSC message payload changed");
@@ -971,7 +964,7 @@ int main() {
     std::cout << "=== Thread Queue Hardening Tests ===\n\n";
 
     test_tick_simulation_mpsc_delivery();
-    test_mpsc_staging_tracks_large_user_capacity();
+    test_mpsc_lane_tracks_large_user_capacity();
     test_registered_mpsc_capacity_sizes_destination_queue();
     test_mpsc_epoch_free_headroom_respects_user_capacity();
     test_mpsc_epoch_free_headroom_sizes_destination_queue();
@@ -982,7 +975,7 @@ int main() {
     test_registered_edge_rate_throttles_spsc_pushes();
     test_bounded_mpsc_epoch_free_headroom_skips_resize();
     test_spsc_epoch_free_headroom_respects_registered_capacity();
-    test_idle_advance_drains_mpsc_staging();
+    test_idle_advance_preserves_direct_mpsc_lane();
     test_lockfree_backpressure_contract();
     test_spsc_user_capacity_backpressures_across_cycles();
     test_spsc_capacity_ignores_same_cycle_consumer_pop_interleaving();

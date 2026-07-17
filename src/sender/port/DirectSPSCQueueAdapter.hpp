@@ -7,7 +7,7 @@
 // and LockFreeQueueAdapter are defined, inside chronon::sender.
 
 /**
- * DirectSPSCQueueAdapter - Experimental registered-edge SPSC backend.
+ * DirectSPSCQueueAdapter - registered-edge SPSC backend.
  *
  * Unlike LockFreeQueueAdapter, the physical queue and the admission ledger
  * share one monotonic producer ticket. A successful release-store of
@@ -22,11 +22,12 @@
  * A pop at cycle C is consequently not admission credit until cycle C + 1.
  */
 template <typename T>
-class DirectSPSCQueueAdapter : public IMessageQueue<T> {
+class DirectSPSCQueueAdapter final : public IMessageQueue<T> {
 private:
     struct Entry {
         T data;
         uint64_t arrive_cycle;
+        uint32_t sender_id;
     };
 
     struct PopEvent {
@@ -36,26 +37,32 @@ private:
 
 public:
     explicit DirectSPSCQueueAdapter(size_t capacity = LockFreeMessageQueue<T>::USABLE_CAPACITY,
-                                    size_t min_usable_capacity = 0)
-        : ring_capacity_(LockFreeMessageQueue<T>::physicalCapacityForUserCapacity(
-              capacity == std::numeric_limits<size_t>::max()
-                  ? min_usable_capacity
-                  : std::max(capacity, min_usable_capacity))),
+                                    size_t min_usable_capacity = 0, bool track_admission = true)
+        : ring_capacity_(LockFreeMessageQueue<T>::physicalCapacityForConfiguration(
+              capacity, min_usable_capacity)),
           ring_mask_(ring_capacity_ - 1),
-          usable_capacity_(ring_capacity_ - 1),
+          usable_capacity_(ring_capacity_),
           buffer_(ring_capacity_),
           user_capacity_(capacity == std::numeric_limits<size_t>::max()
                              ? usable_capacity_
                              : std::min(capacity, usable_capacity_)),
+          track_admission_(track_admission),
+          // At most one pop event exists for each payload publication that has
+          // not yet been observed by the producer. A history ring equal to the
+          // payload ring is therefore sufficient and keeps bounded lanes compact.
           pop_history_(ring_capacity_),
-          pop_history_mask_(ring_mask_) {}
+          pop_history_mask_(pop_history_.size() - 1) {}
+
+    /** Initialization-only: enable simulated-cycle admission credit tracking. */
+    void enableAdmissionTracking() noexcept { track_admission_ = true; }
+    bool tracksAdmission() const noexcept { return track_admission_; }
 
     bool push(T data, uint64_t arrive_cycle) override {
         return pushDirect(std::move(data), arrive_cycle);
     }
 
     /** Producer-only direct path used by InPort after backend selection. */
-    bool pushDirect(T&& data, uint64_t arrive_cycle) {
+    bool pushDirect(T&& data, uint64_t arrive_cycle, uint32_t sender_id = 0) {
         uint64_t tail = tail_ticket_.load(std::memory_order_relaxed);
 
         // cached_head_ticket_ is conservative: only refresh the cross-core
@@ -70,6 +77,7 @@ public:
         Entry& entry = buffer_[tail & ring_mask_];
         entry.data = std::move(data);
         entry.arrive_cycle = arrive_cycle;
+        entry.sender_id = sender_id;
 
         // This single publication is both queue visibility and the admission
         // push ticket observed by admissionOccupancy().
@@ -107,9 +115,14 @@ public:
         Entry& entry = buffer_[head & ring_mask_];
 
         const uint64_t arrive_cycle = entry.arrive_cycle;
-        recordPopArrivalForAdmission_(current_cycle, arrive_cycle);
+        const bool track_admission = track_admission_;
+        if (track_admission) {
+            recordPopArrivalForAdmission_(current_cycle, arrive_cycle);
+        }
         head_ticket_.store(head + 1, std::memory_order_release);
-        recordPopCreditForAdmission_();
+        if (track_admission) {
+            recordPopCreditForAdmission_();
+        }
     }
 
     /**
@@ -158,6 +171,15 @@ public:
             return std::nullopt;
         }
         return buffer_[head & ring_mask_].arrive_cycle;
+    }
+
+    std::optional<std::pair<uint64_t, uint32_t>> peekHead() const {
+        const uint64_t head = head_ticket_.load(std::memory_order_acquire);
+        if (head == tail_ticket_.load(std::memory_order_acquire)) {
+            return std::nullopt;
+        }
+        const Entry& entry = buffer_[head & ring_mask_];
+        return std::make_pair(entry.arrive_cycle, entry.sender_id);
     }
 
     bool empty() const override {
@@ -311,6 +333,7 @@ private:
     // producer's admission publication.
     alignas(64) std::atomic<uint64_t> head_ticket_{0};
     uint64_t cached_tail_ticket_ = 0;
+    bool track_admission_ = true;
     alignas(64) std::atomic<uint64_t> tail_ticket_{0};
     uint64_t cached_head_ticket_ = 0;
 

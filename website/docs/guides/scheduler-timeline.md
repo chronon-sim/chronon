@@ -47,7 +47,6 @@ simulation:
         trace_units: true
         trace_waits: true
         trace_epochs: true
-        trace_arbitration: true
         min_duration_ns: 0
 ```
 
@@ -75,7 +74,7 @@ Equivalent CLI overrides with `SimulationApp`:
 | `trace_units` | `true` | Record each `TickableUnit::executeTick()` slice. |
 | `trace_waits` | `true` | Record predecessor cluster dependency spin waits. |
 | `trace_epochs` | `true` | Record scheduler epoch duration on the scheduler lane. |
-| `trace_arbitration` | `true` | Record MPSC arbitration duration on the scheduler lane. |
+| `trace_arbitration` | `true` | Deprecated compatibility field; no events are emitted by direct MPSC lanes. |
 | `min_duration_ns` | `0` | Drop events shorter than this wall-time duration. |
 
 ## Output Lanes
@@ -87,7 +86,7 @@ events and counter tracks).
 | Lane | Meaning |
 |------|---------|
 | `stream N (logical worker)` | Chronon logical execution stream. Unit duration events on the lane show which unit executed there at that time. |
-| `scheduler` | Main scheduler lane for epoch and arbitration events. |
+| `scheduler` | Main scheduler lane for epoch events. |
 
 These lanes map to logical scheduler streams, not necessarily stable OS thread
 IDs. The current `stdexec::static_thread_pool` may execute bulk work on worker
@@ -96,7 +95,7 @@ Chronon stream assignment.
 
 The `scheduler` lane appears as its own row after the worker streams. It is
 not an extra simulation worker; it contains scheduler-side spans such as epoch
-and MPSC arbitration work. Chronon uses a stable dark-red color seed for
+work. Chronon uses a stable dark-red color seed for
 scheduler stall slices so waits are visually distinct from normal unit work
 without using bright warning colors.
 
@@ -110,8 +109,6 @@ without using bright warning colors.
 | color-stable wait category | `stall: lookahead-floor` | Time spent throttled by the epoch-free lookahead floor. |
 | color-stable wait category | `stall: no-ready-cluster` | Time spent with no locally assigned cluster ready to run. |
 | `scheduler` | `progress epoch` | Wall time for one progress-based lookahead epoch. |
-| `scheduler` | `mpsc arbitration` | Per-cycle MPSC arbitration in barrier mode. |
-| `scheduler` | `epoch-end mpsc arbitration` | End-of-epoch MPSC flush in progress-based mode. |
 | `summary` | `dropped events` | Instant event emitted when `max_events` is exceeded. |
 
 Every duration slice carries `cycle` and `detail` debug annotations (visible in
@@ -132,8 +129,6 @@ Useful patterns:
 - Streams with sparse `unit` slices or large gaps are underutilized.
 - A stream with dense long `unit` slices and many dependent wait slices on other
   streams is likely on the critical path.
-- Large scheduler-lane arbitration slices indicate MPSC queue arbitration is a
-  visible cost for the selected partition.
 - Frequent dropped-event summaries mean the capture window or `max_events`
   should be reduced/increased.
 

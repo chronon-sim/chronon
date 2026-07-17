@@ -33,7 +33,7 @@ class InPort;
 template <typename T>
 class OutPort;
 class Unit;
-class IArbitratablePort;
+class IMultiProducerPort;
 void wakeUnitAt(Unit* unit, uint64_t cycle);
 
 /**
@@ -158,7 +158,7 @@ public:
 
     /**
      * Max producer run-ahead (in cycles) this connection's cross-thread buffer
-     * (MPSC staging ring or SPSC lock-free ring) can absorb while the epoch-free
+     * (direct MPSC lane or SPSC lock-free ring) can absorb while the epoch-free
      * path keeps results identical to the reference: roughly
      * `threshold / rate - delay + 1`, where `threshold` is the entry count at
      * which transfer() stops accepting (the ring, or the InPort capacity if
@@ -171,37 +171,12 @@ public:
     virtual size_t crossThreadHeadroom() const noexcept { return SIZE_MAX; }
 
     /**
-     * Type-erased MPSC admission helper. Called by the destination InPort's
-     * arbiter at cycle boundary. Pops up to `budget` entries from the
-     * per-connection staging ring and forwards them into the shared queue
-     * in FIFO order. Returns the number of entries admitted. Stops on the
-     * first forwarding failure (physical ring full, extremely rare).
-     *
-     * Only the MPSC path uses staging; non-MPSC connections return 0.
-     */
-    virtual size_t arbitrateAdmitErased(size_t budget) = 0;
-
-    /**
-     * Cycle-bounded MPSC admission. Drains up to `budget` entries whose
-     * enqueue_cycle <= max_send_cycle. Used by consumer-tick-driven
-     * arbitration under the lookahead scheduler: the consumer passes
-     * S = min(predecessor-thread completed_cycle) so that only entries
-     * every producer has already published are admitted. See
-     * docs/mpsc-atomic-publish.md.
-     */
-    virtual size_t arbitrateAdmitBoundedErased(size_t budget, uint64_t max_send_cycle) = 0;
-
-    /// Earliest arrival currently staged on this MPSC connection, if any.
-    virtual std::optional<uint64_t> minStagedArrivalCycle() const { return std::nullopt; }
-
-    /**
      * Register this MPSC connection on its destination InPort and return
-     * the InPort's type-erased IArbitratablePort interface so the
-     * TickSimulation can drive cycle-boundary arbitration without ever
-     * knowing the Connection's message type. Returns nullptr when the
-     * connection is not in MPSC mode.
+     * the InPort's type-erased MPSC metadata interface. TickSimulation uses it
+     * for progress-coverage and physical-overflow validation without knowing
+     * the Connection's message type. Returns nullptr outside MPSC mode.
      */
-    virtual class IArbitratablePort* registerOnDestMPSC() = 0;
+    virtual class IMultiProducerPort* registerOnDestMPSC() = 0;
 
     /// True if this is a zero-delay (tight) connection.
     bool isTight() const noexcept { return delay() == 0; }
@@ -340,25 +315,22 @@ public:
         // predicates this is the basis of the "was this in flight at flush?"
         // decision. For LegacyFastPath policy ports the field is set but ignored.
         if (thread_queue_id_ != SIZE_MAX) {
-            // MPSC mode: stage for the InPort arbiter. The arbiter runs on
-            // the consumer thread at the start of its next tick (under the
-            // lookahead scheduler) or at scheduler sync points (Sequential /
-            // Barrier), forwarding from staging into the destination MPSC
-            // adapter in deterministic conn_id order. See docs/mpsc-atomic-publish.md.
+            // MPSC mode: publish directly to this Connection's SPSC lane.
+            // The InPort consumer performs the deterministic k-way merge, so
+            // there is no second staging ring or envelope copy.
             if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
                 return false;
             }
-            const size_t edge_cap = edgeAdmissionCapacity_();
-            if (edge_cap != InPort<T>::UNLIMITED_CAPACITY && stagingSize_() >= edge_cap) {
-                return false;  // staging full -> producer sees back-pressure
+            if (!hasMPSCLaneAdmissionSlot_(send_cycle)) {
+                return false;
             }
+            if (!to_->pushToThreadQueueCancelable(thread_queue_id_, std::move(data), arrive_cycle,
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
-            Staged staged{std::move(data), arrive_cycle, send_cycle, epoch_snapshot};
+                                                  &cancel_epoch_, epoch_snapshot,
 #else
-            Staged staged{std::move(data), arrive_cycle, send_cycle};
+                                                  nullptr, 0,
 #endif
-            if (!stagingTryPush_(std::move(staged))) {
-                // Ring physically full (should be rare: ring is sized >= user cap).
+                                                  send_cycle, conn_id_)) {
                 return false;
             }
             ++pushes_this_cycle_;
@@ -392,13 +364,9 @@ public:
     /**
      * Cancel all in-flight messages previously sent on this connection.
      *
-     * Only bumps the cancellation epoch. Staged entries are dropped lazily
-     * by the arbiter on drain (it compares each entry's epoch_snapshot
-     * against the current epoch). This matters under consumer-tick-driven
-     * arbitration (Option 1): the producer thread and the consumer-thread
-     * arbiter may access staging_ concurrently, so a producer-side
-     * staging_.clear() would race with the arbiter's drain. See R3 in
-     * docs/mpsc-atomic-publish.md.
+     * Only bumps the cancellation epoch. Published entries carry the previous
+     * snapshot and are discarded lazily by the receiver; new entries carry the
+     * new epoch. No queue mutation crosses producer/consumer ownership.
      */
     void cancelInFlight() noexcept override {
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
@@ -412,88 +380,6 @@ public:
 #endif
     }
 
-    /**
-     * Type-erased MPSC admission helper invoked by the InPort arbiter.
-     *
-     * Unbounded drain variant: drains every staging entry whose epoch
-     * matches the current cancel_epoch_. Called by the main-thread
-     * arbiter path (Sequential per-cycle loop, Barrier sync_wait,
-     * lookahead epoch-end flush).
-     */
-    size_t arbitrateAdmitErased(size_t budget) override {
-        return arbitrateAdmitBoundedDirect(budget, std::numeric_limits<uint64_t>::max());
-    }
-
-    /**
-     * Cycle-bounded admission: drains every staging entry whose epoch
-     * matches AND whose enqueue_cycle <= max_send_cycle. Used by the
-     * consumer-tick-driven arbiter (Option 1): the consumer at its own
-     * localCycle computes S = min(predecessor-thread completed_cycle)
-     * and passes S here, so only entries that every producer has
-     * finished writing are admitted this tick.
-     */
-    size_t arbitrateAdmitBoundedErased(size_t budget, uint64_t max_send_cycle) override {
-        return arbitrateAdmitBoundedDirect(budget, max_send_cycle);
-    }
-
-private:
-    friend class InPort<T>;
-
-    [[gnu::noinline]] size_t arbitrateAdmitBoundedDirect(size_t budget, uint64_t max_send_cycle) {
-        if (thread_queue_id_ == SIZE_MAX) {
-            return 0;
-        }
-        size_t admitted = 0;
-#if CHRONON_ENABLE_OUTPORT_CANCELLATION
-        const uint64_t cur_epoch = cancel_epoch_.load(std::memory_order_acquire);
-#endif
-        while (admitted < budget) {
-            Staged* front = stagingPeekFront_();
-            if (!front) break;  // staging empty (observed head == tail under acquire)
-            if (front->enqueue_cycle > max_send_cycle) {
-                // Head entry is for a cycle the slowest predecessor thread
-                // hasn't completed yet. Entries behind it are strictly >=
-                // this cycle (producer pushes cycles in monotonic order), so
-                // stop here — they too are not yet safe to admit.
-                break;
-            }
-#if CHRONON_ENABLE_OUTPORT_CANCELLATION
-            if (front->epoch_snapshot != cur_epoch) {
-                // Staged before a cancelInFlight -> drop without forwarding.
-                stagingPopFront_();
-                continue;
-            }
-#endif
-            if (!transferToSharedQueue_(*front)) {
-                break;  // physical ring of destination is full (rare)
-            }
-            stagingPopFront_();
-            ++admitted;
-        }
-        return admitted;
-    }
-
-    [[gnu::noinline]] size_t arbitrateConsumerCycleDirect(
-        size_t budget, uint64_t consumer_cycle, const std::atomic<uint64_t>* producer_progress) {
-        if (!producer_progress) return 0;
-        const uint64_t producer_completed = producer_progress->load(std::memory_order_acquire);
-        if (producer_completed == 0 || consumer_cycle < delay_) return 0;
-        const uint64_t bound = std::min<uint64_t>(producer_completed - 1, consumer_cycle - delay_);
-        return arbitrateAdmitBoundedDirect(budget, bound);
-    }
-
-public:
-    std::optional<uint64_t> minStagedArrivalCycle() const override {
-        if (thread_queue_id_ == SIZE_MAX) {
-            return std::nullopt;
-        }
-        const size_t head = staging_head_.load(std::memory_order_relaxed);
-        if (head == staging_tail_.load(std::memory_order_acquire)) {
-            return std::nullopt;
-        }
-        return staging_buf_[head].arrive_cycle;
-    }
-
     /// True if the destination can accept data (back-pressure preflight).
     bool canTransfer() const {
         if (dependency_only_transport_) {
@@ -501,18 +387,17 @@ public:
             maybeResetPushesCycle_(send_cycle);
             return pushes_this_cycle_ < edgeCycleRateLimit_();
         }
-        // MPSC path: producer sees back-pressure only when its own staging
-        // ring is full (bounded by the destination InPort's user_cap).
-        // Admission into the shared queue is performed by the InPort arbiter
-        // (either on the consumer thread at tick start or at a scheduler
-        // sync point) in deterministic conn_id order, so the push path
-        // itself does not race on wall-clock ordering across worker threads.
+        // MPSC path: producer sees backpressure on its own direct SPSC lane.
         if (thread_queue_id_ != SIZE_MAX) {
-            if (currentPendingPushes_() >= edgeCycleRateLimit_()) {
+            const uint64_t send_cycle = from_->getCurrentCycle();
+            maybeResetPushesCycle_(send_cycle);
+            if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
                 return false;
             }
-            const size_t edge_cap = edgeAdmissionCapacity_();
-            return edge_cap == InPort<T>::UNLIMITED_CAPACITY || stagingSize_() < edge_cap;
+            if (!hasMPSCLaneAdmissionSlot_(send_cycle)) {
+                return false;
+            }
+            return to_->canPushToThreadQueue(thread_queue_id_);
         }
         const uint64_t send_cycle = from_->getCurrentCycle();
         maybeResetPushesCycle_(send_cycle);
@@ -527,7 +412,7 @@ public:
     Unit* destination() const noexcept override;
     void* sourcePortPtr() const noexcept override { return static_cast<void*>(from_); }
     void* destPortPtr() const noexcept override { return static_cast<void*>(to_); }
-    IArbitratablePort* registerOnDestMPSC() override;
+    IMultiProducerPort* registerOnDestMPSC() override;
 
     void setDependencyOnlyTransport(
         bool enabled,
@@ -564,18 +449,10 @@ public:
 
     void optimizeForMPSC() override {
         if (dependency_only_transport_) return;
-        // Size the SPSC staging ring now that to_->capacity() is finalized.
-        // The producer back-pressures on stagingSize() >= to_->capacity(),
-        // so the physical ring only needs room for the user cap plus one
-        // reserved slot (tail+1 == head signals full). Round up to a power
-        // of 2 for fast masking. Bounded user capacities must not be capped
-        // below the model-visible limit, otherwise canTransfer() and the
-        // physical push path disagree for large ports.
+        // One direct SPSC lane per Connection. The InPort owns lane storage
+        // and its consumer-only deterministic frontier.
         const size_t user_cap = edgeAdmissionCapacity_();
         to_->useMultiProducerQueue(user_cap == InPort<T>::UNLIMITED_CAPACITY ? 0 : user_cap);
-        configureStagingRing_((user_cap == InPort<T>::UNLIMITED_CAPACITY)
-                                  ? (kDefaultUnlimitedStagingRing - 1)
-                                  : user_cap);
     }
 
     void configureRegisteredEdge(std::optional<size_t> capacity,
@@ -605,7 +482,6 @@ public:
         try {
             if (thread_queue_id_ != SIZE_MAX) {
                 to_->useMultiProducerQueue(*requested);
-                configureStagingRing_(*requested);
             } else if (to_->usesLockFreeQueue()) {
                 to_->useLockFreeQueue(*requested);
             } else {
@@ -619,7 +495,8 @@ public:
 
     size_t registerProducerThread(size_t thread_id) override {
         if (dependency_only_transport_) return SIZE_MAX;
-        return to_->registerProducerThread(thread_id);
+        return to_->registerProducerThread(
+            thread_id, edgeAdmissionCapacity_() != InPort<T>::UNLIMITED_CAPACITY);
     }
 
     void setThreadQueueId(size_t queue_id) override {
@@ -635,7 +512,7 @@ public:
     size_t crossThreadHeadroom() const noexcept override {
         if (dependency_only_transport_) return dependency_only_headroom_;
         // Identify the bounded cross-thread buffer this connection fills:
-        //   MPSC (thread_queue_id_ set) -> the per-connection staging ring,
+        //   MPSC (thread_queue_id_ set) -> the per-connection direct lane,
         //   SPSC (lock-free ring)       -> the InPort's lock-free queue (finite
         //                                  even for an unlimited-capacity port),
         //   same-thread / unbounded     -> no ring to overflow (SIZE_MAX).
@@ -669,7 +546,7 @@ public:
         // sit buffered. Cross-thread SPSC admission is cycle-strict: a consumer
         // pop at cycle k does not free producer capacity for another send in
         // cycle k, so its safe run-ahead window is one cycle smaller than the
-        // live-drained MPSC staging window. A delay-1, capacity-1 DFF-style edge
+        // directly drained MPSC lane. A delay-1, capacity-1 DFF-style edge
         // is handled above and remains safe with headroom=1.
         if (buffered_cycles < delay_) return 0;
         if (cycle_strict_spsc) {
@@ -734,9 +611,33 @@ private:
         return occupancy < admission_cap && pushes_this_cycle_ < admission_cap - occupancy;
     }
 
+    bool hasMPSCLaneAdmissionSlot_(uint64_t send_cycle) const noexcept {
+        const size_t admission_cap = edgeAdmissionCapacity_();
+        if (admission_cap == InPort<T>::UNLIMITED_CAPACITY) return true;
+        if (isDFFStyleEdge_()) {
+            const auto min_arrival =
+                to_->threadQueueAdmissionMinArrivalCycle(thread_queue_id_, send_cycle);
+            return !min_arrival.has_value() || *min_arrival == send_cycle;
+        }
+        if (admission_cap == 0) return false;
+
+        const size_t occupancy = mpscAdmissionOccupancy_(send_cycle);
+        return occupancy < admission_cap && pushes_this_cycle_ < admission_cap - occupancy;
+    }
+
     size_t destinationAdmissionOccupancy_(uint64_t send_cycle) const noexcept {
         if (!admission_snapshot_valid_ || send_cycle != last_admission_cycle_) {
             admission_occupancy_at_cycle_start_ = to_->admissionOccupancy(send_cycle);
+            last_admission_cycle_ = send_cycle;
+            admission_snapshot_valid_ = true;
+        }
+        return admission_occupancy_at_cycle_start_;
+    }
+
+    size_t mpscAdmissionOccupancy_(uint64_t send_cycle) const noexcept {
+        if (!admission_snapshot_valid_ || send_cycle != last_admission_cycle_) {
+            admission_occupancy_at_cycle_start_ =
+                to_->threadQueueAdmissionOccupancy(thread_queue_id_, send_cycle);
             last_admission_cycle_ = send_cycle;
             admission_snapshot_valid_ = true;
         }
@@ -751,9 +652,9 @@ private:
     size_t mpscLogicalHeadroomCapacity_() const noexcept {
         const size_t user_cap = edgeAdmissionCapacity_();
         if (user_cap == InPort<T>::UNLIMITED_CAPACITY) {
-            return staging_mask_;
+            return to_->storageCapacity();
         }
-        return std::min(staging_mask_, user_cap);
+        return std::min(to_->storageCapacity(), user_cap);
     }
 
     size_t spscLogicalHeadroomCapacity_() const noexcept {
@@ -775,51 +676,6 @@ private:
         return static_cast<size_t>(cycles) * *rate;
     }
 
-    /// Per-connection staging entry. Holds the original arrive_cycle and
-    /// send_cycle (as enqueue_cycle) so that even if the InPort arbiter
-    /// defers admission by back-pressure, downstream predicates and
-    /// delivery timing still see the *intended* values.
-    struct Staged {
-        T data;
-        uint64_t arrive_cycle;
-        uint64_t enqueue_cycle;
-#if CHRONON_ENABLE_OUTPORT_CANCELLATION
-        uint64_t epoch_snapshot;
-#endif
-    };
-
-    void configureStagingRing_(size_t requested_usable) {
-        if (requested_usable == std::numeric_limits<size_t>::max()) {
-            throw std::length_error("MPSC staging ring capacity is too large");
-        }
-        size_t phys = 1;
-        const size_t target = std::max(requested_usable + 1, kStagingRingMin);
-        while (phys < target) {
-            if (phys > (std::numeric_limits<size_t>::max() / 2)) {
-                throw std::length_error("MPSC staging ring capacity is too large");
-            }
-            phys <<= 1;
-        }
-        std::vector<Staged>(phys).swap(staging_buf_);
-        staging_mask_ = phys - 1;
-        staging_head_.store(0, std::memory_order_relaxed);
-        staging_tail_.store(0, std::memory_order_relaxed);
-    }
-
-    bool transferToSharedQueue_(Staged& entry) {
-        if (!to_->canPushToThreadQueue(thread_queue_id_)) {
-            return false;
-        }
-        return to_->pushToThreadQueueCancelable(thread_queue_id_, std::move(entry.data),
-                                                entry.arrive_cycle,
-#if CHRONON_ENABLE_OUTPORT_CANCELLATION
-                                                &cancel_epoch_, entry.epoch_snapshot,
-#else
-                                                nullptr, 0,
-#endif
-                                                entry.enqueue_cycle, conn_id_);
-    }
-
     OutPort<T>* from_;
     InPort<T>* to_;
     uint32_t delay_;
@@ -835,66 +691,6 @@ private:
     std::optional<size_t> registered_rate_;
     size_t thread_queue_id_ = SIZE_MAX;  ///< SIZE_MAX means not in MPSC mode
     uint32_t conn_id_ = 0;               ///< Stable topology-based tiebreaker
-
-    /// Per-connection staging ring (SPSC). Written exclusively by the
-    /// producer thread (Connection is owned by a single OutPort which is
-    /// owned by a single Unit which ticks on a single thread). Drained
-    /// exclusively by the consumer-side InPort arbiter — either on the
-    /// main thread at scheduler sync points (Sequential, Barrier,
-    /// lookahead epoch-end flush) or on the consumer thread at the start
-    /// of its own tick under the lookahead scheduler (see
-    /// docs/mpsc-atomic-publish.md).
-    ///
-    /// The SPSC ring (std::vector<Staged> + power-of-2 mask, head/tail
-    /// atomics with release-acquire ordering) is the concurrency primitive
-    /// — a plain std::deque would race on node pointers when the producer
-    /// appends concurrently with the arbiter drains. Sizing is chosen at
-    /// optimizeForMPSC() time based on to_->capacity().
-    static constexpr size_t kStagingRingMin = 16;
-    static constexpr size_t kDefaultUnlimitedStagingRing = 4096;
-    std::vector<Staged> staging_buf_;
-    size_t staging_mask_ = 0;                          ///< buffer size - 1 (power of 2)
-    alignas(64) std::atomic<size_t> staging_head_{0};  ///< consumer reads/advances
-    alignas(64) std::atomic<size_t> staging_tail_{0};  ///< producer writes/advances
-
-    size_t stagingSize_() const noexcept { return stagingRingSize_(); }
-
-    size_t stagingRingSize_() const noexcept {
-        const size_t head = staging_head_.load(std::memory_order_acquire);
-        const size_t tail = staging_tail_.load(std::memory_order_acquire);
-        return (tail - head) & staging_mask_;
-    }
-
-    bool stagingTryPush_(Staged&& e) { return stagingRingTryPush_(std::move(e)); }
-
-    bool stagingRingTryPush_(Staged&& e) {
-        const size_t tail = staging_tail_.load(std::memory_order_relaxed);
-        const size_t next = (tail + 1) & staging_mask_;
-        if (next == staging_head_.load(std::memory_order_acquire)) {
-            return false;  // full (one slot reserved to distinguish full vs empty)
-        }
-        staging_buf_[tail] = std::move(e);
-        staging_tail_.store(next, std::memory_order_release);
-        return true;
-    }
-
-    Staged* stagingPeekFront_() noexcept { return stagingRingPeekFront_(); }
-
-    Staged* stagingRingPeekFront_() noexcept {
-        const size_t head = staging_head_.load(std::memory_order_relaxed);
-        if (head == staging_tail_.load(std::memory_order_acquire)) {
-            return nullptr;
-        }
-        return &staging_buf_[head];
-    }
-
-    void stagingPopFront_() noexcept { stagingRingPopFront_(); }
-
-    void stagingRingPopFront_() noexcept {
-        const size_t head = staging_head_.load(std::memory_order_relaxed);
-        staging_buf_[head] = Staged{};  // release owned T early
-        staging_head_.store((head + 1) & staging_mask_, std::memory_order_release);
-    }
 
     /// Producer-side cycle-local push counter (Track H v2 / RTL-strict
     /// backpressure). Touched only by the producer thread for this
@@ -919,17 +715,6 @@ private:
             admission_snapshot_valid_ = false;
         }
     }
-    size_t currentPendingPushes_() const noexcept {
-        if (!from_) return pushes_this_cycle_;
-        const uint64_t now = from_->getCurrentCycle();
-        if (now != last_pushes_cycle_) {
-            pushes_this_cycle_ = 0;
-            last_pushes_cycle_ = now;
-            admission_snapshot_valid_ = false;
-        }
-        return pushes_this_cycle_;
-    }
-
     /// Cancellation epoch for sender-side flush/squash. Each message is
     /// stamped with the epoch value at send time. If the epoch changes
     /// before the receiver consumes it, the message is dropped.

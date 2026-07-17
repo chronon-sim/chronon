@@ -137,7 +137,7 @@ ZeroCycleSnapshot buildHeadroomZeroCycleGraph(const char* prune_value) {
     ba->configureRegisteredEdge(/*capacity=*/1, /*rate=*/1);
     sim.initialize();
 
-    // Force bounded cross-thread staging. Each edge then contributes a reverse
+    // Force bounded cross-thread transport. Each edge then contributes a reverse
     // headroom constraint with delay zero, creating a pair-min zero cycle.
     ab->optimizeForMPSC();
     ba->optimizeForMPSC();

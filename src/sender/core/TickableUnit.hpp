@@ -53,7 +53,6 @@ public:
         detail::TickContextGuard tick_ctx(this, localCycle(), crashName(), crashNameLen(), "tick");
         try {
             beginActiveTick_();
-            arbitrateOwnedMPSCPorts_();
             tick();
             finishActiveTick_();
             advanceLocalCycle();
@@ -70,7 +69,6 @@ public:
     [[gnu::always_inline]] inline void executeTickAlwaysActive() {
         detail::TickContextGuard tick_ctx(this, localCycle(), crashName(), crashNameLen(), "tick");
         try {
-            arbitrateOwnedMPSCPorts_();
             tick();
             advanceLocalCycle();
         } catch (const TickException&) {
@@ -83,43 +81,7 @@ public:
     }
 
     /// Batched inactive-cycle advance used when an entire cluster is idle.
-    [[gnu::always_inline]] inline void advanceIdleTick(uint64_t delta) {
-        if (delta == 0) {
-            return;
-        }
-        if (!hasOwnedMPSCConnections_()) {
-            advanceLocalCycle(delta);
-            return;
-        }
-        for (uint64_t i = 0; i < delta; ++i) {
-            executeIdleTick_();
-        }
-    }
-
-private:
-    /// Fast path for inactive cycles that still need MPSC staging drains.
-    [[gnu::always_inline]] inline void executeIdleTick_() {
-        arbitrateOwnedMPSCPorts_();
-        advanceLocalCycle();
-    }
-
-    /// Drain MPSC staging on the consumer thread before the user's tick()
-    /// body (Option 1, see docs/mpsc-atomic-publish.md). For ports with no
-    /// MPSC connections this is a no-op.
-    [[gnu::always_inline]] inline void arbitrateOwnedMPSCPorts_() noexcept {
-        for (auto* port : ports()) {
-            port->arbitrateMPSCConsumerDriven();
-        }
-    }
-
-    [[gnu::always_inline]] inline bool hasOwnedMPSCConnections_() const noexcept {
-        for (auto* port : ports()) {
-            if (port->hasMPSCConnections()) {
-                return true;
-            }
-        }
-        return false;
-    }
+    [[gnu::always_inline]] inline void advanceIdleTick(uint64_t delta) { advanceLocalCycle(delta); }
 
 protected:
     /**

@@ -222,89 +222,50 @@ class PortBase;
 void recordPortOnOwnerUnit(Unit* unit, PortBase* port);
 
 /**
- * IArbitratablePort - Type-erased interface exposing the per-cycle MPSC
- * arbitration hook to the TickSimulation scheduler.
+ * IMultiProducerPort - type-erased MPSC metadata interface.
  *
- * Only InPorts that have at least one MPSC connection registered implement
- * meaningful behavior; other ports can ignore. TickSimulation keeps a flat
- * list of ports that declared MPSC interest during initialize() and calls
- * arbitrateMPSC() on each at every cycle boundary (sequential tick loop,
- * executeEpochBarrier sync_wait, or the progress-based lookahead scheduler's
- * epoch-end flush).
+ * Payload arbitration disappeared with direct per-Connection SPSC lanes: the
+ * receiver merges lane heads when it reads the InPort.  The scheduler retains
+ * this narrow interface only to prove producer-progress coverage and surface a
+ * physical-ring overflow as a correctness failure.
  */
-class IArbitratablePort {
+class IMultiProducerPort {
 public:
-    virtual ~IArbitratablePort() = default;
-
-    /**
-     * Drain every staged entry whose epoch matches. Called at scheduler
-     * sync points (Sequential per-cycle, Barrier sync_wait, lookahead
-     * epoch-end flush) where every producer has finished its cycle.
-     */
-    virtual void arbitrateMPSC() = 0;
-
-    /**
-     * Cycle-bounded arbitration for consumer-tick-driven execution
-     * (see docs/mpsc-atomic-publish.md). The owning InPort computes
-     *   S = min over producer clusters of completed_cycle.load(acquire)
-     * and drains only entries with enqueue_cycle <= S, in conn_id order.
-     * A no-op if the port has no MPSC connections or if S has not
-     * advanced since the last arbitration.
-     *
-     * Default implementation calls arbitrateMPSC() — safe fallback for
-     * ports that don't need the bounded variant.
-     */
-    virtual void arbitrateMPSCConsumerDriven() noexcept { arbitrateMPSC(); }
-
-    /**
-     * Opaque identity for this arbitrable port. Returned by InPort as its
-     * `this` pointer (same value as destPortPtr() on connections). Used
-     * by TickSimulation to join MPSC InPorts against per-port producer-
-     * thread tables at init time.
-     */
-    virtual void* arbitratablePortKey() noexcept = 0;
-
-    /**
-     * Install the predecessor-thread completed_cycle atomics for
-     * consumer-tick-driven arbitration. Called once during
-     * TickSimulation::initialize() for the lookahead scheduler. Ignored
-     * if empty or if the port has no MPSC connections.
-     */
-    virtual void setArbitrationProgressPointers(std::vector<const std::atomic<uint64_t>*> ptrs) = 0;
+    virtual ~IMultiProducerPort() = default;
 
     /**
      * Install PER-CONNECTION producer completed_cycle atomics for
-     * consumer-tick-driven arbitration. `src_progress` maps each producer
-     * Unit* to its cluster's completed_cycle atomic. The InPort resolves one
-     * atomic per MPSC connection (by connection source), enabling each
-     * connection to be drained up to its OWN producer's progress rather than
-     * the min across producers — required for correctness under heterogeneous
-     * edge delays (a low-delay producer's message must not be held back by a
-     * lagging high-delay producer on the same InPort). Default: no-op.
+     * `src_progress` maps each producer Unit* to its cluster's completed-cycle
+     * publication. The InPort resolves one atomic per direct lane. The
+     * epoch-free scheduler requires complete coverage before allowing clusters
+     * to run independently.
      */
-    virtual void setArbitrationConnProgress(
+    virtual void setProducerProgress(
         const std::unordered_map<Unit*, const std::atomic<uint64_t>*>& /*src_progress*/) {}
 
     /**
-     * True iff every MPSC connection on this port has a resolved per-connection
-     * producer progress atomic, i.e. the heterogeneous-delay-correct
-     * consumer-driven drain in arbitrateMPSCConsumerDriven() fully covers this
-     * port. When false, at least one connection relies on the central per-epoch
-     * arbitrateMPSC() flush to deliver its tail (an unresolved producer is
-     * skipped by the consumer-driven path), so the epoch-free scheduler — which
-     * has no per-epoch flush — must NOT be used. Conservative default: false, so
-     * unknown port types veto epoch-free execution. InPort overrides.
+     * True iff every MPSC lane has a resolved producer-progress atomic. An
+     * unresolved lane vetoes epoch-free execution. Conservative default: false.
      */
-    virtual bool mpscConnProgressFullyResolved() const noexcept { return false; }
+    virtual bool producerProgressFullyResolved() const noexcept { return false; }
+
+    void setArbitrationConnProgress(
+        const std::unordered_map<Unit*, const std::atomic<uint64_t>*>& src_progress) {
+        setProducerProgress(src_progress);
+    }
+    bool mpscConnProgressFullyResolved() const noexcept { return producerProgressFullyResolved(); }
 
     /**
-     * Number of staged pushes dropped because the physical MPSC ring was full.
-     * Nonzero indicates the lookahead window outran the ring capacity — a
-     * correctness failure. Surfaced for the epoch-free A/B watchdog. Default 0
-     * for ports with no multi-producer staging.
+     * Number of direct-lane pushes rejected by the physical ring. Nonzero means
+     * scheduler run-ahead exceeded provisioned transport storage.
      */
-    virtual uint64_t stagingOverflowEvents() const noexcept { return 0; }
+    virtual uint64_t transportOverflowEvents() const noexcept { return 0; }
+
+    /// Backward-compatible name retained for diagnostics clients.
+    uint64_t stagingOverflowEvents() const noexcept { return transportOverflowEvents(); }
 };
+
+using IArbitratablePort [[deprecated("use IMultiProducerPort")]] = IMultiProducerPort;
 
 /**
  * PortBase - Type-erased base class for all ports.
@@ -315,18 +276,6 @@ public:
 
     const std::string& name() const noexcept { return name_; }
     Unit* owner() const noexcept { return owner_; }
-
-    /**
-     * Consumer-tick-driven MPSC arbitration hook
-     * (Option 1, see docs/mpsc-atomic-publish.md). Called at the start of
-     * the owning receiver unit's tick(). Default no-op; InPort overrides
-     * to drain staging for ports with registered MPSC connections.
-     * OutPorts always no-op.
-     */
-    virtual void arbitrateMPSCConsumerDriven() noexcept {}
-
-    /// True if this port owns any MPSC staging queues that need consumer-side drains.
-    virtual bool hasMPSCConnections() const noexcept { return false; }
 
     /// Earliest pending arrival visible through this port, if any.
     virtual std::optional<uint64_t> minArrivalCycle() const { return std::nullopt; }

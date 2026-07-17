@@ -8,16 +8,11 @@
 
 // test_mpsc_mixed_delay_determinism.cpp
 //
-// Regression test for heterogeneous-delay MPSC arbitration. A consumer with
-// fan-in from multiple producers at DIFFERENT edge delays, inside a feedback
-// loop, must produce a result that is identical across worker counts and
-// matches barrier/sequential (i.e. the lookahead scheduler stays cycle-accurate).
-//
-// Before the per-connection arbitration fix (draining each MPSC connection up to
-// its OWN producer's completed cycle rather than the min across producers), the
-// low-delay producer's message was held back by a lagging high-delay producer on
-// the same InPort, arrived a cycle late, and the feedback loop amplified it into
-// a worker-count-dependent divergence.
+// Regression test for heterogeneous-delay direct MPSC lanes. A consumer with
+// fan-in from producers at DIFFERENT edge delays, inside a feedback loop, must
+// produce a result identical across worker counts and match barrier/sequential.
+// This pins the per-Connection progress dependencies that make every lane head
+// for the consumer's current cycle visible before it performs the merge.
 
 #include <cstdint>
 #include <iostream>
@@ -88,7 +83,7 @@ uint64_t runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, u
     TickSimulation sim(cfg);
     // Enough per-tick work that the partitioner spreads the 4 units across
     // workers (so producers/consumer land on different threads and actually
-    // exercise cross-thread MPSC arbitration), but light enough to stay well
+    // exercise cross-thread direct MPSC lanes), but light enough to stay well
     // under the sanitizer test timeout.
     constexpr uint32_t kWork = 1500;
     auto* A = sim.createUnit<Node>("A", 11, kWork);

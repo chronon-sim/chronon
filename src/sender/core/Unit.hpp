@@ -393,8 +393,7 @@ inline void addPortRegistrationToUnit(Unit* unit,
     }
 }
 
-/// Records a PortBase* on its owning Unit so TickableUnit::executeTick can
-/// walk the ports to drive consumer-tick-driven MPSC arbitration.
+/// Records a PortBase* on its owning Unit for wakeup/readiness bookkeeping.
 inline void recordPortOnOwnerUnit(Unit* unit, PortBase* port) {
     if (unit && port) {
         unit->registerPort(port);

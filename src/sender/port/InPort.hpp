@@ -33,11 +33,6 @@ namespace chronon::sender {
 
 namespace detail {
 
-inline bool experimentalTypedMPSCConsumerDispatchEnabled() noexcept {
-    const char* value = std::getenv("CHRONON_EXPERIMENTAL_TYPED_MPSC_CONSUMER_DISPATCH");
-    return value == nullptr || value[0] != '0' || value[1] != '\0';
-}
-
 template <auto KeyFn, typename T>
 concept SelectiveCancelKeyFn = requires(const T& data) {
     { std::invoke(KeyFn, data) } -> std::convertible_to<uint64_t>;
@@ -61,7 +56,7 @@ concept SelectiveCancelKeyFn = requires(const T& data) {
  *   }
  */
 template <typename T>
-class InPort : public PortBase, public IArbitratablePort {
+class InPort : public PortBase, public IMultiProducerPort {
 public:
     using StoredMessage = detail::PortEnvelope<T>;
     static constexpr size_t UNLIMITED_CAPACITY = std::numeric_limits<size_t>::max();
@@ -80,8 +75,6 @@ public:
         : PortBase(owner, std::move(name)),
           capacity_(capacity),
           policy_(policy),
-          typed_mpsc_consumer_dispatch_enabled_(
-              detail::experimentalTypedMPSCConsumerDispatchEnabled()),
           queue_(std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity)) {
         reserveScratch_();
         installAutoRegistration_();
@@ -92,8 +85,6 @@ public:
         : PortBase(owner, std::move(name)),
           capacity_(UNLIMITED_CAPACITY),
           policy_(policy),
-          typed_mpsc_consumer_dispatch_enabled_(
-              detail::experimentalTypedMPSCConsumerDispatchEnabled()),
           queue_(std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(UNLIMITED_CAPACITY)) {
         reserveScratch_();
         installAutoRegistration_();
@@ -142,7 +133,11 @@ public:
     /// single producer). The ring is finite even for an unlimited-capacity port,
     /// so the epoch-free gate must bound producer run-ahead against capacity().
     bool usesLockFreeQueue() const noexcept { return lock_free_queue_; }
-    bool usesExperimentalDirectSPSC() const noexcept { return direct_spsc_queue_raw_ != nullptr; }
+    bool usesDirectSPSC() const noexcept { return direct_spsc_queue_raw_ != nullptr; }
+    [[deprecated("use usesDirectSPSC()")]]
+    bool usesExperimentalDirectSPSC() const noexcept {
+        return usesDirectSPSC();
+    }
 
     /**
      * Switch to lock-free SPSC queue.
@@ -154,7 +149,7 @@ public:
     void useLockFreeQueue(size_t min_usable_capacity = 0) {
         multi_producer_queue_raw_ = nullptr;
         lock_free_queue_ = true;
-        if (queue_detail::experimentalDirectSPSCEnabled()) {
+        if (queue_detail::directSPSCEnabled()) {
             auto direct = std::make_unique<DirectSPSCQueueAdapter<StoredMessage>>(
                 capacity_, min_usable_capacity);
             direct_spsc_queue_raw_ = direct.get();
@@ -210,10 +205,14 @@ public:
      * @return Queue ID for this producer key (used in pushToThreadQueue)
      */
     size_t registerProducerThread(size_t thread_id) {
+        return registerProducerThread(thread_id, capacity_ != UNLIMITED_CAPACITY);
+    }
+
+    size_t registerProducerThread(size_t thread_id, bool track_admission) {
         if (!multi_producer_queue_raw_) {
             return SIZE_MAX;
         }
-        return multi_producer_queue_raw_->addProducerThread(thread_id);
+        return multi_producer_queue_raw_->addProducerThread(thread_id, track_admission);
     }
 
     /// Get the queue ID for a given producer key (multi-producer mode only).
@@ -354,7 +353,22 @@ public:
     }
 
     bool canPushToThreadQueue(size_t queue_id) const {
-        return multi_producer_queue_raw_ && !multi_producer_queue_raw_->fullForThread(queue_id);
+        return multi_producer_queue_raw_ &&
+               !multi_producer_queue_raw_->storageFullForThread(queue_id);
+    }
+
+    size_t threadQueueAdmissionOccupancy(size_t queue_id, uint64_t send_cycle) const noexcept {
+        return multi_producer_queue_raw_
+                   ? multi_producer_queue_raw_->admissionOccupancyForThread(queue_id, send_cycle)
+                   : 0;
+    }
+
+    std::optional<uint64_t> threadQueueAdmissionMinArrivalCycle(
+        size_t queue_id, uint64_t send_cycle) const noexcept {
+        return multi_producer_queue_raw_
+                   ? multi_producer_queue_raw_->admissionMinArrivalCycleForThread(queue_id,
+                                                                                  send_cycle)
+                   : std::nullopt;
     }
 
     size_t capacity() const { return queue_->capacity(); }
@@ -382,10 +396,9 @@ public:
     size_t admissionCapacity() const noexcept { return effectiveCapacity_(); }
 
     /**
-     * Register an MPSC-mode Connection with this InPort so that the
-     * cycle-boundary arbiter can drain its staging deque. Connections are
-     * kept sorted by conn_id to give the arbiter a topology-stable fixed-
-     * priority order independent of num_workers or partition layout.
+     * Register an MPSC-mode Connection with this InPort. Connections are kept
+     * sorted by conn_id for stable topology/progress bookkeeping; payload
+     * ordering is handled by the direct-lane frontier.
      */
     void registerMPSCConnection(ConnectionBase* conn) {
         if (!conn) return;
@@ -436,135 +449,11 @@ public:
         return capacity_ == UNLIMITED_CAPACITY && queue_->size() == 0 && mpsc_connections_.empty();
     }
 
-    /**
-     * Per-cycle MPSC admission arbitration.
-     *
-     * Called by the scheduler at each cycle boundary on InPorts that have
-     * at least one MPSC connection registered. Iterates the connections in
-     * conn_id-ascending order (stable across num_workers since conn_id is
-     * assigned at topology construction) and lets each drain its full
-     * staging deque into the shared queue.
-     *
-     * The user_cap on the InPort governs per-producer staging depth (a
-     * Connection's staging deque is bounded at user_cap, giving the
-     * producer back-pressure when full); the arbiter itself does NOT cap
-     * aggregate per-cycle admission. A strict aggregate-cap budget here
-     * would starve lower-conn_id connections under heavy multi-producer
-     * fan-in: with N producers each pushing at the cap and a budget of
-     * cap/cycle, only the highest-priority producer makes progress.
-     * Bounding admission via per-producer staging plus consumer drain
-     * preserves both determinism (conn_id ordering of admission) and
-     * fairness (every producer that has unblocked staging makes progress
-     * every cycle).
-     */
-    void arbitrateMPSC() override { arbitrateMPSCUpTo_(std::numeric_limits<uint64_t>::max()); }
-
-    /**
-     * Consumer-tick-driven arbitration (Option 1, see
-     * docs/mpsc-atomic-publish.md). Called by TickableUnit::executeTick
-     * on the consumer thread, immediately before the user's tick()
-     * body. Computes the safe drain bound S = min over predecessor
-     * threads of completed_cycle (acquire) and drains staging entries
-     * with enqueue_cycle <= S in conn_id order.
-     *
-     * A no-op if the port has no MPSC connections, if the producer-
-     * thread set was never resolved (progress-based sync off), or if
-     * S has not advanced since the last arbitration.
-     */
-    void arbitrateMPSCConsumerDriven() noexcept override {
-        if (mpsc_connections_.empty()) return;
-
-        // Preferred path: per-connection progress. Drain EACH connection up to
-        // a PER-CONNECTION send-cycle bound. This is required for correctness
-        // under heterogeneous edge delays: with a single min-over-producers
-        // bound (the legacy path below), a low-delay connection's entry needed
-        // at the consumer's current cycle can be held back because a lagging
-        // high-delay producer on the same InPort drags the min down — the
-        // message then arrives a cycle late, diverging from barrier/sequential.
-        //
-        // The bound is min(producer_completed - 1, K - delay):
-        //   - producer_completed - 1: only admit entries the producer has finished.
-        //   - K - delay (K = this consumer's current cycle): only admit entries
-        //     whose arrive_cycle (= send_cycle + delay) is <= K, i.e. visible to
-        //     the receiver THIS cycle. A producer running ahead under lookahead
-        //     must not have its future-cycle entries admitted early — with
-        //     LegacyFastPath selective cancellation, an entry admitted before the
-        //     receiver reaches its cycle can be stamped and then wrongly canceled
-        //     by a later cancelYoungerThan flush, which sequential/barrier (that
-        //     never admit early) would not do.
-        // Each connection's staging is monotonic in send_cycle and has its own
-        // conn_id-keyed ring (one fixed delay), so the shared k-way merge still
-        // pops in (arrive_cycle, conn_id) order. The lookahead gate guarantees
-        // producer_completed >= K+1-delay, so all arrive_cycle <= K entries are
-        // admitted before the consumer reads them.
-        if (!mpsc_conn_progress_.empty()) {
-            constexpr size_t kUnlimitedBudget = std::numeric_limits<size_t>::max();
-            const uint64_t k = getCurrentCycle();
-            if (typed_mpsc_consumer_dispatch_enabled_) {
-                for (size_t i = 0; i < mpsc_connections_.size(); ++i) {
-                    const std::atomic<uint64_t>* p = mpsc_conn_progress_[i];
-                    if (!p) continue;
-                    auto* conn = static_cast<Connection<T>*>(mpsc_connections_[i]);
-                    (void)conn->arbitrateConsumerCycleDirect(kUnlimitedBudget, k, p);
-                }
-                return;
-            }
-            for (size_t i = 0; i < mpsc_connections_.size(); ++i) {
-                const std::atomic<uint64_t>* p = mpsc_conn_progress_[i];
-                if (!p) continue;  // unresolved producer (covered by epoch-end flush)
-                const uint64_t pc = p->load(std::memory_order_acquire);
-                if (pc == 0) continue;  // producer hasn't finished cycle 0 yet
-                const uint64_t delay = mpsc_connections_[i]->delay();
-                if (k < delay) continue;  // nothing has arrived for this edge yet
-                const uint64_t bound = std::min<uint64_t>(pc - 1, k - delay);
-                (void)mpsc_connections_[i]->arbitrateAdmitBoundedErased(kUnlimitedBudget, bound);
-            }
-            return;
-        }
-
-        if (producer_progress_ptrs_.empty()) {
-            // No resolved progress atomics => fall back to unbounded drain.
-            // This path keeps the consumer-driven hook correct when running
-            // in Sequential or Barrier mode (where producers have already
-            // finished their cycle before the consumer ticks).
-            arbitrateMPSCUpTo_(std::numeric_limits<uint64_t>::max());
-            return;
-        }
-        uint64_t s = std::numeric_limits<uint64_t>::max();
-        for (const auto* p : producer_progress_ptrs_) {
-            const uint64_t c = p->load(std::memory_order_acquire);
-            if (c < s) s = c;
-        }
-        const uint64_t last = last_arbitrated_cycle_.load(std::memory_order_relaxed);
-        // completed_cycle is 1-indexed (stores post-increment); s == 0 means
-        // no producer has finished even cycle 0, so nothing is safe to drain.
-        if (s == 0 || s == last) return;
-        // s is "lowest cycle every producer has FINISHED". Drain entries
-        // with enqueue_cycle strictly less than s — i.e. entries pushed
-        // during a cycle every producer has fully completed.
-        arbitrateMPSCUpTo_(s == 0 ? 0 : s - 1);
-        last_arbitrated_cycle_.store(s, std::memory_order_relaxed);
-    }
-
-    bool hasMPSCConnections() const noexcept override { return !mpsc_connections_.empty(); }
-
-    /**
-     * Install the set of `completed_cycle` atomics for the predecessor
-     * threads feeding this InPort's MPSC connections. Called at
-     * TickSimulation::initialize() once the thread_progress_array_
-     * has been allocated. An empty set (e.g. under Sequential or Barrier
-     * execution) makes arbitrateMPSCConsumerDriven() degrade to the
-     * legacy unbounded arbiter — safe because those modes only call it
-     * when producers are known to have finished their cycle.
-     */
-    void setArbitrationProgressPointers(std::vector<const std::atomic<uint64_t>*> ptrs) override {
-        producer_progress_ptrs_ = std::move(ptrs);
-    }
-
     /// Resolve one producer completed_cycle atomic per MPSC connection (by the
     /// connection's source unit), aligned with mpsc_connections_ (conn_id order).
-    /// Enables the per-connection drain in arbitrateMPSCConsumerDriven().
-    void setArbitrationConnProgress(
+    /// Retained for the epoch-free safety gate: every direct lane must have a
+    /// scheduler progress dependency before producer/consumer run-ahead is used.
+    void setProducerProgress(
         const std::unordered_map<Unit*, const std::atomic<uint64_t>*>& src_progress) override {
         mpsc_conn_progress_.clear();
         mpsc_conn_progress_.reserve(mpsc_connections_.size());
@@ -574,13 +463,10 @@ public:
         }
     }
 
-    bool mpscConnProgressFullyResolved() const noexcept override {
+    bool producerProgressFullyResolved() const noexcept override {
         // No fan-in connections => nothing is drained late; safe by vacuity.
         if (mpsc_connections_.empty()) return true;
         // Every connection must have a non-null per-connection progress atomic.
-        // A null entry is an unresolved producer that arbitrateMPSCConsumerDriven
-        // skips (relying on the epoch-end central flush), which epoch-free
-        // execution does not provide mid-run.
         if (mpsc_conn_progress_.size() != mpsc_connections_.size()) return false;
         for (const auto* p : mpsc_conn_progress_) {
             if (!p) return false;
@@ -588,11 +474,9 @@ public:
         return true;
     }
 
-    uint64_t stagingOverflowEvents() const noexcept override {
-        return multi_producer_queue_raw_ ? multi_producer_queue_raw_->stagingOverflowEvents() : 0;
+    uint64_t transportOverflowEvents() const noexcept override {
+        return multi_producer_queue_raw_ ? multi_producer_queue_raw_->transportOverflowEvents() : 0;
     }
-
-    void* arbitratablePortKey() noexcept override { return static_cast<void*>(this); }
 
     /**
      * Try to receive a message synchronously.
@@ -601,16 +485,32 @@ public:
      * @return The message if available, std::nullopt otherwise
      */
     std::optional<T> tryReceive(uint64_t current_cycle) {
+        return tryReceiveFiltered(current_cycle, [](const T&) noexcept { return true; });
+    }
+
+    /**
+     * Receive the first ready message accepted by @p filter.
+     *
+     * Ready messages rejected by the receiver are consumed and permanently
+     * canceled. The predicate must be noexcept and is invoked directly (no
+     * std::function, allocation, or producer-side shared-state read), so
+     * capturing lambdas are supported without indirection.
+     */
+    template <typename Filter>
+        requires std::predicate<Filter&, const T&> &&
+                 std::is_nothrow_invocable_r_v<bool, Filter&, const T&>
+    std::optional<T> tryReceiveFiltered(uint64_t current_cycle, Filter&& filter) {
         if constexpr (std::is_copy_constructible_v<T>) {
             if (!shared_broadcast_connections_.empty()) {
-                return tryReceiveSharedBroadcast_(current_cycle);
+                return tryReceiveSharedBroadcastFiltered_(current_cycle, filter);
             }
         }
         if (direct_spsc_queue_raw_) {
             while (true) {
                 StoredMessage* msg = direct_spsc_queue_raw_->peekReady(current_cycle);
                 if (!msg) return std::nullopt;
-                if (detail::isCanceled(*msg) || isReceiverCanceled_(*msg)) {
+                if (detail::isCanceled(*msg) || isReceiverCanceled_(*msg) ||
+                    !std::invoke(filter, std::as_const(msg->data))) {
                     direct_spsc_queue_raw_->consumePeeked(current_cycle);
                     continue;
                 }
@@ -619,17 +519,40 @@ public:
                 return result;
             }
         }
+        if (multi_producer_queue_raw_) {
+            while (true) {
+                std::optional<T> result;
+                const bool consumed =
+                    multi_producer_queue_raw_->consumeReady(current_cycle, [&](StoredMessage& msg) {
+                        if (detail::isCanceled(msg) || isReceiverCanceled_(msg) ||
+                            !std::invoke(filter, std::as_const(msg.data))) {
+                            return;
+                        }
+                        result.emplace(std::move(msg.data));
+                    });
+                if (!consumed) return std::nullopt;
+                if (result) return result;
+            }
+        }
 
         while (true) {
             auto msg = queue_->tryPop(current_cycle);
             if (!msg.has_value()) {
                 return std::nullopt;
             }
-            if (detail::isCanceled(*msg) || isReceiverCanceled_(*msg)) {
+            if (detail::isCanceled(*msg) || isReceiverCanceled_(*msg) ||
+                !std::invoke(filter, std::as_const(msg->data))) {
                 continue;
             }
             return std::move(msg->data);
         }
+    }
+
+    template <typename Filter>
+        requires std::predicate<Filter&, const T&> &&
+                 std::is_nothrow_invocable_r_v<bool, Filter&, const T&>
+    std::optional<T> tryReceiveFiltered(Filter&& filter) {
+        return tryReceiveFiltered(getCurrentCycle(), std::forward<Filter>(filter));
     }
 
     /**
@@ -704,13 +627,6 @@ public:
     /// Earliest arrival cycle of pending or staged messages, used for lookahead.
     std::optional<uint64_t> minArrivalCycle() const override {
         std::optional<uint64_t> earliest = queue_->minArrivalCycle();
-        for (const auto* conn : mpsc_connections_) {
-            if (auto staged = conn->minStagedArrivalCycle()) {
-                if (!earliest || *staged < *earliest) {
-                    earliest = staged;
-                }
-            }
-        }
         if constexpr (std::is_copy_constructible_v<T>) {
             for (const auto* conn : shared_broadcast_connections_) {
                 if (auto view = conn->peekSharedBroadcast()) {
@@ -1019,7 +935,6 @@ private:
 
     size_t capacity_;
     PortPolicy policy_ = PortPolicy::LegacyFastPath;
-    const bool typed_mpsc_consumer_dispatch_enabled_ = false;
     std::unique_ptr<IMessageQueue<StoredMessage>> queue_;
     DirectSPSCQueueAdapter<StoredMessage>* direct_spsc_queue_raw_ = nullptr;
     MultiProducerQueueAdapter<StoredMessage>* multi_producer_queue_raw_ =
@@ -1048,91 +963,33 @@ private:
     };
 
     [[nodiscard]] std::optional<SharedBroadcastCandidate> peekReadySharedBroadcast_(
-        uint64_t current_cycle) const noexcept {
-        std::optional<SharedBroadcastCandidate> best;
-        for (auto* connection : shared_broadcast_connections_) {
-            auto view = connection->peekSharedBroadcast();
-            if (!view || view->arrive_cycle > current_cycle) continue;
-            if (!best || view->arrive_cycle < best->arrive_cycle ||
-                (view->arrive_cycle == best->arrive_cycle &&
-                 connection->connId() < best->connection->connId())) {
-                best = SharedBroadcastCandidate{.connection = connection,
-                                                .data = view->data,
-                                                .sequence = view->sequence,
-                                                .arrive_cycle = view->arrive_cycle,
-                                                .enqueue_cycle = view->enqueue_cycle};
-            }
-        }
-        return best;
-    }
+        uint64_t current_cycle) const noexcept;
 
-    std::optional<T> tryReceiveSharedBroadcast_(uint64_t current_cycle) {
-        while (true) {
-            auto candidate = peekReadySharedBroadcast_(current_cycle);
-            if (!candidate) return std::nullopt;
+    template <typename Filter>
+    std::optional<T> tryReceiveSharedBroadcastFiltered_(uint64_t current_cycle, Filter& filter);
 
-            StoredMessage message{.data = *candidate->data};
-            message.enqueue_cycle = candidate->enqueue_cycle;
-            message.sender_id = candidate->connection->connId();
-            if (policy_ == PortPolicy::LegacyFastPath) {
-                const uint64_t filter_generation =
-                    receiver_filter_generation_.load(std::memory_order_acquire);
-                if (filter_generation != std::numeric_limits<uint64_t>::max()) {
-                    message.receiver_generation_snapshot =
-                        candidate->connection->sharedReceiverGenerationSnapshot(candidate->sequence,
-                                                                                filter_generation);
-                }
-            }
-            candidate->connection->popSharedBroadcast(candidate->sequence);
-            if (isReceiverCanceled_(message)) {
-                continue;
-            }
-            return std::move(message.data);
-        }
-    }
+    std::optional<T> tryReceiveSharedBroadcast_(uint64_t current_cycle);
 
     std::vector<Connection<T>*> shared_broadcast_connections_;
 
-    /// MPSC arbitration state. Populated by registerMPSCConnection() during
-    /// TickSimulation::initialize().
+    /// Direct MPSC lane registry, sorted by topology-stable conn_id.
     std::vector<ConnectionBase*> mpsc_connections_;
 
-    /// Consumer-tick-driven arbitration state (see docs/mpsc-atomic-publish.md).
-    /// Resolved at initialize() to the set of
-    /// thread_progress_array_[p].completed_cycle atomics whose threads feed
-    /// this InPort's MPSC connections. Empty when progress-based sync is
-    /// not in use — arbitrateMPSCConsumerDriven() falls back to unbounded
-    /// drain in that case.
-    std::vector<const std::atomic<uint64_t>*> producer_progress_ptrs_;
     /// Per-connection producer completed_cycle atomics, aligned with
-    /// mpsc_connections_ (one entry per connection, conn_id order). Populated
-    /// by setArbitrationConnProgress(); enables heterogeneous-delay-correct
-    /// per-connection draining. nullptr entries (unresolved) are skipped.
+    /// mpsc_connections_. Used only to prove the epoch-free scheduler has a
+    /// progress dependency for every lane.
     std::vector<const std::atomic<uint64_t>*> mpsc_conn_progress_;
-    /// Last S we drained up to, used to short-circuit re-arbitration when S
-    /// hasn't advanced. Written only by the consumer thread, so relaxed
-    /// ordering suffices.
-    std::atomic<uint64_t> last_arbitrated_cycle_{0};
-
-    /// Shared arbitration body used by both arbitrateMPSC() (unbounded,
-    /// legacy / main-thread sync points) and arbitrateMPSCConsumerDriven()
-    /// (bounded by min predecessor completed_cycle).
-    void arbitrateMPSCUpTo_(uint64_t max_send_cycle) noexcept {
-        if (mpsc_connections_.empty()) return;
-        constexpr size_t kUnlimitedBudget = std::numeric_limits<size_t>::max();
-        for (ConnectionBase* conn : mpsc_connections_) {
-            (void)conn->arbitrateAdmitBoundedErased(kUnlimitedBudget, max_send_cycle);
-        }
-    }
 };
 
+#include "detail/InPortSharedBroadcastImpl.hpp"
+
 template <typename T>
-IArbitratablePort* Connection<T>::registerOnDestMPSC() {
+IMultiProducerPort* Connection<T>::registerOnDestMPSC() {
     if (thread_queue_id_ == SIZE_MAX || !to_) {
         return nullptr;
     }
     to_->registerMPSCConnection(this);
-    return static_cast<IArbitratablePort*>(to_);
+    return static_cast<IMultiProducerPort*>(to_);
 }
 
 template <typename T>

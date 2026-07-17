@@ -305,7 +305,7 @@ OutPort<Instruction> ──(delay=3)──► InPort<Instruction>
 Features:
 - **Type-safe**: `OutPort<T>` connects only to `InPort<T>`
 - **Delay-based delivery**: Messages sent at cycle `T` arrive at cycle `T + delay`
-- **Three queue modes**: SingleThread (no sync), LockFree (SPSC atomics), MultiProducer (per-producer staging)
+- **Three queue modes**: SingleThread (no sync), LockFree (SPSC atomics), MultiProducer (direct per-Connection SPSC lanes)
 - **Backpressure**: `canSend()` preflight checks both per-cycle capacity and destination availability
 - **All-or-nothing fanout**: Multi-destination sends either all succeed or all fail
 - **Message cancellation**: `cancelInFlight()` with generation tracking — stale messages dropped without queue scanning

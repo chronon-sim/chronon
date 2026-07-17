@@ -10,7 +10,7 @@ Chronon automatically parallelizes simulation based on dependency analysis and l
 
 For wall-clock scheduler diagnosis, Chronon can also emit a Perfetto/Chrome
 Trace timeline of logical execution streams, unit tick slices, cross-thread
-dependency spin waits, epoch spans, and MPSC arbitration. See
+dependency spin waits, and epoch spans. See
 [Scheduler Timeline Trace](scheduler-timeline.md).
 
 ## Dependency Graph
@@ -282,9 +282,9 @@ for the slowest one at each boundary.
 runtime can prove it is safe: the whole run becomes a single window in which
 run-ahead is bounded solely by
 `lookahead_floor_ + max_lookahead_cycles` (refreshed lazily as the global-minimum
-cluster advances) and per-connection MPSC arbitration, with one MPSC flush at the
-end of the run instead of one per epoch. Results stay bit-identical to every other
-mode; only wall-clock changes.
+cluster advances), dependency progress, and direct-lane transport headroom.
+MPSC payloads need neither per-epoch arbitration nor a run-end flush. Results
+stay bit-identical to every other mode; only wall-clock changes.
 
 The per-epoch lookahead fallback is deprecated and will be removed in a future
 release. It remains only as a compatibility/safety fallback while epoch-free
@@ -326,9 +326,9 @@ change):
 
 **Cross-thread buffer headroom.** In fixed-layout epoch-free lookahead, without
 the per-epoch drain, a producer can run ahead of a consumer and leave entries
-buffered in the connection's cross-thread ring — the per-connection MPSC staging
-ring for a multi-producer port, or the SPSC lock-free ring for a single-producer
-cross-thread edge. For bounded `InPort`s, lock-free rings are sized at
+buffered in the connection's cross-thread ring — a direct per-Connection SPSC
+lane for a multi-producer port, or the SPSC lock-free ring for a single-producer
+cross-thread edge. For bounded `InPort`s, these rings are sized at
 initialization so the declared capacity fits. For unlimited-capacity `InPort`s,
 the physical lock-free rings remain bounded by the default ring size, and the
 port never model-side back-pressures, so a producer could silently overflow the

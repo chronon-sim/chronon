@@ -82,8 +82,8 @@ struct TickSimulationConfig {
     size_t num_threads = std::thread::hardware_concurrency();
     bool enable_parallel = true;
     bool enable_lookahead = true;
-    // Lookahead uses per-cluster progress atomics (consumer-tick-driven MPSC
-    // arbitration). Placement is always cluster-aware: when there are no
+    // Lookahead uses per-cluster progress atomics and direct MPSC lanes.
+    // Placement is always cluster-aware: when there are no
     // tight (delay=0) edges every unit becomes its own single-member cluster.
     uint32_t max_lookahead_cycles = 100;     // Upper bound for per-unit lookahead window
     uint64_t epoch_size = 64;                // Deprecated: fallback-only
