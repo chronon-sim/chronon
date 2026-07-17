@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "Connection.hpp"
+#include "DelayOneCycleQueueAdapter.hpp"
 #include "MessageQueue.hpp"
 #include "Port.hpp"
 #include "PortDirectory.hpp"
@@ -103,6 +104,19 @@ public:
     PortPolicy policy() const noexcept { return policy_; }
 
 private:
+    friend class Connection<T>;
+
+    void useDelayOneCycleQueue() {
+        multi_producer_queue_raw_ = nullptr;
+        direct_spsc_queue_raw_ = nullptr;
+        lock_free_queue_ = false;
+        if (queue_detail::experimentalDelayOneCycleQueueEnabled()) {
+            queue_ = std::make_unique<DelayOneCycleQueueAdapter<StoredMessage>>(capacity_);
+        } else {
+            queue_ = std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity_);
+        }
+    }
+
     /// Pre-size the receiveAllBuffered() scratch buffers so the first drain on a
     /// bounded-capacity port doesn't allocate (unlimited ports just grow once).
     void reserveScratch_() {
@@ -752,72 +766,17 @@ public:
      */
     template <auto KeyFn, typename K>
         requires detail::SelectiveCancelKeyFn<KeyFn, T>
-    void cancelOlderThan(K watermark) {
-        if (policy_ != PortPolicy::LegacyFastPath) {
-            // StageSelective: install the lower half of a timestamp-scoped
-            // keep range. A same-cycle cancelYoungerThan call intersects with
-            // this predicate in-place, so cancelOutsideInclusive remains one
-            // receiver-side predicate and never adds a sender-side atomic read.
-            if (!configureReceiverSelectiveExtractorAndScope_<KeyFn>()) {
-                return;
-            }
-            const uint64_t cycle = getCurrentCycle();
-            const uint64_t threshold = static_cast<uint64_t>(watermark);
-            stage_state_.install(cycle, threshold, std::numeric_limits<uint64_t>::max());
-            traceStageInstall_(cycle);
-            return;
-        }
-        if (!configureReceiverSelectiveExtractorAndScope_<KeyFn>()) {
-            return;
-        }
-        const uint64_t threshold = static_cast<uint64_t>(watermark);
-        auto cur = receiver_min_keep_key_.load(std::memory_order_relaxed);
-        while (cur < threshold &&
-               !receiver_min_keep_key_.compare_exchange_weak(
-                   cur, threshold, std::memory_order_release, std::memory_order_relaxed));
-    }
+    void cancelOlderThan(K watermark);
 
     /// Selectively cancel in-flight messages where KeyFn(data) > watermark.
     template <auto KeyFn, typename K>
         requires detail::SelectiveCancelKeyFn<KeyFn, T>
-    void cancelYoungerThan(K watermark) {
-        if (policy_ != PortPolicy::LegacyFastPath) {
-            // StageSelective: install a per-flush predicate. Each predicate
-            // is independent and retired pop-driven (see StagePredicate).
-            // No generation bumps, no mutex, no bound mutation that #7
-            // races against.
-            //
-            // We still need a key extractor; ensure it's set. We pass through
-            // configureReceiverSelectiveExtractorAndScope_ for that side
-            // effect, but its generation/scope mutations are harmless under
-            // StageSelective (they are simply ignored by the StageSelective
-            // path of isReceiverCanceled_).
-            if (!configureReceiverSelectiveExtractorAndScope_<KeyFn>()) {
-                return;
-            }
-            const uint64_t cycle = getCurrentCycle();
-            const uint64_t thr = static_cast<uint64_t>(watermark);
-            stage_state_.install(cycle, 0, thr);
-            traceStageInstall_(cycle);
-            return;
-        }
-        if (!configureReceiverSelectiveExtractorAndScope_<KeyFn>()) {
-            return;
-        }
-        const uint64_t threshold = static_cast<uint64_t>(watermark);
-        auto cur = receiver_max_keep_key_.load(std::memory_order_relaxed);
-        while (cur > threshold &&
-               !receiver_max_keep_key_.compare_exchange_weak(
-                   cur, threshold, std::memory_order_release, std::memory_order_relaxed));
-    }
+    void cancelYoungerThan(K watermark);
 
     /// Keep only keys in [min_keep, max_keep] for current in-flight generation.
     template <auto KeyFn, typename MinK, typename MaxK>
         requires detail::SelectiveCancelKeyFn<KeyFn, T>
-    void cancelOutsideInclusive(MinK min_keep, MaxK max_keep) {
-        cancelOlderThan<KeyFn>(min_keep);
-        cancelYoungerThan<KeyFn>(max_keep);
-    }
+    void cancelOutsideInclusive(MinK min_keep, MaxK max_keep);
 
     /**
      * Clear receiver-side selective cancellation bounds and extractor.
@@ -832,40 +791,12 @@ public:
      * (for backward compat with the LegacyFastPath path) — we simply ignore the
      * reset and let install() accumulate predicates into the slots array.
      */
-    void resetSelectiveCancellation() {
-        if (policy_ != PortPolicy::LegacyFastPath) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(receiver_cancel_mutex_);
-        receiver_min_keep_key_.store(0, std::memory_order_release);
-        receiver_max_keep_key_.store(std::numeric_limits<uint64_t>::max(),
-                                     std::memory_order_release);
-        receiver_key_extractor_.store(nullptr, std::memory_order_release);
-        receiver_filter_generation_.store(std::numeric_limits<uint64_t>::max(),
-                                          std::memory_order_release);
-    }
+    void resetSelectiveCancellation();
 
 private:
     uint64_t getCurrentCycle() const;
 
-    void traceStageInstall_(uint64_t cycle) const noexcept {
-        if (!stageTraceEnabled_() || !stageTracePortMatches_(name_)) {
-            return;
-        }
-        uint64_t min_keep = 0;
-        uint64_t max_keep = std::numeric_limits<uint64_t>::max();
-        for (const auto& predicate : stage_state_.slots) {
-            if (predicate.flush_cycle == cycle) {
-                min_keep = predicate.min_keep;
-                max_keep = predicate.max_keep;
-                break;
-            }
-        }
-        std::fprintf(stderr, "[STAGE] install port=%s cycle=%lu keep=[%lu,%lu] live=%zu hwm=%zu\n",
-                     name_.c_str(), static_cast<unsigned long>(cycle),
-                     static_cast<unsigned long>(min_keep), static_cast<unsigned long>(max_keep),
-                     stage_state_.active_slot_count(), stage_state_.high_water);
-    }
+    void traceStageInstall_(uint64_t cycle) const noexcept;
 
     /// Effective backpressure bound = user-set capacity, but never larger
     /// than the underlying ring's physical capacity (overflow protection).
@@ -909,108 +840,14 @@ private:
 
     template <auto KeyFn>
         requires detail::SelectiveCancelKeyFn<KeyFn, T>
-    bool configureReceiverSelectiveExtractorAndScope_() {
-        constexpr ReceiverSelectiveKeyExtractor new_extractor = +[](const T& data) -> uint64_t {
-            return static_cast<uint64_t>(std::invoke(KeyFn, data));
-        };
+    bool configureReceiverSelectiveExtractorAndScope_();
 
-        std::lock_guard<std::mutex> lock(receiver_cancel_mutex_);
-
-        auto existing = receiver_key_extractor_.load(std::memory_order_acquire);
-        if (!existing) {
-            receiver_key_extractor_.store(new_extractor, std::memory_order_release);
-            existing = new_extractor;
-        }
-
-        // Keep the first extractor for consistency.
-        if (existing != new_extractor) {
-            return false;
-        }
-
-        ensureReceiverScopeToInFlightLocked_();
-        return true;
-    }
-
-    void ensureReceiverScopeToInFlightLocked_() {
-        const uint64_t all_generations = std::numeric_limits<uint64_t>::max();
-        if (receiver_filter_generation_.load(std::memory_order_acquire) != all_generations) {
-            return;
-        }
-
-        // Always bump the enqueue generation so future messages are stamped
-        // with a different generation and won't be subject to the current
-        // cancellation policy. Critical for flush recovery: after a flush,
-        // new instructions must not be canceled by the old policy.
-        const uint64_t generation =
-            receiver_enqueue_generation_.fetch_add(1, std::memory_order_acq_rel);
-        receiver_filter_generation_.store(generation, std::memory_order_release);
-        if constexpr (std::is_copy_constructible_v<T>) {
-            for (auto* conn : shared_broadcast_connections_) {
-                conn->captureSharedReceiverCancellationScope(generation);
-            }
-        }
-    }
+    void ensureReceiverScopeToInFlightLocked_();
 
     /// Non-const: the StageSelective path mutates stage_state_ (lazy
     /// retirement of obsolete predicates). Safe because stage_state_ is
     /// touched only from the receiver thread.
-    [[nodiscard]] bool isReceiverCanceled_(const StoredMessage& msg) noexcept {
-        if (policy_ != PortPolicy::LegacyFastPath) {
-            // StageSelective: predicates are checked here.
-            // No mutex, no atomic; stage_state_ is touched only by the
-            // receiver thread (install and shouldCancel; retirement is
-            // pop-driven inside shouldCancel).
-            auto key_fn = receiver_key_extractor_.load(std::memory_order_acquire);
-            if (!key_fn) {
-                return false;
-            }
-            if (stage_state_.slots.empty()) {
-                return false;
-            }
-            const uint64_t key = key_fn(msg.data);
-            const bool cancel = stage_state_.shouldCancel(msg.enqueue_cycle, key);
-            if (stageTraceEnabled_() && stageTracePortMatches_(name_)) {
-                char slots_buf[512];
-                int off = 0;
-                for (size_t i = 0; i < stage_state_.slots.size() && off < 400; ++i) {
-                    off += std::snprintf(
-                        slots_buf + off, sizeof(slots_buf) - off, " s%zu{fc=%lu,keep=[%lu,%lu]}", i,
-                        static_cast<unsigned long>(stage_state_.slots[i].flush_cycle),
-                        static_cast<unsigned long>(stage_state_.slots[i].min_keep),
-                        static_cast<unsigned long>(stage_state_.slots[i].max_keep));
-                }
-                if (off == 0) {
-                    slots_buf[0] = '\0';
-                }
-                std::fprintf(stderr,
-                             "[STAGE] check   port=%s enq_cyc=%lu key=%lu result=%s live=%zu%s\n",
-                             name_.c_str(), static_cast<unsigned long>(msg.enqueue_cycle),
-                             static_cast<unsigned long>(key), cancel ? "CANCEL" : "pass ",
-                             stage_state_.active_slot_count(), slots_buf);
-            }
-            return cancel;
-        }
-
-        auto key_fn = receiver_key_extractor_.load(std::memory_order_acquire);
-        if (!key_fn) {
-            return false;
-        }
-
-        const uint64_t filter_generation =
-            receiver_filter_generation_.load(std::memory_order_acquire);
-        // Messages from generations NEWER than the filter should bypass
-        // cancellation (they were enqueued after the flush). Messages from
-        // the filter generation or any OLDER generation must be checked.
-        if (filter_generation != std::numeric_limits<uint64_t>::max() &&
-            msg.receiver_generation_snapshot > filter_generation) {
-            return false;
-        }
-
-        const uint64_t key = key_fn(msg.data);
-        const uint64_t min_keep = receiver_min_keep_key_.load(std::memory_order_acquire);
-        const uint64_t max_keep = receiver_max_keep_key_.load(std::memory_order_acquire);
-        return key < min_keep || key > max_keep;
-    }
+    [[nodiscard]] bool isReceiverCanceled_(const StoredMessage& msg) noexcept;
 
     void stampReceiverGeneration_(StoredMessage& msg) {
         msg.receiver_generation_snapshot =
@@ -1125,6 +962,12 @@ private:
         }
     }
 };
+
+}  // namespace chronon::sender
+
+#include "detail/InPortCancellationImpl.hpp"
+
+namespace chronon::sender {
 
 template <typename T>
 IArbitratablePort* Connection<T>::registerOnDestMPSC() {

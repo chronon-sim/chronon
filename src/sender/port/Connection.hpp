@@ -548,7 +548,11 @@ public:
         if (registered_capacity_.has_value()) {
             to_->setCapacity(*registered_capacity_);
         }
-        to_->useSingleThreadQueue();
+        if (delay_ == 1) {
+            to_->useDelayOneCycleQueue();
+        } else {
+            to_->useSingleThreadQueue();
+        }
     }
 
     void optimizeForSPSC() override {

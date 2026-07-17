@@ -7,11 +7,13 @@
 // staging.
 
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "../TestAssertions.hpp"
+#include "sender/port/DelayOneCycleQueueAdapter.hpp"
 #include "sender/port/MessageQueue.hpp"
 
 using namespace chronon::sender;
@@ -407,6 +409,58 @@ void test_direct_spsc_consume_ready_discard_path() {
     std::cout << "PASSED\n";
 }
 
+void test_delay_one_cycle_queue_differential_semantics() {
+    std::cout << "Testing delay-one slab queue differential semantics... ";
+
+    SingleThreadQueueAdapter<int> heap(20);
+    DelayOneCycleQueueAdapter<int> slab(20);
+    for (uint64_t cycle = 0; cycle < 80; ++cycle) {
+        for (int lane = 0; lane < 3; ++lane) {
+            const int value = static_cast<int>(cycle * 3 + lane);
+            CHECK(heap.push(value, cycle + 1));
+            CHECK(slab.push(value, cycle + 1));
+        }
+        CHECK(heap.size() == slab.size());
+        CHECK(heap.full() == slab.full());
+        CHECK(heap.available() == slab.available());
+        if (cycle >= 24) {
+            const auto heap_values = heap.popAll(cycle - 20);
+            const auto slab_values = slab.popAll(cycle - 20);
+            CHECK(heap_values == slab_values);
+        }
+    }
+    CHECK(heap.popAll(UINT64_MAX) == slab.popAll(UINT64_MAX));
+    CHECK(slab.empty());
+
+    slab.push(7, 100);
+    slab.clear();
+    CHECK(slab.empty());
+    CHECK(slab.push(8, 1));
+    CHECK(slab.tryPop(1) == std::optional<int>{8});
+    std::cout << "PASSED\n";
+}
+
+void test_delay_one_cycle_queue_move_only_and_contract() {
+    std::cout << "Testing delay-one slab queue move-only/monotonic contract... ";
+
+    DelayOneCycleQueueAdapter<std::unique_ptr<int>> queue;
+    for (int i = 0; i < 40; ++i) CHECK(queue.push(std::make_unique<int>(i), i / 2 + 1));
+    for (int i = 0; i < 40; ++i) {
+        auto value = queue.tryPop(i / 2 + 1);
+        CHECK(value.has_value() && **value == i);
+    }
+
+    CHECK(queue.push(std::make_unique<int>(1), 10));
+    bool rejected = false;
+    try {
+        queue.push(std::make_unique<int>(2), 9);
+    } catch (const std::logic_error&) {
+        rejected = true;
+    }
+    CHECK(rejected);
+    std::cout << "PASSED\n";
+}
+
 int main() {
     std::cout << "=== Registered Queue Tests ===\n\n";
 
@@ -422,6 +476,8 @@ int main() {
     test_direct_spsc_adapter_differential_semantics();
     test_direct_spsc_adapter_wraparound_and_backpressure();
     test_direct_spsc_consume_ready_discard_path();
+    test_delay_one_cycle_queue_differential_semantics();
+    test_delay_one_cycle_queue_move_only_and_contract();
 
     std::cout << "\nAll registered queue tests PASSED!\n";
     return 0;
