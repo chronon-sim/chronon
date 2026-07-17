@@ -223,6 +223,9 @@ public:
     uint64_t currentCycle() const noexcept { return current_cycle_; }
     uint64_t tickFrequencyHz() const noexcept { return config_.tick_frequency_hz; }
     size_t unitCount() const noexcept { return units_.size(); }
+    size_t transparentBroadcastConnectionCount() const noexcept {
+        return transparent_broadcast_connection_count_;
+    }
     bool isInitialized() const noexcept { return initialized_; }
     bool timelineTraceEnabled() const noexcept { return timeline_trace_.enabled(); }
     const std::string& timelineTraceFile() const noexcept { return timeline_trace_.file(); }
@@ -504,6 +507,7 @@ private:
 
     void optimizeAllQueuesForSingleThread();
     void optimizeConnectionQueuesForThreads();
+    size_t optimizeTransparentBroadcasts_();
 
     /**
      * Pick queue adapters that remain valid after runtime cluster
@@ -844,6 +848,7 @@ private:
     PlatformMetrics precomputed_platform_metrics_{};
     bool has_precomputed_costs_ = false;
     bool force_stable_connection_queues_ = false;
+    size_t transparent_broadcast_connection_count_ = 0;
 
     struct alignas(64) ThreadSamplingState {
         std::vector<uint64_t> tick_times;

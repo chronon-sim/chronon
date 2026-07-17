@@ -19,10 +19,12 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "MessageQueue.hpp"
+#include "SharedBroadcastTransport.hpp"
 
 namespace chronon::sender {
 
@@ -46,7 +48,22 @@ public:
     virtual uint32_t delay() const noexcept = 0;
     virtual Unit* source() const noexcept = 0;
     virtual Unit* destination() const noexcept = 0;
+    virtual void* sourcePortPtr() const noexcept { return nullptr; }
     virtual void* destPortPtr() const noexcept = 0;
+
+    /// True when this edge can participate in the automatic delay-one
+    /// shared-broadcast transport without changing model-visible semantics.
+    virtual bool transparentBroadcastEligible(size_t headroom_cycles) const noexcept {
+        (void)headroom_cycles;
+        return false;
+    }
+
+    /// Enable the shared transport for every connection owned by this edge's
+    /// source OutPort. Called once per eligible source during initialize().
+    virtual bool enableTransparentBroadcastForSource(size_t headroom_cycles) {
+        (void)headroom_cycles;
+        return false;
+    }
 
     /// Keep this edge in the scheduler dependency graph without transporting
     /// payloads. Intended for model-owned shared fabrics that carry data once
@@ -204,6 +221,9 @@ public:
 template <typename T>
 class Connection : public ConnectionBase {
 public:
+    using SharedBroadcast = detail::SharedBroadcastTransport<T>;
+    using SharedBroadcastView = typename SharedBroadcast::View;
+
     /**
      * Create a connection with specified delay.
      *
@@ -213,6 +233,82 @@ public:
      */
     Connection(OutPort<T>* from, InPort<T>* to, uint32_t delay)
         : from_(from), to_(to), delay_(delay) {}
+
+    bool transparentBroadcastEligible(size_t headroom_cycles) const noexcept override {
+        if constexpr (!std::is_copy_constructible_v<T>) {
+            return false;
+        }
+        return from_ && to_ && delay_ == 1 && !dependency_only_transport_ &&
+               !registered_capacity_.has_value() && !registered_rate_.has_value() &&
+               to_->transparentBroadcastEligible() &&
+               from_->transparentBroadcastCapacityEligible(headroom_cycles);
+    }
+
+    bool enableTransparentBroadcastForSource(size_t headroom_cycles) override {
+        return from_ && from_->enableTransparentBroadcast(headroom_cycles);
+    }
+
+    void attachTransparentBroadcast(SharedBroadcast* transport) {
+        if (!transport || shared_broadcast_) {
+            throw std::logic_error("invalid transparent broadcast attachment");
+        }
+        shared_broadcast_ = transport;
+        shared_broadcast_->registerConsumerCursor(&shared_head_);
+        to_->registerSharedBroadcastConnection(this);
+        setDependencyOnlyTransport(true, shared_broadcast_->headroomCycles());
+    }
+
+    [[nodiscard]] bool transparentBroadcastEnabled() const noexcept {
+        return shared_broadcast_ != nullptr;
+    }
+
+    [[nodiscard]] std::optional<SharedBroadcastView> peekSharedBroadcast() const noexcept {
+        if (!shared_broadcast_) return std::nullopt;
+        uint64_t head = shared_head_.load(std::memory_order_relaxed);
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+        const uint64_t cancel_before = shared_cancel_before_.load(std::memory_order_acquire);
+        if (head < cancel_before) {
+            head = cancel_before;
+            shared_head_.store(head, std::memory_order_release);
+        }
+#endif
+        return shared_broadcast_->peek(head);
+    }
+
+    void popSharedBroadcast(uint64_t sequence) noexcept {
+        if (!shared_broadcast_) return;
+        const uint64_t head = shared_head_.load(std::memory_order_relaxed);
+        if (head == sequence) {
+            shared_head_.store(sequence + 1, std::memory_order_release);
+        }
+    }
+
+    void flushSharedBroadcast() noexcept {
+        if (!shared_broadcast_) return;
+        shared_head_.store(shared_broadcast_->publishedExclusive(), std::memory_order_release);
+    }
+
+    [[nodiscard]] size_t sharedBroadcastQueuedCount() const noexcept {
+        if (!shared_broadcast_) return 0;
+        const uint64_t head = shared_head_.load(std::memory_order_relaxed);
+        const uint64_t tail = shared_broadcast_->publishedExclusive();
+        return static_cast<size_t>(tail - std::min(head, tail));
+    }
+
+    void captureSharedReceiverCancellationScope(uint64_t generation) noexcept {
+        if (!shared_broadcast_) return;
+        shared_receiver_filter_generation_ = generation;
+        shared_receiver_cutoff_exclusive_ = shared_broadcast_->publishedExclusive();
+    }
+
+    [[nodiscard]] uint64_t sharedReceiverGenerationSnapshot(
+        uint64_t sequence, uint64_t filter_generation) const noexcept {
+        if (shared_receiver_filter_generation_ != filter_generation) {
+            return filter_generation;
+        }
+        return sequence < shared_receiver_cutoff_exclusive_ ? filter_generation
+                                                            : filter_generation + 1;
+    }
 
     /**
      * Transfer data through the connection.
@@ -303,6 +399,11 @@ public:
      */
     void cancelInFlight() noexcept override {
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
+        if (shared_broadcast_) {
+            shared_cancel_before_.store(shared_broadcast_->publishedExclusive(),
+                                        std::memory_order_release);
+            return;
+        }
         if (dependency_only_transport_) return;
         cancel_epoch_.fetch_add(1, std::memory_order_acq_rel);
 #endif
@@ -421,6 +522,7 @@ public:
     uint32_t delay() const noexcept override { return delay_; }
     Unit* source() const noexcept override;
     Unit* destination() const noexcept override;
+    void* sourcePortPtr() const noexcept override { return static_cast<void*>(from_); }
     void* destPortPtr() const noexcept override { return static_cast<void*>(to_); }
     IArbitratablePort* registerOnDestMPSC() override;
 
@@ -718,6 +820,13 @@ private:
     OutPort<T>* from_;
     InPort<T>* to_;
     uint32_t delay_;
+    SharedBroadcast* shared_broadcast_ = nullptr;
+    alignas(64) mutable std::atomic<uint64_t> shared_head_{0};
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+    std::atomic<uint64_t> shared_cancel_before_{0};
+#endif
+    uint64_t shared_receiver_filter_generation_ = std::numeric_limits<uint64_t>::max();
+    uint64_t shared_receiver_cutoff_exclusive_ = 0;
     bool dependency_only_transport_ = false;
     std::optional<size_t> registered_capacity_;
     std::optional<size_t> registered_rate_;

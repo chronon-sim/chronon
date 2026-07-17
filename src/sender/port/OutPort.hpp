@@ -100,10 +100,13 @@ public:
         }
 
         bool result;
-        if (dependency_only_transport_) {
+        const uint64_t current = getCurrentCycle();
+        if (shared_broadcast_) {
+            result = publishTransparentBroadcast_(T{data}, current);
+        } else if (dependency_only_transport_) {
             result = true;
         } else if (connections_.size() == 1) {
-            result = connections_[0]->transfer(T{data}, getCurrentCycle());
+            result = connections_[0]->transfer(T{data}, current);
         } else {
             // Multi-connection fanout: preflight every destination before
             // mutating any queue. Prevents partial delivery when a later
@@ -111,7 +114,6 @@ public:
             if (!allConnectionsCanTransfer_()) {
                 return false;
             }
-            uint64_t current = getCurrentCycle();
             result = true;
             for (auto& conn : connections_) {
                 if (!conn->transfer(T{data}, current)) {
@@ -143,17 +145,19 @@ public:
         }
 
         bool result;
-        if (dependency_only_transport_) {
+        const uint64_t current = getCurrentCycle();
+        if (shared_broadcast_) {
+            result = publishTransparentBroadcast_(std::move(data), current);
+        } else if (dependency_only_transport_) {
             result = true;
         } else if (connections_.size() == 1) {
-            result = connections_[0]->transfer(std::move(data), getCurrentCycle());
+            result = connections_[0]->transfer(std::move(data), current);
         } else {
             // Multi-connection fanout: preflight before mutating any queue
             // (see overload above).
             if (!allConnectionsCanTransfer_()) {
                 return false;
             }
-            uint64_t current = getCurrentCycle();
             result = true;
 
             for (size_t i = 0; i + 1 < connections_.size(); ++i) {
@@ -192,6 +196,7 @@ public:
             updateCycleCounter_();
             if (sent_this_cycle_ >= per_cycle_capacity_) return false;
         }
+        if (shared_broadcast_) return shared_broadcast_->canPublish();
         if (dependency_only_transport_) return true;
         for (const auto& conn : connections_) {
             if (!conn->canTransfer()) {
@@ -208,7 +213,7 @@ public:
      * enqueued at destination ports will be dropped on receive.
      */
     void cancelInFlight() {
-        if (dependency_only_transport_) return;
+        if (dependency_only_transport_ && !shared_broadcast_) return;
         for (auto& conn : connections_) {
             conn->cancelInFlight();
         }
@@ -235,6 +240,41 @@ public:
     }
 
     bool dependencyOnlyTransport() const noexcept { return dependency_only_transport_; }
+
+    [[nodiscard]] bool transparentBroadcastCapacityEligible(size_t headroom_cycles) const noexcept {
+        return !dependency_only_transport_ && connections_.size() >= 2 &&
+               per_cycle_capacity_ != UNLIMITED_CAPACITY &&
+               detail::SharedBroadcastTransport<T>::automaticAllocationEligible(
+                   headroom_cycles, per_cycle_capacity_);
+    }
+
+    /// Install a Port-internal one-write/many-reader transport. TickSimulation
+    /// calls this only after validating the complete connected component, so
+    /// every destination InPort switches atomically from physical queues to
+    /// shared replay while the declared connections remain dependency edges.
+    bool enableTransparentBroadcast(size_t headroom_cycles) {
+        if (shared_broadcast_) return true;
+        if (!transparentBroadcastCapacityEligible(headroom_cycles)) {
+            return false;
+        }
+        for (const auto& connection : connections_) {
+            if (!connection->transparentBroadcastEligible(headroom_cycles)) {
+                return false;
+            }
+        }
+
+        auto transport = std::make_unique<detail::SharedBroadcastTransport<T>>(headroom_cycles,
+                                                                               per_cycle_capacity_);
+        for (auto& connection : connections_) {
+            connection->attachTransparentBroadcast(transport.get());
+        }
+        shared_broadcast_ = std::move(transport);
+        return true;
+    }
+
+    [[nodiscard]] bool transparentBroadcastEnabled() const noexcept {
+        return shared_broadcast_ != nullptr;
+    }
 
     /// Find the first connection targeting @p to, or nullptr if not connected.
     Connection<T>* connectionTo(const InPort<T>* to) noexcept {
@@ -296,6 +336,20 @@ private:
         return true;
     }
 
+    template <typename U>
+    bool publishTransparentBroadcast_(U&& data, uint64_t current_cycle) {
+        if (!shared_broadcast_->publish(std::forward<U>(data), current_cycle, 1)) {
+            return false;
+        }
+        if (last_broadcast_wakeup_cycle_ != current_cycle) {
+            last_broadcast_wakeup_cycle_ = current_cycle;
+            for (const auto& connection : connections_) {
+                wakeUnitAt(connection->destination(), current_cycle + 1);
+            }
+        }
+        return true;
+    }
+
     void updateCycleCounter_() const {
         uint64_t current = getCurrentCycle();
         if (current != last_counted_cycle_) {
@@ -308,6 +362,8 @@ private:
     size_t per_cycle_capacity_ = 1;
     mutable size_t sent_this_cycle_ = 0;
     mutable uint64_t last_counted_cycle_ = 0;
+    std::unique_ptr<detail::SharedBroadcastTransport<T>> shared_broadcast_;
+    uint64_t last_broadcast_wakeup_cycle_ = std::numeric_limits<uint64_t>::max();
     bool dependency_only_transport_ = false;
     size_t dependency_only_headroom_ = std::numeric_limits<size_t>::max();
 };
