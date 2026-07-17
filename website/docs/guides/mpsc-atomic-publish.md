@@ -135,6 +135,30 @@ producer-progress dependency and enough physical headroom. A physical overflow
 is counted as a correctness failure; it is not silently converted into model
 back pressure.
 
+## Shared fanout without a second control plane
+
+High-fanout delay-one components use a different data plane but the same
+receiver control plane. `SharedBroadcastTransport` stores an immutable payload
+once per source and gives each destination connection an independent,
+cache-line-aligned replay cursor. It avoids multiplying payload storage by the
+fanout while preserving consumer-local progress.
+
+The cursor set is wrapped by `SharedBroadcastQueueAdapter`, an `IMessageQueue`
+implementation owned and accessed by the destination. The adapter performs the
+same stable `(arrive_cycle, connection_id)` merge and supplies ready queries,
+bulk drains, queue statistics, and flush. Its typed `consumeReady` entry point
+shares the same filter/cancel visitor used by direct SPSC and MPSC, while
+avoiding virtual dispatch on the hot path. `InPort` therefore has no
+broadcast-specific filtering or cancellation implementation, and producers
+never read receiver filter state. Registration is complete before execution,
+so the adapter's connection vector is immutable on the steady-state path and
+needs no lock.
+
+The explicit `DelayOneBroadcastFabric` remains a separate public specialization
+for models that manually own a fixed compile-time ring. It does not provide the
+full Port cancellation/filter contract and is not the implementation behind
+automatic transparent fanout.
+
 ## Receiver filtering and cancellation
 
 `tryReceiveFiltered` performs arbitrary receiver-owned cancellation without
@@ -188,7 +212,8 @@ rare control paths, not cycle-level publication.
 The regression suite covers ring wraparound, real two-thread SPSC stress,
 same-cycle ties, mixed delays, 30-run worker-count determinism, dynamic
 rebalancing, finite-capacity back pressure, sparse 256-lane fan-in, hot-lane
-reinsertion, and receiver filtering. Release validation passes all 45 tests.
+reinsertion, and receiver filtering. Release validation passes the full
+regression suite.
 
 `chronon_mpsc_lane_frontier_benchmark` records sparse and four-active-lane
 traffic without allocating on the timed path. On the reference development

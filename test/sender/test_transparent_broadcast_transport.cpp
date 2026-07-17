@@ -12,6 +12,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -143,6 +144,14 @@ void testAutomaticSelectionAndPortSemantics() {
               "consumer InPort did not switch to shared replay");
         check(!consumer->in.hasData(0), "delay-one payload became visible in the send cycle");
     }
+    bool reconfiguration_rejected = false;
+    try {
+        bus.consumers[0]->in.useSingleThreadQueue();
+    } catch (const std::logic_error&) {
+        reconfiguration_rejected = true;
+    }
+    check(reconfiguration_rejected,
+          "queue reconfiguration silently detached an active shared transport");
 
     check(bus.producers[1]->out.send(90), "pre-cancel producer 1 send failed");
     bus.consumers[0]->in.cancelYoungerThan<&valueKey>(50);
@@ -152,6 +161,14 @@ void testAutomaticSelectionAndPortSemantics() {
     bus.producers[0]->out.cancelInFlight();
     check(bus.producers[0]->out.send(11), "post-cancel producer 0 send failed");
 
+    check(!bus.consumers[0]->in.hasData(0),
+          "shared queue facade exposed a future payload as ready");
+    check(bus.consumers[0]->in.hasData(1), "shared queue facade did not expose a ready payload");
+    check(bus.consumers[0]->in.queuedMessageCount() == 3,
+          "shared queue facade did not retire sender-canceled payloads");
+    check(bus.consumers[0]->in.capacity() == InPort<uint64_t>::UNLIMITED_CAPACITY &&
+              bus.consumers[0]->in.available() == InPort<uint64_t>::UNLIMITED_CAPACITY,
+          "shared queue facade introduced model-visible backpressure");
     check(bus.consumers[0]->in.minArrivalCycle() == 1,
           "shared transport reported the wrong earliest arrival");
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
@@ -169,6 +186,10 @@ void testAutomaticSelectionAndPortSemantics() {
     check(buffered == other_expected, "receiveAllBuffered differs from queue transport");
     check(drainTryReceive(bus.consumers[3]->in, 1) == other_expected,
           "shared replay was destructive across consumers");
+    for (auto* consumer : bus.consumers) {
+        check(consumer->in.queuedMessageCount() == 0,
+              "shared queue facade retained a drained payload");
+    }
 
     check(bus.producers[0]->out.send(12), "flush test send failed");
     bus.consumers[3]->in.flush();
@@ -177,6 +198,8 @@ void testAutomaticSelectionAndPortSemantics() {
               "flush on one consumer affected another consumer cursor");
     }
     check(!bus.consumers[3]->in.hasData(1), "flush did not drop future shared payloads");
+    check(bus.consumers[3]->in.queuedMessageCount() == 0,
+          "flush did not clear the shared queue facade");
 }
 
 void testReceiverFilterIsCursorLocal() {

@@ -237,7 +237,27 @@ validation test, and their counter-metadata test are therefore not built when
 this option is `OFF`; those models rely on sender-side cancellation for correct
 flush semantics.
 
-## Shared Delay-One Broadcast Fabric
+## Automatic Shared Delay-One Broadcast
+
+Normal `OutPort`/`InPort` graphs automatically use a shared data plane when an
+entire connected Port component is safe for the optimization: every source has
+at least four destinations, every edge has delay one, payloads are copyable,
+destinations are unbounded, and no registered edge capacity or rate changes the
+admission contract. Selection is all-or-nothing for the component.
+
+`SharedBroadcastTransport` stores each source payload once and gives every
+destination connection an independent cache-line-aligned cursor. On the receive
+side, `SharedBroadcastQueueAdapter` exposes those cursors through the same
+`IMessageQueue` contract as SPSC and MPSC transports. Consequently `hasData`,
+`minArrivalCycle`, `tryReceiveFiltered`, receiver cancellation, bulk receive,
+queue statistics, and `flush` all use the normal `InPort` control plane. A slow
+or flushed consumer changes only its own cursor and cannot destroy another
+consumer's replay.
+
+This optimization is transparent to models. Set
+`CHRONON_EXPERIMENTAL_TRANSPARENT_BROADCAST=0` only for A/B diagnosis.
+
+## Explicit Shared Delay-One Broadcast Fabric
 
 `DelayOneBroadcastFabric<T, P, C>` is an explicit specialization for a complete
 `P`-producer by `C`-consumer, delay-one broadcast bus. It stores each producer
@@ -273,6 +293,10 @@ delay-one fanout before changing any connection to dependency-only transport
 and exposes the finite ring depth as scheduler headroom. When necessary, the
 lookahead scheduler adds reverse dependencies that prevent a producer from
 wrapping an unread bucket.
+
+For new models, prefer normal Ports and their automatic shared transport. The
+explicit fabric remains available for existing code that intentionally owns a
+fixed compile-time ring and calls `publish()`/`consume()` itself.
 
 ## Usage Pattern
 

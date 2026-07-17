@@ -28,6 +28,7 @@
 #include "MessageQueue.hpp"
 #include "Port.hpp"
 #include "PortDirectory.hpp"
+#include "detail/SharedBroadcastQueueAdapter.hpp"
 
 namespace chronon::sender {
 
@@ -123,6 +124,9 @@ public:
      * WARNING: Must be called before simulation starts (queue must be empty).
      */
     void useSingleThreadQueue() {
+        if (shared_broadcast_queue_raw_) {
+            throw std::logic_error("cannot replace an active shared broadcast transport");
+        }
         multi_producer_queue_raw_ = nullptr;
         direct_spsc_queue_raw_ = nullptr;
         lock_free_queue_ = false;
@@ -147,6 +151,9 @@ public:
      * Uses atomic operations instead of mutex.
      */
     void useLockFreeQueue(size_t min_usable_capacity = 0) {
+        if (shared_broadcast_queue_raw_) {
+            throw std::logic_error("cannot replace an active shared broadcast transport");
+        }
         multi_producer_queue_raw_ = nullptr;
         lock_free_queue_ = true;
         if (queue_detail::directSPSCEnabled()) {
@@ -174,6 +181,9 @@ public:
             multi_producer_queue_raw_->ensurePerThreadUsableCapacity(
                 min_per_thread_usable_capacity);
             return;
+        }
+        if (shared_broadcast_queue_raw_) {
+            throw std::logic_error("cannot replace an active shared broadcast transport");
         }
         direct_spsc_queue_raw_ = nullptr;
         lock_free_queue_ = false;
@@ -414,26 +424,29 @@ public:
     /** Register one source lane selected by transparent broadcast discovery. */
     void registerSharedBroadcastConnection(Connection<T>* conn) {
         if (!conn) return;
-        if (queue_->size() != 0 || !mpsc_connections_.empty()) {
-            throw std::logic_error("cannot enable shared broadcast on a non-empty InPort");
-        }
-        auto it = shared_broadcast_connections_.begin();
-        for (; it != shared_broadcast_connections_.end(); ++it) {
-            if (*it == conn) return;
-            if ((*it)->connId() > conn->connId()) break;
-        }
-        shared_broadcast_connections_.insert(it, conn);
+        if constexpr (!std::is_copy_constructible_v<T>) {
+            throw std::logic_error("shared broadcast requires copy-constructible payloads");
+        } else {
+            if (!shared_broadcast_queue_raw_) {
+                if (queue_->size() != 0 || !mpsc_connections_.empty()) {
+                    throw std::logic_error("cannot enable shared broadcast on a non-empty InPort");
+                }
+                auto adapter = std::make_unique<detail::SharedBroadcastQueueAdapter<T>>(
+                    &receiver_filter_generation_);
+                shared_broadcast_queue_raw_ = adapter.get();
+                direct_spsc_queue_raw_ = nullptr;
+                multi_producer_queue_raw_ = nullptr;
+                lock_free_queue_ = false;
+                queue_ = std::move(adapter);
+            }
+            shared_broadcast_queue_raw_->registerConnection(conn);
 
-        // Unit::initialize() runs before transparent-broadcast discovery. If
-        // legacy receiver cancellation established its in-flight scope there,
-        // no shared lane existed for ensureReceiverScopeToInFlightLocked_() to
-        // stamp. Catch this newly attached lane up now: the current shared tail
-        // is the cutoff, so every later publish belongs to the next generation
-        // and is not filtered by the initialize-time cancellation.
-        if (policy_ == PortPolicy::LegacyFastPath) {
-            const uint64_t generation = receiver_filter_generation_.load(std::memory_order_acquire);
-            if (generation != std::numeric_limits<uint64_t>::max()) {
-                if constexpr (std::is_copy_constructible_v<T>) {
+            // Unit::initialize() runs before transport discovery. Catch a
+            // newly attached lane up to any in-flight cancellation scope.
+            if (policy_ == PortPolicy::LegacyFastPath) {
+                const uint64_t generation =
+                    receiver_filter_generation_.load(std::memory_order_acquire);
+                if (generation != std::numeric_limits<uint64_t>::max()) {
                     conn->captureSharedReceiverCancellationScope(generation);
                 }
             }
@@ -441,7 +454,7 @@ public:
     }
 
     [[nodiscard]] bool usesTransparentBroadcast() const noexcept {
-        return !shared_broadcast_connections_.empty();
+        return shared_broadcast_queue_raw_ != nullptr;
     }
 
     [[nodiscard]] bool transparentBroadcastEligible() const noexcept {
@@ -501,51 +514,19 @@ public:
                  std::is_nothrow_invocable_r_v<bool, Filter&, const T&>
     std::optional<T> tryReceiveFiltered(uint64_t current_cycle, Filter&& filter) {
         if constexpr (std::is_copy_constructible_v<T>) {
-            if (!shared_broadcast_connections_.empty()) {
-                return tryReceiveSharedBroadcastFiltered_(current_cycle, filter);
+            if (shared_broadcast_queue_raw_) {
+                return tryReceiveFromSharedQueue_(current_cycle, filter);
             }
         }
         if (direct_spsc_queue_raw_) {
-            while (true) {
-                StoredMessage* msg = direct_spsc_queue_raw_->peekReady(current_cycle);
-                if (!msg) return std::nullopt;
-                if (detail::isCanceled(*msg) || isReceiverCanceled_(*msg) ||
-                    !std::invoke(filter, std::as_const(msg->data))) {
-                    direct_spsc_queue_raw_->consumePeeked(current_cycle);
-                    continue;
-                }
-                std::optional<T> result{std::in_place, std::move(msg->data)};
-                direct_spsc_queue_raw_->consumePeeked(current_cycle);
-                return result;
-            }
+            return tryReceiveFromConsumableQueue_(*direct_spsc_queue_raw_, current_cycle, filter);
         }
         if (multi_producer_queue_raw_) {
-            while (true) {
-                std::optional<T> result;
-                const bool consumed =
-                    multi_producer_queue_raw_->consumeReady(current_cycle, [&](StoredMessage& msg) {
-                        if (detail::isCanceled(msg) || isReceiverCanceled_(msg) ||
-                            !std::invoke(filter, std::as_const(msg.data))) {
-                            return;
-                        }
-                        result.emplace(std::move(msg.data));
-                    });
-                if (!consumed) return std::nullopt;
-                if (result) return result;
-            }
+            return tryReceiveFromConsumableQueue_(*multi_producer_queue_raw_, current_cycle,
+                                                  filter);
         }
 
-        while (true) {
-            auto msg = queue_->tryPop(current_cycle);
-            if (!msg.has_value()) {
-                return std::nullopt;
-            }
-            if (detail::isCanceled(*msg) || isReceiverCanceled_(*msg) ||
-                !std::invoke(filter, std::as_const(msg->data))) {
-                continue;
-            }
-            return std::move(msg->data);
-        }
+        return tryReceiveFromQueue_(*queue_, current_cycle, filter);
     }
 
     template <typename Filter>
@@ -562,19 +543,10 @@ public:
      * @return Vector of all ready messages
      */
     std::vector<T> receiveAll(uint64_t current_cycle) {
-        if constexpr (std::is_copy_constructible_v<T>) {
-            if (!shared_broadcast_connections_.empty()) {
-                std::vector<T> result;
-                while (auto value = tryReceiveSharedBroadcast_(current_cycle)) {
-                    result.push_back(std::move(*value));
-                }
-                return result;
-            }
-        }
-        auto all = queue_->popAll(current_cycle);
+        popAllReadyInto_(drain_scratch_, current_cycle);
         std::vector<T> result;
-        result.reserve(all.size());
-        for (auto& msg : all) {
+        result.reserve(drain_scratch_.size());
+        for (auto& msg : drain_scratch_) {
             if (!detail::isCanceled(msg) && !isReceiverCanceled_(msg)) {
                 result.push_back(std::move(msg.data));
             }
@@ -592,16 +564,7 @@ public:
      * drains its port), so the buffers need no synchronization.
      */
     const std::vector<T>& receiveAllBuffered(uint64_t current_cycle) {
-        if constexpr (std::is_copy_constructible_v<T>) {
-            if (!shared_broadcast_connections_.empty()) {
-                recv_scratch_.clear();
-                while (auto value = tryReceiveSharedBroadcast_(current_cycle)) {
-                    recv_scratch_.push_back(std::move(*value));
-                }
-                return recv_scratch_;
-            }
-        }
-        queue_->popAllInto(drain_scratch_, current_cycle);
+        popAllReadyInto_(drain_scratch_, current_cycle);
         recv_scratch_.clear();
         for (auto& msg : drain_scratch_) {
             if (!detail::isCanceled(msg) && !isReceiverCanceled_(msg)) {
@@ -613,12 +576,8 @@ public:
     const std::vector<T>& receiveAllBuffered() { return receiveAllBuffered(getCurrentCycle()); }
 
     bool hasData(uint64_t current_cycle) const {
-        if constexpr (std::is_copy_constructible_v<T>) {
-            if (!shared_broadcast_connections_.empty()) {
-                return peekReadySharedBroadcast_(current_cycle).has_value();
-            }
-        }
-        return queue_->hasReady(current_cycle);
+        return shared_broadcast_queue_raw_ ? shared_broadcast_queue_raw_->hasReady(current_cycle)
+                                           : queue_->hasReady(current_cycle);
     }
 
     /// True if messages are ready at the owning Unit's current local cycle.
@@ -626,36 +585,20 @@ public:
 
     /// Earliest arrival cycle of pending or staged messages, used for lookahead.
     std::optional<uint64_t> minArrivalCycle() const override {
-        std::optional<uint64_t> earliest = queue_->minArrivalCycle();
-        if constexpr (std::is_copy_constructible_v<T>) {
-            for (const auto* conn : shared_broadcast_connections_) {
-                if (auto view = conn->peekSharedBroadcast()) {
-                    if (!earliest || view->arrive_cycle < *earliest) {
-                        earliest = view->arrive_cycle;
-                    }
-                }
-            }
-        }
-        return earliest;
+        return shared_broadcast_queue_raw_ ? shared_broadcast_queue_raw_->minArrivalCycle()
+                                           : queue_->minArrivalCycle();
     }
 
     size_t queuedMessageCount() const {
-        size_t count = queue_->size();
-        if constexpr (std::is_copy_constructible_v<T>) {
-            for (const auto* conn : shared_broadcast_connections_) {
-                count += conn->sharedBroadcastQueuedCount();
-            }
-        }
-        return count;
+        return shared_broadcast_queue_raw_ ? shared_broadcast_queue_raw_->size() : queue_->size();
     }
 
     /// Drop all queued messages (including future arrivals).
     void flush() {
-        queue_->clear();
-        if constexpr (std::is_copy_constructible_v<T>) {
-            for (auto* conn : shared_broadcast_connections_) {
-                conn->flushSharedBroadcast();
-            }
+        if (shared_broadcast_queue_raw_) {
+            shared_broadcast_queue_raw_->clear();
+        } else {
+            queue_->clear();
         }
     }
 
@@ -764,6 +707,74 @@ public:
 private:
     uint64_t getCurrentCycle() const;
 
+    template <typename Filter>
+    [[gnu::noinline]] std::optional<T> tryReceiveFromSharedQueue_(uint64_t current_cycle,
+                                                                  Filter& filter) {
+        return tryReceiveFromConsumableQueue_(*shared_broadcast_queue_raw_, current_cycle, filter);
+    }
+
+    template <typename Queue, typename Filter>
+    std::optional<T> tryReceiveFromConsumableQueue_(Queue& queue, uint64_t current_cycle,
+                                                    Filter& filter) {
+        while (true) {
+            std::optional<T> result;
+            auto visit = [&](StoredMessage& msg) {
+                if (isSenderCanceledByQueue_<Queue>(msg) || isReceiverCanceled_(msg) ||
+                    !std::invoke(filter, std::as_const(msg.data))) {
+                    return;
+                }
+                result.emplace(std::move(msg.data));
+            };
+            bool consumed;
+            if constexpr (std::is_same_v<std::remove_cvref_t<Queue>,
+                                         detail::SharedBroadcastQueueAdapter<T>>) {
+                const uint64_t generation =
+                    policy_ == PortPolicy::LegacyFastPath
+                        ? receiver_filter_generation_.load(std::memory_order_acquire)
+                        : std::numeric_limits<uint64_t>::max();
+                consumed = queue.consumeReady(current_cycle, generation, visit);
+            } else {
+                consumed = queue.consumeReady(current_cycle, visit);
+            }
+            if (!consumed) return std::nullopt;
+            if (result) return result;
+        }
+    }
+
+    template <typename Queue>
+    [[nodiscard]] static bool isSenderCanceledByQueue_(const StoredMessage& msg) noexcept {
+        if constexpr (requires { Queue::resolves_sender_cancellation; }) {
+            static_assert(Queue::resolves_sender_cancellation);
+            (void)msg;
+            return false;
+        } else {
+            return detail::isCanceled(msg);
+        }
+    }
+
+    template <typename Queue, typename Filter>
+    std::optional<T> tryReceiveFromQueue_(Queue& queue, uint64_t current_cycle, Filter& filter) {
+        while (true) {
+            auto msg = queue.tryPop(current_cycle);
+            if (!msg.has_value()) return std::nullopt;
+            if (detail::isCanceled(*msg) || isReceiverCanceled_(*msg) ||
+                !std::invoke(filter, std::as_const(msg->data))) {
+                continue;
+            }
+            return std::move(msg->data);
+        }
+    }
+
+    void popAllReadyInto_(std::vector<StoredMessage>& out, uint64_t current_cycle) {
+        if constexpr (std::is_copy_constructible_v<T>) {
+            if (shared_broadcast_queue_raw_) {
+                shared_broadcast_queue_raw_->popAllInto(out, current_cycle);
+                return;
+            }
+        }
+        queue_->popAllInto(out, current_cycle);
+    }
+
     void traceStageInstall_(uint64_t cycle) const noexcept {
         if (!stageTraceEnabled_() || !stageTracePortMatches_(name_)) {
             return;
@@ -860,10 +871,8 @@ private:
         const uint64_t generation =
             receiver_enqueue_generation_.fetch_add(1, std::memory_order_acq_rel);
         receiver_filter_generation_.store(generation, std::memory_order_release);
-        if constexpr (std::is_copy_constructible_v<T>) {
-            for (auto* conn : shared_broadcast_connections_) {
-                conn->captureSharedReceiverCancellationScope(generation);
-            }
+        if (shared_broadcast_queue_raw_) {
+            shared_broadcast_queue_raw_->captureReceiverCancellationScope(generation);
         }
     }
 
@@ -936,6 +945,7 @@ private:
     size_t capacity_;
     PortPolicy policy_ = PortPolicy::LegacyFastPath;
     std::unique_ptr<IMessageQueue<StoredMessage>> queue_;
+    detail::SharedBroadcastQueueAdapter<T>* shared_broadcast_queue_raw_ = nullptr;
     DirectSPSCQueueAdapter<StoredMessage>* direct_spsc_queue_raw_ = nullptr;
     MultiProducerQueueAdapter<StoredMessage>* multi_producer_queue_raw_ =
         nullptr;                    ///< Non-owning ptr for MPSC access
@@ -954,24 +964,6 @@ private:
     /// receiver thread (install/retire/shouldCancel). No locking needed.
     detail::InPortStageCancelState stage_state_{};
 
-    struct SharedBroadcastCandidate {
-        Connection<T>* connection = nullptr;
-        const T* data = nullptr;
-        uint64_t sequence = 0;
-        uint64_t arrive_cycle = 0;
-        uint64_t enqueue_cycle = 0;
-    };
-
-    [[nodiscard]] std::optional<SharedBroadcastCandidate> peekReadySharedBroadcast_(
-        uint64_t current_cycle) const noexcept;
-
-    template <typename Filter>
-    std::optional<T> tryReceiveSharedBroadcastFiltered_(uint64_t current_cycle, Filter& filter);
-
-    std::optional<T> tryReceiveSharedBroadcast_(uint64_t current_cycle);
-
-    std::vector<Connection<T>*> shared_broadcast_connections_;
-
     /// Direct MPSC lane registry, sorted by topology-stable conn_id.
     std::vector<ConnectionBase*> mpsc_connections_;
 
@@ -980,8 +972,6 @@ private:
     /// progress dependency for every lane.
     std::vector<const std::atomic<uint64_t>*> mpsc_conn_progress_;
 };
-
-#include "detail/InPortSharedBroadcastImpl.hpp"
 
 template <typename T>
 IMultiProducerPort* Connection<T>::registerOnDestMPSC() {
