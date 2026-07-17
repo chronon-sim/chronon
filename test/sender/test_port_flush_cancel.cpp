@@ -406,25 +406,49 @@ void test_inport_selective_cancel_mismatched_keyfn_is_noop() {
 }
 
 void test_inport_selective_cancel_mpsc_thread_queues() {
-    std::cout << "Testing InPort selective cancel on MPSC thread queues... ";
+    std::cout << "Testing future-arrival selective cancel through MPSC connections... ";
 
+    TestUnit prod0("prod0");
+    TestUnit prod1("prod1");
     TestUnit cons("cons");
+    OutPort<TaggedMsg> out0{&prod0, "out0", 4};
+    OutPort<TaggedMsg> out1{&prod1, "out1", 4};
     InPort<TaggedMsg> in{&cons, "in", 64};
-    in.useMultiProducerQueue();
+    auto* conn0 = out0.connect(&in, 5);
+    auto* conn1 = out1.connect(&in, 5);
 
-    [[maybe_unused]] const size_t q0 = in.registerProducerThread(0);
-    [[maybe_unused]] const size_t q1 = in.registerProducerThread(1);
-    assert(q0 != SIZE_MAX);
-    assert(q1 != SIZE_MAX);
+    conn0->setConnId(10);
+    conn1->setConnId(20);
+    conn0->optimizeForMPSC();
+    conn1->optimizeForMPSC();
+    const size_t lane0 = conn0->registerProducerThread(100);
+    const size_t lane1 = conn1->registerProducerThread(200);
+    require(lane0 != SIZE_MAX && lane1 != SIZE_MAX && lane0 != lane1,
+            "failed to register direct MPSC lanes");
+    conn0->setThreadQueueId(lane0);
+    conn1->setThreadQueueId(lane1);
+    require(conn0->registerOnDestMPSC() != nullptr && conn1->registerOnDestMPSC() != nullptr,
+            "failed to register MPSC connections on the destination");
+    require(in.isMultiProducerMode(), "test did not select the direct MPSC transport");
 
-    // Existing in-flight messages (generation 0).
-    assert(in.pushToThreadQueue(q0, TaggedMsg{.id = 10, .seq = 10, .payload = 0}, 5));
-    assert(in.pushToThreadQueue(q1, TaggedMsg{.id = 30, .seq = 30, .payload = 0}, 5));
+    // Already-published messages are in flight even though delay=5 keeps them
+    // invisible until cycle 5. This scope must match the ordinary queue path.
+    prod0.setCycle(0);
+    prod1.setCycle(0);
+    require(out0.send(TaggedMsg{.id = 10, .seq = 10, .payload = 0}),
+            "failed to publish old low-key MPSC message");
+    require(out1.send(TaggedMsg{.id = 30, .seq = 30, .payload = 0}),
+            "failed to publish old retained MPSC message");
 
     in.cancelOlderThan<&TaggedMsg::id>(static_cast<uint64_t>(20));
 
-    // New message should be in generation 1 and not filtered by prior scope.
-    assert(in.pushToThreadQueue(q0, TaggedMsg{.id = 15, .seq = 15, .payload = 0}, 6));
+    // Messages published after the cancellation enter the next generation.
+    prod0.setCycle(1);
+    prod1.setCycle(1);
+    require(out0.send(TaggedMsg{.id = 15, .seq = 15, .payload = 0}),
+            "failed to publish new low-key MPSC message");
+    require(out1.send(TaggedMsg{.id = 25, .seq = 25, .payload = 0}),
+            "failed to publish new retained MPSC message");
 
     std::vector<uint64_t> cycle5_ids;
     for (int i = 0; i < 10; ++i) {
@@ -433,9 +457,10 @@ void test_inport_selective_cancel_mpsc_thread_queues() {
     assert(cycle5_ids.size() == 1);
     assert(cycle5_ids[0] == 30);
 
-    [[maybe_unused]] auto msg = in.tryReceive(6);
-    assert(msg.has_value());
-    assert(msg->id == 15);
+    auto first_new = in.tryReceive(6);
+    auto second_new = in.tryReceive(6);
+    assert(first_new.has_value() && first_new->id == 15);
+    assert(second_new.has_value() && second_new->id == 25);
     assert(!in.tryReceive(6).has_value());
 
     std::cout << "PASSED\n";
