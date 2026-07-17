@@ -1,0 +1,480 @@
+// Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
+// Author: Haomeng Wang <chang_yun@outlook.com>
+// SPDX-License-Identifier: MPL-2.0
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+#include <array>
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "sender/core/TickSimulation.hpp"
+
+using namespace chronon::sender;
+
+namespace {
+
+int failures = 0;
+
+void check(bool condition, const std::string& message) {
+    if (!condition) {
+        std::cerr << "FAIL: " << message << '\n';
+        ++failures;
+    }
+}
+
+uint64_t valueKey(const uint64_t& value) { return value; }
+
+class PassiveProducer : public TickableUnit {
+public:
+    PassiveProducer(std::string name, size_t rate = 8)
+        : TickableUnit(std::move(name)), out(this, "out", rate) {}
+
+    void tick() override {}
+
+    OutPort<uint64_t> out;
+};
+
+class InitializingProducer : public PassiveProducer {
+public:
+    explicit InitializingProducer(std::string name) : PassiveProducer(std::move(name)) {}
+
+    void initialize() override { check(out.send(7), "initialize-time send failed"); }
+};
+
+class PassiveConsumer : public TickableUnit {
+public:
+    explicit PassiveConsumer(std::string name) : TickableUnit(std::move(name)) {}
+
+    void tick() override {}
+
+    InPort<uint64_t> in{this, "in"};
+};
+
+class StageSelectiveConsumer : public TickableUnit {
+public:
+    explicit StageSelectiveConsumer(std::string name) : TickableUnit(std::move(name)) {}
+
+    void tick() override {}
+
+    InPort<uint64_t> in{this, "in", PortPolicy::StageSelective};
+};
+
+class InitializingCancelConsumer : public TickableUnit {
+public:
+    explicit InitializingCancelConsumer(std::string name) : TickableUnit(std::move(name)) {}
+
+    void initialize() override { in.cancelYoungerThan<&valueKey>(50); }
+    void tick() override {}
+
+    InPort<uint64_t> in{this, "in"};
+};
+
+class MoveOnlyProducer : public TickableUnit {
+public:
+    explicit MoveOnlyProducer(std::string name) : TickableUnit(std::move(name)) {}
+
+    void tick() override {}
+
+    OutPort<std::unique_ptr<int>> out{this, "out", 0};
+};
+
+class MoveOnlyConsumer : public TickableUnit {
+public:
+    explicit MoveOnlyConsumer(std::string name) : TickableUnit(std::move(name)) {}
+
+    void tick() override {}
+
+    InPort<std::unique_ptr<int>> in{this, "in"};
+};
+
+struct PassiveBus {
+    std::array<PassiveProducer*, 2> producers{};
+    std::array<PassiveConsumer*, 4> consumers{};
+};
+
+PassiveBus makePassiveBus(TickSimulation& simulation) {
+    PassiveBus bus;
+    for (size_t producer = 0; producer < bus.producers.size(); ++producer) {
+        bus.producers[producer] =
+            simulation.createUnit<PassiveProducer>("producer" + std::to_string(producer));
+    }
+    for (size_t consumer = 0; consumer < bus.consumers.size(); ++consumer) {
+        bus.consumers[consumer] =
+            simulation.createUnit<PassiveConsumer>("consumer" + std::to_string(consumer));
+    }
+    for (auto* producer : bus.producers) {
+        for (auto* consumer : bus.consumers) {
+            simulation.connect(producer->out, consumer->in, 1);
+        }
+    }
+    return bus;
+}
+
+std::vector<uint64_t> drainTryReceive(InPort<uint64_t>& port, uint64_t cycle) {
+    std::vector<uint64_t> values;
+    while (auto value = port.tryReceive(cycle)) values.push_back(*value);
+    return values;
+}
+
+void testAutomaticSelectionAndPortSemantics() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto bus = makePassiveBus(simulation);
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == 8,
+          "complete 2x4 delay-one bus was not selected automatically");
+    for (auto* producer : bus.producers) {
+        check(producer->out.transparentBroadcastEnabled(),
+              "producer OutPort did not switch to shared transport");
+    }
+    for (auto* consumer : bus.consumers) {
+        check(consumer->in.usesTransparentBroadcast(),
+              "consumer InPort did not switch to shared replay");
+        check(!consumer->in.hasData(0), "delay-one payload became visible in the send cycle");
+    }
+
+    check(bus.producers[1]->out.send(90), "pre-cancel producer 1 send failed");
+    bus.consumers[0]->in.cancelYoungerThan<&valueKey>(50);
+    check(bus.producers[1]->out.send(91), "post-cancel producer 1 send failed");
+
+    check(bus.producers[0]->out.send(10), "pre-cancel producer 0 send failed");
+    bus.producers[0]->out.cancelInFlight();
+    check(bus.producers[0]->out.send(11), "post-cancel producer 0 send failed");
+
+    check(bus.consumers[0]->in.minArrivalCycle() == 1,
+          "shared transport reported the wrong earliest arrival");
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+    const std::vector<uint64_t> consumer0_expected{11, 91};
+    const std::vector<uint64_t> other_expected{11, 90, 91};
+#else
+    const std::vector<uint64_t> consumer0_expected{10, 11, 91};
+    const std::vector<uint64_t> other_expected{10, 11, 90, 91};
+#endif
+    check(drainTryReceive(bus.consumers[0]->in, 1) == consumer0_expected,
+          "sender or receiver cancellation semantics changed");
+    check(bus.consumers[1]->in.receiveAll(1) == other_expected,
+          "receiveAll lost deterministic producer order");
+    const auto& buffered = bus.consumers[2]->in.receiveAllBuffered(1);
+    check(buffered == other_expected, "receiveAllBuffered differs from queue transport");
+    check(drainTryReceive(bus.consumers[3]->in, 1) == other_expected,
+          "shared replay was destructive across consumers");
+
+    check(bus.producers[0]->out.send(12), "flush test send failed");
+    bus.consumers[3]->in.flush();
+    for (size_t consumer = 0; consumer < 3; ++consumer) {
+        check(drainTryReceive(bus.consumers[consumer]->in, 1) == std::vector<uint64_t>({12}),
+              "flush on one consumer affected another consumer cursor");
+    }
+    check(!bus.consumers[3]->in.hasData(1), "flush did not drop future shared payloads");
+}
+
+void testUnsafeComponentsFallBackAtomically() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto* producer = simulation.createUnit<PassiveProducer>("producer");
+    std::array<PassiveConsumer*, 4> consumers{};
+    for (size_t i = 0; i < consumers.size(); ++i) {
+        consumers[i] = simulation.createUnit<PassiveConsumer>("consumer" + std::to_string(i));
+        if (i == 0) consumers[i]->in.setCapacity(8);
+        simulation.connect(producer->out, consumers[i]->in, 1);
+    }
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == 0,
+          "bounded destination did not veto the whole Port component");
+    check(!producer->out.transparentBroadcastEnabled(),
+          "unsafe component was partially switched to shared transport");
+    check(producer->out.send(7), "fallback queue send failed");
+    for (auto* consumer : consumers) {
+        check(consumer->in.tryReceive(1) == std::optional<uint64_t>{7},
+              "fallback queue changed delivery semantics");
+    }
+}
+
+void testOversizedRateFallsBackAtomically() {
+    using OversizedPayload = std::array<uint8_t, 1u << 20>;
+    check(!detail::SharedBroadcastTransport<OversizedPayload>::automaticAllocationEligible(512, 1),
+          "oversized payload passed the automatic allocation limit");
+
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    constexpr size_t kTooManyMessagesPerCycle = (1u << 20) / 512 + 1;
+    auto* producer = simulation.createUnit<PassiveProducer>("producer", kTooManyMessagesPerCycle);
+    std::array<PassiveConsumer*, 4> consumers{};
+    for (size_t i = 0; i < consumers.size(); ++i) {
+        consumers[i] = simulation.createUnit<PassiveConsumer>("consumer" + std::to_string(i));
+        simulation.connect(producer->out, consumers[i]->in, 1);
+    }
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == 0,
+          "oversized producer rate did not veto the whole Port component");
+    check(!producer->out.transparentBroadcastEnabled(),
+          "oversized component was partially switched to shared transport");
+}
+
+void testInitializedQueueFallsBackAtomically() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto* producer = simulation.createUnit<InitializingProducer>("producer");
+    std::array<PassiveConsumer*, 4> consumers{};
+    for (size_t i = 0; i < consumers.size(); ++i) {
+        consumers[i] = simulation.createUnit<PassiveConsumer>("consumer" + std::to_string(i));
+        simulation.connect(producer->out, consumers[i]->in, 1);
+    }
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == 0,
+          "an initialized queue did not veto the whole Port component");
+    check(!producer->out.transparentBroadcastEnabled(),
+          "an initialized component was partially switched to shared transport");
+}
+
+void testStageSelectiveCancellation() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto* producer = simulation.createUnit<PassiveProducer>("producer");
+    std::array<StageSelectiveConsumer*, 4> consumers{};
+    for (size_t i = 0; i < consumers.size(); ++i) {
+        consumers[i] =
+            simulation.createUnit<StageSelectiveConsumer>("consumer" + std::to_string(i));
+        simulation.connect(producer->out, consumers[i]->in, 1);
+    }
+    simulation.initialize();
+
+    check(producer->out.send(90), "StageSelective pre-flush send failed");
+    simulation.run(1);
+    consumers[0]->in.cancelYoungerThan<&valueKey>(50);
+    check(producer->out.send(91), "StageSelective post-flush send failed");
+
+    check(drainTryReceive(consumers[0]->in, 2) == std::vector<uint64_t>({91}),
+          "StageSelective enqueue-cycle scope changed on shared replay");
+    for (size_t i = 1; i < consumers.size(); ++i) {
+        check(drainTryReceive(consumers[i]->in, 2) == std::vector<uint64_t>({90, 91}),
+              "StageSelective filter affected another consumer");
+    }
+}
+
+void testInitializeTimeCancellationScope() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto* producer = simulation.createUnit<PassiveProducer>("producer");
+    auto* canceled = simulation.createUnit<InitializingCancelConsumer>("canceled");
+    std::array<PassiveConsumer*, 3> other_consumers{
+        simulation.createUnit<PassiveConsumer>("consumer0"),
+        simulation.createUnit<PassiveConsumer>("consumer1"),
+        simulation.createUnit<PassiveConsumer>("consumer2")};
+    simulation.connect(producer->out, canceled->in, 1);
+    for (auto* consumer : other_consumers) simulation.connect(producer->out, consumer->in, 1);
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == 4,
+          "initialize-time cancellation prevented transparent broadcast selection");
+    check(producer->out.send(90), "post-initialize broadcast send failed");
+    check(canceled->in.tryReceive(1) == std::optional<uint64_t>{90},
+          "initialize-time cancellation leaked into later shared publishes");
+    for (auto* consumer : other_consumers) {
+        check(consumer->in.tryReceive(1) == std::optional<uint64_t>{90},
+              "initialize-time cancellation affected another consumer");
+    }
+}
+
+void testMoveOnlyPayloadUsesQueuePath() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto* producer = simulation.createUnit<MoveOnlyProducer>("producer");
+    auto* consumer = simulation.createUnit<MoveOnlyConsumer>("consumer");
+    simulation.connect(producer->out, consumer->in, 1);
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == 0,
+          "move-only payload unexpectedly selected transparent broadcast");
+    check(producer->out.send(std::make_unique<int>(7)), "move-only tryReceive send failed");
+    auto first = consumer->in.tryReceive(1);
+    check(first && **first == 7, "move-only tryReceive changed queue-path delivery");
+
+    check(producer->out.send(std::make_unique<int>(8)), "move-only receiveAll send 1 failed");
+    check(producer->out.send(std::make_unique<int>(9)), "move-only receiveAll send 2 failed");
+    auto all = consumer->in.receiveAll(1);
+    check(all.size() == 2 && *all[0] == 8 && *all[1] == 9,
+          "move-only receiveAll changed queue-path delivery");
+
+    check(producer->out.send(std::make_unique<int>(10)),
+          "move-only receiveAllBuffered send failed");
+    const auto& buffered = consumer->in.receiveAllBuffered(1);
+    check(buffered.size() == 1 && *buffered[0] == 10,
+          "move-only receiveAllBuffered changed queue-path delivery");
+}
+
+class StreamingProducer : public TickableUnit {
+public:
+    StreamingProducer(std::string name, uint64_t producer_id)
+        : TickableUnit(std::move(name)), producer_id_(producer_id) {}
+
+    void tick() override {
+        const uint64_t value = (localCycle() << 1) | producer_id_;
+        if (!out.send(value)) ++failed_sends_;
+    }
+
+    OutPort<uint64_t> out{this, "out", 1};
+    uint64_t failedSends() const noexcept { return failed_sends_; }
+
+private:
+    uint64_t producer_id_ = 0;
+    uint64_t failed_sends_ = 0;
+};
+
+class StreamingConsumer : public TickableUnit {
+public:
+    explicit StreamingConsumer(std::string name) : TickableUnit(std::move(name)) {}
+
+    void tick() override {
+        for (uint64_t value : in.receiveAll(localCycle())) {
+            received_.push_back({localCycle(), value});
+        }
+    }
+
+    InPort<uint64_t> in{this, "in"};
+    const auto& received() const noexcept { return received_; }
+
+private:
+    std::vector<std::pair<uint64_t, uint64_t>> received_;
+};
+
+void testStalledConsumerKeepsUnlimitedSemantics() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto* producer = simulation.createUnit<StreamingProducer>("producer", 0);
+    auto* stalled = simulation.createUnit<PassiveConsumer>("stalled");
+    std::array<StreamingConsumer*, 3> draining{
+        simulation.createUnit<StreamingConsumer>("consumer0"),
+        simulation.createUnit<StreamingConsumer>("consumer1"),
+        simulation.createUnit<StreamingConsumer>("consumer2")};
+    simulation.connect(producer->out, stalled->in, 1);
+    for (auto* consumer : draining) simulation.connect(producer->out, consumer->in, 1);
+
+    constexpr uint64_t kCycles = 1'200;
+    simulation.run(kCycles);
+    check(simulation.transparentBroadcastConnectionCount() == 4,
+          "stalled-consumer bus did not use transparent broadcast");
+    check(producer->failedSends() == 0,
+          "an unlimited stalled consumer introduced broadcast backpressure");
+    check(stalled->in.queuedMessageCount() == kCycles,
+          "stalled consumer did not retain every broadcast payload");
+    for (auto* consumer : draining) {
+        check(consumer->received().size() == kCycles - 1,
+              "draining consumer lost payloads while another consumer stalled");
+    }
+    check(stalled->in.receiveAll(kCycles).size() == kCycles,
+          "stalled consumer could not replay payloads across chunk boundaries");
+}
+
+void testParallelLookaheadReplay() {
+    TickSimulationConfig config;
+    config.num_threads = 4;
+    config.enable_parallel = true;
+    config.enable_lookahead = true;
+    config.enable_epoch_free_lookahead = true;
+    config.enable_dynamic_rebalance = false;
+    config.enable_weighted_partitioning = true;
+    config.partition_solver = TickSimulationConfig::PartitionSolverType::Weighted;
+    config.initial_partition_sync_cost_ns = 0.0;
+    TickSimulation simulation(config);
+
+    std::array<StreamingProducer*, 2> producers{
+        simulation.createUnit<StreamingProducer>("producer0", 0),
+        simulation.createUnit<StreamingProducer>("producer1", 1)};
+    std::array<StreamingConsumer*, 4> consumers{
+        simulation.createUnit<StreamingConsumer>("consumer0"),
+        simulation.createUnit<StreamingConsumer>("consumer1"),
+        simulation.createUnit<StreamingConsumer>("consumer2"),
+        simulation.createUnit<StreamingConsumer>("consumer3")};
+    for (auto* producer : producers) {
+        for (auto* consumer : consumers) simulation.connect(producer->out, consumer->in, 1);
+    }
+    PlatformMetrics metrics{};
+    metrics.atomic_roundtrip_ns = 0.0;
+    simulation.setPrecomputedUnitCosts(std::vector<double>(6, 100.0), metrics);
+
+    constexpr uint64_t kCycles = 1'200;
+    simulation.run(kCycles);
+    check(simulation.transparentBroadcastConnectionCount() == 8,
+          "parallel bus did not use transparent broadcast");
+    check(simulation.epochFreeRunCount() > 0,
+          "parallel transport test did not exercise epoch-free lookahead");
+    for (auto* producer : producers) {
+        check(producer->failedSends() == 0, "shared ring back-pressured a draining consumer");
+    }
+    for (auto* consumer : consumers) {
+        const auto& received = consumer->received();
+        check(received.size() == 2 * (kCycles - 1),
+              "parallel consumer received the wrong message count");
+        if (received.size() != 2 * (kCycles - 1)) continue;
+        for (uint64_t cycle = 1; cycle < kCycles; ++cycle) {
+            const size_t base = static_cast<size_t>((cycle - 1) * 2);
+            check(received[base] == std::pair<uint64_t, uint64_t>{cycle, (cycle - 1) << 1},
+                  "producer 0 replay cycle or order changed");
+            check(
+                received[base + 1] == std::pair<uint64_t, uint64_t>{cycle, ((cycle - 1) << 1) | 1},
+                "producer 1 replay cycle or order changed");
+        }
+    }
+}
+
+void testEnvironmentOptOut() {
+    setenv("CHRONON_EXPERIMENTAL_TRANSPARENT_BROADCAST", "0", 1);
+
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto bus = makePassiveBus(simulation);
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == 0,
+          "environment opt-out did not disable automatic transport selection");
+    check(!bus.producers[0]->out.transparentBroadcastEnabled(),
+          "environment opt-out left an OutPort on shared transport");
+    check(bus.producers[0]->out.send(42), "opt-out fallback send failed");
+    for (auto* consumer : bus.consumers) {
+        consumer->in.arbitrateMPSCConsumerDriven();
+        check(consumer->in.tryReceive(1) == std::optional<uint64_t>{42},
+              "opt-out fallback changed Port delivery");
+    }
+
+    unsetenv("CHRONON_EXPERIMENTAL_TRANSPARENT_BROADCAST");
+}
+
+}  // namespace
+
+int main() {
+    testAutomaticSelectionAndPortSemantics();
+    testUnsafeComponentsFallBackAtomically();
+    testOversizedRateFallsBackAtomically();
+    testInitializedQueueFallsBackAtomically();
+    testStageSelectiveCancellation();
+    testInitializeTimeCancellationScope();
+    testMoveOnlyPayloadUsesQueuePath();
+    testStalledConsumerKeepsUnlimitedSemantics();
+    testParallelLookaheadReplay();
+    testEnvironmentOptOut();
+    std::cout << (failures == 0 ? "ALL PASSED\n" : "FAILED\n");
+    return failures == 0 ? 0 : 1;
+}
