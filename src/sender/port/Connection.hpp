@@ -223,6 +223,7 @@ class Connection : public ConnectionBase {
 public:
     using SharedBroadcast = detail::SharedBroadcastTransport<T>;
     using SharedBroadcastView = typename SharedBroadcast::View;
+    using SharedBroadcastCursor = typename SharedBroadcast::ConsumerCursor;
 
     /**
      * Create a connection with specified delay.
@@ -253,9 +254,11 @@ public:
             throw std::logic_error("invalid transparent broadcast attachment");
         }
         shared_broadcast_ = transport;
-        shared_broadcast_->registerConsumerCursor(&shared_head_);
+        shared_broadcast_->registerConsumerCursor(&shared_cursor_);
         to_->registerSharedBroadcastConnection(this);
-        setDependencyOnlyTransport(true, shared_broadcast_->headroomCycles());
+        // Eligible destinations are semantically unbounded. The segmented
+        // transport grows instead of introducing a reverse headroom edge.
+        setDependencyOnlyTransport(true, std::numeric_limits<size_t>::max());
     }
 
     [[nodiscard]] bool transparentBroadcastEnabled() const noexcept {
@@ -264,33 +267,33 @@ public:
 
     [[nodiscard]] std::optional<SharedBroadcastView> peekSharedBroadcast() const noexcept {
         if (!shared_broadcast_) return std::nullopt;
-        uint64_t head = shared_head_.load(std::memory_order_relaxed);
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
+        uint64_t head = shared_broadcast_->consumerSequence(shared_cursor_);
         const uint64_t cancel_before = shared_cancel_before_.load(std::memory_order_acquire);
         if (head < cancel_before) {
             head = cancel_before;
-            shared_head_.store(head, std::memory_order_release);
+            shared_broadcast_->advance(shared_cursor_, head);
         }
 #endif
-        return shared_broadcast_->peek(head);
+        return shared_broadcast_->peek(shared_cursor_);
     }
 
     void popSharedBroadcast(uint64_t sequence) noexcept {
         if (!shared_broadcast_) return;
-        const uint64_t head = shared_head_.load(std::memory_order_relaxed);
+        const uint64_t head = shared_broadcast_->consumerSequence(shared_cursor_);
         if (head == sequence) {
-            shared_head_.store(sequence + 1, std::memory_order_release);
+            shared_broadcast_->advance(shared_cursor_, sequence + 1);
         }
     }
 
     void flushSharedBroadcast() noexcept {
         if (!shared_broadcast_) return;
-        shared_head_.store(shared_broadcast_->publishedExclusive(), std::memory_order_release);
+        shared_broadcast_->advance(shared_cursor_, shared_broadcast_->publishedExclusive());
     }
 
     [[nodiscard]] size_t sharedBroadcastQueuedCount() const noexcept {
         if (!shared_broadcast_) return 0;
-        const uint64_t head = shared_head_.load(std::memory_order_relaxed);
+        const uint64_t head = shared_broadcast_->consumerSequence(shared_cursor_);
         const uint64_t tail = shared_broadcast_->publishedExclusive();
         return static_cast<size_t>(tail - std::min(head, tail));
     }
@@ -821,7 +824,7 @@ private:
     InPort<T>* to_;
     uint32_t delay_;
     SharedBroadcast* shared_broadcast_ = nullptr;
-    alignas(64) mutable std::atomic<uint64_t> shared_head_{0};
+    mutable SharedBroadcastCursor shared_cursor_{};
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
     std::atomic<uint64_t> shared_cancel_before_{0};
 #endif

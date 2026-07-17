@@ -276,6 +276,35 @@ private:
     std::vector<std::pair<uint64_t, uint64_t>> received_;
 };
 
+void testStalledConsumerKeepsUnlimitedSemantics() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto* producer = simulation.createUnit<StreamingProducer>("producer", 0);
+    auto* stalled = simulation.createUnit<PassiveConsumer>("stalled");
+    std::array<StreamingConsumer*, 3> draining{
+        simulation.createUnit<StreamingConsumer>("consumer0"),
+        simulation.createUnit<StreamingConsumer>("consumer1"),
+        simulation.createUnit<StreamingConsumer>("consumer2")};
+    simulation.connect(producer->out, stalled->in, 1);
+    for (auto* consumer : draining) simulation.connect(producer->out, consumer->in, 1);
+
+    constexpr uint64_t kCycles = 1'200;
+    simulation.run(kCycles);
+    check(simulation.transparentBroadcastConnectionCount() == 4,
+          "stalled-consumer bus did not use transparent broadcast");
+    check(producer->failedSends() == 0,
+          "an unlimited stalled consumer introduced broadcast backpressure");
+    check(stalled->in.queuedMessageCount() == kCycles,
+          "stalled consumer did not retain every broadcast payload");
+    for (auto* consumer : draining) {
+        check(consumer->received().size() == kCycles - 1,
+              "draining consumer lost payloads while another consumer stalled");
+    }
+    check(stalled->in.receiveAll(kCycles).size() == kCycles,
+          "stalled consumer could not replay payloads across chunk boundaries");
+}
+
 void testParallelLookaheadReplay() {
     TickSimulationConfig config;
     config.num_threads = 4;
@@ -303,7 +332,7 @@ void testParallelLookaheadReplay() {
     metrics.atomic_roundtrip_ns = 0.0;
     simulation.setPrecomputedUnitCosts(std::vector<double>(6, 100.0), metrics);
 
-    constexpr uint64_t kCycles = 200;
+    constexpr uint64_t kCycles = 1'200;
     simulation.run(kCycles);
     check(simulation.transparentBroadcastConnectionCount() == 8,
           "parallel bus did not use transparent broadcast");
@@ -359,6 +388,7 @@ int main() {
     testOversizedRateFallsBackAtomically();
     testInitializedQueueFallsBackAtomically();
     testStageSelectiveCancellation();
+    testStalledConsumerKeepsUnlimitedSemantics();
     testParallelLookaheadReplay();
     testEnvironmentOptOut();
     std::cout << (failures == 0 ? "ALL PASSED\n" : "FAILED\n");
