@@ -9,6 +9,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -74,20 +75,27 @@ public:
     template <typename Visitor>
     bool consumeReady(uint64_t current_cycle, uint64_t receiver_filter_generation,
                       Visitor&& visitor) {
-        auto candidate = peekBest_(current_cycle);
-        if (!candidate) return false;
+        if constexpr (!std::is_copy_constructible_v<T>) {
+            (void)current_cycle;
+            (void)receiver_filter_generation;
+            (void)visitor;
+            throw std::logic_error("shared broadcast requires copy-constructible payloads");
+        } else {
+            auto candidate = peekBest_(current_cycle);
+            if (!candidate) return false;
 
-        StoredMessage message{.data = *candidate->data};
-        message.enqueue_cycle = candidate->enqueue_cycle;
-        message.sender_id = candidate->connection->connId();
-        if (receiver_filter_generation != std::numeric_limits<uint64_t>::max()) {
-            message.receiver_generation_snapshot =
-                candidate->connection->sharedReceiverGenerationSnapshot(candidate->sequence,
-                                                                        receiver_filter_generation);
+            StoredMessage message{.data = *candidate->data};
+            message.enqueue_cycle = candidate->enqueue_cycle;
+            message.sender_id = candidate->connection->connId();
+            if (receiver_filter_generation != std::numeric_limits<uint64_t>::max()) {
+                message.receiver_generation_snapshot =
+                    candidate->connection->sharedReceiverGenerationSnapshot(
+                        candidate->sequence, receiver_filter_generation);
+            }
+            std::forward<Visitor>(visitor)(message);
+            candidate->connection->popSharedBroadcast(candidate->sequence);
+            return true;
         }
-        std::forward<Visitor>(visitor)(message);
-        candidate->connection->popSharedBroadcast(candidate->sequence);
-        return true;
     }
 
     std::optional<StoredMessage> tryPop(uint64_t current_cycle) override {
