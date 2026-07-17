@@ -19,6 +19,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -409,6 +410,21 @@ public:
             if ((*it)->connId() > conn->connId()) break;
         }
         shared_broadcast_connections_.insert(it, conn);
+
+        // Unit::initialize() runs before transparent-broadcast discovery. If
+        // legacy receiver cancellation established its in-flight scope there,
+        // no shared lane existed for ensureReceiverScopeToInFlightLocked_() to
+        // stamp. Catch this newly attached lane up now: the current shared tail
+        // is the cutoff, so every later publish belongs to the next generation
+        // and is not filtered by the initialize-time cancellation.
+        if (policy_ == PortPolicy::LegacyFastPath) {
+            const uint64_t generation = receiver_filter_generation_.load(std::memory_order_acquire);
+            if (generation != std::numeric_limits<uint64_t>::max()) {
+                if constexpr (std::is_copy_constructible_v<T>) {
+                    conn->captureSharedReceiverCancellationScope(generation);
+                }
+            }
+        }
     }
 
     [[nodiscard]] bool usesTransparentBroadcast() const noexcept {
@@ -416,6 +432,7 @@ public:
     }
 
     [[nodiscard]] bool transparentBroadcastEligible() const noexcept {
+        if constexpr (!std::is_copy_constructible_v<T>) return false;
         return capacity_ == UNLIMITED_CAPACITY && queue_->size() == 0 && mpsc_connections_.empty();
     }
 
@@ -584,8 +601,10 @@ public:
      * @return The message if available, std::nullopt otherwise
      */
     std::optional<T> tryReceive(uint64_t current_cycle) {
-        if (!shared_broadcast_connections_.empty()) {
-            return tryReceiveSharedBroadcast_(current_cycle);
+        if constexpr (std::is_copy_constructible_v<T>) {
+            if (!shared_broadcast_connections_.empty()) {
+                return tryReceiveSharedBroadcast_(current_cycle);
+            }
         }
         if (direct_spsc_queue_raw_) {
             while (true) {
@@ -620,12 +639,14 @@ public:
      * @return Vector of all ready messages
      */
     std::vector<T> receiveAll(uint64_t current_cycle) {
-        if (!shared_broadcast_connections_.empty()) {
-            std::vector<T> result;
-            while (auto value = tryReceiveSharedBroadcast_(current_cycle)) {
-                result.push_back(std::move(*value));
+        if constexpr (std::is_copy_constructible_v<T>) {
+            if (!shared_broadcast_connections_.empty()) {
+                std::vector<T> result;
+                while (auto value = tryReceiveSharedBroadcast_(current_cycle)) {
+                    result.push_back(std::move(*value));
+                }
+                return result;
             }
-            return result;
         }
         auto all = queue_->popAll(current_cycle);
         std::vector<T> result;
@@ -648,12 +669,14 @@ public:
      * drains its port), so the buffers need no synchronization.
      */
     const std::vector<T>& receiveAllBuffered(uint64_t current_cycle) {
-        if (!shared_broadcast_connections_.empty()) {
-            recv_scratch_.clear();
-            while (auto value = tryReceiveSharedBroadcast_(current_cycle)) {
-                recv_scratch_.push_back(std::move(*value));
+        if constexpr (std::is_copy_constructible_v<T>) {
+            if (!shared_broadcast_connections_.empty()) {
+                recv_scratch_.clear();
+                while (auto value = tryReceiveSharedBroadcast_(current_cycle)) {
+                    recv_scratch_.push_back(std::move(*value));
+                }
+                return recv_scratch_;
             }
-            return recv_scratch_;
         }
         queue_->popAllInto(drain_scratch_, current_cycle);
         recv_scratch_.clear();
@@ -667,8 +690,10 @@ public:
     const std::vector<T>& receiveAllBuffered() { return receiveAllBuffered(getCurrentCycle()); }
 
     bool hasData(uint64_t current_cycle) const {
-        if (!shared_broadcast_connections_.empty()) {
-            return peekReadySharedBroadcast_(current_cycle).has_value();
+        if constexpr (std::is_copy_constructible_v<T>) {
+            if (!shared_broadcast_connections_.empty()) {
+                return peekReadySharedBroadcast_(current_cycle).has_value();
+            }
         }
         return queue_->hasReady(current_cycle);
     }
@@ -686,10 +711,12 @@ public:
                 }
             }
         }
-        for (const auto* conn : shared_broadcast_connections_) {
-            if (auto view = conn->peekSharedBroadcast()) {
-                if (!earliest || view->arrive_cycle < *earliest) {
-                    earliest = view->arrive_cycle;
+        if constexpr (std::is_copy_constructible_v<T>) {
+            for (const auto* conn : shared_broadcast_connections_) {
+                if (auto view = conn->peekSharedBroadcast()) {
+                    if (!earliest || view->arrive_cycle < *earliest) {
+                        earliest = view->arrive_cycle;
+                    }
                 }
             }
         }
@@ -698,8 +725,10 @@ public:
 
     size_t queuedMessageCount() const {
         size_t count = queue_->size();
-        for (const auto* conn : shared_broadcast_connections_) {
-            count += conn->sharedBroadcastQueuedCount();
+        if constexpr (std::is_copy_constructible_v<T>) {
+            for (const auto* conn : shared_broadcast_connections_) {
+                count += conn->sharedBroadcastQueuedCount();
+            }
         }
         return count;
     }
@@ -707,8 +736,10 @@ public:
     /// Drop all queued messages (including future arrivals).
     void flush() {
         queue_->clear();
-        for (auto* conn : shared_broadcast_connections_) {
-            conn->flushSharedBroadcast();
+        if constexpr (std::is_copy_constructible_v<T>) {
+            for (auto* conn : shared_broadcast_connections_) {
+                conn->flushSharedBroadcast();
+            }
         }
     }
 
@@ -913,8 +944,10 @@ private:
         const uint64_t generation =
             receiver_enqueue_generation_.fetch_add(1, std::memory_order_acq_rel);
         receiver_filter_generation_.store(generation, std::memory_order_release);
-        for (auto* conn : shared_broadcast_connections_) {
-            conn->captureSharedReceiverCancellationScope(generation);
+        if constexpr (std::is_copy_constructible_v<T>) {
+            for (auto* conn : shared_broadcast_connections_) {
+                conn->captureSharedReceiverCancellationScope(generation);
+            }
         }
     }
 
@@ -1008,7 +1041,10 @@ private:
 
     struct SharedBroadcastCandidate {
         Connection<T>* connection = nullptr;
-        typename Connection<T>::SharedBroadcastView view{};
+        const T* data = nullptr;
+        uint64_t sequence = 0;
+        uint64_t arrive_cycle = 0;
+        uint64_t enqueue_cycle = 0;
     };
 
     [[nodiscard]] std::optional<SharedBroadcastCandidate> peekReadySharedBroadcast_(
@@ -1017,10 +1053,14 @@ private:
         for (auto* connection : shared_broadcast_connections_) {
             auto view = connection->peekSharedBroadcast();
             if (!view || view->arrive_cycle > current_cycle) continue;
-            if (!best || view->arrive_cycle < best->view.arrive_cycle ||
-                (view->arrive_cycle == best->view.arrive_cycle &&
+            if (!best || view->arrive_cycle < best->arrive_cycle ||
+                (view->arrive_cycle == best->arrive_cycle &&
                  connection->connId() < best->connection->connId())) {
-                best = SharedBroadcastCandidate{.connection = connection, .view = *view};
+                best = SharedBroadcastCandidate{.connection = connection,
+                                                .data = view->data,
+                                                .sequence = view->sequence,
+                                                .arrive_cycle = view->arrive_cycle,
+                                                .enqueue_cycle = view->enqueue_cycle};
             }
         }
         return best;
@@ -1031,19 +1071,19 @@ private:
             auto candidate = peekReadySharedBroadcast_(current_cycle);
             if (!candidate) return std::nullopt;
 
-            StoredMessage message{.data = *candidate->view.data};
-            message.enqueue_cycle = candidate->view.enqueue_cycle;
+            StoredMessage message{.data = *candidate->data};
+            message.enqueue_cycle = candidate->enqueue_cycle;
             message.sender_id = candidate->connection->connId();
             if (policy_ == PortPolicy::LegacyFastPath) {
                 const uint64_t filter_generation =
                     receiver_filter_generation_.load(std::memory_order_acquire);
                 if (filter_generation != std::numeric_limits<uint64_t>::max()) {
                     message.receiver_generation_snapshot =
-                        candidate->connection->sharedReceiverGenerationSnapshot(
-                            candidate->view.sequence, filter_generation);
+                        candidate->connection->sharedReceiverGenerationSnapshot(candidate->sequence,
+                                                                                filter_generation);
                 }
             }
-            candidate->connection->popSharedBroadcast(candidate->view.sequence);
+            candidate->connection->popSharedBroadcast(candidate->sequence);
             if (isReceiverCanceled_(message)) {
                 continue;
             }

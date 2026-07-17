@@ -800,7 +800,7 @@ private:
             }
             phys <<= 1;
         }
-        staging_buf_.assign(phys, Staged{});
+        std::vector<Staged>(phys).swap(staging_buf_);
         staging_mask_ = phys - 1;
         staging_head_.store(0, std::memory_order_relaxed);
         staging_tail_.store(0, std::memory_order_relaxed);

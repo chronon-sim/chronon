@@ -13,6 +13,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -153,6 +154,12 @@ public:
         } else if (connections_.size() == 1) {
             result = connections_[0]->transfer(std::move(data), current);
         } else {
+            if constexpr (!std::is_copy_constructible_v<T>) {
+                // A move-only payload cannot be replicated across multiple
+                // physical queues. Preserve the valid single-connection move
+                // path above and report unsupported fanout as backpressure.
+                return false;
+            }
             // Multi-connection fanout: preflight before mutating any queue
             // (see overload above).
             if (!allConnectionsCanTransfer_()) {
@@ -160,13 +167,15 @@ public:
             }
             result = true;
 
-            for (size_t i = 0; i + 1 < connections_.size(); ++i) {
-                if (!connections_[i]->transfer(T{data}, current)) {
+            if constexpr (std::is_copy_constructible_v<T>) {
+                for (size_t i = 0; i + 1 < connections_.size(); ++i) {
+                    if (!connections_[i]->transfer(T{data}, current)) {
+                        result = false;
+                    }
+                }
+                if (!connections_.back()->transfer(std::move(data), current)) {
                     result = false;
                 }
-            }
-            if (!connections_.back()->transfer(std::move(data), current)) {
-                result = false;
             }
         }
 

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -65,6 +66,34 @@ public:
     void tick() override {}
 
     InPort<uint64_t> in{this, "in", PortPolicy::StageSelective};
+};
+
+class InitializingCancelConsumer : public TickableUnit {
+public:
+    explicit InitializingCancelConsumer(std::string name) : TickableUnit(std::move(name)) {}
+
+    void initialize() override { in.cancelYoungerThan<&valueKey>(50); }
+    void tick() override {}
+
+    InPort<uint64_t> in{this, "in"};
+};
+
+class MoveOnlyProducer : public TickableUnit {
+public:
+    explicit MoveOnlyProducer(std::string name) : TickableUnit(std::move(name)) {}
+
+    void tick() override {}
+
+    OutPort<std::unique_ptr<int>> out{this, "out", 0};
+};
+
+class MoveOnlyConsumer : public TickableUnit {
+public:
+    explicit MoveOnlyConsumer(std::string name) : TickableUnit(std::move(name)) {}
+
+    void tick() override {}
+
+    InPort<std::unique_ptr<int>> in{this, "in"};
 };
 
 struct PassiveBus {
@@ -241,6 +270,59 @@ void testStageSelectiveCancellation() {
     }
 }
 
+void testInitializeTimeCancellationScope() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto* producer = simulation.createUnit<PassiveProducer>("producer");
+    auto* canceled = simulation.createUnit<InitializingCancelConsumer>("canceled");
+    std::array<PassiveConsumer*, 3> other_consumers{
+        simulation.createUnit<PassiveConsumer>("consumer0"),
+        simulation.createUnit<PassiveConsumer>("consumer1"),
+        simulation.createUnit<PassiveConsumer>("consumer2")};
+    simulation.connect(producer->out, canceled->in, 1);
+    for (auto* consumer : other_consumers) simulation.connect(producer->out, consumer->in, 1);
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == 4,
+          "initialize-time cancellation prevented transparent broadcast selection");
+    check(producer->out.send(90), "post-initialize broadcast send failed");
+    check(canceled->in.tryReceive(1) == std::optional<uint64_t>{90},
+          "initialize-time cancellation leaked into later shared publishes");
+    for (auto* consumer : other_consumers) {
+        check(consumer->in.tryReceive(1) == std::optional<uint64_t>{90},
+              "initialize-time cancellation affected another consumer");
+    }
+}
+
+void testMoveOnlyPayloadUsesQueuePath() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto* producer = simulation.createUnit<MoveOnlyProducer>("producer");
+    auto* consumer = simulation.createUnit<MoveOnlyConsumer>("consumer");
+    simulation.connect(producer->out, consumer->in, 1);
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == 0,
+          "move-only payload unexpectedly selected transparent broadcast");
+    check(producer->out.send(std::make_unique<int>(7)), "move-only tryReceive send failed");
+    auto first = consumer->in.tryReceive(1);
+    check(first && **first == 7, "move-only tryReceive changed queue-path delivery");
+
+    check(producer->out.send(std::make_unique<int>(8)), "move-only receiveAll send 1 failed");
+    check(producer->out.send(std::make_unique<int>(9)), "move-only receiveAll send 2 failed");
+    auto all = consumer->in.receiveAll(1);
+    check(all.size() == 2 && *all[0] == 8 && *all[1] == 9,
+          "move-only receiveAll changed queue-path delivery");
+
+    check(producer->out.send(std::make_unique<int>(10)),
+          "move-only receiveAllBuffered send failed");
+    const auto& buffered = consumer->in.receiveAllBuffered(1);
+    check(buffered.size() == 1 && *buffered[0] == 10,
+          "move-only receiveAllBuffered changed queue-path delivery");
+}
+
 class StreamingProducer : public TickableUnit {
 public:
     StreamingProducer(std::string name, uint64_t producer_id)
@@ -388,6 +470,8 @@ int main() {
     testOversizedRateFallsBackAtomically();
     testInitializedQueueFallsBackAtomically();
     testStageSelectiveCancellation();
+    testInitializeTimeCancellationScope();
+    testMoveOnlyPayloadUsesQueuePath();
     testStalledConsumerKeepsUnlimitedSemantics();
     testParallelLookaheadReplay();
     testEnvironmentOptOut();
