@@ -13,9 +13,12 @@
 // queue holds which message. Replaces the previous round-robin policy
 // which produced delivery orders that depended on pop history.
 
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "sender/port/MessageQueue.hpp"
@@ -162,6 +165,62 @@ void test_partial_readiness() {
     EXPECT_EQ(q.empty(), true);
 }
 
+// Test 5: sparse active lanes span several bitmap words and retain the
+// queue-id fallback ordering used by direct adapter tests without sender ids.
+void test_sparse_high_fanin_words() {
+    MultiProducerQueueAdapter<int> q;
+    std::vector<size_t> lanes;
+    for (size_t i = 0; i < 257; ++i) lanes.push_back(q.addProducerThread(i + 1));
+
+    for (size_t lane : {size_t{256}, size_t{128}, size_t{64}, size_t{63}, size_t{0}}) {
+        EXPECT_EQ(q.pushFromThread(lanes[lane], static_cast<int>(lane), 100), true);
+    }
+    const std::vector<int> expected{0, 63, 64, 128, 256};
+    const auto out = q.popAll(100);
+    EXPECT_EQ(out.size(), expected.size());
+    for (size_t i = 0; i < out.size(); ++i) EXPECT_EQ(out[i], expected[i]);
+    EXPECT_EQ(q.empty(), true);
+}
+
+// Test 6: the producer waits for the lane to become physically empty before
+// every publish. This repeatedly races producer publication against the
+// consumer's active-bit clear/recheck protocol.
+void test_active_lane_clear_publish_race() {
+    MultiProducerQueueAdapter<uint64_t> q;
+    size_t lane = 0;
+    for (size_t i = 0; i < 130; ++i) lane = q.addProducerThread(i + 1);
+
+    constexpr uint64_t kMessages = 20'000;
+    std::atomic<bool> stop{false};
+    std::thread producer([&] {
+        for (uint64_t value = 0; value < kMessages && !stop.load(); ++value) {
+            while (!q.empty() && !stop.load()) std::this_thread::yield();
+            while (!q.pushFromThread(lane, value, 0, 130) && !stop.load()) {
+                std::this_thread::yield();
+            }
+        }
+    });
+
+    uint64_t received = 0;
+    bool order_ok = true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (received < kMessages && std::chrono::steady_clock::now() < deadline) {
+        if (auto value = q.tryPop(0)) {
+            if (*value != received) {
+                order_ok = false;
+                break;
+            }
+            ++received;
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    stop.store(true);
+    producer.join();
+    EXPECT_EQ(order_ok, true);
+    EXPECT_EQ(received, kMessages);
+}
+
 }  // namespace
 
 int main() {
@@ -169,6 +228,8 @@ int main() {
     RUN_TEST(test_same_cycle_tiebreak_by_queue_id);
     RUN_TEST(test_run_to_run_stability);
     RUN_TEST(test_partial_readiness);
+    RUN_TEST(test_sparse_high_fanin_words);
+    RUN_TEST(test_active_lane_clear_publish_race);
 
     std::cout << "\n[==========] " << test_passed << "/" << test_count << " tests passed\n";
     return (test_passed == test_count) ? 0 : 1;

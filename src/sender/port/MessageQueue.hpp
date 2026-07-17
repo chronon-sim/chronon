@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
@@ -32,6 +33,10 @@ inline bool experimentalDirectSPSCEnabled() noexcept {
     return value == nullptr || value[0] != '0' || value[1] != '\0';
 }
 
+inline bool experimentalMPSCActiveLanesEnabled() noexcept {
+    const char* value = std::getenv("CHRONON_EXPERIMENTAL_MPSC_ACTIVE_LANES");
+    return value == nullptr || value[0] != '0' || value[1] != '\0';
+}
 }  // namespace queue_detail
 
 struct LockFreeQueueAdapterTestAccess;
@@ -629,20 +634,11 @@ private:
  *
  * Ordering guarantees:
  * - Primary key: arrive_cycle (lowest first).
- * - Tiebreak key: queue_id (lowest first). queue_id is assigned by
- *   MultiProducerQueueAdapter::addProducerThread in the order producer
- *   threads are discovered during TickSimulation::optimizeConnectionQueuesForThreads,
- *   which iterates a std::set<size_t>. This makes ordering reproducible run-to-run
- *   for a fixed num_workers. Chronon's scheduler registers one queue per
- *   Connection and passes the stable conn_id as sender_id, so same-cycle ties
- *   remain topology-stable across thread placements.
+ * - Tiebreak key: Connection::conn_id, supplied as sender_id, so same-cycle
+ *   ordering remains stable across thread placements and worker counts.
  *
- * Correctness prerequisite:
- * - Each per-connection LockFreeMessageQueue must be pushed with non-decreasing
- *   arrive_cycle (i.e., producer pushes arrive_cycle = X + const_delay where X
- *   is monotonically advancing). This holds for any TickableUnit whose push
- *   site is `OutPort::send(data)` with fixed delay — the standard pattern.
- *   Mixed-delay producers must not route through MultiProducerQueueAdapter.
+ * Each per-connection lane must be pushed with non-decreasing arrive_cycle;
+ * fixed-delay OutPort connections satisfy this requirement.
  */
 template <typename T>
 class MultiProducerQueueAdapter : public IMessageQueue<T> {
@@ -670,7 +666,8 @@ public:
               capacity == std::numeric_limits<size_t>::max()
                   ? min_per_thread_usable_capacity
                   : std::max(capacity, min_per_thread_usable_capacity))),
-          user_capacity_(capacity) {}
+          user_capacity_(capacity),
+          active_lane_tracking_requested_(queue_detail::experimentalMPSCActiveLanesEnabled()) {}
 
     void ensurePerThreadUsableCapacity(size_t min_usable_capacity) {
         if (min_usable_capacity == std::numeric_limits<size_t>::max()) {
@@ -692,6 +689,7 @@ public:
             for (auto& queue : thread_queues_) {
                 queue = std::make_unique<LockFreeMessageQueue<T>>(per_thread_queue_capacity_);
             }
+            for (auto& word : active_lane_words_) word.store(0, std::memory_order_relaxed);
             return;
         }
         per_thread_queue_capacity_ = requested;
@@ -712,13 +710,18 @@ public:
         size_t id = thread_queues_.size();
         thread_queues_.push_back(
             std::make_unique<LockFreeMessageQueue<T>>(per_thread_queue_capacity_));
+        if (active_lane_tracking_requested_ && id % 64 == 0) active_lane_words_.emplace_back(0);
+        if (active_lane_tracking_requested_ &&
+            thread_queues_.size() == kActiveLaneTrackingThreshold) {
+            active_lane_tracking_enabled_ = true;
+            for (size_t lane = 0; lane < id; ++lane) {
+                if (!thread_queues_[lane]->empty()) markLaneActive_(lane);
+            }
+        }
         thread_to_queue_id_[thread_id] = id;
         return id;
     }
 
-    /**
-     * Get the queue ID for a given thread.
-     */
     size_t getQueueIdForThread(size_t thread_id) const {
         auto it = thread_to_queue_id_.find(thread_id);
         if (it != thread_to_queue_id_.end()) {
@@ -745,6 +748,7 @@ public:
             return false;
         }
         const bool ok = thread_queues_[queue_id]->tryPush(std::move(data), arrive_cycle, sender_id);
+        if (ok) markLaneActive_(queue_id);
         if (!ok) {
             // Physical SPSC ring full: the entry is dropped, which corrupts the
             // run. Under epoch-free lookahead a producer can run up to
@@ -763,14 +767,13 @@ public:
         return staging_overflow_events_.load(std::memory_order_relaxed);
     }
 
-    // IMessageQueue interface - consumer polls all producer queues.
-
     bool push(T data, uint64_t arrive_cycle) override {
-        // Default push to first queue (should use pushFromThread for MPSC)
         if (thread_queues_.empty()) {
             return false;
         }
-        return thread_queues_[0]->tryPush(std::move(data), arrive_cycle);
+        const bool ok = thread_queues_[0]->tryPush(std::move(data), arrive_cycle);
+        if (ok) markLaneActive_(0);
+        return ok;
     }
 
     std::optional<T> tryPop(uint64_t current_cycle) override {
@@ -787,9 +790,13 @@ public:
         size_t best = SIZE_MAX;
         uint64_t best_ac = UINT64_MAX;
         uint32_t best_sid = UINT32_MAX;
-        for (size_t i = 0; i < thread_queues_.size(); ++i) {
+        forEachCandidateLane_([&](size_t i) {
             auto head = thread_queues_[i]->peekHead();
-            if (!head.has_value() || head->first > current_cycle) continue;
+            if (!head.has_value()) {
+                clearLaneIfEmpty_(i);
+                return true;
+            }
+            if (head->first > current_cycle) return true;
             const uint64_t ac = head->first;
             const uint32_t sid = head->second;
             if (ac < best_ac || (ac == best_ac && sid < best_sid)) {
@@ -797,9 +804,12 @@ public:
                 best_sid = sid;
                 best = i;
             }
-        }
+            return true;
+        });
         if (best == SIZE_MAX) return std::nullopt;
-        return thread_queues_[best]->tryPop(current_cycle);
+        auto value = thread_queues_[best]->tryPop(current_cycle);
+        clearLaneIfEmpty_(best);
+        return value;
     }
 
     std::vector<T> popAll(uint64_t current_cycle) override {
@@ -816,33 +826,39 @@ public:
     }
 
     bool hasReady(uint64_t current_cycle) const override {
-        for (auto& q : thread_queues_) {
-            auto min = q->minArrivalCycle();
+        bool ready = false;
+        forEachCandidateLane_([&](size_t i) {
+            auto min = thread_queues_[i]->minArrivalCycle();
             if (min.has_value() && *min <= current_cycle) {
-                return true;
+                ready = true;
+                return false;
             }
-        }
-        return false;
+            return true;
+        });
+        return ready;
     }
 
     std::optional<uint64_t> minArrivalCycle() const override {
         std::optional<uint64_t> min;
-        for (auto& q : thread_queues_) {
-            auto cycle = q->minArrivalCycle();
+        forEachCandidateLane_([&](size_t i) {
+            auto cycle = thread_queues_[i]->minArrivalCycle();
             if (cycle.has_value()) {
                 if (!min.has_value() || *cycle < *min) {
                     min = cycle;
                 }
             }
-        }
+            return true;
+        });
         return min;
     }
 
     bool empty() const override {
-        for (auto& q : thread_queues_) {
-            if (!q->empty()) return false;
-        }
-        return true;
+        bool all_empty = true;
+        forEachCandidateLane_([&](size_t i) {
+            all_empty = thread_queues_[i]->empty();
+            return all_empty;
+        });
+        return all_empty;
     }
 
     bool full() const override {
@@ -857,9 +873,10 @@ public:
 
     size_t size() const override {
         size_t total = 0;
-        for (const auto& q : thread_queues_) {
-            total += q->size();
-        }
+        forEachCandidateLane_([&](size_t i) {
+            total += thread_queues_[i]->size();
+            return true;
+        });
         return total;
     }
 
@@ -892,15 +909,55 @@ public:
         for (auto& q : thread_queues_) {
             q->clear();
         }
+        for (auto& word : active_lane_words_) word.store(0, std::memory_order_release);
+        for (size_t i = 0; i < thread_queues_.size(); ++i) {
+            if (!thread_queues_[i]->empty()) markLaneActive_(i);
+        }
     }
 
 private:
+    static constexpr size_t kActiveLaneTrackingThreshold = 32;
     size_t perThreadUsableCapacity_() const noexcept { return per_thread_queue_capacity_ - 1; }
 
+    void markLaneActive_(size_t lane) const noexcept {
+        if (!active_lane_tracking_enabled_) return;
+        active_lane_words_[lane / 64].fetch_or(uint64_t{1} << (lane % 64),
+                                               std::memory_order_release);
+    }
+
+    void clearLaneIfEmpty_(size_t lane) noexcept {
+        if (!active_lane_tracking_enabled_ || !thread_queues_[lane]->empty()) return;
+        const uint64_t mask = uint64_t{1} << (lane % 64);
+        active_lane_words_[lane / 64].fetch_and(~mask, std::memory_order_acq_rel);
+        if (!thread_queues_[lane]->empty()) markLaneActive_(lane);
+    }
+
+    template <typename Visitor>
+    bool forEachCandidateLane_(Visitor&& visitor) const {
+        if (!active_lane_tracking_enabled_) {
+            for (size_t i = 0; i < thread_queues_.size(); ++i) {
+                if (!visitor(i)) return false;
+            }
+            return true;
+        }
+        for (size_t word_index = 0; word_index < active_lane_words_.size(); ++word_index) {
+            uint64_t bits = active_lane_words_[word_index].load(std::memory_order_acquire);
+            while (bits != 0) {
+                const size_t lane = word_index * 64 + std::countr_zero(bits);
+                if (lane < thread_queues_.size() && !visitor(lane)) return false;
+                bits &= bits - 1;
+            }
+        }
+        return true;
+    }
+
     std::vector<std::unique_ptr<LockFreeMessageQueue<T>>> thread_queues_;
+    mutable std::deque<std::atomic<uint64_t>> active_lane_words_;
     std::unordered_map<size_t, size_t> thread_to_queue_id_;  // thread_id -> queue_id
     size_t per_thread_queue_capacity_;
     size_t user_capacity_;  // Soft aggregate cap consulted by arbiter/full().
+    const bool active_lane_tracking_requested_;
+    bool active_lane_tracking_enabled_ = false;
     std::atomic<uint64_t> staging_overflow_events_{0};  // full-ring drops (watchdog)
 };
 

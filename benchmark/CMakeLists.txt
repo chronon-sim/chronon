@@ -59,3 +59,17 @@ target_link_libraries(chronon_typed_mpsc_dispatch_benchmark PRIVATE
 )
 
 target_compile_features(chronon_typed_mpsc_dispatch_benchmark PRIVATE cxx_std_20)
+
+add_executable(chronon_mpsc_sparse_fanin_benchmark
+    mpsc_sparse_fanin_benchmark.cpp
+)
+
+target_include_directories(chronon_mpsc_sparse_fanin_benchmark PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_link_libraries(chronon_mpsc_sparse_fanin_benchmark PRIVATE
+    chronon_compile_options
+)
+
+target_compile_features(chronon_mpsc_sparse_fanin_benchmark PRIVATE cxx_std_20)
