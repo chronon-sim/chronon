@@ -61,6 +61,60 @@ public:
 };
 ```
 
+## Atomic multi-port transactions
+
+Use `reserve()` when one logical model transition must publish through several
+independent `OutPort`s. A successful handle has already claimed every port's
+per-cycle rate and every connection's queue-depth admission; no payload is
+visible until `commit()` validates the complete claim set.
+
+```cpp
+OutPort<InstData>* selected_iq = selectIssueQueue(inst);
+
+auto tx = reserve(*selected_iq, out_rob_write);
+if (!tx) {
+    return;  // retain model state and retry next tick
+}
+
+// Positional commit: values follow the reserve() port order.
+if (tx.commit(inst, inst)) {
+    advanceDispatchState();
+}
+```
+
+The same transaction can stage values by port identity. `send()` on a
+transaction is only a staging operation; it does not call `OutPort::send()`:
+
+```cpp
+auto tx = reserve(*selected_iq, out_rob_write);
+if (!tx) return;
+
+if (!tx.send(*selected_iq, inst) || !tx.send(out_rob_write, inst) || !tx.commit()) return;
+advanceDispatchState();
+```
+
+The contract is deliberately narrow:
+
+- every participating port must be owned by the same `Unit`, and a port may
+  appear only once;
+- a reservation is valid only in the producer's current simulated cycle;
+- changing an `OutPort` or destination capacity, changing port topology, or
+  calling an enabled `cancelInFlight()` invalidates an outstanding transaction;
+- an invalid commit releases every claim and delivers nothing; a second commit
+  also returns `false`, so retry cannot duplicate a previously delivered subset;
+- dropping the handle or calling `tx.cancel()` releases every claim without
+  publishing;
+- connected payload types need non-throwing move construction and assignment;
+  a non-broadcast fanout additionally needs a non-throwing copy constructor.
+
+The transaction handle is stack-backed. Producer-owned claim bookkeeping
+reuses the existing cycle-local admission counters and object padding; a cold
+destination epoch invalidates claims after configuration or cancellation
+changes. Ordinary `send()` and `canSend()` gain no transaction check, lock,
+atomic operation, allocation, or virtual dispatch. MPSC claims target the
+connection's private SPSC lane; receiver activity can only free a claimed slot
+before commit.
+
 ## InPort
 
 ```cpp

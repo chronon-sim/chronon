@@ -79,6 +79,8 @@ using sender::PortBase;
 using sender::PortBindingRegistry;
 using sender::PortDirectory;
 using sender::PortPolicy;
+using sender::PortTransaction;
+using sender::reserve;
 
 // --- Params ---
 using params::Param;

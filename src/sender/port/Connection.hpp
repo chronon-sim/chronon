@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -362,10 +363,12 @@ public:
         if (shared_broadcast_) {
             shared_cancel_before_.store(shared_broadcast_->publishedExclusive(),
                                         std::memory_order_release);
+            if (to_) to_->invalidatePortTransactions_();
             return;
         }
         if (dependency_only_transport_) return;
         cancel_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        if (to_) to_->invalidatePortTransactions_();
 #endif
     }
 
@@ -412,6 +415,7 @@ public:
         if (enabled) {
             thread_queue_id_ = SIZE_MAX;
         }
+        if (to_) to_->invalidatePortTransactions_();
     }
 
     bool dependencyOnlyTransport() const noexcept override { return dependency_only_transport_; }
@@ -456,18 +460,15 @@ public:
 
     void configureRegisteredEdge(std::optional<size_t> capacity,
                                  std::optional<size_t> rate) override {
-        if (capacity.has_value()) {
-            if (*capacity == 0) {
-                throw std::invalid_argument("registered edge capacity must be positive");
-            }
-            registered_capacity_ = *capacity;
+        if (capacity.has_value() && *capacity == 0) {
+            throw std::invalid_argument("registered edge capacity must be positive");
         }
-        if (rate.has_value()) {
-            if (*rate == 0) {
-                throw std::invalid_argument("registered edge rate must be positive");
-            }
-            registered_rate_ = *rate;
+        if (rate.has_value() && *rate == 0) {
+            throw std::invalid_argument("registered edge rate must be positive");
         }
+        if (capacity.has_value()) registered_capacity_ = *capacity;
+        if (rate.has_value()) registered_rate_ = *rate;
+        if (to_) to_->invalidatePortTransactions_();
     }
 
     bool ensureEpochFreeHeadroom(uint32_t max_lookahead_cycles) override {
@@ -501,6 +502,7 @@ public:
     void setThreadQueueId(size_t queue_id) override {
         if (!dependency_only_transport_) {
             thread_queue_id_ = queue_id;
+            if (to_) to_->invalidatePortTransactions_();
         }
     }
 
@@ -570,13 +572,118 @@ public:
         return buffered_cycles - delay_ + 1;
     }
 
-    void setConnId(uint32_t conn_id) noexcept override { conn_id_ = conn_id; }
+    void setConnId(uint32_t conn_id) noexcept override {
+        if (conn_id_ != conn_id) {
+            conn_id_ = conn_id;
+            if (to_) to_->invalidatePortTransactions_();
+        }
+    }
     uint32_t connId() const noexcept override { return conn_id_; }
 
     OutPort<T>* from() const noexcept { return from_; }
     InPort<T>* to() const noexcept { return to_; }
 
 private:
+    friend class OutPort<T>;
+
+    /**
+     * Claim one producer-owned transfer slot without publishing a payload.
+     *
+     * Chronon gives every Connection exactly one producer.  In MPSC mode that
+     * producer owns a private SPSC lane; in SPSC/same-thread mode it is the only
+     * writer of the destination queue.  A receiver can therefore only preserve
+     * or release a successful physical-capacity check.  Reserving the existing
+     * producer-cycle push counter also makes ordinary transfer() calls account
+     * for this claim without adding a transaction branch to their hot path.
+     */
+    bool tryReserveTransfer_(uint64_t send_cycle) {
+        if (dependency_only_transport_ || shared_broadcast_ != nullptr) {
+            return false;
+        }
+
+        maybeResetPushesCycle_(send_cycle);
+        if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
+            return false;
+        }
+
+        if (thread_queue_id_ != SIZE_MAX) {
+            if (!hasMPSCLaneAdmissionSlot_(send_cycle) ||
+                !to_->canPushToThreadQueue(thread_queue_id_)) {
+                return false;
+            }
+        } else if (!hasDestinationAdmissionSlot_(send_cycle)) {
+            return false;
+        }
+
+        ++pushes_this_cycle_;
+        transaction_destination_epoch_ = to_->portTransactionEpoch_();
+        return true;
+    }
+
+    /** Validate a previously claimed slot without consuming another credit. */
+    bool transactionReservationValid_(uint64_t send_cycle) const {
+        if (from_->getCurrentCycle() != send_cycle || last_pushes_cycle_ != send_cycle ||
+            pushes_this_cycle_ == 0 || dependency_only_transport_ || shared_broadcast_ != nullptr ||
+            transaction_destination_epoch_ != to_->portTransactionEpoch_() ||
+            pushes_this_cycle_ > edgeCycleRateLimit_()) {
+            return false;
+        }
+
+        if (thread_queue_id_ != SIZE_MAX) {
+            return hasMPSCLaneAdmissionForPending_(send_cycle, pushes_this_cycle_) &&
+                   to_->canPushToThreadQueue(thread_queue_id_);
+        }
+        return hasDestinationAdmissionForPending_(send_cycle, pushes_this_cycle_);
+    }
+
+    /** Release one uncommitted producer-cycle claim. */
+    void releaseReservedTransfer_(uint64_t send_cycle) noexcept {
+        if (last_pushes_cycle_ == send_cycle && pushes_this_cycle_ != 0) {
+            --pushes_this_cycle_;
+        }
+    }
+
+    /**
+     * Publish through a slot that was validated as part of the complete
+     * multi-port transaction.
+     *
+     * There is deliberately no logical admission recheck here: the claim is
+     * already included in pushes_this_cycle_.  Once every participating port
+     * validates, producer ownership proves that the physical push cannot become
+     * full before this call (consumers only free space).  A false return is thus
+     * a framework invariant violation, not model backpressure after partial
+     * publication.
+     */
+    void commitReservedTransfer_(T data, uint64_t send_cycle) {
+        const uint64_t arrive_cycle = send_cycle + delay_;
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+        const uint64_t cancel_epoch = cancel_epoch_.load(std::memory_order_acquire);
+#endif
+        bool ok = false;
+        if (thread_queue_id_ != SIZE_MAX) {
+            ok = to_->pushToThreadQueueCancelable(thread_queue_id_, std::move(data), arrive_cycle,
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+                                                  &cancel_epoch_, cancel_epoch,
+#else
+                                                  nullptr, 0,
+#endif
+                                                  send_cycle, conn_id_);
+        } else {
+            ok = to_->enqueueCancelable(std::move(data), arrive_cycle,
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+                                        &cancel_epoch_, cancel_epoch,
+#else
+                                        nullptr, 0,
+#endif
+                                        send_cycle, conn_id_);
+        }
+
+        if (!ok) {
+            std::terminate();
+        }
+        wakeUnitAt(destination(), arrive_cycle);
+    }
+
     std::optional<size_t> effectiveHeadroomRate_() const noexcept {
         if (registered_rate_.has_value()) {
             return *registered_rate_;
@@ -606,6 +713,25 @@ private:
         return minCapacity_(limit, edgeAdmissionCapacity_());
     }
 
+    bool hasDestinationAdmissionForPending_(uint64_t send_cycle, size_t pending_pushes) const {
+        if (isDFFStyleEdge_()) {
+            const auto min_arrival = to_->admissionMinArrivalCycle(send_cycle);
+            return !min_arrival.has_value() || *min_arrival == send_cycle;
+        }
+        size_t admission_cap = edgeAdmissionCapacity_();
+        if (admission_cap == InPort<T>::UNLIMITED_CAPACITY) {
+            admission_cap = to_->capacity();
+        }
+        if (admission_cap == InPort<T>::UNLIMITED_CAPACITY) {
+            return true;
+        }
+        if (admission_cap == 0) {
+            return false;
+        }
+        const size_t occupancy = destinationAdmissionOccupancy_(send_cycle);
+        return occupancy <= admission_cap && pending_pushes <= admission_cap - occupancy;
+    }
+
     bool hasDestinationAdmissionSlot_(uint64_t send_cycle) const noexcept {
         if (isDFFStyleEdge_()) {
             const auto min_arrival = to_->admissionMinArrivalCycle(send_cycle);
@@ -623,6 +749,21 @@ private:
         }
         const size_t occupancy = destinationAdmissionOccupancy_(send_cycle);
         return occupancy < admission_cap && pushes_this_cycle_ < admission_cap - occupancy;
+    }
+
+    bool hasMPSCLaneAdmissionForPending_(uint64_t send_cycle,
+                                         size_t pending_pushes) const noexcept {
+        const size_t admission_cap = edgeAdmissionCapacity_();
+        if (admission_cap == InPort<T>::UNLIMITED_CAPACITY) return true;
+        if (isDFFStyleEdge_()) {
+            const auto min_arrival =
+                to_->threadQueueAdmissionMinArrivalCycle(thread_queue_id_, send_cycle);
+            return !min_arrival.has_value() || *min_arrival == send_cycle;
+        }
+        if (admission_cap == 0) return false;
+
+        const size_t occupancy = mpscAdmissionOccupancy_(send_cycle);
+        return occupancy <= admission_cap && pending_pushes <= admission_cap - occupancy;
     }
 
     bool hasMPSCLaneAdmissionSlot_(uint64_t send_cycle) const noexcept {
@@ -694,6 +835,12 @@ private:
     InPort<T>* to_;
     uint32_t delay_;
     SharedBroadcast* shared_broadcast_ = nullptr;
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+    // Fits in the pre-existing padding before the cache-aligned broadcast
+    // cursor. Producer and receiver normally only read this word; cancellation
+    // is the rare writer, so no steady-state ownership ping-pong is introduced.
+    std::atomic<uint64_t> cancel_epoch_{0};
+#endif
     mutable SharedBroadcastCursor shared_cursor_{};
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
     std::atomic<uint64_t> shared_cancel_before_{0};
@@ -727,15 +874,13 @@ private:
             admission_snapshot_valid_ = false;
         }
     }
-    /// Cancellation epoch for sender-side flush/squash. Each message is
-    /// stamped with the epoch value at send time. If the epoch changes
-    /// before the receiver consumes it, the message is dropped.
-#if CHRONON_ENABLE_OUTPORT_CANCELLATION
-    std::atomic<uint64_t> cancel_epoch_{0};
-#endif
     /// Finite producer run-ahead supported by a model-owned external
     /// transport. SIZE_MAX retains the legacy unbounded dependency-only edge.
     size_t dependency_only_headroom_ = std::numeric_limits<size_t>::max();
+    // Snapshot of the destination's cold control-plane epoch. This occupies
+    // the Connection's pre-existing tail padding, so transactions do not grow
+    // the cache-aligned object or perturb ordinary send/canSend fields.
+    uint32_t transaction_destination_epoch_ = 0;
 };
 
 }  // namespace chronon::sender

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -22,6 +23,9 @@
 #include "PortDirectory.hpp"
 
 namespace chronon::sender {
+
+template <typename... Ports>
+class PortTransaction;
 
 /**
  * OutPort - Sends data to connected InPorts.
@@ -42,6 +46,8 @@ namespace chronon::sender {
 template <typename T>
 class OutPort : public PortBase {
 public:
+    using value_type = T;
+
     /**
      * Create an output port.
      *
@@ -78,6 +84,7 @@ public:
         conn->setDependencyOnlyTransport(dependency_only_transport_, dependency_only_headroom_);
         auto* ptr = conn.get();
         connections_.push_back(std::move(conn));
+        invalidateTransaction_();
         return ptr;
     }
 
@@ -222,6 +229,9 @@ public:
      * enqueued at destination ports will be dropped on receive.
      */
     void cancelInFlight() {
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+        invalidateTransaction_();
+#endif
         if (dependency_only_transport_ && !shared_broadcast_) return;
         for (auto& conn : connections_) {
             conn->cancelInFlight();
@@ -240,6 +250,7 @@ public:
     void setDependencyOnlyTransport(
         bool enabled = true,
         size_t cross_thread_headroom = std::numeric_limits<size_t>::max()) noexcept {
+        invalidateTransaction_();
         dependency_only_transport_ = enabled;
         dependency_only_headroom_ =
             enabled ? cross_thread_headroom : std::numeric_limits<size_t>::max();
@@ -278,6 +289,7 @@ public:
             connection->attachTransparentBroadcast(transport.get());
         }
         shared_broadcast_ = std::move(transport);
+        invalidateTransaction_();
         return true;
     }
 
@@ -307,7 +319,13 @@ public:
 
     /// Set the per-cycle send capacity at runtime (UNLIMITED_CAPACITY = unlimited).
     /// Passing 0 is accepted as the legacy unlimited spelling.
-    void setPerCycleCapacity(size_t cap) { per_cycle_capacity_ = normalizeCapacity_(cap); }
+    void setPerCycleCapacity(size_t cap) {
+        const size_t normalized = normalizeCapacity_(cap);
+        if (normalized != per_cycle_capacity_) {
+            per_cycle_capacity_ = normalized;
+            invalidateTransaction_();
+        }
+    }
 
     /// @return Max sends per cycle (UNLIMITED_CAPACITY = unlimited).
     size_t perCycleCapacity() const { return per_cycle_capacity_; }
@@ -332,8 +350,181 @@ public:
     uint64_t getCurrentCycle() const;
 
 private:
+    template <typename... Ports>
+    friend class PortTransaction;
+
+    struct PackedTransactionState {
+        static constexpr uint64_t MASK = (uint64_t{1} << 56) - 1;
+
+        [[nodiscard]] uint64_t load() const noexcept {
+            uint64_t value = 0;
+            for (size_t i = 0; i < sizeof(bytes); ++i) {
+                value |= static_cast<uint64_t>(bytes[i]) << (i * 8);
+            }
+            return value;
+        }
+
+        void store(uint64_t value) noexcept {
+            value &= MASK;
+            for (size_t i = 0; i < sizeof(bytes); ++i) {
+                bytes[i] = static_cast<uint8_t>(value >> (i * 8));
+            }
+        }
+
+        uint8_t bytes[7]{};
+    };
+    static_assert(sizeof(PackedTransactionState) == 7);
+
+    struct TransactionReservation {
+        uint64_t token = 0;
+        uint64_t cycle = 0;
+        size_t connection_count = 0;
+        bool counted_cycle_capacity = false;
+    };
+
+    [[nodiscard]] bool transactionPayloadSupported_() const noexcept {
+        if constexpr (!std::is_nothrow_move_constructible_v<T> ||
+                      !std::is_nothrow_move_assignable_v<T>) {
+            return connections_.empty() || dependency_only_transport_;
+        }
+        if (!shared_broadcast_ && !dependency_only_transport_ && connections_.size() > 1) {
+            if constexpr (!std::is_nothrow_copy_constructible_v<T>) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool tryReserveTransaction_(TransactionReservation& reservation) {
+        uint64_t transaction_state = transaction_state_.load();
+        if ((transaction_state & 1U) != 0 || !transactionPayloadSupported_()) {
+            return false;
+        }
+
+        const uint64_t current = getCurrentCycle();
+        if (!connections_.empty() && per_cycle_capacity_ != UNLIMITED_CAPACITY) {
+            updateCycleCounter_();
+            if (sent_this_cycle_ >= per_cycle_capacity_) return false;
+        }
+
+        size_t connection_count = 0;
+        if (!connections_.empty() && !shared_broadcast_ && !dependency_only_transport_) {
+            size_t claimed = 0;
+            for (; claimed < connections_.size(); ++claimed) {
+                if (!connections_[claimed]->tryReserveTransfer_(current)) {
+                    while (claimed != 0) {
+                        connections_[--claimed]->releaseReservedTransfer_(current);
+                    }
+                    return false;
+                }
+            }
+            connection_count = claimed;
+        } else if (shared_broadcast_ && !shared_broadcast_->canPublish()) {
+            return false;
+        }
+
+        bool counted_cycle_capacity = false;
+        if (!connections_.empty() && per_cycle_capacity_ != UNLIMITED_CAPACITY) {
+            ++sent_this_cycle_;
+            counted_cycle_capacity = true;
+        }
+
+        transaction_state = (transaction_state + 1) & PackedTransactionState::MASK;
+        transaction_state_.store(transaction_state);
+        reservation = TransactionReservation{.token = transaction_state,
+                                             .cycle = current,
+                                             .connection_count = connection_count,
+                                             .counted_cycle_capacity = counted_cycle_capacity};
+        return true;
+    }
+
+    [[nodiscard]] bool transactionReservationValid_(
+        const TransactionReservation& reservation) const {
+        if (reservation.token == 0 || transaction_state_.load() != reservation.token ||
+            getCurrentCycle() != reservation.cycle) {
+            return false;
+        }
+
+        if (reservation.counted_cycle_capacity) {
+            updateCycleCounter_();
+            if (last_counted_cycle_ != reservation.cycle || sent_this_cycle_ == 0 ||
+                per_cycle_capacity_ == UNLIMITED_CAPACITY ||
+                sent_this_cycle_ > per_cycle_capacity_) {
+                return false;
+            }
+        }
+
+        if (reservation.connection_count != 0) {
+            for (size_t i = 0; i < reservation.connection_count; ++i) {
+                if (!connections_[i]->transactionReservationValid_(reservation.cycle)) {
+                    return false;
+                }
+            }
+        } else if (shared_broadcast_ && !shared_broadcast_->canPublish()) {
+            return false;
+        }
+        return true;
+    }
+
+    void releaseTransaction_(TransactionReservation& reservation) noexcept {
+        if (reservation.token == 0) return;
+        if (reservation.connection_count != 0) {
+            for (size_t i = 0; i < reservation.connection_count; ++i) {
+                connections_[i]->releaseReservedTransfer_(reservation.cycle);
+            }
+        }
+        if (reservation.counted_cycle_capacity && last_counted_cycle_ == reservation.cycle &&
+            sent_this_cycle_ != 0) {
+            --sent_this_cycle_;
+        }
+        finishTransaction_();
+        reservation.token = 0;
+    }
+
+    void commitTransaction_(TransactionReservation& reservation, T data) {
+        if (connections_.empty()) {
+            finishTransaction_();
+            reservation.token = 0;
+            return;
+        }
+
+        const uint64_t current = reservation.cycle;
+        if (shared_broadcast_) {
+            if (!publishTransparentBroadcast_(std::move(data), current)) {
+                std::terminate();
+            }
+        } else if (!dependency_only_transport_) {
+            if (connections_.size() == 1) {
+                connections_.front()->commitReservedTransfer_(std::move(data), current);
+            } else {
+                if constexpr (std::is_copy_constructible_v<T>) {
+                    for (size_t i = 0; i + 1 < connections_.size(); ++i) {
+                        connections_[i]->commitReservedTransfer_(T{data}, current);
+                    }
+                    connections_.back()->commitReservedTransfer_(std::move(data), current);
+                } else {
+                    std::terminate();
+                }
+            }
+        }
+
+        finishTransaction_();
+        reservation.token = 0;
+    }
+
     static constexpr size_t normalizeCapacity_(size_t cap) noexcept {
         return cap == 0 ? UNLIMITED_CAPACITY : cap;
+    }
+
+    void invalidateTransaction_() noexcept {
+        transaction_state_.store((transaction_state_.load() + 2) & PackedTransactionState::MASK);
+    }
+
+    void finishTransaction_() noexcept {
+        const uint64_t state = transaction_state_.load();
+        if ((state & 1U) != 0) {
+            transaction_state_.store((state + 1) & PackedTransactionState::MASK);
+        }
     }
 
     bool allConnectionsCanTransfer_() const {
@@ -374,6 +565,11 @@ private:
     std::unique_ptr<detail::SharedBroadcastTransport<T>> shared_broadcast_;
     uint64_t last_broadcast_wakeup_cycle_ = std::numeric_limits<uint64_t>::max();
     bool dependency_only_transport_ = false;
+    // Producer-owned transaction state occupies the existing seven-byte
+    // alignment gap before dependency_only_headroom_. Even values are idle;
+    // odd values identify the sole active claim. Ordinary send/canSend never
+    // read these bytes.
+    PackedTransactionState transaction_state_{};
     size_t dependency_only_headroom_ = std::numeric_limits<size_t>::max();
 };
 
