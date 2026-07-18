@@ -30,6 +30,7 @@
 #include "port/Port.hpp"
 #include "port/PortDirectory.hpp"
 #include "port/PortTransaction.hpp"
+#include "port/ReliablePortSender.hpp"
 #include "schedule/DependencyGraph.hpp"
 #include "schedule/SchedulerTimelineTrace.hpp"
 #include "schedule/SimulatedAnnealingPartitioner.hpp"

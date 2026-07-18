@@ -130,6 +130,75 @@ destination epoch covers configuration or cancellation changes. Ordinary
 allocation, or virtual dispatch. MPSC claims target the connection's private
 SPSC lane; receiver activity can only free a claimed slot before commit.
 
+## Reliable delivery under backpressure
+
+`ReliablePortSender` provides a bounded, framework-owned retry slot for
+architectural messages that must not be dropped. Declare it next to its
+`OutPort` and keep the model state that produced a message unchanged while
+`send()` returns `false`:
+
+```cpp
+OutPort<Completion> out_completion{this, "out_completion"};
+ReliablePortSender reliable_completion{out_completion};
+
+void tick() override {
+    Completion completion = buildCompletion(rob_head_);
+    if (!reliable_completion.send(std::move(completion))) {
+        return;  // payload is retained; rob_head_ must remain unchanged
+    }
+    advanceRobHead();
+}
+```
+
+On the next producer cycle, `send()` retries the retained payload before it
+observes or moves the new argument. At most one attempt is made per simulated
+cycle. A successful result releases the slot, so retry cannot duplicate a
+previous delivery. `submit()` and `retry()` expose the same state machine
+explicitly; calling `submit()` while occupied, or `retry()` while empty, throws
+a diagnostic containing the owning unit, ports, payload types, and pending
+cycle.
+
+One sender can cover several independent ports. Its retry uses the atomic port
+transaction described above, preserving deliver-all-or-deliver-none behavior:
+
+```cpp
+ReliablePortSender reliable_dispatch{out_selected_iq, out_rob};
+
+if (!reliable_dispatch.send(iq_entry, rob_entry)) return;
+advanceDispatchState();
+```
+
+The retry slot is deliberately bounded to one logical payload tuple. This is a
+stalling architectural-delivery policy, not an unbounded elasticity queue.
+Fanout, per-cycle rate, destination depth, SPSC/MPSC selection, and deterministic
+ordering continue to come from the underlying ports and transaction claims.
+The transaction topology restrictions therefore also apply to a reliable
+sender.
+
+Pending payloads have not entered an `InPort`, so cancellation is explicit:
+
+```cpp
+reliable_completion.cancelPending();
+reliable_completion.cancelPendingIf(
+    [flush_uid](const Completion& value) noexcept { return value.uid >= flush_uid; });
+reliable_completion.flushPending<&Completion::uid>(
+    FlushRange::atAndYounger(flush_uid));
+
+// Cancel both the retained request and already-published messages.
+reliable_completion.cancelInFlight();
+```
+
+Receiver-side `InPort::flush<KeyFn>()` and `tryReceiveFiltered()` still govern
+payloads after publication. A model handling a flush signal should apply the
+same architectural predicate to `flushPending()` for an older request that is
+still producer-owned.
+
+`ReliablePortSender` is cache-line aligned and producer-private. It uses an
+inline `optional<tuple<...>>`; the retry layer introduces no additional lock,
+shared atomic, virtual call, or heap allocation above the selected port
+transport. Units that do not opt in retain byte-identical generated code for
+ordinary `OutPort::send()`, `canSend()`, and `Connection` transfer paths.
+
 ## InPort
 
 ```cpp

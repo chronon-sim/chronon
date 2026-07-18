@@ -80,6 +80,7 @@ using sender::PortBindingRegistry;
 using sender::PortDirectory;
 using sender::PortPolicy;
 using sender::PortTransaction;
+using sender::ReliablePortSender;
 using sender::reserve;
 
 // --- Params ---
