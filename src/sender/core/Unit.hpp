@@ -204,6 +204,18 @@ public:
     void registerPort(PortBase* port) { ports_.push_back(port); }
     const std::vector<PortBase*>& ports() const noexcept { return ports_; }
 
+    /** Initialization-only registration for ports with receiver cycle work. */
+    void registerCyclePreparedPort(PortBase* port) {
+        if (!port) return;
+        if (!cycle_prepared_ports_) {
+            cycle_prepared_ports_ = std::make_unique<std::vector<PortBase*>>();
+        }
+        if (std::find(cycle_prepared_ports_->begin(), cycle_prepared_ports_->end(), port) ==
+            cycle_prepared_ports_->end()) {
+            cycle_prepared_ports_->push_back(port);
+        }
+    }
+
     /// Triggers registration of all pending ports to PortDirectory.
     void setTreeNode(tree::TreeNode* node) {
         tree_node_ = node;
@@ -269,7 +281,24 @@ protected:
         }
     }
 
+    /**
+     * One predictable null check for ordinary Units. The loop is kept out of
+     * line and exists only for Units owning a bounded MPSC destination.
+     */
+    [[gnu::always_inline]] inline void prepareCyclePorts_() {
+        if (cycle_prepared_ports_ == nullptr) [[likely]] {
+            return;
+        }
+        prepareCyclePortsSlow_();
+    }
+
 private:
+    [[gnu::noinline]] void prepareCyclePortsSlow_() {
+        for (PortBase* port : *cycle_prepared_ports_) {
+            port->prepareConsumerCycle(local_cycle_);
+        }
+    }
+
     void enableActivityScheduling_() noexcept {
         port_wake_enabled_.store(true, std::memory_order_release);
     }
@@ -349,6 +378,8 @@ private:
     std::atomic<bool> wake_tracking_enabled_{false};
     uint32_t id_;
     std::vector<PortBase*> ports_;
+    /// Lazily allocated: the common Unit has no receiver cycle hook.
+    std::unique_ptr<std::vector<PortBase*>> cycle_prepared_ports_;
     tree::TreeNode* tree_node_ = nullptr;
     std::vector<std::function<void(const std::string&)>> pending_port_registrations_;
 };
@@ -399,6 +430,13 @@ inline void addPortRegistrationToUnit(Unit* unit,
 inline void recordPortOnOwnerUnit(Unit* unit, PortBase* port) {
     if (unit && port) {
         unit->registerPort(port);
+    }
+}
+
+/// Registers a receiver-cycle hook without exposing Unit's definition to Port.hpp.
+inline void recordCyclePreparedPortOnOwnerUnit(Unit* unit, PortBase* port) {
+    if (unit && port) {
+        unit->registerCyclePreparedPort(port);
     }
 }
 

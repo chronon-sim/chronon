@@ -48,8 +48,10 @@ struct TickSimulationConfig {
     /// Epoch-free lookahead: in the persistent-worker lookahead path, collapse
     /// the per-epoch std::barrier into a single
     /// run-spanning window. Run-ahead is then bounded by lookahead_floor_ +
-    /// max_lookahead_cycles plus per-edge queue-headroom dependencies. Direct
-    /// MPSC lanes require neither per-cycle arbitration nor a run-end flush.
+    /// max_lookahead_cycles plus per-edge queue-headroom dependencies. MPSC
+    /// lanes require neither centralized scheduler arbitration nor a run-end
+    /// flush. Bounded destinations perform aggregate admission on their owning
+    /// Unit immediately before its tick.
     /// Engaged by runParallel() only when the persistent path is eligible,
     /// max_lookahead_cycles is positive, and every MPSC port has fully resolved
     /// per-connection progress; otherwise it falls back to the barrier path.

@@ -303,9 +303,10 @@ public:
         // enqueue_cycle = sender's localCycle at push time. Every PortPolicy
         // uses it as the deterministic selective-flush scope boundary.
         if (thread_queue_id_ != SIZE_MAX) {
-            // MPSC mode: publish directly to this Connection's SPSC lane.
-            // The InPort consumer performs the deterministic k-way merge, so
-            // there is no second staging ring or envelope copy.
+            // MPSC mode: publish directly to this Connection's SPSC ingress
+            // lane. Unbounded InPorts consume the selected slot in place;
+            // bounded InPorts move ready entries into a receiver-owned shared
+            // FIFO with deterministic aggregate admission.
             if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
                 return false;
             }
@@ -439,6 +440,16 @@ public:
         if (dependency_only_transport_) return;
         // One direct SPSC lane per Connection. The InPort owns lane storage
         // and its consumer-only deterministic frontier.
+        //
+        // A registered edge capacity is the destination depth for every
+        // transport selected during initialization.  Propagate it before the
+        // adapter is created so an otherwise-unbounded InPort allocates the
+        // receiver-owned aggregate FIFO instead of treating the value only as
+        // private-lane headroom.  This mirrors the same-thread and SPSC paths
+        // above and remains entirely off the steady-state send/receive path.
+        if (registered_capacity_.has_value()) {
+            to_->setCapacity(*registered_capacity_);
+        }
         const size_t user_cap = edgeAdmissionCapacity_();
         to_->useMultiProducerQueue(user_cap == InPort<T>::UNLIMITED_CAPACITY ? 0 : user_cap);
     }
@@ -506,12 +517,17 @@ public:
         //   same-thread / unbounded     -> no ring to overflow (SIZE_MAX).
         const bool dff_style = isDFFStyleEdge_();
         size_t ring_usable;
-        bool cycle_strict_spsc = false;
+        bool cycle_strict_admission = false;
         if (thread_queue_id_ != SIZE_MAX) {
             ring_usable = mpscLogicalHeadroomCapacity_();
+            // A bounded MPSC lane publishes receiver pops into the same
+            // simulated-cycle admission ledger as SPSC. Its reverse scheduler
+            // dependency must therefore keep the producer one cycle closer to
+            // the consumer than a transport-only, unbounded lane.
+            cycle_strict_admission = edgeAdmissionCapacity_() != InPort<T>::UNLIMITED_CAPACITY;
         } else if (to_->usesLockFreeQueue()) {
             ring_usable = spscLogicalHeadroomCapacity_();
-            cycle_strict_spsc = true;
+            cycle_strict_admission = true;
         } else {
             if (dff_style) {
                 // Same-thread DFF-style edges have no physical ring, but they
@@ -531,15 +547,25 @@ public:
         const size_t buffered_cycles = ring_usable / *rate;
         // The consumer drains only *due* entries (arrive_cycle <= k, i.e.
         // send_cycle <= k - delay_), so delay_ cycles of not-yet-due entries always
-        // sit buffered. Cross-thread SPSC admission is cycle-strict: a consumer
-        // pop at cycle k does not free producer capacity for another send in
-        // cycle k, so its safe run-ahead window is one cycle smaller than the
-        // directly drained MPSC lane. A delay-1, capacity-1 DFF-style edge
-        // is handled above and remains safe with headroom=1.
+        // sit buffered. Model-visible SPSC and bounded-MPSC admission is
+        // cycle-strict: a consumer pop at cycle k does not free producer
+        // capacity for another send in cycle k, so its safe run-ahead window is
+        // one cycle smaller than a transport-only unbounded MPSC lane. A
+        // delay-1, capacity-1 DFF-style edge is handled above and remains safe
+        // with headroom=1.
         if (buffered_cycles < delay_) return 0;
-        if (cycle_strict_spsc) {
+        if (cycle_strict_admission) {
             if (buffered_cycles == delay_) return 0;
-            return buffered_cycles - delay_;
+            const size_t physical_headroom = buffered_cycles - delay_;
+            // A finite architectural capacity snapshot for producer cycle C
+            // must observe every receiver pop through C-1. More physical ring
+            // slack may prevent overflow, but it cannot make missing simulated
+            // credit deterministic. Reverse-delay 1 (headroom 2) is therefore
+            // the widest safe epoch-free window for a model-bounded edge.
+            if (edgeAdmissionCapacity_() != InPort<T>::UNLIMITED_CAPACITY) {
+                return std::min<size_t>(physical_headroom, 2);
+            }
+            return physical_headroom;
         }
         return buffered_cycles - delay_ + 1;
     }

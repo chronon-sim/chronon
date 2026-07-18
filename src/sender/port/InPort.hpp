@@ -177,13 +177,16 @@ public:
      *
      * Call this during initialization for cross-thread connections where
      * multiple source threads write to this port.
-     * Creates independent SPSC queues polled by the consumer. TickSimulation
-     * uses stable connection ids as the producer keys.
+     * Creates independent SPSC ingress lanes polled by the consumer.
+     * TickSimulation uses stable connection ids as the producer keys. Bounded
+     * ports also create one receiver-owned aggregate FIFO; unbounded ports keep
+     * the direct in-place lane-consume fast path.
      */
     void useMultiProducerQueue(size_t min_per_thread_usable_capacity = 0) {
         if (multi_producer_queue_raw_) {
             multi_producer_queue_raw_->ensurePerThreadUsableCapacity(
                 min_per_thread_usable_capacity);
+            registerCyclePreparationIfBounded_();
             return;
         }
         if (shared_broadcast_queue_raw_) {
@@ -195,6 +198,7 @@ public:
             capacity_, min_per_thread_usable_capacity);
         multi_producer_queue_raw_ = mpq.get();
         queue_ = std::move(mpq);
+        registerCyclePreparationIfBounded_();
     }
 
     /**
@@ -379,8 +383,12 @@ public:
     }
 
     void setCapacity(size_t capacity) {
+        // Configuration-time operation. Multi-producer mode rejects a change
+        // while either ingress or the shared FIFO contains data so no payload
+        // can be silently displaced.
         queue_->setCapacity(capacity);
         capacity_ = capacity;
+        registerCyclePreparationIfBounded_();
     }
 
     /**
@@ -576,6 +584,27 @@ public:
         return shared_broadcast_queue_raw_ ? shared_broadcast_queue_raw_->size() : queue_->size();
     }
 
+    /**
+     * Messages waiting in per-Connection ingress lanes, outside the bounded
+     * destination FIFO. Diagnostic only; normal model backpressure uses
+     * OutPort/Connection and does not scan every producer lane.
+     */
+    size_t transportPendingMessageCount() const noexcept {
+        return multi_producer_queue_raw_ ? multi_producer_queue_raw_->stagedSize() : 0;
+    }
+
+    /** Largest aggregate destination FIFO occupancy observed since creation. */
+    size_t sharedFifoHighWatermark() const noexcept {
+        return multi_producer_queue_raw_ ? multi_producer_queue_raw_->sharedFifoHighWatermark() : 0;
+    }
+
+    /** Receiver-cycle hook registered only for bounded MPSC InPorts. */
+    void prepareConsumerCycle(uint64_t current_cycle) override {
+        if (multi_producer_queue_raw_) {
+            multi_producer_queue_raw_->prepareSharedFifo(current_cycle);
+        }
+    }
+
     /// Drop all queued messages (including future arrivals).
     void flush() {
         if (shared_broadcast_queue_raw_) {
@@ -630,6 +659,15 @@ public:
 
 private:
     uint64_t getCurrentCycle() const;
+
+    void registerCyclePreparationIfBounded_() {
+        if (cycle_preparation_registered_ || !multi_producer_queue_raw_ ||
+            capacity_ == UNLIMITED_CAPACITY) {
+            return;
+        }
+        recordCyclePreparedPortOnOwnerUnit(owner_, this);
+        cycle_preparation_registered_ = true;
+    }
 
     template <auto KeyFn>
     static uint64_t extractSelectiveFlushKey_(const T& data) {
@@ -812,6 +850,7 @@ private:
     MultiProducerQueueAdapter<StoredMessage>* multi_producer_queue_raw_ =
         nullptr;                    ///< Non-owning ptr for MPSC access
     bool lock_free_queue_ = false;  ///< True iff queue_ is the lock-free SPSC ring
+    bool cycle_preparation_registered_ = false;
     // Reused by receiveAllBuffered() to avoid per-cycle allocation; single-consumer,
     // so no synchronization is needed.
     std::vector<StoredMessage> drain_scratch_;

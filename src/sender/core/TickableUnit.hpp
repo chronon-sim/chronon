@@ -53,6 +53,7 @@ public:
         detail::TickContextGuard tick_ctx(this, localCycle(), crashName(), crashNameLen(), "tick");
         try {
             beginActiveTick_();
+            prepareCyclePorts_();
             tick();
             finishActiveTick_();
             advanceLocalCycle();
@@ -69,6 +70,7 @@ public:
     [[gnu::always_inline]] inline void executeTickAlwaysActive() {
         detail::TickContextGuard tick_ctx(this, localCycle(), crashName(), crashNameLen(), "tick");
         try {
+            prepareCyclePorts_();
             tick();
             advanceLocalCycle();
         } catch (const TickException&) {
