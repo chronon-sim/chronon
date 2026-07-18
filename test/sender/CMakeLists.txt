@@ -32,6 +32,7 @@ add_executable(sender_test_weighted_partitioner test_weighted_partitioner.cpp)
 add_executable(sender_test_priority_arbiter test_priority_arbiter.cpp)
 add_executable(sender_test_outport_per_cycle_capacity test_outport_per_cycle_capacity.cpp)
 add_executable(sender_test_port_transaction test_port_transaction.cpp)
+add_executable(sender_test_reliable_port_sender test_reliable_port_sender.cpp)
 add_executable(sender_test_mpsc_kway_merge test_mpsc_kway_merge.cpp)
 add_executable(sender_test_mpsc_deterministic_arbitration_atomic_publish test_mpsc_deterministic_arbitration_atomic_publish.cpp)
 add_executable(sender_test_mpsc_shared_depth test_mpsc_shared_depth.cpp)
@@ -75,6 +76,7 @@ target_link_libraries(sender_test_weighted_partitioner PRIVATE chronon::core)
 target_link_libraries(sender_test_priority_arbiter PRIVATE chronon::core)
 target_link_libraries(sender_test_outport_per_cycle_capacity PRIVATE chronon::core)
 target_link_libraries(sender_test_port_transaction PRIVATE chronon::core Threads::Threads)
+target_link_libraries(sender_test_reliable_port_sender PRIVATE chronon::core Threads::Threads)
 target_link_libraries(sender_test_mpsc_kway_merge PRIVATE chronon::core)
 target_link_libraries(sender_test_mpsc_deterministic_arbitration_atomic_publish PRIVATE chronon::core Threads::Threads)
 target_link_libraries(sender_test_mpsc_shared_depth PRIVATE chronon::core Threads::Threads)
@@ -119,6 +121,7 @@ target_include_directories(sender_test_weighted_partitioner PRIVATE ${chronon_SO
 target_include_directories(sender_test_priority_arbiter PRIVATE ${chronon_SOURCE_DIR}/src)
 target_include_directories(sender_test_outport_per_cycle_capacity PRIVATE ${chronon_SOURCE_DIR}/src)
 target_include_directories(sender_test_port_transaction PRIVATE ${chronon_SOURCE_DIR}/src)
+target_include_directories(sender_test_reliable_port_sender PRIVATE ${chronon_SOURCE_DIR}/src)
 target_include_directories(sender_test_mpsc_kway_merge PRIVATE ${chronon_SOURCE_DIR}/src)
 target_include_directories(sender_test_mpsc_deterministic_arbitration_atomic_publish PRIVATE ${chronon_SOURCE_DIR}/src)
 target_include_directories(sender_test_mpsc_shared_depth PRIVATE ${chronon_SOURCE_DIR}/src)
@@ -163,6 +166,7 @@ target_compile_features(sender_test_weighted_partitioner PRIVATE cxx_std_20)
 target_compile_features(sender_test_priority_arbiter PRIVATE cxx_std_20)
 target_compile_features(sender_test_outport_per_cycle_capacity PRIVATE cxx_std_20)
 target_compile_features(sender_test_port_transaction PRIVATE cxx_std_20)
+target_compile_features(sender_test_reliable_port_sender PRIVATE cxx_std_20)
 target_compile_features(sender_test_mpsc_kway_merge PRIVATE cxx_std_20)
 target_compile_features(sender_test_mpsc_deterministic_arbitration_atomic_publish PRIVATE cxx_std_20)
 target_compile_features(sender_test_mpsc_shared_depth PRIVATE cxx_std_20)
@@ -193,6 +197,7 @@ foreach(target sender_test_message_queue sender_test_lockfree_message_queue send
 endforeach()
 target_link_libraries(sender_test_selective_flush_range PRIVATE chronon_compile_options)
 target_link_libraries(sender_test_port_transaction PRIVATE chronon_compile_options)
+target_link_libraries(sender_test_reliable_port_sender PRIVATE chronon_compile_options)
 if(CHRONON_ENABLE_OUTPORT_CANCELLATION)
     target_link_libraries(sender_test_cpu_pipeline_flush_validation PRIVATE chronon_compile_options)
 endif()
@@ -222,6 +227,7 @@ add_test(NAME sender_weighted_partitioner COMMAND sender_test_weighted_partition
 add_test(NAME sender_priority_arbiter COMMAND sender_test_priority_arbiter)
 add_test(NAME sender_outport_per_cycle_capacity COMMAND sender_test_outport_per_cycle_capacity)
 add_test(NAME sender_port_transaction COMMAND sender_test_port_transaction)
+add_test(NAME sender_reliable_port_sender COMMAND sender_test_reliable_port_sender)
 add_test(NAME sender_mpsc_kway_merge COMMAND sender_test_mpsc_kway_merge)
 add_test(NAME sender_mpsc_deterministic_arbitration_atomic_publish COMMAND sender_test_mpsc_deterministic_arbitration_atomic_publish)
 add_test(NAME sender_mpsc_shared_depth COMMAND sender_test_mpsc_shared_depth)
@@ -255,6 +261,11 @@ set_tests_properties(sender_message_queue sender_dependency_graph sender_port_di
 set_tests_properties(sender_port_transaction
     PROPERTIES
     TIMEOUT 60
+    LABELS "sender"
+)
+set_tests_properties(sender_reliable_port_sender
+    PROPERTIES
+    TIMEOUT 120
     LABELS "sender"
 )
 if(CHRONON_ENABLE_OUTPORT_CANCELLATION)

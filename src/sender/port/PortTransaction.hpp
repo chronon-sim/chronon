@@ -20,6 +20,9 @@
 
 namespace chronon::sender {
 
+template <typename... Ts>
+class ReliablePortSender;
+
 /**
  * Stack-only, producer-owned reservation spanning independent OutPorts.
  *
@@ -52,7 +55,8 @@ class PortTransaction<OutPort<Ts>...> {
 
 public:
     explicit PortTransaction(OutPort<Ts>&... ports) : ports_(&ports...) {
-        reserved_ = contextValid_() && reserveFrom_<0>();
+        supported_ = contextValid_();
+        reserved_ = supported_ && reserveFrom_<0>();
     }
 
     ~PortTransaction() { releaseAll_(); }
@@ -65,12 +69,16 @@ public:
         : ports_(other.ports_),
           reservations_(other.reservations_),
           staged_(std::move(other.staged_)),
+          supported_(other.supported_),
           reserved_(std::exchange(other.reserved_, false)) {}
 
     PortTransaction& operator=(PortTransaction&&) = delete;
 
     /** True when every claim still belongs to this cycle and remains valid. */
     [[nodiscard]] explicit operator bool() const { return valid(); }
+
+    /** True when the participating owners, topology, and payload types are supported. */
+    [[nodiscard]] bool supported() const noexcept { return supported_; }
 
     [[nodiscard]] bool valid() const { return reserved_ && validateFrom_<0>(); }
 
@@ -120,6 +128,21 @@ public:
     }
 
 private:
+    template <typename... Us>
+    friend class ReliablePortSender;
+
+    /**
+     * Commit payloads already owned by a reliable sender. Validation happens
+     * before the first move, so a transiently invalid claim leaves the tuple
+     * intact for a later retry.
+     */
+    [[nodiscard]] bool commitOwned_(std::tuple<Ts...>& payloads) {
+        if (!reserved_ || !validateForCommit_()) return false;
+        commitTupleFrom_<0>(payloads);
+        reserved_ = false;
+        return true;
+    }
+
     [[nodiscard]] bool contextValid_() const noexcept {
         constexpr size_t count = sizeof...(Ts);
         const auto* first = std::get<0>(ports_);
@@ -148,7 +171,14 @@ private:
                 if (identities[i] == identities[j]) return false;
             }
         }
-        return boundedDestinationsDisjoint_();
+
+        bool payloads_supported = true;
+        std::apply(
+            [&](const auto*... ports) {
+                payloads_supported = (ports->transactionPayloadSupported_() && ...);
+            },
+            ports_);
+        return payloads_supported && boundedDestinationsDisjoint_();
     }
 
     /**
@@ -277,6 +307,7 @@ private:
     Ports ports_;
     Reservations reservations_;
     StagedPayloads staged_;
+    bool supported_ = false;
     bool reserved_ = false;
 };
 

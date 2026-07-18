@@ -427,9 +427,7 @@ private:
 
     [[nodiscard]] bool tryReserveTransaction_(TransactionReservation& reservation) {
         uint64_t transaction_state = transaction_state_.load();
-        if ((transaction_state & 1U) != 0 || !transactionPayloadSupported_()) {
-            return false;
-        }
+        if ((transaction_state & 1U) != 0) return false;
 
         const uint64_t current = getCurrentCycle();
         if (!connections_.empty() && per_cycle_capacity_ != UNLIMITED_CAPACITY) {

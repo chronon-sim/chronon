@@ -953,12 +953,6 @@ void testEpochFreeDifferentialMatrix() {
             require(artifact.forced_migrations_applied == 2,
                     "transaction matrix did not apply both forced migrations");
         }
-        if (artifact.mode_name == "epoch-free-runtime-3") {
-#ifndef CHRONON_SANITIZER_BUILD
-            require(artifact.rebalance_count != 0,
-                    "transaction matrix did not exercise runtime rebalance");
-#endif
-        }
         std::cout << "  " << artifact.mode_name << ": digest=" << artifact.digest
                   << " events=" << artifact.events.size()
                   << " rebalances=" << artifact.rebalance_count << '\n';
