@@ -191,11 +191,11 @@ public:
 
     void tick() override {
         if (localCycle() == 10) {
-            in.cancelOutsideInclusive<&TaggedMessage::keyOf>(uint64_t{4}, uint64_t{6});
+            in.flush<&TaggedMessage::keyOf>(FlushRange::outsideInclusive(uint64_t{4}, uint64_t{6}));
             event(ModelEventKind::Flush, 4, 6);
         }
         if (localCycle() == 12) {
-            in.cancelYoungerThan<&TaggedMessage::keyOf>(uint64_t{8});
+            in.flush<&TaggedMessage::keyOf>(FlushRange::youngerThan(uint64_t{8}));
             event(ModelEventKind::Flush, 0, 8);
         }
 

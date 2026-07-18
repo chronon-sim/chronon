@@ -177,9 +177,11 @@ if (auto message = in.tryReceiveFiltered(localCycle(), valid_epoch)) {
 Ready messages rejected by the predicate are permanently consumed. The
 predicate is a constrained `noexcept` template parameter: there is no
 `std::function`, indirect predicate call, heap allocation, or producer-side
-read. Chronon's watermark APIs (`cancelOlderThan`, `cancelYoungerThan`, and
-`cancelOutsideInclusive`) remain available for persistent, in-flight-scoped
-filters; `PortPolicy::StageSelective` keeps their mutable state on the receiver.
+read. Persistent architectural squashes use
+`InPort::flush<KeyFn>(FlushRange)`. Its immutable predicates are receiver-owned
+for every `PortPolicy`; heterogeneous-delay MPSC retirement follows the stable
+arrival frontier and producer-progress publications instead of assuming enqueue
+cycles remain ordered.
 
 Sender-side `OutPort::cancelInFlight()` remains an epoch-stamped lazy cancel:
 the sender advances an atomic epoch and the receiver discards older envelopes.

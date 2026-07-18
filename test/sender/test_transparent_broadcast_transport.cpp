@@ -40,6 +40,7 @@ public:
         : TickableUnit(std::move(name)), out(this, "out", rate) {}
 
     void tick() override {}
+    void setCycle(uint64_t cycle) { setLocalCycle(cycle); }
 
     OutPort<uint64_t> out;
 };
@@ -56,6 +57,7 @@ public:
     explicit PassiveConsumer(std::string name) : TickableUnit(std::move(name)) {}
 
     void tick() override {}
+    void setCycle(uint64_t cycle) { setLocalCycle(cycle); }
 
     InPort<uint64_t> in{this, "in"};
 };
@@ -154,7 +156,9 @@ void testAutomaticSelectionAndPortSemantics() {
           "queue reconfiguration silently detached an active shared transport");
 
     check(bus.producers[1]->out.send(90), "pre-cancel producer 1 send failed");
+    bus.consumers[0]->setCycle(1);
     bus.consumers[0]->in.cancelYoungerThan<&valueKey>(50);
+    bus.producers[1]->setCycle(1);
     check(bus.producers[1]->out.send(91), "post-cancel producer 1 send failed");
 
     check(bus.producers[0]->out.send(10), "pre-cancel producer 0 send failed");
@@ -164,8 +168,13 @@ void testAutomaticSelectionAndPortSemantics() {
     check(!bus.consumers[0]->in.hasData(0),
           "shared queue facade exposed a future payload as ready");
     check(bus.consumers[0]->in.hasData(1), "shared queue facade did not expose a ready payload");
-    check(bus.consumers[0]->in.queuedMessageCount() == 3,
-          "shared queue facade did not retire sender-canceled payloads");
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+    constexpr size_t expected_queued_messages = 3;
+#else
+    constexpr size_t expected_queued_messages = 4;
+#endif
+    check(bus.consumers[0]->in.queuedMessageCount() == expected_queued_messages,
+          "shared queue facade reported the wrong compile-time cancellation semantics");
     check(bus.consumers[0]->in.capacity() == InPort<uint64_t>::UNLIMITED_CAPACITY &&
               bus.consumers[0]->in.available() == InPort<uint64_t>::UNLIMITED_CAPACITY,
           "shared queue facade introduced model-visible backpressure");
@@ -178,13 +187,13 @@ void testAutomaticSelectionAndPortSemantics() {
     const std::vector<uint64_t> consumer0_expected{10, 11, 91};
     const std::vector<uint64_t> other_expected{10, 11, 90, 91};
 #endif
-    check(drainTryReceive(bus.consumers[0]->in, 1) == consumer0_expected,
+    check(drainTryReceive(bus.consumers[0]->in, 2) == consumer0_expected,
           "sender or receiver cancellation semantics changed");
-    check(bus.consumers[1]->in.receiveAll(1) == other_expected,
+    check(bus.consumers[1]->in.receiveAll(2) == other_expected,
           "receiveAll lost deterministic producer order");
-    const auto& buffered = bus.consumers[2]->in.receiveAllBuffered(1);
+    const auto& buffered = bus.consumers[2]->in.receiveAllBuffered(2);
     check(buffered == other_expected, "receiveAllBuffered differs from queue transport");
-    check(drainTryReceive(bus.consumers[3]->in, 1) == other_expected,
+    check(drainTryReceive(bus.consumers[3]->in, 2) == other_expected,
           "shared replay was destructive across consumers");
     for (auto* consumer : bus.consumers) {
         check(consumer->in.queuedMessageCount() == 0,
