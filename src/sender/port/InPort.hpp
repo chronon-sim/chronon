@@ -60,6 +60,7 @@ concept SelectiveCancelKeyFn = requires(const T& data) {
 template <typename T>
 class InPort : public PortBase, public IMultiProducerPort {
     friend struct InPortSelectiveFlushTestAccess;
+    friend class Connection<T>;
 
 public:
     using StoredMessage = detail::PortEnvelope<T>;
@@ -135,6 +136,7 @@ public:
         lock_free_queue_ = false;
         queue_ = std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity_,
                                                                            cycle_strict_admission);
+        invalidatePortTransactions_();
     }
 
     /// True when this port drains a bounded lock-free SPSC ring (cross-thread,
@@ -165,11 +167,13 @@ public:
                 capacity_, min_usable_capacity);
             direct_spsc_queue_raw_ = direct.get();
             queue_ = std::move(direct);
+            invalidatePortTransactions_();
             return;
         }
         direct_spsc_queue_raw_ = nullptr;
         queue_ =
             std::make_unique<LockFreeQueueAdapter<StoredMessage>>(capacity_, min_usable_capacity);
+        invalidatePortTransactions_();
     }
 
     /**
@@ -186,6 +190,7 @@ public:
         if (multi_producer_queue_raw_) {
             multi_producer_queue_raw_->ensurePerThreadUsableCapacity(
                 min_per_thread_usable_capacity);
+            invalidatePortTransactions_();
             registerCyclePreparationIfBounded_();
             return;
         }
@@ -198,6 +203,7 @@ public:
             capacity_, min_per_thread_usable_capacity);
         multi_producer_queue_raw_ = mpq.get();
         queue_ = std::move(mpq);
+        invalidatePortTransactions_();
         registerCyclePreparationIfBounded_();
     }
 
@@ -230,7 +236,10 @@ public:
         if (!multi_producer_queue_raw_) {
             return SIZE_MAX;
         }
-        return multi_producer_queue_raw_->addProducerThread(thread_id, track_admission);
+        const size_t queue_id =
+            multi_producer_queue_raw_->addProducerThread(thread_id, track_admission);
+        invalidatePortTransactions_();
+        return queue_id;
     }
 
     /// Get the queue ID for a given producer key (multi-producer mode only).
@@ -388,6 +397,7 @@ public:
         // can be silently displaced.
         queue_->setCapacity(capacity);
         capacity_ = capacity;
+        invalidatePortTransactions_();
         registerCyclePreparationIfBounded_();
     }
 
@@ -402,6 +412,30 @@ public:
     /** Initialization-only connection metadata for selective-flush retirement. */
     void registerIncomingDelay(uint32_t delay) noexcept {
         max_incoming_delay_ = std::max(max_incoming_delay_, delay);
+    }
+
+    /**
+     * Register one connection in its producer-owned destination transaction
+     * group. Topology construction is single-threaded; after initialization a
+     * group is touched only by its source Unit's worker.
+     */
+    detail::ProducerDestinationTransactionState* registerTransactionProducer(
+        Unit* producer, ConnectionBase* connection) {
+        if (!producer || !connection) return nullptr;
+        if (!producer_transaction_states_) {
+            producer_transaction_states_ = std::make_unique<ProducerTransactionStates>();
+        }
+        for (auto& state : *producer_transaction_states_) {
+            if (state->producer != producer) continue;
+            state->connections.push_back({.connection = connection});
+            return state.get();
+        }
+
+        auto state = std::make_unique<detail::ProducerDestinationTransactionState>(producer);
+        state->connections.push_back({.connection = connection});
+        auto* result = state.get();
+        producer_transaction_states_->push_back(std::move(state));
+        return result;
     }
 
     /**
@@ -438,6 +472,7 @@ public:
                 queue_ = std::move(adapter);
             }
             shared_broadcast_queue_raw_->registerConnection(conn);
+            invalidatePortTransactions_();
         }
     }
 
@@ -660,6 +695,14 @@ public:
 private:
     uint64_t getCurrentCycle() const;
 
+    [[nodiscard]] uint32_t portTransactionEpoch_() const noexcept {
+        return port_transaction_epoch_.load(std::memory_order_acquire);
+    }
+
+    void invalidatePortTransactions_() noexcept {
+        port_transaction_epoch_.fetch_add(1, std::memory_order_release);
+    }
+
     void registerCyclePreparationIfBounded_() {
         if (cycle_preparation_registered_ || !multi_producer_queue_raw_ ||
             capacity_ == UNLIMITED_CAPACITY) {
@@ -851,6 +894,10 @@ private:
         nullptr;                    ///< Non-owning ptr for MPSC access
     bool lock_free_queue_ = false;  ///< True iff queue_ is the lock-free SPSC ring
     bool cycle_preparation_registered_ = false;
+    // Lives in the six-byte alignment hole before drain_scratch_. Even a
+    // continuously invalidated cycle-local claim cannot observe 2^32 control
+    // mutations before commit, so wrapping cannot resurrect a live claim.
+    std::atomic<uint32_t> port_transaction_epoch_{0};
     // Reused by receiveAllBuffered() to avoid per-cycle allocation; single-consumer,
     // so no synchronization is needed.
     std::vector<StoredMessage> drain_scratch_;
@@ -867,6 +914,12 @@ private:
     /// mpsc_connections_. Besides proving scheduler coverage, a live selective
     /// flush uses them to stabilize the heterogeneous-delay arrival frontier.
     std::vector<const std::atomic<uint64_t>*> mpsc_conn_progress_;
+
+    /// Lazily allocated topology-only ownership for cache-line-isolated,
+    /// producer-owned transaction control blocks.
+    using ProducerTransactionStates =
+        std::vector<std::unique_ptr<detail::ProducerDestinationTransactionState>>;
+    std::unique_ptr<ProducerTransactionStates> producer_transaction_states_;
 };
 
 template <typename T>
