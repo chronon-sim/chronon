@@ -16,10 +16,12 @@ excluded from `OFF` builds because their flush implementation calls
 only in `ON` builds; receiver-side flush and selective-cancellation coverage
 remains enabled in both configurations.
 
-`PortEnvelope<uint64_t>` is 48 bytes with cancellation enabled and 32 bytes
-when disabled. Receiver-side selective cancellation remains available. Exact
-OutPort cancellation is intentionally not reimplemented with a cycle timestamp
-because that cannot distinguish sends before and after a mid-cycle cancel.
+After the unified receiver-owned FlushRange change,
+`PortEnvelope<uint64_t>` is 40 bytes with cancellation enabled and 24 bytes
+when disabled; both layouts shed the former receiver-generation stamp.
+Receiver-side selective cancellation remains available. Exact OutPort
+cancellation is intentionally not reimplemented with a cycle timestamp because
+that cannot distinguish sends before and after a mid-cycle cancel.
 
 ## Clean Nucleus A/B
 

@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -36,10 +35,6 @@ public:
     using StoredMessage = PortEnvelope<T>;
     static constexpr bool resolves_sender_cancellation = true;
 
-    explicit SharedBroadcastQueueAdapter(
-        const std::atomic<uint64_t>* receiver_filter_generation) noexcept
-        : receiver_filter_generation_(receiver_filter_generation) {}
-
     void registerConnection(Connection<T>* connection) {
         if (!connection) {
             throw std::invalid_argument("shared broadcast connection is null");
@@ -52,12 +47,6 @@ public:
         connections_.insert(it, connection);
     }
 
-    void captureReceiverCancellationScope(uint64_t generation) noexcept {
-        for (auto* connection : connections_) {
-            connection->captureSharedReceiverCancellationScope(generation);
-        }
-    }
-
     // Shared payloads are published by OutPort directly into the transport.
     bool push(StoredMessage, uint64_t) override {
         throw std::logic_error("shared broadcast payloads must be published through OutPort");
@@ -65,19 +54,8 @@ public:
 
     template <typename Visitor>
     bool consumeReady(uint64_t current_cycle, Visitor&& visitor) {
-        const uint64_t generation =
-            receiver_filter_generation_
-                ? receiver_filter_generation_->load(std::memory_order_acquire)
-                : std::numeric_limits<uint64_t>::max();
-        return consumeReady(current_cycle, generation, std::forward<Visitor>(visitor));
-    }
-
-    template <typename Visitor>
-    bool consumeReady(uint64_t current_cycle, uint64_t receiver_filter_generation,
-                      Visitor&& visitor) {
         if constexpr (!std::is_copy_constructible_v<T>) {
             (void)current_cycle;
-            (void)receiver_filter_generation;
             (void)visitor;
             throw std::logic_error("shared broadcast requires copy-constructible payloads");
         } else {
@@ -87,11 +65,6 @@ public:
             StoredMessage message{.data = *candidate->data};
             message.enqueue_cycle = candidate->enqueue_cycle;
             message.sender_id = candidate->connection->connId();
-            if (receiver_filter_generation != std::numeric_limits<uint64_t>::max()) {
-                message.receiver_generation_snapshot =
-                    candidate->connection->sharedReceiverGenerationSnapshot(
-                        candidate->sequence, receiver_filter_generation);
-            }
             std::forward<Visitor>(visitor)(message);
             candidate->connection->popSharedBroadcast(candidate->sequence);
             return true;
@@ -192,7 +165,6 @@ private:
         return std::numeric_limits<size_t>::max();
     }
 
-    const std::atomic<uint64_t>* receiver_filter_generation_ = nullptr;
     std::vector<Connection<T>*> connections_;
 };
 

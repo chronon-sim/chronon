@@ -78,13 +78,15 @@ public:
     /**
      * Optimize destination port for same-thread access.
      *
-     * Switches InPort to use lock-free SingleThreadMessageQueue.
+     * Switches InPort to use the synchronization-free SingleThreadMessageQueue.
      * Call this during initialization when both source and destination
-     * are determined to be on the same thread (same cluster).
+     * are determined to be on the same worker. Epoch-free execution enables
+     * cycle-strict admission because separate local clusters can temporarily
+     * execute out of their normal sweep order.
      *
      * This keeps intra-cluster registered edges on the cheapest storage.
      */
-    virtual void optimizeForSameThread() = 0;
+    virtual void optimizeForSameThread(bool cycle_strict_admission = false) = 0;
 
     /**
      * Optimize destination port for cross-thread SPSC access.
@@ -208,7 +210,9 @@ public:
      * @param delay Number of cycles for message delivery
      */
     Connection(OutPort<T>* from, InPort<T>* to, uint32_t delay)
-        : from_(from), to_(to), delay_(delay) {}
+        : from_(from), to_(to), delay_(delay) {
+        if (to_) to_->registerIncomingDelay(delay_);
+    }
 
     bool transparentBroadcastEligible(size_t headroom_cycles) const noexcept override {
         if constexpr (!std::is_copy_constructible_v<T>) {
@@ -273,21 +277,6 @@ public:
         return static_cast<size_t>(tail - std::min(head, tail));
     }
 
-    void captureSharedReceiverCancellationScope(uint64_t generation) noexcept {
-        if (!shared_broadcast_) return;
-        shared_receiver_filter_generation_ = generation;
-        shared_receiver_cutoff_exclusive_ = shared_broadcast_->publishedExclusive();
-    }
-
-    [[nodiscard]] uint64_t sharedReceiverGenerationSnapshot(
-        uint64_t sequence, uint64_t filter_generation) const noexcept {
-        if (shared_receiver_filter_generation_ != filter_generation) {
-            return filter_generation;
-        }
-        return sequence < shared_receiver_cutoff_exclusive_ ? filter_generation
-                                                            : filter_generation + 1;
-    }
-
     /**
      * Transfer data through the connection.
      *
@@ -311,9 +300,8 @@ public:
         const uint64_t epoch_snapshot = cancel_epoch_.load(std::memory_order_acquire);
 #endif
         const uint64_t arrive_cycle = send_cycle + delay_;
-        // enqueue_cycle = sender's localCycle at push time. For StageSelective
-        // predicates this is the basis of the "was this in flight at flush?"
-        // decision. For LegacyFastPath policy ports the field is set but ignored.
+        // enqueue_cycle = sender's localCycle at push time. Every PortPolicy
+        // uses it as the deterministic selective-flush scope boundary.
         if (thread_queue_id_ != SIZE_MAX) {
             // MPSC mode: publish directly to this Connection's SPSC lane.
             // The InPort consumer performs the deterministic k-way merge, so
@@ -427,13 +415,13 @@ public:
 
     bool dependencyOnlyTransport() const noexcept override { return dependency_only_transport_; }
 
-    void optimizeForSameThread() override {
+    void optimizeForSameThread(bool cycle_strict_admission = false) override {
         if (dependency_only_transport_) return;
         thread_queue_id_ = SIZE_MAX;
         if (registered_capacity_.has_value()) {
             to_->setCapacity(*registered_capacity_);
         }
-        to_->useSingleThreadQueue();
+        to_->useSingleThreadQueue(cycle_strict_admission);
     }
 
     void optimizeForSPSC() override {
@@ -684,8 +672,6 @@ private:
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
     std::atomic<uint64_t> shared_cancel_before_{0};
 #endif
-    uint64_t shared_receiver_filter_generation_ = std::numeric_limits<uint64_t>::max();
-    uint64_t shared_receiver_cutoff_exclusive_ = 0;
     bool dependency_only_transport_ = false;
     std::optional<size_t> registered_capacity_;
     std::optional<size_t> registered_rate_;

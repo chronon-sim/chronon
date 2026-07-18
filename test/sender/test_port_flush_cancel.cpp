@@ -174,6 +174,7 @@ void test_inport_selective_cancel_basic() {
     }
 
     // Cancel messages with id < 30 via receiver-side API.
+    cons.setCycle(1);
     in.cancelOlderThan<&TaggedMsg::id>(static_cast<uint64_t>(30));
 
     // Receive at arrival cycle.
@@ -206,6 +207,7 @@ void test_inport_selective_cancel_monotonic_watermark() {
         assert(out.send(TaggedMsg{.id = id, .seq = id, .payload = 0}));
     }
 
+    cons.setCycle(1);
     // First watermark: cancel id < 10.
     in.cancelOlderThan<&TaggedMsg::id>(static_cast<uint64_t>(10));
     // Raise watermark: cancel id < 20.
@@ -241,6 +243,7 @@ void test_inport_selective_cancel_younger_than() {
     }
 
     // Drop keys > 30 (keep 10, 20, 30).
+    cons.setCycle(1);
     in.cancelYoungerThan<&TaggedMsg::id>(static_cast<uint64_t>(30));
 
     std::vector<uint64_t> received_ids;
@@ -257,7 +260,7 @@ void test_inport_selective_cancel_younger_than() {
 }
 
 void test_inport_selective_cancel_reset() {
-    std::cout << "Testing InPort selective cancel reset clears bounds/extractor... ";
+    std::cout << "Testing InPort selective reset cannot resurrect overlap... ";
 
     TestUnit prod("prod");
     TestUnit cons("cons");
@@ -265,19 +268,16 @@ void test_inport_selective_cancel_reset() {
     InPort<TaggedMsg> in{&cons, "in", 64};
     out.connect(&in, 4);
 
-    // First configure id-based filtering.
-    in.cancelOlderThan<&TaggedMsg::id>(static_cast<uint64_t>(20));
-
-    // Reset, then switch to seq-based filtering. Allowed after reset.
-    in.resetSelectiveCancellation();
-
-    // Send messages BEFORE the new cancel so they are in-flight when
-    // the seq-based policy fires (selective cancel scopes to in-flight).
     prod.setCycle(0);
-    assert(out.send(TaggedMsg{.id = 10, .seq = 150, .payload = 0}));  // keep (seq >= 100)
-    assert(out.send(TaggedMsg{.id = 30, .seq = 90, .payload = 0}));   // drop (seq < 100)
-    assert(out.send(TaggedMsg{.id = 5, .seq = 200, .payload = 0}));   // keep (seq >= 100)
+    assert(out.send(TaggedMsg{.id = 10, .seq = 150, .payload = 0}));
+    assert(out.send(TaggedMsg{.id = 30, .seq = 90, .payload = 0}));
+    assert(out.send(TaggedMsg{.id = 30, .seq = 150, .payload = 0}));
 
+    cons.setCycle(1);
+    in.cancelOlderThan<&TaggedMsg::id>(static_cast<uint64_t>(20));
+    // Compatibility reset is intentionally a no-op: clearing the first live
+    // predicate here would resurrect a zombie during an overlapping flush.
+    in.resetSelectiveCancellation();
     in.cancelOlderThan<&TaggedMsg::seq>(static_cast<uint64_t>(100));
 
     std::vector<uint64_t> received_ids;
@@ -285,10 +285,8 @@ void test_inport_selective_cancel_reset() {
         if (auto msg = in.tryReceive(4)) received_ids.push_back(msg->id);
     }
 
-    // id=10 must survive, proving prior id<20 bound was cleared.
-    assert(received_ids.size() == 2);
-    assert(received_ids[0] == 10);
-    assert(received_ids[1] == 5);
+    assert(received_ids.size() == 1);
+    assert(received_ids[0] == 30);
 
     std::cout << "PASSED\n";
 }
@@ -310,6 +308,7 @@ void test_inport_selective_cancel_with_epoch_cancel() {
     }
 
     // Selective cancel: drop id < 20 (drops id=10).
+    cons.setCycle(1);
     in.cancelOlderThan<&TaggedMsg::id>(static_cast<uint64_t>(20));
 
     // Epoch cancel: drops ALL remaining (ids 20, 30).
@@ -318,8 +317,7 @@ void test_inport_selective_cancel_with_epoch_cancel() {
     // Nothing should survive.
     assert(!in.tryReceive(5).has_value());
 
-    // New messages after epoch bump are in a new generation and should not
-    // be filtered (receiver-side selective cancel was scoped to in-flight).
+    // Messages enqueued in the flush cycle are post-flush and must survive.
     prod.setCycle(1);
     assert(out.send(TaggedMsg{.id = 15, .seq = 15, .payload = 0}));
     assert(out.send(TaggedMsg{.id = 25, .seq = 25, .payload = 0}));
@@ -329,7 +327,7 @@ void test_inport_selective_cancel_with_epoch_cancel() {
         if (auto msg = in.tryReceive(6)) received_ids.push_back(msg->id);
     }
 
-    // Both survive because selective cancel was scoped to old generation.
+    // Both survive because selective cancel is scoped to pre-flush cycles.
     assert(received_ids.size() == 2);
     assert(received_ids[0] == 15);
     assert(received_ids[1] == 25);
@@ -347,15 +345,16 @@ void test_inport_selective_cancel_scoped_to_inflight() {
     InPort<TaggedMsg> in{&cons, "in", 64};
     out.connect(&in, 5);
 
-    // In-flight generation at cycle 0.
+    // Messages enqueued before the receiver's flush cycle.
     prod.setCycle(0);
     assert(out.send(TaggedMsg{.id = 10, .seq = 10, .payload = 0}));
     assert(out.send(TaggedMsg{.id = 30, .seq = 30, .payload = 0}));
 
-    // InPort selective cancel defaults to in-flight scope.
+    // InPort selective cancel scopes to messages from earlier cycles.
+    cons.setCycle(1);
     in.cancelOlderThan<&TaggedMsg::id>(static_cast<uint64_t>(20));
 
-    // New generation (after cancellation call) should remain unaffected.
+    // Same-cycle and later enqueues remain unaffected.
     prod.setCycle(1);
     assert(out.send(TaggedMsg{.id = 15, .seq = 15, .payload = 0}));
     assert(out.send(TaggedMsg{.id = 25, .seq = 25, .payload = 0}));
@@ -378,8 +377,8 @@ void test_inport_selective_cancel_scoped_to_inflight() {
     std::cout << "PASSED\n";
 }
 
-void test_inport_selective_cancel_mismatched_keyfn_is_noop() {
-    std::cout << "Testing InPort mismatched KeyFn keeps original extractor... ";
+void test_inport_selective_cancel_keyfn_composition() {
+    std::cout << "Testing InPort independent KeyFn predicates compose... ";
 
     TestUnit prod("prod");
     TestUnit cons("cons");
@@ -392,14 +391,16 @@ void test_inport_selective_cancel_mismatched_keyfn_is_noop() {
     prod.setCycle(0);
     assert(out.send(TaggedMsg{.id = 10, .seq = 200, .payload = 0}));
     assert(out.send(TaggedMsg{.id = 30, .seq = 1, .payload = 0}));
+    assert(out.send(TaggedMsg{.id = 30, .seq = 200, .payload = 0}));
 
+    cons.setCycle(1);
     in.cancelOlderThan<&TaggedMsg::id>(static_cast<uint64_t>(20));
-    in.cancelOlderThan<&TaggedMsg::seq>(
-        static_cast<uint64_t>(100));  // ignored (mismatched extractor)
+    in.cancelOlderThan<&TaggedMsg::seq>(static_cast<uint64_t>(100));
 
     [[maybe_unused]] auto msg = in.tryReceive(4);
     assert(msg.has_value());
     assert(msg->id == 30);
+    assert(msg->seq == 200);
     assert(!in.tryReceive(4).has_value());
 
     std::cout << "PASSED\n";
@@ -440,9 +441,10 @@ void test_inport_selective_cancel_mpsc_thread_queues() {
     require(out1.send(TaggedMsg{.id = 30, .seq = 30, .payload = 0}),
             "failed to publish old retained MPSC message");
 
+    cons.setCycle(1);
     in.cancelOlderThan<&TaggedMsg::id>(static_cast<uint64_t>(20));
 
-    // Messages published after the cancellation enter the next generation.
+    // Messages published in the flush cycle bypass the older predicate.
     prod0.setCycle(1);
     prod1.setCycle(1);
     require(out0.send(TaggedMsg{.id = 15, .seq = 15, .payload = 0}),
@@ -628,13 +630,15 @@ int main() {
     std::cout << "=== Port Flush/Cancel Tests ===\n\n";
 
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
+    static_assert(sizeof(void*) != 8 || sizeof(detail::PortEnvelope<uint64_t>) == 40,
+                  "cancelable envelope should omit receiver flush metadata");
     test_delayed_cancel_drops_message();
     test_delayed_cancel_only_affects_prior_epoch();
     test_fanout_cancel_drops_all();
     test_delay0_cancel_before_receive();
 #else
-    static_assert(sizeof(detail::PortEnvelope<uint64_t>) == 32,
-                  "non-cancelable envelope should omit epoch pointer and snapshot");
+    static_assert(sizeof(detail::PortEnvelope<uint64_t>) == 24,
+                  "non-cancelable envelope should contain only payload and routing metadata");
 #endif
     test_inport_flush_drops_future_messages();
     test_inport_selective_cancel_basic();
@@ -645,7 +649,7 @@ int main() {
     test_inport_selective_cancel_with_epoch_cancel();
 #endif
     test_inport_selective_cancel_scoped_to_inflight();
-    test_inport_selective_cancel_mismatched_keyfn_is_noop();
+    test_inport_selective_cancel_keyfn_composition();
     test_inport_selective_cancel_mpsc_thread_queues();
     test_receiver_filter_cancels_rejected_messages();
     test_receiver_filter_direct_spsc_path();

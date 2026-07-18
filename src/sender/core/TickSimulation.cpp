@@ -680,11 +680,16 @@ void TickSimulation::optimizeConnectionQueuesForThreads() {
         unit_to_idx[static_cast<Unit*>(unit_ptrs_[i])] = i;
     }
 
-    auto getThreadForUnit = [&](Unit* unit) -> size_t {
+    auto getClusterForUnit = [&](Unit* unit) -> size_t {
         auto it = unit_to_idx.find(unit);
         if (it == unit_to_idx.end()) return SIZE_MAX;
         size_t cluster = unit_to_cluster_[it->second];
-        if (cluster >= cluster_to_thread_.size()) return SIZE_MAX;
+        return cluster < cluster_to_thread_.size() ? cluster : SIZE_MAX;
+    };
+
+    auto getThreadForUnit = [&](Unit* unit) -> size_t {
+        const size_t cluster = getClusterForUnit(unit);
+        if (cluster == SIZE_MAX) return SIZE_MAX;
         return cluster_to_thread_[cluster];
     };
 
@@ -723,7 +728,16 @@ void TickSimulation::optimizeConnectionQueuesForThreads() {
 
         if (all_same_thread) {
             if (conns.size() == 1) {
-                conns[0]->optimizeForSameThread();
+                // Epoch-free workers may skip a floor-blocked producer cluster
+                // and run its local consumer first in the same sweep. Preserve
+                // cycle-start admission without charging same-cluster or
+                // barrier-only edges for bookkeeping they cannot need.
+                const size_t src_cluster = getClusterForUnit(conns[0]->source());
+                const size_t dst_cluster = getClusterForUnit(dst);
+                const bool cycle_strict_admission =
+                    config_.enable_lookahead && src_cluster != SIZE_MAX &&
+                    dst_cluster != SIZE_MAX && src_cluster != dst_cluster;
+                conns[0]->optimizeForSameThread(cycle_strict_admission);
                 same_thread_count += 1;
             } else {
                 // Multi-producer fan-in (even on one thread): route through

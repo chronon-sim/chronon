@@ -8,9 +8,9 @@
 
 // test_stage_selective_port.cpp
 //
-// Tests for PortPolicy::StageSelective: enqueue_cycle stamping, StagePredicate
-// install/retire/shouldCancel, overlapping flushes (#7), and the removal of
-// sender-side cancellation filtering (#8).
+// Compatibility coverage for PortPolicy::StageSelective: enqueue-cycle
+// stamping, receiver-owned predicate install/retire/evaluation, overlapping
+// flushes (#7), and the removal of sender-side filtering (#8).
 
 #include <cstddef>
 #include <cstdint>
@@ -299,8 +299,8 @@ void test_older_than_timestamp_scope() {
     std::cout << "PASSED\n";
 }
 
-void test_mismatched_extractor_does_not_install_predicate() {
-    std::cout << "Testing StageSelective mismatched extractor rejection... ";
+void test_independent_extractors_compose() {
+    std::cout << "Testing StageSelective independent extractor composition... ";
 
     TestUnit prod("prod");
     TestUnit cons("cons");
@@ -310,15 +310,17 @@ void test_mismatched_extractor_does_not_install_predicate() {
     out.connect(&in, /*delay=*/1);
 
     prod.setCycle(2);
-    EXPECT(out.send(TaggedMsg{.key = 10, .payload = 100}), "push message");
+    EXPECT(out.send(TaggedMsg{.key = 10, .payload = 100}), "push rejected payload");
+    EXPECT(out.send(TaggedMsg{.key = 10, .payload = 250}), "push retained payload");
 
     cons.setCycle(3);
     in.cancelYoungerThan<&TaggedMsg::getKey>(uint64_t{20});
     in.cancelOlderThan<&TaggedMsg::getPayload>(uint64_t{200});
 
     const auto value = in.tryReceive(3);
-    EXPECT(value.has_value(), "mismatched extractor must not install a lower-bound predicate");
-    EXPECT(value->key == 10, "original key predicate must remain authoritative");
+    EXPECT(value.has_value(), "message satisfying both predicates must survive");
+    EXPECT(value->payload == 250, "payload predicate did not compose with key predicate");
+    EXPECT(!in.tryReceive(3).has_value(), "message rejected by either predicate survived");
 
     std::cout << "PASSED\n";
 }
@@ -332,6 +334,7 @@ void test_fixed_delay_mpsc_frontier_flush() {
 
     TestUnit cons("cons");
     InPort<TaggedMsg> in{&cons, "in", 64, PortPolicy::StageSelective};
+    in.registerIncomingDelay(1);
     in.useMultiProducerQueue(/*min_per_thread_usable_capacity=*/4);
 
     std::vector<size_t> lanes;
@@ -376,7 +379,7 @@ int main() {
     test_sender_filter_removal();
     test_range_flush_semantic();
     test_older_than_timestamp_scope();
-    test_mismatched_extractor_does_not_install_predicate();
+    test_independent_extractors_compose();
     test_fixed_delay_mpsc_frontier_flush();
     std::cout << "All StageSelective port tests passed.\n";
     return 0;

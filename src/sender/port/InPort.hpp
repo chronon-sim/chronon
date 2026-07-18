@@ -16,7 +16,6 @@
 #include <functional>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -31,6 +30,8 @@
 #include "detail/SharedBroadcastQueueAdapter.hpp"
 
 namespace chronon::sender {
+
+struct InPortSelectiveFlushTestAccess;
 
 namespace detail {
 
@@ -58,6 +59,8 @@ concept SelectiveCancelKeyFn = requires(const T& data) {
  */
 template <typename T>
 class InPort : public PortBase, public IMultiProducerPort {
+    friend struct InPortSelectiveFlushTestAccess;
+
 public:
     using StoredMessage = detail::PortEnvelope<T>;
     static constexpr size_t UNLIMITED_CAPACITY = std::numeric_limits<size_t>::max();
@@ -123,14 +126,15 @@ public:
      *
      * WARNING: Must be called before simulation starts (queue must be empty).
      */
-    void useSingleThreadQueue() {
+    void useSingleThreadQueue(bool cycle_strict_admission = false) {
         if (shared_broadcast_queue_raw_) {
             throw std::logic_error("cannot replace an active shared broadcast transport");
         }
         multi_producer_queue_raw_ = nullptr;
         direct_spsc_queue_raw_ = nullptr;
         lock_free_queue_ = false;
-        queue_ = std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity_);
+        queue_ = std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity_,
+                                                                           cycle_strict_admission);
     }
 
     /// True when this port drains a bounded lock-free SPSC ring (cross-thread,
@@ -251,18 +255,6 @@ public:
         }
         StoredMessage msg{.data = std::move(data)};
         msg.enqueue_cycle = enqueue_cycle;
-        // Only LegacyFastPath uses receiver_generation_snapshot. Skipping the
-        // stamp on StageSelective avoids the cross-thread acquire-load of
-        // receiver_enqueue_generation_ entirely (the read identified in #8).
-        if (policy_ == PortPolicy::LegacyFastPath) {
-            stampReceiverGeneration_(msg);
-        }
-        // StageSelective: NEVER consult receiver state from the sender
-        // thread; that read is what races in #8. The receiver applies the
-        // predicate when it pops.
-        if (policy_ == PortPolicy::LegacyFastPath && isReceiverCanceled_(msg)) {
-            return true;
-        }
         return multi_producer_queue_raw_->pushFromThread(queue_id, std::move(msg), arrive_cycle,
                                                          sender_id);
     }
@@ -284,13 +276,7 @@ public:
         (void)epoch_snapshot;
 #endif
         msg.enqueue_cycle = enqueue_cycle;
-        if (policy_ == PortPolicy::LegacyFastPath) {
-            stampReceiverGeneration_(msg);
-        }
         if (detail::isCanceled(msg)) {
-            return true;
-        }
-        if (policy_ == PortPolicy::LegacyFastPath && isReceiverCanceled_(msg)) {
             return true;
         }
         return multi_producer_queue_raw_->pushFromThread(queue_id, std::move(msg), arrive_cycle,
@@ -321,8 +307,8 @@ public:
      * Cancelable enqueue with explicit enqueue_cycle stamp.
      *
      * Connection::transfer() uses this overload (computed as send_cycle, which
-     * is the producer's localCycle) so that StageSelective predicates can
-     * decide whether the message predates the most recent flush.
+     * is the producer's localCycle) so receiver-owned predicates can decide
+     * whether the message predates a flush.
      */
     bool enqueueCancelable(T data, uint64_t arrive_cycle, const std::atomic<uint64_t>* cancel_epoch,
                            uint64_t epoch_snapshot, uint64_t enqueue_cycle,
@@ -405,6 +391,11 @@ public:
      */
     size_t admissionCapacity() const noexcept { return effectiveCapacity_(); }
 
+    /** Initialization-only connection metadata for selective-flush retirement. */
+    void registerIncomingDelay(uint32_t delay) noexcept {
+        max_incoming_delay_ = std::max(max_incoming_delay_, delay);
+    }
+
     /**
      * Register an MPSC-mode Connection with this InPort. Connections are kept
      * sorted by conn_id for stable topology/progress bookkeeping; payload
@@ -431,8 +422,7 @@ public:
                 if (queue_->size() != 0 || !mpsc_connections_.empty()) {
                     throw std::logic_error("cannot enable shared broadcast on a non-empty InPort");
                 }
-                auto adapter = std::make_unique<detail::SharedBroadcastQueueAdapter<T>>(
-                    &receiver_filter_generation_);
+                auto adapter = std::make_unique<detail::SharedBroadcastQueueAdapter<T>>();
                 shared_broadcast_queue_raw_ = adapter.get();
                 direct_spsc_queue_raw_ = nullptr;
                 multi_producer_queue_raw_ = nullptr;
@@ -440,16 +430,6 @@ public:
                 queue_ = std::move(adapter);
             }
             shared_broadcast_queue_raw_->registerConnection(conn);
-
-            // Unit::initialize() runs before transport discovery. Catch a
-            // newly attached lane up to any in-flight cancellation scope.
-            if (policy_ == PortPolicy::LegacyFastPath) {
-                const uint64_t generation =
-                    receiver_filter_generation_.load(std::memory_order_acquire);
-                if (generation != std::numeric_limits<uint64_t>::max()) {
-                    conn->captureSharedReceiverCancellationScope(generation);
-                }
-            }
         }
     }
 
@@ -464,8 +444,9 @@ public:
 
     /// Resolve one producer completed_cycle atomic per MPSC connection (by the
     /// connection's source unit), aligned with mpsc_connections_ (conn_id order).
-    /// Retained for the epoch-free safety gate: every direct lane must have a
-    /// scheduler progress dependency before producer/consumer run-ahead is used.
+    /// Used by the epoch-free safety gate and by selective-flush retirement:
+    /// every direct lane must have a scheduler progress publication before a
+    /// visible future head can prove that all pre-flush publishes are complete.
     void setProducerProgress(
         const std::unordered_map<Unit*, const std::atomic<uint64_t>*>& src_progress) override {
         mpsc_conn_progress_.clear();
@@ -551,6 +532,7 @@ public:
                 result.push_back(std::move(msg.data));
             }
         }
+        if (!drain_scratch_.empty()) retireSelectiveFlushesAfterDrain_(current_cycle);
         return result;
     }
 
@@ -571,6 +553,7 @@ public:
                 recv_scratch_.push_back(std::move(msg.data));
             }
         }
+        if (!drain_scratch_.empty()) retireSelectiveFlushesAfterDrain_(current_cycle);
         return recv_scratch_;
     }
     const std::vector<T>& receiveAllBuffered() { return receiveAllBuffered(getCurrentCycle()); }
@@ -603,109 +586,55 @@ public:
     }
 
     /**
-     * Selectively cancel in-flight messages where KeyFn(data) < watermark.
-     *
-     * Receiver-side selective cancellation defaults to in-flight scope: the
-     * first cancellation call captures the current enqueue generation so
-     * future messages are unaffected.
+     * Apply one receiver-owned range predicate to messages enqueued before
+     * the current receiver cycle. Messages enqueued in this cycle or later are
+     * post-flush and bypass it. The operation is independent of PortPolicy,
+     * queue backend, producer count, and edge delay.
      */
+    template <auto KeyFn>
+        requires detail::SelectiveCancelKeyFn<KeyFn, T>
+    void flush(FlushRange keep_range) {
+        constexpr auto extractor = &extractSelectiveFlushKey_<KeyFn>;
+        const uint64_t cycle = getCurrentCycle();
+        selective_flush_state_.install(cycle, keep_range, extractor);
+        traceSelectiveFlushInstall_(cycle, extractor);
+    }
+
+    /// Compatibility spelling: cancel keys strictly below @p watermark.
     template <auto KeyFn, typename K>
         requires detail::SelectiveCancelKeyFn<KeyFn, T>
     void cancelOlderThan(K watermark) {
-        if (policy_ != PortPolicy::LegacyFastPath) {
-            // StageSelective: install the lower half of a timestamp-scoped
-            // keep range. A same-cycle cancelYoungerThan call intersects with
-            // this predicate in-place, so cancelOutsideInclusive remains one
-            // receiver-side predicate and never adds a sender-side atomic read.
-            if (!configureReceiverSelectiveExtractorAndScope_<KeyFn>()) {
-                return;
-            }
-            const uint64_t cycle = getCurrentCycle();
-            const uint64_t threshold = static_cast<uint64_t>(watermark);
-            stage_state_.install(cycle, threshold, std::numeric_limits<uint64_t>::max());
-            traceStageInstall_(cycle);
-            return;
-        }
-        if (!configureReceiverSelectiveExtractorAndScope_<KeyFn>()) {
-            return;
-        }
-        const uint64_t threshold = static_cast<uint64_t>(watermark);
-        auto cur = receiver_min_keep_key_.load(std::memory_order_relaxed);
-        while (cur < threshold &&
-               !receiver_min_keep_key_.compare_exchange_weak(
-                   cur, threshold, std::memory_order_release, std::memory_order_relaxed));
+        flush<KeyFn>(FlushRange::olderThan(watermark));
     }
 
-    /// Selectively cancel in-flight messages where KeyFn(data) > watermark.
+    /// Compatibility spelling: cancel keys strictly above @p watermark.
     template <auto KeyFn, typename K>
         requires detail::SelectiveCancelKeyFn<KeyFn, T>
     void cancelYoungerThan(K watermark) {
-        if (policy_ != PortPolicy::LegacyFastPath) {
-            // StageSelective: install a per-flush predicate. Each predicate
-            // is independent and retired pop-driven (see StagePredicate).
-            // No generation bumps, no mutex, no bound mutation that #7
-            // races against.
-            //
-            // We still need a key extractor; ensure it's set. We pass through
-            // configureReceiverSelectiveExtractorAndScope_ for that side
-            // effect, but its generation/scope mutations are harmless under
-            // StageSelective (they are simply ignored by the StageSelective
-            // path of isReceiverCanceled_).
-            if (!configureReceiverSelectiveExtractorAndScope_<KeyFn>()) {
-                return;
-            }
-            const uint64_t cycle = getCurrentCycle();
-            const uint64_t thr = static_cast<uint64_t>(watermark);
-            stage_state_.install(cycle, 0, thr);
-            traceStageInstall_(cycle);
-            return;
-        }
-        if (!configureReceiverSelectiveExtractorAndScope_<KeyFn>()) {
-            return;
-        }
-        const uint64_t threshold = static_cast<uint64_t>(watermark);
-        auto cur = receiver_max_keep_key_.load(std::memory_order_relaxed);
-        while (cur > threshold &&
-               !receiver_max_keep_key_.compare_exchange_weak(
-                   cur, threshold, std::memory_order_release, std::memory_order_relaxed));
+        flush<KeyFn>(FlushRange::youngerThan(watermark));
     }
 
-    /// Keep only keys in [min_keep, max_keep] for current in-flight generation.
+    /// Compatibility spelling: keep only [min_keep, max_keep].
     template <auto KeyFn, typename MinK, typename MaxK>
         requires detail::SelectiveCancelKeyFn<KeyFn, T>
     void cancelOutsideInclusive(MinK min_keep, MaxK max_keep) {
-        cancelOlderThan<KeyFn>(min_keep);
-        cancelYoungerThan<KeyFn>(max_keep);
+        flush<KeyFn>(FlushRange::outsideInclusive(min_keep, max_keep));
     }
 
     /**
-     * Clear receiver-side selective cancellation bounds and extractor.
-     *
-     * StageSelective: this is a NO-OP. Predicates are scoped per-flush and
-     * retired automatically pop-driven by shouldCancel(). Clearing
-     * live predicates here would re-open the #7 overlapping-flush zombie
-     * bug: a second flush's reset would erase the first flush's strict
-     * max_keep, allowing zombies enqueued between the two flushes to bypass
-     * the stricter predicate. The caller is expected to continue invoking
-     * resetSelectiveCancellation() + cancelYoungerThan() in that order
-     * (for backward compat with the LegacyFastPath path) — we simply ignore the
-     * reset and let install() accumulate predicates into the slots array.
+     * Compatibility no-op. Selective predicates are immutable, independently
+     * scoped, and retire automatically; clearing live state could resurrect a
+     * message canceled by an overlapping flush.
      */
-    void resetSelectiveCancellation() {
-        if (policy_ != PortPolicy::LegacyFastPath) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(receiver_cancel_mutex_);
-        receiver_min_keep_key_.store(0, std::memory_order_release);
-        receiver_max_keep_key_.store(std::numeric_limits<uint64_t>::max(),
-                                     std::memory_order_release);
-        receiver_key_extractor_.store(nullptr, std::memory_order_release);
-        receiver_filter_generation_.store(std::numeric_limits<uint64_t>::max(),
-                                          std::memory_order_release);
-    }
+    void resetSelectiveCancellation() noexcept {}
 
 private:
     uint64_t getCurrentCycle() const;
+
+    template <auto KeyFn>
+    static uint64_t extractSelectiveFlushKey_(const T& data) {
+        return static_cast<uint64_t>(std::invoke(KeyFn, data));
+    }
 
     template <typename Filter>
     [[gnu::noinline]] std::optional<T> tryReceiveFromSharedQueue_(uint64_t current_cycle,
@@ -725,18 +654,9 @@ private:
                 }
                 result.emplace(std::move(msg.data));
             };
-            bool consumed;
-            if constexpr (std::is_same_v<std::remove_cvref_t<Queue>,
-                                         detail::SharedBroadcastQueueAdapter<T>>) {
-                const uint64_t generation =
-                    policy_ == PortPolicy::LegacyFastPath
-                        ? receiver_filter_generation_.load(std::memory_order_acquire)
-                        : std::numeric_limits<uint64_t>::max();
-                consumed = queue.consumeReady(current_cycle, generation, visit);
-            } else {
-                consumed = queue.consumeReady(current_cycle, visit);
-            }
+            const bool consumed = queue.consumeReady(current_cycle, visit);
             if (!consumed) return std::nullopt;
+            retireSelectiveFlushesAtFront_(queue, current_cycle);
             if (result) return result;
         }
     }
@@ -757,11 +677,12 @@ private:
         while (true) {
             auto msg = queue.tryPop(current_cycle);
             if (!msg.has_value()) return std::nullopt;
-            if (detail::isCanceled(*msg) || isReceiverCanceled_(*msg) ||
-                !std::invoke(filter, std::as_const(msg->data))) {
-                continue;
+            const bool rejected = detail::isCanceled(*msg) || isReceiverCanceled_(*msg) ||
+                                  !std::invoke(filter, std::as_const(msg->data));
+            retireSelectiveFlushesAtFront_(queue, current_cycle);
+            if (!rejected) {
+                return std::move(msg->data);
             }
-            return std::move(msg->data);
         }
     }
 
@@ -775,23 +696,78 @@ private:
         queue_->popAllInto(out, current_cycle);
     }
 
-    void traceStageInstall_(uint64_t cycle) const noexcept {
+    void retireSelectiveFlushesAfterDrain_(uint64_t current_cycle) noexcept {
+        if (selective_flush_state_.empty()) return;
+        if (shared_broadcast_queue_raw_) {
+            retireSelectiveFlushesAtFront_(*shared_broadcast_queue_raw_, current_cycle);
+        } else {
+            retireSelectiveFlushesAtFront_(*queue_, current_cycle);
+        }
+    }
+
+    template <typename Queue>
+    void retireSelectiveFlushesAtFront_(const Queue& queue,
+                                        uint64_t drained_through_cycle) noexcept {
+        if (selective_flush_state_.empty()) return;
+        auto front_arrival = queue.minArrivalCycle();
+        const uint64_t empty_frontier =
+            drained_through_cycle == std::numeric_limits<uint64_t>::max()
+                ? drained_through_cycle
+                : drained_through_cycle + 1;
+        uint64_t retirement_frontier = front_arrival.value_or(empty_frontier);
+        if (!selective_flush_state_.hasRetirementCandidate(retirement_frontier,
+                                                           max_incoming_delay_))
+            return;
+
+        const auto producer_progress_floor = mpscProducerProgressFloor_();
+        if (producer_progress_floor) {
+            // A producer publishes its queue entry before release-publishing
+            // completed_cycle. Re-read the frontier after acquiring progress
+            // so an old arrival published between the first head read and the
+            // progress read cannot hide behind a stale future head.
+            front_arrival = queue.minArrivalCycle();
+            retirement_frontier = front_arrival.value_or(empty_frontier);
+        }
+        selective_flush_state_.retireBeforeArrival(retirement_frontier, max_incoming_delay_,
+                                                   producer_progress_floor);
+    }
+
+    [[nodiscard]] std::optional<uint64_t> mpscProducerProgressFloor_() const noexcept {
+        if (!multi_producer_queue_raw_ || mpsc_conn_progress_.empty() ||
+            mpsc_conn_progress_.size() != mpsc_connections_.size()) {
+            return std::nullopt;
+        }
+
+        uint64_t floor = std::numeric_limits<uint64_t>::max();
+        for (const auto* progress : mpsc_conn_progress_) {
+            // An unresolved set vetoes epoch-free execution, so its queue is
+            // drained by a globally synchronized mode and needs no progress gate.
+            if (!progress) return std::nullopt;
+            floor = std::min(floor, progress->load(std::memory_order_acquire));
+        }
+        return floor;
+    }
+
+    void traceSelectiveFlushInstall_(
+        uint64_t cycle,
+        typename detail::SelectiveFlushPredicate<T>::KeyExtractor extractor) const noexcept {
         if (!stageTraceEnabled_() || !stageTracePortMatches_(name_)) {
             return;
         }
-        uint64_t min_keep = 0;
-        uint64_t max_keep = std::numeric_limits<uint64_t>::max();
-        for (const auto& predicate : stage_state_.slots) {
-            if (predicate.flush_cycle == cycle) {
-                min_keep = predicate.min_keep;
-                max_keep = predicate.max_keep;
+        FlushRange range =
+            FlushRange::outsideInclusive(uint64_t{0}, std::numeric_limits<uint64_t>::max());
+        for (const auto& predicate : selective_flush_state_.slots) {
+            if (predicate.flush_cycle == cycle && predicate.key_extractor == extractor) {
+                range = predicate.keep_range;
                 break;
             }
         }
-        std::fprintf(stderr, "[STAGE] install port=%s cycle=%lu keep=[%lu,%lu] live=%zu hwm=%zu\n",
+        std::fprintf(stderr,
+                     "[STAGE] install port=%s cycle=%lu keep=%c%lu,%lu%c live=%zu hwm=%zu\n",
                      name_.c_str(), static_cast<unsigned long>(cycle),
-                     static_cast<unsigned long>(min_keep), static_cast<unsigned long>(max_keep),
-                     stage_state_.active_slot_count(), stage_state_.high_water);
+                     range.minInclusive() ? '[' : '(', static_cast<unsigned long>(range.minKeep()),
+                     static_cast<unsigned long>(range.maxKeep()), range.maxInclusive() ? ']' : ')',
+                     selective_flush_state_.active_slot_count(), selective_flush_state_.high_water);
     }
 
     /// Effective backpressure bound = user-set capacity, but never larger
@@ -805,24 +781,9 @@ private:
     }
 
     bool enqueueStored_(StoredMessage msg, uint64_t arrive_cycle) {
-        // See pushToThreadQueue for rationale: only LegacyFastPath consumes
-        // receiver_generation_snapshot. Skipping the cross-thread acquire-
-        // load on StageSelective makes the "no sender-side
-        // receiver-atomic read" claim true at the C++ statement level (#8).
-        if (policy_ == PortPolicy::LegacyFastPath) {
-            stampReceiverGeneration_(msg);
-        }
-
-        // Drop immediately if already canceled.
-        // - cancel_epoch check is cheap and policy-independent.
-        // - Receiver-side selective filter is consulted only in the LegacyFastPath
-        //   path. The StageSelective paths apply the predicate
-        //   exclusively at pop time so the sender thread never reads receiver
-        //   state (eliminates the #8 race).
+        // Sender-owned epoch cancellation may be resolved before publication.
+        // Receiver selective-flush state is intentionally never consulted here.
         if (detail::isCanceled(msg)) {
-            return true;
-        }
-        if (policy_ == PortPolicy::LegacyFastPath && isReceiverCanceled_(msg)) {
             return true;
         }
 
@@ -832,114 +793,15 @@ private:
         return queue_->push(std::move(msg), arrive_cycle);
     }
 
-    using ReceiverSelectiveKeyExtractor = uint64_t (*)(const T&);
-
-    template <auto KeyFn>
-        requires detail::SelectiveCancelKeyFn<KeyFn, T>
-    bool configureReceiverSelectiveExtractorAndScope_() {
-        constexpr ReceiverSelectiveKeyExtractor new_extractor = +[](const T& data) -> uint64_t {
-            return static_cast<uint64_t>(std::invoke(KeyFn, data));
-        };
-
-        std::lock_guard<std::mutex> lock(receiver_cancel_mutex_);
-
-        auto existing = receiver_key_extractor_.load(std::memory_order_acquire);
-        if (!existing) {
-            receiver_key_extractor_.store(new_extractor, std::memory_order_release);
-            existing = new_extractor;
-        }
-
-        // Keep the first extractor for consistency.
-        if (existing != new_extractor) {
-            return false;
-        }
-
-        ensureReceiverScopeToInFlightLocked_();
-        return true;
-    }
-
-    void ensureReceiverScopeToInFlightLocked_() {
-        const uint64_t all_generations = std::numeric_limits<uint64_t>::max();
-        if (receiver_filter_generation_.load(std::memory_order_acquire) != all_generations) {
-            return;
-        }
-
-        // Always bump the enqueue generation so future messages are stamped
-        // with a different generation and won't be subject to the current
-        // cancellation policy. Critical for flush recovery: after a flush,
-        // new instructions must not be canceled by the old policy.
-        const uint64_t generation =
-            receiver_enqueue_generation_.fetch_add(1, std::memory_order_acq_rel);
-        receiver_filter_generation_.store(generation, std::memory_order_release);
-        if (shared_broadcast_queue_raw_) {
-            shared_broadcast_queue_raw_->captureReceiverCancellationScope(generation);
-        }
-    }
-
-    /// Non-const: the StageSelective path mutates stage_state_ (lazy
-    /// retirement of obsolete predicates). Safe because stage_state_ is
-    /// touched only from the receiver thread.
     [[nodiscard]] bool isReceiverCanceled_(const StoredMessage& msg) noexcept {
-        if (policy_ != PortPolicy::LegacyFastPath) {
-            // StageSelective: predicates are checked here.
-            // No mutex, no atomic; stage_state_ is touched only by the
-            // receiver thread (install and shouldCancel; retirement is
-            // pop-driven inside shouldCancel).
-            auto key_fn = receiver_key_extractor_.load(std::memory_order_acquire);
-            if (!key_fn) {
-                return false;
-            }
-            if (stage_state_.slots.empty()) {
-                return false;
-            }
-            const uint64_t key = key_fn(msg.data);
-            const bool cancel = stage_state_.shouldCancel(msg.enqueue_cycle, key);
-            if (stageTraceEnabled_() && stageTracePortMatches_(name_)) {
-                char slots_buf[512];
-                int off = 0;
-                for (size_t i = 0; i < stage_state_.slots.size() && off < 400; ++i) {
-                    off += std::snprintf(
-                        slots_buf + off, sizeof(slots_buf) - off, " s%zu{fc=%lu,keep=[%lu,%lu]}", i,
-                        static_cast<unsigned long>(stage_state_.slots[i].flush_cycle),
-                        static_cast<unsigned long>(stage_state_.slots[i].min_keep),
-                        static_cast<unsigned long>(stage_state_.slots[i].max_keep));
-                }
-                if (off == 0) {
-                    slots_buf[0] = '\0';
-                }
-                std::fprintf(stderr,
-                             "[STAGE] check   port=%s enq_cyc=%lu key=%lu result=%s live=%zu%s\n",
-                             name_.c_str(), static_cast<unsigned long>(msg.enqueue_cycle),
-                             static_cast<unsigned long>(key), cancel ? "CANCEL" : "pass ",
-                             stage_state_.active_slot_count(), slots_buf);
-            }
-            return cancel;
+        if (selective_flush_state_.empty()) return false;
+        const bool cancel = selective_flush_state_.shouldCancel(msg);
+        if (stageTraceEnabled_() && stageTracePortMatches_(name_)) {
+            std::fprintf(stderr, "[STAGE] check port=%s enq_cyc=%lu result=%s live=%zu\n",
+                         name_.c_str(), static_cast<unsigned long>(msg.enqueue_cycle),
+                         cancel ? "CANCEL" : "pass ", selective_flush_state_.active_slot_count());
         }
-
-        auto key_fn = receiver_key_extractor_.load(std::memory_order_acquire);
-        if (!key_fn) {
-            return false;
-        }
-
-        const uint64_t filter_generation =
-            receiver_filter_generation_.load(std::memory_order_acquire);
-        // Messages from generations NEWER than the filter should bypass
-        // cancellation (they were enqueued after the flush). Messages from
-        // the filter generation or any OLDER generation must be checked.
-        if (filter_generation != std::numeric_limits<uint64_t>::max() &&
-            msg.receiver_generation_snapshot > filter_generation) {
-            return false;
-        }
-
-        const uint64_t key = key_fn(msg.data);
-        const uint64_t min_keep = receiver_min_keep_key_.load(std::memory_order_acquire);
-        const uint64_t max_keep = receiver_max_keep_key_.load(std::memory_order_acquire);
-        return key < min_keep || key > max_keep;
-    }
-
-    void stampReceiverGeneration_(StoredMessage& msg) {
-        msg.receiver_generation_snapshot =
-            receiver_enqueue_generation_.load(std::memory_order_acquire);
+        return cancel;
     }
 
     size_t capacity_;
@@ -954,22 +816,17 @@ private:
     // so no synchronization is needed.
     std::vector<StoredMessage> drain_scratch_;
     std::vector<T> recv_scratch_;
-    mutable std::mutex receiver_cancel_mutex_;
-    std::atomic<uint64_t> receiver_min_keep_key_{0};
-    std::atomic<uint64_t> receiver_max_keep_key_{std::numeric_limits<uint64_t>::max()};
-    std::atomic<ReceiverSelectiveKeyExtractor> receiver_key_extractor_{nullptr};
-    std::atomic<uint64_t> receiver_filter_generation_{std::numeric_limits<uint64_t>::max()};
-    std::atomic<uint64_t> receiver_enqueue_generation_{0};
-    /// StageSelective: per-port live flush predicates. Touched only from the
-    /// receiver thread (install/retire/shouldCancel). No locking needed.
-    detail::InPortStageCancelState stage_state_{};
+    /// Initialization-only maximum; read by the destination Unit thereafter.
+    uint32_t max_incoming_delay_ = 0;
+    /// Installed, evaluated, and retired only by the destination Unit.
+    detail::InPortSelectiveFlushState<T> selective_flush_state_{};
 
     /// Direct MPSC lane registry, sorted by topology-stable conn_id.
     std::vector<ConnectionBase*> mpsc_connections_;
 
     /// Per-connection producer completed_cycle atomics, aligned with
-    /// mpsc_connections_. Used only to prove the epoch-free scheduler has a
-    /// progress dependency for every lane.
+    /// mpsc_connections_. Besides proving scheduler coverage, a live selective
+    /// flush uses them to stabilize the heterogeneous-delay arrival frontier.
     std::vector<const std::atomic<uint64_t>*> mpsc_conn_progress_;
 };
 

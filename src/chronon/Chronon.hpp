@@ -72,6 +72,7 @@ using FactoryRegistry = sender::factory::SenderFactoryRegistry;
 // --- Port ---
 using sender::Connection;
 using sender::DelayOneBroadcastFabric;
+using sender::FlushRange;
 using sender::InPort;
 using sender::OutPort;
 using sender::PortBase;

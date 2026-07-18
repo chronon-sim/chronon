@@ -32,6 +32,10 @@ struct EpochFreeDifferentialTestAccess {
     static bool migrateAtRunBoundary(TickSimulation& simulation, Unit* unit, size_t target_thread) {
         return simulation.forceEpochFreeMigrationAtBoundary_(unit, target_thread);
     }
+
+    static std::string vetoReason(const TickSimulation& simulation) {
+        return simulation.epochFreeVetoReason_();
+    }
 };
 
 namespace test {
@@ -333,7 +337,8 @@ std::vector<RunArtifact> runEpochFreeMatrix(const TickSimulationConfig& base_con
             if (mode.kind != EpochFreeRunKind::SequentialReference &&
                 simulation.epochFreeRunCount() == epoch_free_before) {
                 throw std::runtime_error("mode=" + mode.name +
-                                         " fell back from epoch-free lookahead");
+                                         " fell back from epoch-free lookahead: " +
+                                         EpochFreeDifferentialTestAccess::vetoReason(simulation));
             }
             completed += executed;
         };

@@ -106,7 +106,11 @@ public:
     // Drop all queued messages (including future arrivals)
     void flush();
 
-    // Receiver-side selective cancellation (in-flight scoped by default)
+    // Receiver-owned selective flush (messages from earlier enqueue cycles)
+    template<auto KeyFn>
+    void flush(FlushRange keep_range);
+
+    // Source-compatible wrappers over FlushRange
     template<auto KeyFn, typename K>
     void cancelOlderThan(K watermark);
     template<auto KeyFn, typename K>
@@ -149,9 +153,11 @@ producer->out.cancelInFlight();
 consumer->in.flush();
 ```
 
-## Selective Cancellation
+## Selective Flush
 
-Selective cancellation is available on **InPort** (receiver-side). It allows fine-grained key-based filtering of in-flight messages without dropping everything.
+Selective flush is available on **InPort**. It keeps an explicit key range for
+messages that were already in flight while leaving messages produced in the
+flush cycle or later untouched.
 
 For one-shot arbitrary filtering, `tryReceiveFiltered(cycle, predicate)` scans
 ready messages in deterministic delivery order and permanently consumes every
@@ -165,17 +171,13 @@ auto current_epoch = [epoch](const Message& message) noexcept {
 auto message = in.tryReceiveFiltered(localCycle(), current_epoch);
 ```
 
-`cancelOlderThan<KeyFn>(watermark)` selectively drops in-flight messages where `KeyFn(msg) < watermark`, without affecting newer messages.
-
-`cancelYoungerThan<KeyFn>(watermark)` selectively drops in-flight messages where `KeyFn(msg) > watermark`, without affecting older messages.
-
-`resetSelectiveCancellation()` clears LegacyFastPath receiver-side bounds. It is intentionally a no-op for `PortPolicy::StageSelective`, where flush predicates retire automatically on the receiver pop path.
-
 ```cpp
-// Receiver-side selective filtering on the destination port
-in_instr.cancelOlderThan<&Instruction::id>(flush_point_id + 1);
-in_instr.cancelYoungerThan<&Instruction::id>(flush_point_id);
-in_instr.resetSelectiveCancellation();
+// Cancel the flush point and every younger instruction. UID zero and UINT64_MAX
+// require no model-side +/- 1 conversion.
+in_instr.flush<&Instruction::id>(FlushRange::atAndYounger(flush_point_id));
+
+// Keep only an inclusive architectural window.
+in_instr.flush<&Instruction::id>(FlushRange::outsideInclusive(oldest, youngest));
 
 // All-or-nothing cancel on OutPort
 out_icache_miss.cancelInFlight();
@@ -183,38 +185,57 @@ out_icache_miss.cancelInFlight();
 
 **API:**
 ```cpp
-template<auto KeyFn, typename K>
-void InPort<T>::cancelOlderThan(K watermark);
+template<auto KeyFn>
+void InPort<T>::flush(FlushRange keep_range);
 
-template<auto KeyFn, typename K>
-void InPort<T>::cancelYoungerThan(K watermark);
+FlushRange::youngerThan(uid);       // cancel key > uid
+FlushRange::atAndYounger(uid);      // cancel key >= uid
+FlushRange::olderThan(uid);         // cancel key < uid
+FlushRange::atAndOlder(uid);        // cancel key <= uid
+FlushRange::outsideInclusive(a, b); // cancel key < a or key > b
 
-template<auto KeyFn, typename MinK, typename MaxK>
-void InPort<T>::cancelOutsideInclusive(MinK min_keep, MaxK max_keep);
+// Compatibility spellings, implemented by the same FlushRange engine:
+cancelOlderThan<KeyFn>(uid);
+cancelYoungerThan<KeyFn>(uid);
+cancelOutsideInclusive<KeyFn>(a, b);
 ```
 
 - `KeyFn` — pointer-to-member or callable that extracts a key from `T` (e.g., `&MyMsg::id`), projected to `uint64_t`
-- `watermark` — lower/upper threshold used by the selected API
+- `FlushRange` retains open/closed bounds explicitly; it never performs
+  overflow-prone boundary arithmetic
 
 **Semantics:**
-- **Legacy monotonic bounds**: `LegacyFastPath` raises only the lower bound and lowers only the upper bound for its current in-flight generation
-- **Timestamp-scoped range**: `StageSelective` installs a receiver-only `{flush_cycle, min_keep, max_keep}` predicate. Same-cycle calls intersect their ranges; messages enqueued at or after the flush cycle are unaffected
-- **Fixed-delay ordering**: `StageSelective` predicate retirement relies on monotonic enqueue cycles and is intended for fixed-delay stage-register ports
-- **InPort state**: receiver-side bounds are tracked per input port
-- **Single extractor per InPort**: first `KeyFn` set on an input port is retained; mismatched extractors are ignored
-- **Low overhead when unused**: receive path does one extractor-pointer load and exits immediately when selective cancellation is not configured
+- **One contract for every backend and policy**: `LegacyFastPath` and
+  `StageSelective`, same-thread queues, direct SPSC, direct-lane MPSC, and
+  shared broadcast all use the same receiver-owned predicates
+- **Cycle boundary**: a flush installed in receiver cycle `F` applies only to
+  messages stamped with `enqueue_cycle < F`; cycle `F` and later are post-flush
+- **Monotonic overlap**: predicates remain independent across cycles. Calls for
+  the same extractor in one cycle intersect their keep ranges, and calls for
+  different extractors compose. `resetSelectiveCancellation()` is a
+  compatibility no-op and cannot resurrect a zombie
+- **Arbitrary positive delays**: retirement follows the stable queue-arrival
+  frontier using the maximum incoming edge delay. Epoch-free MPSC additionally
+  gates retirement on its existing per-producer scheduler progress. It does not
+  assume enqueue cycles are monotonic, which is essential for
+  heterogeneous-delay MPSC fan-in
+- **Receiver ownership**: producers stamp only their local enqueue cycle and
+  never read mutable receiver state. Predicate state uses no lock or atomic;
+  only retirement may acquire-load existing scheduler progress while a flush
+  is live
+- **Low overhead when unused**: receive performs one predictable empty-state
+  check; sender and envelope paths carry no selective generation state
 - **Composable with epoch cancel**: both checks are evaluated — a message is dropped if *either* condition is met
-- **In-flight default for InPort**: first receiver-side selective call auto-scopes to currently in-flight messages (including future-arrival queued messages). New enqueues are unaffected unless re-scoped/reset.
 
 | Cancel Type | Scope | Granularity | Use Case |
 |---|---|---|---|
 | `OutPort::cancelInFlight()` | All in-flight | All-or-nothing | Full pipeline flush |
-| `InPort::cancelOlderThan<KeyFn>(wm)` | Key-based | Selective | Squash older than misprediction point |
-| `InPort::cancelYoungerThan<KeyFn>(wm)` | Key-based | Selective | Squash younger speculative messages |
-| `InPort::cancelOutsideInclusive<KeyFn>(min,max)` | Key-based | Selective range | Keep only bounded window |
+| `InPort::flush<KeyFn>(FlushRange)` | Earlier enqueue cycles | Explicit open/closed key range | Precise architectural squash |
 | `InPort::flush()` | Receiver queue | Immediate drop | Clear local queue |
 
-**Delay-0 caveat:** For zero-delay (INLINE) connections, messages are delivered in the same cycle they are sent. Selective cancel still works but the window between send and receive is very small — cancel must occur before `tryReceive()` on the same cycle.
+**Delay-0 caveat:** A range flush intentionally treats every message enqueued in
+the flush cycle as post-flush. For an exact mid-cycle all-or-nothing cutoff, use
+the sender-owned `OutPort::cancelInFlight()` epoch instead.
 
 ## Build-Time Non-Cancelable OutPort Path
 
@@ -227,8 +248,8 @@ cmake -S . -B build -DCHRONON_ENABLE_OUTPORT_CANCELLATION=OFF
 The default is `ON` and preserves full cancellation semantics. `OFF` is an
 explicit whole-build contract: `cancelInFlight()` becomes a no-op, the sender
 path omits its cancellation-epoch acquire, direct MPSC lane envelopes omit the
-epoch stamp, and `PortEnvelope` omits the cancellation pointer and snapshot. Receiver-side
-`InPort` selective cancellation remains available.
+epoch stamp, and `PortEnvelope` omits the cancellation pointer and snapshot.
+Receiver-side `InPort` selective flush remains available.
 
 Do not disable the option merely because cancellation is rare. It is safe only
 after auditing the complete model and every linked component for
@@ -398,6 +419,11 @@ Bounded lanes allocate the smallest sufficient power-of-two payload ring.
 Unlimited model-visible ports retain bounded physical storage. Physical
 storage, simulated-cycle admission credit, and per-cycle edge rate are separate
 checks; a same-cycle host pop never nondeterministically reopens model capacity.
+For bounded edges whose endpoints share one epoch-free worker, a non-atomic
+consumer-owned pop summary preserves that same cycle-start contract when the
+lookahead floor temporarily changes cluster execution order. Sequential and
+unbounded same-thread queues bypass this ledger, and no same-thread path takes a
+lock.
 
 ## Per-Cycle Capacity (OutPort Bandwidth Limiting)
 

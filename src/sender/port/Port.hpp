@@ -38,11 +38,11 @@
 namespace chronon::sender {
 
 /**
- * StageSelective cancellation tracing (CHRONON_STAGE_TRACE env).
+ * Selective-flush tracing (CHRONON_STAGE_TRACE env, retained for compatibility).
  *
  * Permanent diagnostic feature. Emits one line per install/retire/
- * shouldCancel on a StageSelective InPort, for investigating flush
- * and cancellation behavior in production builds.
+ * receiver-side predicate checks for investigating flush behavior in
+ * production builds.
  *
  * Enable: CHRONON_STAGE_TRACE=1 (or any non-empty value)
  * Optional filter: CHRONON_STAGE_TRACE_PORT=<substring of port name>
@@ -63,30 +63,97 @@ inline bool stageTracePortMatches_(const std::string& name) noexcept {
 }
 
 /**
- * PortPolicy - Selects InPort cancellation/dispatch behavior.
+ * PortPolicy - Source-compatible InPort policy tag.
  *
- * - LegacyFastPath (default): legacy behavior. cancelYoungerThan/cancelOlderThan
- *   use the receiver-side generation/min-key/max-key bound mechanism. The
- *   sender path (enqueueStored_, pushFromThread) early-rejects messages that
- *   already look canceled. This is the backward-compatible default. Carries
- *   the known #7 overlapping-flush gap and #8 generation race in parallel
- *   mode; new code that needs strong cancellation guarantees should use
- *   StageSelective.
- *
- * - StageSelective: optimized for fixed-delay stage-register ports with selective
- *   cancellation. Each message carries `enqueue_cycle` (producer's localCycle
- *   at push time). cancelYoungerThan(key) installs a StagePredicate
- *   {flush_cycle = receiver localCycle, min_keep, max_keep}; predicates are
- *   stored in a small fixed-size slot array and retired when the receiver
- *   advances past flush_cycle. The sender side does NOT consult receiver
- *   state — the filter is applied receiver-side only on pop. This eliminates
- *   the cross-thread receiver-atomic read that races in parallel mode (#8)
- *   and the overlapping-flush zombie escape (#7).
+ * Both values use the same receiver-owned selective-flush engine. The tag is
+ * retained so existing model declarations remain source compatible while the
+ * public FlushRange contract is independent of queue policy and topology.
  */
 enum class PortPolicy : uint8_t {
     LegacyFastPath = 0,
     General [[deprecated("Use LegacyFastPath")]] = LegacyFastPath,  ///< Backward-compatible alias.
     StageSelective = 1,
+};
+
+/**
+ * Explicit keep range for an in-flight selective flush.
+ *
+ * UID order follows the conventional CPU meaning: a larger UID is younger.
+ * Bounds retain their inclusive/exclusive form, so full-width keys and UID
+ * zero never require caller-side `uid - 1` or `uid + 1` arithmetic.
+ */
+class FlushRange {
+public:
+    template <typename K>
+    [[nodiscard]] static constexpr FlushRange youngerThan(K key) noexcept {
+        return {0, static_cast<uint64_t>(key), true, true};
+    }
+
+    template <typename K>
+    [[nodiscard]] static constexpr FlushRange atAndYounger(K key) noexcept {
+        return {0, static_cast<uint64_t>(key), true, false};
+    }
+
+    template <typename K>
+    [[nodiscard]] static constexpr FlushRange olderThan(K key) noexcept {
+        return {static_cast<uint64_t>(key), std::numeric_limits<uint64_t>::max(), true, true};
+    }
+
+    template <typename K>
+    [[nodiscard]] static constexpr FlushRange atAndOlder(K key) noexcept {
+        return {static_cast<uint64_t>(key), std::numeric_limits<uint64_t>::max(), false, true};
+    }
+
+    template <typename MinK, typename MaxK>
+    [[nodiscard]] static constexpr FlushRange outsideInclusive(MinK min_keep,
+                                                               MaxK max_keep) noexcept {
+        return {static_cast<uint64_t>(min_keep), static_cast<uint64_t>(max_keep), true, true};
+    }
+
+    [[nodiscard]] constexpr bool keeps(uint64_t key) const noexcept {
+        if (key < min_keep_ || key > max_keep_) return false;
+        if (key == min_keep_ && !min_inclusive_) return false;
+        if (key == max_keep_ && !max_inclusive_) return false;
+        return true;
+    }
+
+    [[nodiscard]] constexpr FlushRange intersectedWith(FlushRange other) const noexcept {
+        FlushRange result = *this;
+        if (other.min_keep_ > result.min_keep_) {
+            result.min_keep_ = other.min_keep_;
+            result.min_inclusive_ = other.min_inclusive_;
+        } else if (other.min_keep_ == result.min_keep_) {
+            result.min_inclusive_ = result.min_inclusive_ && other.min_inclusive_;
+        }
+
+        if (other.max_keep_ < result.max_keep_) {
+            result.max_keep_ = other.max_keep_;
+            result.max_inclusive_ = other.max_inclusive_;
+        } else if (other.max_keep_ == result.max_keep_) {
+            result.max_inclusive_ = result.max_inclusive_ && other.max_inclusive_;
+        }
+        return result;
+    }
+
+    [[nodiscard]] constexpr uint64_t minKeep() const noexcept { return min_keep_; }
+    [[nodiscard]] constexpr uint64_t maxKeep() const noexcept { return max_keep_; }
+    [[nodiscard]] constexpr bool minInclusive() const noexcept { return min_inclusive_; }
+    [[nodiscard]] constexpr bool maxInclusive() const noexcept { return max_inclusive_; }
+
+    friend constexpr bool operator==(const FlushRange&, const FlushRange&) = default;
+
+private:
+    constexpr FlushRange(uint64_t min_keep, uint64_t max_keep, bool min_inclusive,
+                         bool max_inclusive) noexcept
+        : min_keep_(min_keep),
+          max_keep_(max_keep),
+          min_inclusive_(min_inclusive),
+          max_inclusive_(max_inclusive) {}
+
+    uint64_t min_keep_ = 0;
+    uint64_t max_keep_ = std::numeric_limits<uint64_t>::max();
+    bool min_inclusive_ = true;
+    bool max_inclusive_ = true;
 };
 
 namespace detail {
@@ -98,10 +165,9 @@ struct PortEnvelope {
     const std::atomic<uint64_t>* cancel_epoch = nullptr;  ///< nullptr => not cancelable
     uint64_t epoch_snapshot = 0;
 #endif
-    uint64_t receiver_generation_snapshot = 0;
     /// Producer's localCycle at push time (arrive_cycle - delay). Used by
-    /// StageSelective predicates to decide whether a message was in-flight
-    /// at the time of a flush.
+    /// receiver-owned predicates to decide whether a message was in flight at
+    /// the start of a flush. The sender never reads receiver flush state.
     uint64_t enqueue_cycle = 0;
     /// Stable producer tiebreaker for topology-keyed multi-producer queues.
     /// Connection::conn_id is deterministic for a fixed topology, so same-cycle
@@ -123,90 +189,112 @@ template <typename T>
 }
 
 /**
- * StagePredicate - A single live "keep only [min_keep, max_keep] among messages
- * enqueued before flush_cycle" rule.
+ * A single live "keep only range among messages enqueued before flush_cycle"
+ * rule. The extractor is part of the predicate, allowing independent flushes
+ * over different message fields to compose without mutable global extractor
+ * state or a reset sequence.
  */
-struct StagePredicate {
+template <typename T>
+struct SelectiveFlushPredicate {
+    using KeyExtractor = uint64_t (*)(const T&);
+
     uint64_t flush_cycle = 0;
-    uint64_t min_keep = 0;
-    uint64_t max_keep = 0;
+    FlushRange keep_range =
+        FlushRange::outsideInclusive(uint64_t{0}, std::numeric_limits<uint64_t>::max());
+    KeyExtractor key_extractor = nullptr;
 };
 
 /**
- * InPortStageCancelState - Holds the active StagePredicates for a
- * StageSelective InPort.
+ * Receiver-owned active selective-flush predicates for an InPort.
  *
- * Retirement is pop-driven (not time-driven): shouldCancel() retires a slot
- * in place as soon as a pop arrives whose enqueue_cycle is >= the slot's
- * flush_cycle. Since enqueue_cycle is monotonically non-decreasing on a
- * port (SPSC order; MPSC k-way-merge on arrive_cycle), that first
- * post-flush pop proves no later message can match the predicate either,
- * so the slot is dead and safe to reclaim. This makes the predicate
- * lifetime a function of actual pop traffic rather than wall-clock cycles,
- * which matches RTL: a DFF-backed skid buffer keeps its flow-control
- * commitment until traffic actually moves through it, not at some arbitrary
- * "next clock edge."
+ * Incoming messages are ordered by arrival cycle, not enqueue cycle. With
+ * heterogeneous MPSC delays enqueue cycles can regress, so retirement uses
+ * the queue's stable arrival frontier. A predicate for flush cycle F can only
+ * affect arrivals through F - 1 + max_incoming_delay. Once the next queue head
+ * is beyond that bound, epoch-free dependency progress proves that no producer
+ * can publish another affected message.
  *
- * The ring holds a few slots so overlapping flushes (issue #7) each get
- * their own predicate. install() merges same-cycle flushes into one slot.
+ * State is installed, evaluated, and retired exclusively by the destination
+ * Unit. There are no locks or atomics in this control plane.
  */
-struct InPortStageCancelState {
-    /// Live predicates. Elastic so flush storms can't overflow a fixed ring.
-    /// Each entry is 16 bytes; typical depth is single-digit, worst case
-    /// observed is ~16 (comprehensive_test section 53 BTB-miss burst).
-    /// shouldCancel retires slots pop-driven: a single post-flush pop drops
-    /// all obsolete slots in one pass.
-    std::vector<StagePredicate> slots;
+template <typename T>
+struct InPortSelectiveFlushState {
+    using Predicate = SelectiveFlushPredicate<T>;
+    using KeyExtractor = typename Predicate::KeyExtractor;
+
+    std::vector<Predicate> slots;
     /// High-water mark tracking for diagnostics (CHRONON_STAGE_TRACE).
     size_t high_water = 0;
 
-    void install(uint64_t flush_cycle, uint64_t min_keep, uint64_t max_keep) {
-        // Merge same-cycle installs — a single flush broadcast fans out to
-        // multiple cancel calls per tick. Collapse them into one slot and
-        // intersect the keep ranges, preserving both older-than and
-        // younger-than constraints without a second predicate walk.
+    void install(uint64_t flush_cycle, FlushRange keep_range, KeyExtractor key_extractor) {
+        // Calls for the same field in one cycle describe one architectural
+        // flush. Intersect them in place; different fields remain independent.
         for (auto& p : slots) {
-            if (p.flush_cycle == flush_cycle) {
-                if (min_keep > p.min_keep) {
-                    p.min_keep = min_keep;
-                }
-                if (max_keep < p.max_keep) {
-                    p.max_keep = max_keep;
-                }
+            if (p.flush_cycle == flush_cycle && p.key_extractor == key_extractor) {
+                p.keep_range = p.keep_range.intersectedWith(keep_range);
                 return;
             }
         }
-        slots.push_back({flush_cycle, min_keep, max_keep});
+        slots.push_back({flush_cycle, keep_range, key_extractor});
         if (slots.size() > high_water) {
             high_water = slots.size();
         }
     }
 
-    void clear() noexcept { slots.clear(); }
+    [[nodiscard]] bool hasRetirementCandidate(uint64_t front_arrival,
+                                              uint32_t max_incoming_delay) const noexcept {
+        for (const auto& p : slots) {
+            if (p.flush_cycle == 0 ||
+                front_arrival > lastAffectedArrival_(p.flush_cycle, max_incoming_delay)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
-    /// Non-const because we retire obsolete slots in place. Safe to mutate
-    /// because stage_state_ is touched only from the receiver thread.
-    [[nodiscard]] bool shouldCancel(uint64_t enqueue_cycle, uint64_t key) noexcept {
-        bool cancel = false;
+    void retireBeforeArrival(uint64_t front_arrival, uint32_t max_incoming_delay,
+                             std::optional<uint64_t> producer_progress_floor) noexcept {
         size_t i = 0;
         while (i < slots.size()) {
             const auto& p = slots[i];
-            if (enqueue_cycle >= p.flush_cycle) {
-                // Post-flush pop. enqueue_cycle is monotone on this port,
-                // so no later message can match this predicate; retire.
+            // In epoch-free MPSC mode an empty lane can still publish an older
+            // arrival after another lane exposes a future head. Wait until
+            // every producer has completed all enqueue cycles covered by this
+            // predicate before treating the visible head as a stable frontier.
+            if (producer_progress_floor && *producer_progress_floor < p.flush_cycle) {
+                ++i;
+                continue;
+            }
+            if (p.flush_cycle == 0 ||
+                front_arrival > lastAffectedArrival_(p.flush_cycle, max_incoming_delay)) {
                 slots[i] = slots.back();
                 slots.pop_back();
                 continue;
             }
-            if (key < p.min_keep || key > p.max_keep) {
-                cancel = true;
-            }
             ++i;
         }
-        return cancel;
     }
 
+    [[nodiscard]] bool shouldCancel(const PortEnvelope<T>& message) const noexcept {
+        for (const auto& p : slots) {
+            if (message.enqueue_cycle >= p.flush_cycle) continue;
+            if (!p.keep_range.keeps(p.key_extractor(message.data))) return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool empty() const noexcept { return slots.empty(); }
     [[nodiscard]] size_t active_slot_count() const noexcept { return slots.size(); }
+
+private:
+    [[nodiscard]] static uint64_t lastAffectedArrival_(uint64_t flush_cycle,
+                                                       uint32_t max_incoming_delay) noexcept {
+        const uint64_t last_enqueue = flush_cycle == 0 ? 0 : flush_cycle - 1;
+        const uint64_t max_cycle = std::numeric_limits<uint64_t>::max();
+        return max_incoming_delay > max_cycle - last_enqueue
+                   ? max_cycle
+                   : last_enqueue + static_cast<uint64_t>(max_incoming_delay);
+    }
 };
 
 }  // namespace detail
