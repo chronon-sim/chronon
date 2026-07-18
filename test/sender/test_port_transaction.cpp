@@ -351,6 +351,27 @@ void testRepeatedBoundedEdgeOnOnePortIsRejected() {
             "repeated-edge rejection consumed the OutPort's cycle credit");
 }
 
+void testSharedFiniteSPSCTransportIsRejected() {
+    ManualUnit producer("producer");
+    ManualUnit sink("sink");
+    OutPort<int> out0{&producer, "out0", 2};
+    OutPort<int> out1{&producer, "out1", 2};
+    InPort<int> unbounded{&sink, "unbounded"};
+    out0.connect(&unbounded, 0);
+    out1.connect(&unbounded, 0);
+    unbounded.useLockFreeQueue(2);
+
+    require(unbounded.configuredCapacity() == InPort<int>::UNLIMITED_CAPACITY,
+            "finite-transport test accidentally bounded model admission");
+    require(unbounded.storageCapacity() != InPort<int>::UNLIMITED_CAPACITY,
+            "finite-transport test did not install bounded SPSC storage");
+    producer.setCycle(12);
+    auto tx = reserve(out0, out1);
+    require(!tx, "transaction accepted duplicate claims on one finite SPSC transport");
+    require(out0.sentThisCycle() == 0 && out1.sentThisCycle() == 0,
+            "finite-SPSC rejection consumed port credit");
+}
+
 void testSharedUnboundedDestinationRemainsSupported() {
     ManualUnit producer("producer");
     ManualUnit sink("sink");
@@ -371,6 +392,45 @@ void testSharedUnboundedDestinationRemainsSupported() {
     require(second.has_value() && *second == 13,
             "shared unbounded destination lost the second payload");
     requireEmpty(unbounded, 12, "shared unbounded transaction duplicated a payload");
+}
+
+void testSharedUnboundedMPSCDestinationUsesIndependentLanes() {
+    ManualUnit producer("producer");
+    ManualUnit peer("peer");
+    ManualUnit sink("sink");
+    OutPort<int> out0{&producer, "out0", 1};
+    OutPort<int> out1{&producer, "out1", 1};
+    OutPort<int> peer_out{&peer, "peer_out", 1};
+    InPort<int> unbounded{&sink, "unbounded"};
+    auto* connection0 = out0.connect(&unbounded, 0);
+    auto* connection1 = out1.connect(&unbounded, 0);
+    auto* peer_connection = peer_out.connect(&unbounded, 0);
+
+    std::array<Connection<int>*, 3> connections{connection0, connection1, peer_connection};
+    for (uint32_t i = 0; i < connections.size(); ++i) {
+        connections[i]->setConnId(i);
+        connections[i]->optimizeForMPSC();
+        const size_t lane = connections[i]->registerProducerThread(i + 1);
+        require(lane != SIZE_MAX, "unbounded MPSC lane registration failed");
+        connections[i]->setThreadQueueId(lane);
+        require(connections[i]->registerOnDestMPSC() != nullptr,
+                "unbounded MPSC destination registration failed");
+    }
+
+    producer.setCycle(13);
+    peer.setCycle(13);
+    auto tx = reserve(out0, out1);
+    require(static_cast<bool>(tx) && tx.commit(130, 131),
+            "transaction rejected independent unbounded MPSC lanes");
+    require(peer_out.send(132), "peer could not publish through its independent MPSC lane");
+
+    const auto first = unbounded.tryReceive(13);
+    const auto second = unbounded.tryReceive(13);
+    const auto third = unbounded.tryReceive(13);
+    require(first.has_value() && *first == 130, "first transaction MPSC lane was reordered");
+    require(second.has_value() && *second == 131, "second transaction MPSC lane was reordered");
+    require(third.has_value() && *third == 132, "peer MPSC lane was lost or reordered");
+    requireEmpty(unbounded, 13, "unbounded MPSC transaction duplicated a payload");
 }
 
 void testTransactionSpansSharedBroadcastTransport() {
@@ -763,7 +823,9 @@ int main() {
         testInvalidPortSetsAreRejected();
         testSharedBoundedDestinationIsRejectedBeforeClaim();
         testRepeatedBoundedEdgeOnOnePortIsRejected();
+        testSharedFiniteSPSCTransportIsRejected();
         testSharedUnboundedDestinationRemainsSupported();
+        testSharedUnboundedMPSCDestinationUsesIndependentLanes();
         testTransactionSpansSharedBroadcastTransport();
         testTransactionSpansSPSCAndMPSC();
         testEpochFreeDifferentialMatrix();

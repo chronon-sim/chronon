@@ -391,10 +391,15 @@ private:
     void visitBoundedTransactionDestinations_(Visitor&& visitor) const {
         if (dependency_only_transport_ || shared_broadcast_) return;
         for (const auto& connection : connections_) {
-            if (connection->dependencyOnlyTransport() ||
-                connection->edgeAdmissionCapacity_() == UNLIMITED_CAPACITY) {
+            if (connection->dependencyOnlyTransport()) {
                 continue;
             }
+            const bool bounded_model_admission =
+                connection->edgeAdmissionCapacity_() != UNLIMITED_CAPACITY;
+            const bool bounded_shared_transport =
+                !connection->hasThreadQueueId() &&
+                connection->to()->storageCapacity() != UNLIMITED_CAPACITY;
+            if (!bounded_model_admission && !bounded_shared_transport) continue;
             std::forward<Visitor>(visitor)(static_cast<const void*>(connection->to()));
         }
     }
