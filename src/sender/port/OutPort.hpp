@@ -503,7 +503,7 @@ private:
         reservation.token = 0;
     }
 
-    void commitTransaction_(TransactionReservation& reservation, T data) {
+    void commitTransaction_(TransactionReservation& reservation, T&& data) {
         if (connections_.empty()) {
             finishTransaction_();
             reservation.token = 0;

@@ -109,8 +109,10 @@ The contract is deliberately narrow:
   also returns `false`, so retry cannot duplicate a previously delivered subset;
 - dropping the handle or calling `tx.cancel()` releases every claim without
   publishing;
-- connected payload types need non-throwing move construction and assignment;
-  a non-broadcast fanout additionally needs a non-throwing copy constructor.
+- payload-carrying connections need non-throwing move construction and
+  assignment; a non-broadcast fanout additionally needs a non-throwing copy
+  constructor. Unconnected and dependency-only ports do not move their no-op
+  payload during publication.
 
 The transaction handle is stack-backed. Producer-owned claim bookkeeping
 reuses the existing cycle-local admission counters and object padding; a cold

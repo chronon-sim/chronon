@@ -34,6 +34,21 @@ void require(bool condition, const std::string& message) {
     if (!condition) fail(message);
 }
 
+struct ThrowingMovePayload {
+    int value = 0;
+
+    ThrowingMovePayload() = default;
+    explicit ThrowingMovePayload(int payload) : value(payload) {}
+    ThrowingMovePayload(const ThrowingMovePayload&) = default;
+    ThrowingMovePayload& operator=(const ThrowingMovePayload&) = default;
+    ThrowingMovePayload(ThrowingMovePayload&&) {
+        throw std::runtime_error("ThrowingMovePayload move construction");
+    }
+    ThrowingMovePayload& operator=(ThrowingMovePayload&&) {
+        throw std::runtime_error("ThrowingMovePayload move assignment");
+    }
+};
+
 template <typename T>
 void requireEmpty(InPort<T>& port, uint64_t cycle, const std::string& message) {
     require(!port.tryReceive(cycle).has_value(), message);
@@ -311,6 +326,55 @@ void testInvalidPortSetsAreRejected() {
     require(!duplicate, "transaction accepted the same OutPort twice");
     auto cross_owner = reserve(out0, out1);
     require(!cross_owner, "transaction accepted ports owned by different Units");
+}
+
+void testNoopThrowingPayloadCannotPartiallyCommit() {
+    ManualUnit producer("producer");
+    ManualUnit sink("sink");
+    ManualUnit dependency_sink("dependency_sink");
+    OutPort<int> real{&producer, "real", 3};
+    OutPort<ThrowingMovePayload> dependency_only{&producer, "dependency_only", 1};
+    OutPort<ThrowingMovePayload> unconnected{&producer, "unconnected", 1};
+    InPort<int> real_in{&sink, "real_in", 3};
+    InPort<ThrowingMovePayload> dependency_in{&dependency_sink, "dependency_in", 1};
+    real.connect(&real_in, 0);
+    dependency_only.connect(&dependency_in, 0);
+    dependency_only.setDependencyOnlyTransport();
+
+    const ThrowingMovePayload payload{42};
+
+    producer.setCycle(9);
+    auto positional = reserve(real, dependency_only);
+    require(static_cast<bool>(positional),
+            "dependency-only throwing payload could not reserve positionally");
+    require(positional.commit(90, payload),
+            "dependency-only throwing payload failed positional commit");
+    const auto positional_value = real_in.tryReceive(9);
+    require(positional_value.has_value() && *positional_value == 90,
+            "positional no-op payload changed the real transaction delivery");
+    requireEmpty(dependency_in, 9, "dependency-only transaction published a payload");
+
+    producer.setCycle(10);
+    auto staged = reserve(real, dependency_only);
+    require(static_cast<bool>(staged),
+            "dependency-only throwing payload could not reserve for staging");
+    require(staged.send(real, 100), "failed to stage the real transaction payload");
+    require(staged.send(dependency_only, payload),
+            "failed to stage the dependency-only transaction payload");
+    require(staged.commit(), "dependency-only throwing payload failed staged commit");
+    const auto staged_value = real_in.tryReceive(10);
+    require(staged_value.has_value() && *staged_value == 100,
+            "staged no-op payload changed the real transaction delivery");
+    requireEmpty(dependency_in, 10, "staged dependency-only transaction published a payload");
+
+    producer.setCycle(11);
+    auto no_connection = reserve(real, unconnected);
+    require(static_cast<bool>(no_connection), "unconnected throwing payload could not reserve");
+    require(no_connection.commit(110, payload),
+            "unconnected throwing payload failed positional commit");
+    const auto unconnected_value = real_in.tryReceive(11);
+    require(unconnected_value.has_value() && *unconnected_value == 110,
+            "unconnected no-op payload changed the real transaction delivery");
 }
 
 void testSharedBoundedDestinationIsRejectedBeforeClaim() {
@@ -821,6 +885,7 @@ int main() {
         testReceiverFlushDoesNotCancelUnpublishedTransaction();
         testCycleBoundaryAndExplicitRelease();
         testInvalidPortSetsAreRejected();
+        testNoopThrowingPayloadCannotPartiallyCommit();
         testSharedBoundedDestinationIsRejectedBeforeClaim();
         testRepeatedBoundedEdgeOnOnePortIsRejected();
         testSharedFiniteSPSCTransportIsRejected();
