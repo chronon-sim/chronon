@@ -610,6 +610,14 @@ private:
     friend struct PredecessorCycleCacheTestAccess;
     /// Test-only white-box access for transitive dependency pruning.
     friend struct TransitiveDependencyPruneTestAccess;
+    /// Test-only safe-point migration used by the epoch-free differential
+    /// harness. The seam is intentionally outside the worker hot path.
+    friend struct EpochFreeDifferentialTestAccess;
+
+    /// Move the cluster containing @p unit while all persistent workers are
+    /// stopped between run() spans. Returns false when the request is invalid
+    /// or the simulation is not at a legal epoch-free dynamic safe point.
+    bool forceEpochFreeMigrationAtBoundary_(Unit* unit, size_t target_thread);
 
     /// Worker-private lower bounds for predecessor progress. Each cache lives
     /// for one worker invocation and needs no atomic synchronization of its own.

@@ -143,4 +143,59 @@ void TickSimulation::rebuildThreadUnitsFromClusterOwners_() {
     }
 }
 
+bool TickSimulation::forceEpochFreeMigrationAtBoundary_(Unit* unit, size_t target_thread) {
+    if (!unit || !initialized_ || !config_.enable_parallel || !config_.enable_lookahead ||
+        !config_.enable_epoch_free_lookahead || !config_.enable_dynamic_rebalance ||
+        !shouldUseParallelExecution_() ||
+        epoch_free_dynamic_runtime_active_.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    initDynamicMigrationRuntime_();
+    if (!cluster_runtime_owner_ || !cluster_execution_owner_ ||
+        target_thread >= dynamic_runtime_thread_count_ ||
+        migration_request_.state.load(std::memory_order_acquire) !=
+            static_cast<uint8_t>(MigrationRequestState::None)) {
+        return false;
+    }
+
+    size_t unit_index = SIZE_MAX;
+    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
+        if (static_cast<Unit*>(unit_ptrs_[i]) == unit) {
+            unit_index = i;
+            break;
+        }
+    }
+    if (unit_index == SIZE_MAX || unit_index >= unit_to_cluster_.size()) {
+        return false;
+    }
+
+    const size_t cluster = unit_to_cluster_[unit_index];
+    if (cluster >= dynamic_runtime_cluster_count_ ||
+        cluster_execution_owner_[cluster].load(std::memory_order_acquire) != SIZE_MAX ||
+        cluster_migration_pending_[cluster].load(std::memory_order_acquire) != 0) {
+        return false;
+    }
+
+    const size_t source = cluster_runtime_owner_[cluster].load(std::memory_order_acquire);
+    if (source >= dynamic_runtime_thread_count_ || source == target_thread) {
+        return false;
+    }
+
+    // run() has joined every persistent worker before this seam is callable.
+    // Publish the new owner and generation for the next worker launch, whose
+    // ownership refresh uses acquire loads.
+    cluster_runtime_owner_[cluster].store(target_thread, std::memory_order_release);
+    if (cluster < dynamic_cluster_last_migration_cycle_.size()) {
+        dynamic_cluster_last_migration_cycle_[cluster] = current_cycle_;
+        dynamic_cluster_last_source_thread_[cluster] = source;
+        dynamic_cluster_last_target_thread_[cluster] = target_thread;
+    }
+    cluster_assignment_generation_.fetch_add(1, std::memory_order_release);
+    ++rebalance_count_;
+    cycles_since_last_actual_rebalance_ = 0;
+    rebuildThreadUnitsFromClusterOwners_();
+    return true;
+}
+
 }  // namespace chronon::sender

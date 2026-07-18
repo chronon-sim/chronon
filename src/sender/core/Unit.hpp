@@ -95,7 +95,6 @@ public:
     /// constructor. sleepUntil(), sleepForever(), and setTickInterval(N > 1)
     /// enable it automatically once they are used.
     void enableActivityScheduling() noexcept {
-        activity_scheduling_enabled_ = true;
         port_wake_enabled_.store(true, std::memory_order_release);
         wake_tracking_enabled_.store(true, std::memory_order_release);
         setNextActiveCycleMin_(local_cycle_);
@@ -133,7 +132,9 @@ public:
         return port_wake_enabled_.load(std::memory_order_acquire);
     }
 
-    bool usesActivityScheduling() const noexcept { return activity_scheduling_enabled_; }
+    bool usesActivityScheduling() const noexcept {
+        return port_wake_enabled_.load(std::memory_order_relaxed);
+    }
 
     void setTickInterval(uint32_t interval) noexcept {
         const uint32_t normalized = interval == 0 ? 1 : interval;
@@ -157,7 +158,7 @@ public:
     }
 
     bool shouldRunTickAt(uint64_t cycle) const noexcept {
-        if (!activity_scheduling_enabled_) {
+        if (!port_wake_enabled_.load(std::memory_order_relaxed)) {
             return true;
         }
         const uint64_t next = next_active_cycle_.load(std::memory_order_acquire);
@@ -169,7 +170,7 @@ public:
     }
 
     uint64_t nextRunnableCycleAtOrAfter(uint64_t cycle) const noexcept {
-        if (!activity_scheduling_enabled_) {
+        if (!port_wake_enabled_.load(std::memory_order_relaxed)) {
             return cycle;
         }
         uint64_t base = std::max(cycle, next_active_cycle_.load(std::memory_order_acquire));
@@ -249,7 +250,7 @@ protected:
     }
 
     void beginActiveTick_() noexcept {
-        if (!activity_scheduling_enabled_) {
+        if (!port_wake_enabled_.load(std::memory_order_relaxed)) {
             return;
         }
         activity_control_used_.store(false, std::memory_order_relaxed);
@@ -260,7 +261,7 @@ protected:
     }
 
     void finishActiveTick_() noexcept {
-        if (!activity_scheduling_enabled_) {
+        if (!port_wake_enabled_.load(std::memory_order_relaxed)) {
             return;
         }
         if (!activity_control_used_.load(std::memory_order_relaxed)) {
@@ -270,7 +271,6 @@ protected:
 
 private:
     void enableActivityScheduling_() noexcept {
-        activity_scheduling_enabled_ = true;
         port_wake_enabled_.store(true, std::memory_order_release);
     }
 
@@ -342,7 +342,9 @@ private:
     std::multiset<uint64_t> pending_wake_cycles_;
     std::atomic<uint32_t> tick_interval_{1};
     std::atomic<bool> activity_control_used_{false};
-    bool activity_scheduling_enabled_ = false;
+    /// Single source of truth for activity scheduling and port wakeup opt-in.
+    /// Owner-side relaxed reads require only a non-RMW load; cross-thread port
+    /// producers use acceptsPortWakeups()'s acquire load.
     std::atomic<bool> port_wake_enabled_{false};
     std::atomic<bool> wake_tracking_enabled_{false};
     uint32_t id_;
