@@ -286,6 +286,34 @@ cluster advances), dependency progress, and direct-lane transport headroom.
 MPSC payloads need neither per-epoch arbitration nor a run-end flush. Results
 stay bit-identical to every other mode; only wall-clock changes.
 
+#### Normative scheduler-equivalence contract
+
+For a fixed model, initial state, input stream, and simulated-clock
+configuration, sequential execution and every legal epoch-free execution must
+produce exactly the same model-visible behavior. This is a correctness
+requirement, not a best-effort determinism property. It covers:
+
+- delivery cycle and same-cycle receive order;
+- every `send()`/backpressure result;
+- state committed at each simulated clock edge;
+- receiver filter and cancellation results;
+- architectural output and termination cycle.
+
+Worker placement, host wall time, wait samples, and migration diagnostics are
+scheduler metadata and are intentionally excluded. Static worker-count changes
+and whole-cluster migrations at legal scheduler fences must not alter the
+model-visible trace.
+
+CI enforces this contract with an epoch-free differential harness. Each Unit
+writes to its own pre-reserved event stream, so recording needs no shared lock
+or atomic. Streams are canonicalized after the run by `(cycle, component,
+sequence)` and compared with the sequential reference. A failure reports the
+first divergent cycle, component, expected event, and actual event instead of
+only a final checksum. Deterministic migration tests split an epoch-free run at
+declared cycles and move a complete cluster while all workers are quiescent;
+this exercises live queues and receiver filters without adding a callback or
+branch to the production worker loop.
+
 The per-epoch lookahead fallback is deprecated and will be removed in a future
 release. It remains only as a compatibility/safety fallback while epoch-free
 coverage is hardened. Keep `enable_epoch_free_lookahead` enabled and treat any
