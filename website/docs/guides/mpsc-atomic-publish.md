@@ -28,16 +28,20 @@ lanes rather than as one contended multi-producer queue.
 ## Data flow
 
 ```text
- producer A ── Connection A ── SPSC lane A ─┐
- producer B ── Connection B ── SPSC lane B ─┼─ receiver frontier ─ filter ─ InPort<T>
- producer C ── Connection C ── SPSC lane C ─┘
-                         producer-owned          consumer-owned
+ producer A ── Connection A ── SPSC ingress A ─┐
+ producer B ── Connection B ── SPSC ingress B ─┼─ receiver frontier ─┬─ filter
+ producer C ── Connection C ── SPSC ingress C ─┘                     │
+                                                                     └─ bounded shared FIFO ─ filter
+                              producer-owned                           consumer-owned
 ```
 
-There is one payload publication and one payload consumption. A producer no
-longer writes a `Connection` staging ring for a scheduler arbiter to copy into a
-second InPort queue. The scheduler no longer scans ports at unit ticks,
-barriers, or epoch boundaries.
+There is one producer publication. Unbounded InPorts consume the selected lane
+slot in place. Bounded InPorts perform one receiver-owned move into a
+preallocated shared ring, then consume from that ring; they do not copy the
+payload. A producer no longer writes a `Connection` staging ring for a scheduler
+arbiter, and the scheduler does not scan all ports at barriers or epoch
+boundaries. Only Units owning bounded MPSC destinations keep a compact list of
+cycle-prepared ports and invoke it immediately before `tick()`.
 
 ## SPSC lane
 
@@ -112,6 +116,10 @@ Physical ring availability and architectural queue capacity are deliberately
 separate:
 
 - **physical storage** prevents memory overwrite on the host;
+- **private ingress** transports one Connection's publications without producer
+  contention;
+- **aggregate destination FIFO** bounds total architectural occupancy and new
+  admissions in a receiver cycle;
 - **model admission** determines whether hardware represented by the model is
   ready in a particular simulated cycle;
 - **edge rate** limits sends per producer cycle.
@@ -129,6 +137,21 @@ unbounded model admission disables this ledger entirely. Credit history has the
 same power-of-two size as its payload ring: there cannot be more unobserved pop
 credits than published payloads. It therefore remains compact and never
 allocates during execution.
+
+For bounded fan-in, the receiver starts each cycle with an admission budget
+equal to the InPort capacity. It repeatedly selects the deterministic minimum
+ready lane head and moves it into a separately allocated power-of-two shared
+ring until either the ring or that cycle's budget is full. A consumer pop may
+open physical room, but it cannot create more than one cycle's aggregate
+credit. A mid-cycle flush likewise drops occupancy without resetting the
+budget. The shared state is cache-line aligned and touched only by the receiver;
+producers neither read it nor contend on a reservation atomic.
+
+If the shared FIFO remains full, ingress stops draining. Per-Connection lanes
+then fill and return non-blocking backpressure independently. A finite
+architectural capacity also installs a reverse epoch-free dependency that makes
+producer cycle `C` observe receiver pop credits through `C-1`; extra physical
+ring slack cannot substitute for this simulated-cycle ordering.
 
 The epoch-free scheduler separately proves that every direct lane has a
 producer-progress dependency and enough physical headroom. A physical overflow
@@ -213,9 +236,10 @@ rare control paths, not cycle-level publication.
 
 The regression suite covers ring wraparound, real two-thread SPSC stress,
 same-cycle ties, mixed delays, 30-run worker-count determinism, dynamic
-rebalancing, finite-capacity back pressure, sparse 256-lane fan-in, hot-lane
-reinsertion, and receiver filtering. Release validation passes the full
-regression suite.
+rebalancing, finite-capacity back pressure, aggregate depth/rate saturation,
+slow-consumer bursts across epoch-free workers 2 through 8, forced migration,
+receiver filtering and selective flush, sparse 256-lane fan-in, and hot-lane
+reinsertion. Release validation passes the full regression suite.
 
 `chronon_mpsc_lane_frontier_benchmark` records sparse and four-active-lane
 traffic without allocating on the timed path. On the reference development

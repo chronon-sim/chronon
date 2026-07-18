@@ -730,8 +730,9 @@ private:
     /// Pointers only — Connections are owned by their OutPort.
     std::vector<ConnectionBase*> connections_;
 
-    /// Flat, deduplicated list of InPorts with at least one direct MPSC lane.
-    /// Used for initialization-time progress coverage and overflow diagnostics.
+    /// Flat, deduplicated list of InPorts with at least one MPSC ingress lane.
+    /// Used for initialization-time progress coverage and overflow diagnostics;
+    /// bounded FIFO preparation is registered directly on the owning Unit.
     std::vector<IMultiProducerPort*> multi_producer_ports_;
 
     DependencyGraph dep_graph_;

@@ -23,7 +23,8 @@
 // Expectations:
 //   - All 30 runs produce the same (arrive_cycle, producer_id, sequence) trace.
 //   - Total cycle counts match across all runs.
-//   - Every producer sends exactly 200 messages and all 600 are received.
+//   - Aggregate shared-depth pressure is deterministic and fair across lanes.
+//   - Every successfully sent message is received exactly once.
 
 #include <algorithm>
 #include <array>
@@ -229,7 +230,6 @@ int main() {
 
     constexpr uint64_t PRODUCER_TICKS = 100;
     constexpr size_t USER_CAP = 4;
-    constexpr uint64_t MSGS_PER_PRODUCER = PRODUCER_TICKS * 2;
 
     const std::vector<size_t> worker_counts = {1, 2, 3, 4, 6, 8};
     constexpr int REPEATS = 5;
@@ -257,19 +257,28 @@ int main() {
 
     const RunResult& golden = results.front();
 
-    // Check 1: no messages lost.
+    // Check 1: the aggregate capacity creates real backpressure without loss or
+    // fixed-priority starvation. Producers intentionally stop after 100 model
+    // ticks, so failed sends are not retried by this scenario.
     for (size_t i = 0; i < results.size(); ++i) {
         const auto& r = results[i];
-        for (int p = 0; p < 3; ++p) {
-            if (r.sent_per_producer[p] != MSGS_PER_PRODUCER) {
-                std::cerr << "FAIL run " << i << ": producer " << p << " sent "
-                          << r.sent_per_producer[p] << " expected " << MSGS_PER_PRODUCER << "\n";
-                ++failures;
-            }
+        const uint64_t total_sent =
+            r.sent_per_producer[0] + r.sent_per_producer[1] + r.sent_per_producer[2];
+        const auto [min_sent, max_sent] =
+            std::minmax_element(r.sent_per_producer.begin(), r.sent_per_producer.end());
+        if (*max_sent >= PRODUCER_TICKS * 2) {
+            std::cerr << "FAIL run " << i
+                      << ": aggregate shared capacity did not backpressure every producer\n";
+            ++failures;
         }
-        if (r.total_received != 3 * MSGS_PER_PRODUCER) {
+        if (*max_sent - *min_sent > 2) {
+            std::cerr << "FAIL run " << i << ": unfair sent counts [" << r.sent_per_producer[0]
+                      << ',' << r.sent_per_producer[1] << ',' << r.sent_per_producer[2] << "]\n";
+            ++failures;
+        }
+        if (r.total_received != total_sent) {
             std::cerr << "FAIL run " << i << ": received " << r.total_received << " expected "
-                      << (3 * MSGS_PER_PRODUCER) << "\n";
+                      << total_sent << " successful sends\n";
             ++failures;
         }
     }

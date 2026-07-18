@@ -619,8 +619,8 @@ void test_spsc_epoch_free_headroom_respects_registered_capacity() {
     std::cout << "PASSED\n";
 }
 
-void test_idle_advance_preserves_direct_mpsc_lane() {
-    std::cout << "Testing idle advance preserves direct MPSC lane... ";
+void test_idle_advance_preserves_bounded_mpsc_ingress() {
+    std::cout << "Testing idle advance preserves bounded MPSC ingress... ";
 
     ManualUnit prod("prod");
     IdleMPSCReceiverUnit cons("cons");
@@ -636,16 +636,25 @@ void test_idle_advance_preserves_direct_mpsc_lane() {
 
     prod.setCycle(0);
     require(out.send(42), "MPSC send failed before idle drain");
-    require(cons.in.queuedMessageCount() == 1, "direct MPSC lane did not publish the message");
+    require(cons.in.queuedMessageCount() == 0,
+            "future MPSC ingress was counted as shared FIFO occupancy");
+    require(cons.in.transportPendingMessageCount() == 1,
+            "bounded MPSC ingress did not publish the message");
     require(!cons.in.tryReceive(0).has_value(), "arrival-cycle gate was bypassed");
 
     cons.advanceIdleTick(3);
 
     require(cons.localCycle() == 3, "idle advance did not update receiver cycle");
-    require(cons.in.queuedMessageCount() == 1, "idle advance lost the direct-lane message");
+    require(cons.in.queuedMessageCount() == 0,
+            "idle advance materialized shared FIFO state outside a receiver tick");
+    require(cons.in.transportPendingMessageCount() == 1,
+            "idle advance lost the bounded MPSC ingress message");
     auto value = cons.in.tryReceive(3);
     require(value.has_value(), "drained MPSC message was not visible after idle advance");
     require(*value == 42, "drained MPSC message payload changed");
+    require(cons.in.queuedMessageCount() == 0, "shared FIFO retained the consumed MPSC message");
+    require(cons.in.transportPendingMessageCount() == 0,
+            "ingress retained the consumed MPSC message");
 
     std::cout << "PASSED\n";
 }
@@ -975,7 +984,7 @@ int main() {
     test_registered_edge_rate_throttles_spsc_pushes();
     test_bounded_mpsc_epoch_free_headroom_skips_resize();
     test_spsc_epoch_free_headroom_respects_registered_capacity();
-    test_idle_advance_preserves_direct_mpsc_lane();
+    test_idle_advance_preserves_bounded_mpsc_ingress();
     test_lockfree_backpressure_contract();
     test_spsc_user_capacity_backpressures_across_cycles();
     test_spsc_capacity_ignores_same_cycle_consumer_pop_interleaving();

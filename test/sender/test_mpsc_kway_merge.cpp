@@ -278,8 +278,19 @@ void test_registration_and_invalid_lane_contracts() {
 
     // The generic IMessageQueue path is defined to use lane zero.
     EXPECT_EQ(q.push(9, 5), true);
-    EXPECT_EQ(q.available(), size_t{3});
+    EXPECT_EQ(q.stagedSize(), size_t{1});
+    EXPECT_EQ(q.size(), size_t{0});
+    EXPECT_EQ(q.available(), size_t{4});
     EXPECT_EQ(q.tryPop(4).has_value(), false);
+    EXPECT_EQ(q.stagedSize(), size_t{1});
+    EXPECT_EQ(q.size(), size_t{0});
+    EXPECT_EQ(q.hasReady(5), true);
+    EXPECT_EQ(q.stagedSize(), size_t{1});
+    EXPECT_EQ(q.size(), size_t{0});
+    q.prepareSharedFifo(5);
+    EXPECT_EQ(q.stagedSize(), size_t{0});
+    EXPECT_EQ(q.size(), size_t{1});
+    EXPECT_EQ(q.available(), size_t{3});
     EXPECT_TRUE(q.tryPop(5) == std::optional<int>{9});
 
     // Upgrading a duplicate registration enables the simulated-cycle
@@ -288,6 +299,64 @@ void test_registration_and_invalid_lane_contracts() {
     EXPECT_TRUE(q.admissionMinArrivalCycleForThread(lane, 5) == std::optional<uint64_t>{5});
     EXPECT_EQ(q.admissionOccupancyForThread(lane, 6), size_t{0});
     EXPECT_EQ(q.admissionMinArrivalCycleForThread(lane, 6).has_value(), false);
+}
+
+void test_bounded_shared_fifo_depth_and_cycle_admission() {
+    constexpr size_t kDepth = 3;
+    MultiProducerQueueAdapter<int> q(/*capacity=*/kDepth,
+                                     /*min_per_thread_usable_capacity=*/8);
+    const size_t lane0 = q.addProducerThread(10);
+    const size_t lane1 = q.addProducerThread(20);
+    const size_t lane2 = q.addProducerThread(30);
+
+    // Six ready transport entries may exist across private ingress lanes, but
+    // none is part of the destination FIFO until its receiver cycle begins.
+    EXPECT_EQ(q.pushFromThread(lane2, 2, 1, 30), true);
+    EXPECT_EQ(q.pushFromThread(lane2, 5, 1, 30), true);
+    EXPECT_EQ(q.pushFromThread(lane1, 1, 1, 20), true);
+    EXPECT_EQ(q.pushFromThread(lane1, 4, 1, 20), true);
+    EXPECT_EQ(q.pushFromThread(lane0, 0, 1, 10), true);
+    EXPECT_EQ(q.pushFromThread(lane0, 3, 1, 10), true);
+    EXPECT_EQ(q.stagedSize(), size_t{6});
+    EXPECT_EQ(q.size(), size_t{0});
+
+    q.prepareSharedFifo(1);
+    EXPECT_EQ(q.size(), kDepth);
+    EXPECT_EQ(q.stagedSize(), size_t{3});
+    EXPECT_EQ(q.available(), size_t{0});
+    EXPECT_EQ(q.sharedFifoHighWatermark(), kDepth);
+
+    // Re-preparing or popping in the same simulated cycle cannot admit a
+    // fourth entry after the cycle's aggregate admission credit is exhausted.
+    q.prepareSharedFifo(1);
+    EXPECT_EQ(q.stagedSize(), size_t{3});
+    EXPECT_TRUE(q.tryPop(1) == std::optional<int>{0});
+    EXPECT_EQ(q.size(), size_t{2});
+    q.prepareSharedFifo(1);
+    EXPECT_EQ(q.size(), size_t{2});
+    EXPECT_EQ(q.stagedSize(), size_t{3});
+
+    // The next receiver cycle may admit at most three more entries. Carried
+    // FIFO entries remain ahead of newly admitted entries, preserving the
+    // global (arrival, sender, lane) order without exceeding depth.
+    const size_t staged_before = q.stagedSize();
+    const auto rest = q.popAll(2);
+    EXPECT_TRUE(rest == std::vector<int>({3, 1, 4, 2, 5}));
+    EXPECT_EQ(staged_before - q.stagedSize(), kDepth);
+    EXPECT_EQ(q.sharedFifoHighWatermark(), kDepth);
+    EXPECT_EQ(q.empty(), true);
+
+    // A receiver flush in the same cycle does not mint a second aggregate
+    // admission budget.
+    q.clear();
+    EXPECT_EQ(q.pushFromThread(lane0, 6, 2, 10), true);
+    EXPECT_EQ(q.pushFromThread(lane1, 7, 2, 20), true);
+    q.prepareSharedFifo(2);
+    EXPECT_EQ(q.size(), size_t{0});
+    EXPECT_EQ(q.stagedSize(), size_t{2});
+    q.prepareSharedFifo(3);
+    EXPECT_EQ(q.size(), size_t{2});
+    EXPECT_TRUE(q.popAll(3) == std::vector<int>({6, 7}));
 }
 
 void test_capacity_growth_and_physical_overflow_accounting() {
@@ -449,6 +518,7 @@ int main() {
     RUN_TEST(test_frontier_requeues_hot_lane);
     RUN_TEST(test_scan_to_frontier_preserves_inflight_messages);
     RUN_TEST(test_registration_and_invalid_lane_contracts);
+    RUN_TEST(test_bounded_shared_fifo_depth_and_cycle_admission);
     RUN_TEST(test_capacity_growth_and_physical_overflow_accounting);
     RUN_TEST(test_set_capacity_upgrades_existing_unbounded_lanes);
     RUN_TEST(test_clear_resets_scan_and_frontier_state);

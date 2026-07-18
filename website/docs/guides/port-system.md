@@ -76,7 +76,7 @@ public:
     // Queue type selection (call during initialization before simulation starts)
     void useSingleThreadQueue();      // Same-thread connections (no mutex)
     void useLockFreeQueue();          // Cross-thread SPSC (lock-free atomics)
-    void useMultiProducerQueue();     // Cross-thread MPSC (per-thread queues)
+    void useMultiProducerQueue();     // Cross-thread MPSC ingress + shared FIFO
     void configureForSourceThreadCount(size_t source_thread_count);
 
     // Multi-producer queue API (only valid in MPSC mode)
@@ -122,7 +122,11 @@ public:
     // Query
     bool hasData(uint64_t current_cycle) const;
     bool hasMessages() const;  // Uses owner->localCycle()
+    // Destination FIFO occupancy (never exceeds capacity on bounded MPSC)
     size_t queuedMessageCount() const;
+    // Per-Connection ingress entries, outside the destination FIFO (diagnostic)
+    size_t transportPendingMessageCount() const;
+    size_t sharedFifoHighWatermark() const;
     bool canAccept(uint32_t pending = 0) const;
     size_t capacity() const;
     size_t available() const;
@@ -388,7 +392,7 @@ consumer->in.configureForSourceThreadCount(source_thread_count);
 // Cross-thread SPSC (lock-free)
 consumer->in.useLockFreeQueue();
 
-// Cross-thread MPSC (per-thread queues)
+// Cross-thread MPSC (private ingress lanes; bounded ports add a shared FIFO)
 consumer->in.useMultiProducerQueue();
 ```
 
@@ -409,16 +413,33 @@ if (consumer->in.canAcceptOnThreadQueue(queue_id)) {
 }
 ```
 
-The producer publishes the envelope directly into that lane; there is no
-Connection staging queue, payload copy, or scheduler arbitration pass. The
-consumer merges lane heads by `(arrive_cycle, stable_connection_id, lane_id)`.
-Small fan-in uses a direct scan; large fan-in uses sharded activity
-notifications and a consumer-owned min-heap.
+The producer publishes the envelope directly into its private SPSC ingress
+lane. There is no contended global tail, producer-side arbitration, or scheduler
+arbitration pass. The consumer merges lane heads by
+`(arrive_cycle, stable_connection_id, lane_id)`. Small fan-in uses a direct
+scan; large fan-in uses sharded activity notifications and a consumer-owned
+min-heap.
 
-Bounded lanes allocate the smallest sufficient power-of-two payload ring.
-Unlimited model-visible ports retain bounded physical storage. Physical
-storage, simulated-cycle admission credit, and per-cycle edge rate are separate
-checks; a same-cycle host pop never nondeterministically reopens model capacity.
+An unbounded InPort consumes the selected lane slot in place, preserving the
+direct-lane fast path. A bounded InPort has a preallocated, receiver-only shared
+ring. Immediately before the destination Unit ticks, it admits ready lane heads
+into that ring in deterministic merge order. Both aggregate occupancy and new
+admissions in one receiver cycle are capped by `InPort::capacity()`.
+
+Private lanes are transport storage, not extra architectural FIFO entries.
+`queuedMessageCount()` reports the shared destination FIFO;
+`transportPendingMessageCount()` exposes ingress backlog for diagnostics. A
+successful `send()` means the Connection accepted the message into its ingress
+lane. If the shared FIFO remains full, the receiver stops draining ingress;
+those bounded lanes then fill and propagate non-blocking backpressure to their
+individual producers.
+
+Bounded ingress lanes and the aggregate destination FIFO allocate power-of-two
+storage once during configuration; receive performs no allocation. Unlimited
+model-visible ports retain bounded physical storage. Physical storage,
+simulated-cycle admission credit, aggregate FIFO admission, and per-edge rate
+are separate checks; a same-cycle host pop never nondeterministically reopens
+model capacity.
 For bounded edges whose endpoints share one epoch-free worker, a non-atomic
 consumer-owned pop summary preserves that same cycle-start contract when the
 lookahead floor temporarily changes cluster execution order. Sequential and
@@ -493,8 +514,8 @@ void tick() override {
 ```
 
 **Notes:**
-- `send()` remains non-blocking. It returns `false` when the destination
-  queue (or per-thread MPSC queue) is full.
+- `send()` remains non-blocking. It returns `false` when the destination SPSC
+  queue or the Connection's MPSC ingress lane is full.
 - Lock-free SPSC/MPSC queues use monotonic absolute tickets and power-of-two
   masking. Every physical slot is usable; no sentinel slot is reserved. Bounded
   rings are rounded up at initialization. Unlimited model-visible ports still
@@ -514,11 +535,13 @@ if (in_port.canAcceptOnThreadQueue(queue_id)) {
 }
 ```
 
-Each producer connection owns one direct SPSC lane. One producer filling its
-lane does not contend on a global enqueue tail or block unrelated lanes. The
-consumer processes heads in arrival-cycle order with a stable connection-id
-tiebreak. Receiver-side filters run after deterministic selection and
-permanently consume rejected messages.
+Each producer connection owns one direct SPSC ingress lane. One producer filling
+its lane does not contend on a global enqueue tail or directly block unrelated
+lanes. For bounded destinations, a full shared FIFO stops receiver admission;
+backpressure then reaches each producer as its own ingress fills. The consumer
+processes heads in arrival-cycle order with a stable connection-id tiebreak.
+Receiver-side filters and selective flushes run after deterministic admission,
+preserve enqueue-cycle scope, and permanently consume rejected messages.
 
 ## Multiple Connections
 

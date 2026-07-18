@@ -308,13 +308,15 @@ class Unit;
 void addPortRegistrationToUnit(Unit* unit, std::function<void(const std::string&)> registration);
 class PortBase;
 void recordPortOnOwnerUnit(Unit* unit, PortBase* port);
+void recordCyclePreparedPortOnOwnerUnit(Unit* unit, PortBase* port);
 
 /**
  * IMultiProducerPort - type-erased MPSC metadata interface.
  *
- * Payload arbitration disappeared with direct per-Connection SPSC lanes: the
- * receiver merges lane heads when it reads the InPort.  The scheduler retains
- * this narrow interface only to prove producer-progress coverage and surface a
+ * Each Connection publishes through a private SPSC ingress lane. Unbounded
+ * ports merge lane heads directly; bounded ports materialize a receiver-owned
+ * aggregate FIFO at the destination cycle boundary. The scheduler retains this
+ * narrow interface only to prove producer-progress coverage and surface a
  * physical-ring overflow as a correctness failure.
  */
 class IMultiProducerPort {
@@ -367,6 +369,15 @@ public:
 
     /// Earliest pending arrival visible through this port, if any.
     virtual std::optional<uint64_t> minArrivalCycle() const { return std::nullopt; }
+
+    /**
+     * Receiver-owned cycle-boundary preparation.
+     *
+     * Only ports that explicitly register this hook are called by Unit. The
+     * default is therefore absent from the ordinary port/tick hot path rather
+     * than a virtual call on every PortBase each cycle.
+     */
+    virtual void prepareConsumerCycle(uint64_t /*current_cycle*/) {}
 
 protected:
     PortBase(Unit* owner, std::string name) : owner_(owner), name_(std::move(name)) {
