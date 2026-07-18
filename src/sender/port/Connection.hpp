@@ -78,13 +78,15 @@ public:
     /**
      * Optimize destination port for same-thread access.
      *
-     * Switches InPort to use lock-free SingleThreadMessageQueue.
+     * Switches InPort to use the synchronization-free SingleThreadMessageQueue.
      * Call this during initialization when both source and destination
-     * are determined to be on the same thread (same cluster).
+     * are determined to be on the same worker. Epoch-free execution enables
+     * cycle-strict admission because separate local clusters can temporarily
+     * execute out of their normal sweep order.
      *
      * This keeps intra-cluster registered edges on the cheapest storage.
      */
-    virtual void optimizeForSameThread() = 0;
+    virtual void optimizeForSameThread(bool cycle_strict_admission = false) = 0;
 
     /**
      * Optimize destination port for cross-thread SPSC access.
@@ -413,13 +415,13 @@ public:
 
     bool dependencyOnlyTransport() const noexcept override { return dependency_only_transport_; }
 
-    void optimizeForSameThread() override {
+    void optimizeForSameThread(bool cycle_strict_admission = false) override {
         if (dependency_only_transport_) return;
         thread_queue_id_ = SIZE_MAX;
         if (registered_capacity_.has_value()) {
             to_->setCapacity(*registered_capacity_);
         }
-        to_->useSingleThreadQueue();
+        to_->useSingleThreadQueue(cycle_strict_admission);
     }
 
     void optimizeForSPSC() override {

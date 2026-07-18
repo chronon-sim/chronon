@@ -307,7 +307,8 @@ public:
      * @param current_cycle The current simulation cycle
      * @return The message data if available, std::nullopt otherwise
      */
-    std::optional<T> tryPop(uint64_t current_cycle) {
+    template <typename OnPop>
+    std::optional<T> tryPopWithArrival(uint64_t current_cycle, OnPop&& on_pop) {
         if (messages_.empty()) {
             return std::nullopt;
         }
@@ -317,9 +318,15 @@ public:
             return std::nullopt;
         }
 
+        const uint64_t arrive_cycle = top.arrive_cycle;
         T data = std::move(const_cast<InternalMessage&>(top).data);
         messages_.pop();
+        std::forward<OnPop>(on_pop)(arrive_cycle);
         return data;
+    }
+
+    std::optional<T> tryPop(uint64_t current_cycle) {
+        return tryPopWithArrival(current_cycle, [](uint64_t) noexcept {});
     }
 
     std::vector<T> popAll(uint64_t current_cycle) {
@@ -474,9 +481,253 @@ private:
     QueueImpl queue_;
 };
 
-/** Adapts SingleThreadMessageQueue (no synchronization) to IMessageQueue. */
+/**
+ * SingleThreadQueueAdapter - cycle-strict registered-edge storage without
+ * synchronization.
+ *
+ * Epoch-free workers may temporarily skip an earlier local cluster while it
+ * waits on the shared lookahead floor, then execute a later cluster in the
+ * same worker sweep.  A consumer pop at cycle C must therefore not become
+ * producer admission credit until C + 1 even though both Units are owned by
+ * one host thread.  Consulting the live priority-queue size would make model
+ * backpressure depend on that wall-clock interleaving.
+ *
+ * Bounded ports keep a ring of per-cycle pop summaries. Admission is the live
+ * queue size plus pops whose simulated cycle has not become credit yet. There
+ * are no atomics, locks, cache-line handoffs, push-side bookkeeping, or
+ * per-message allocations; the uncommon history expansion only occurs when a
+ * producer trails more distinct pop cycles than the small initialization
+ * reserve can retain. Unbounded ports bypass the ledger entirely.
+ */
 template <typename T>
-using SingleThreadQueueAdapter = QueueAdapterImpl<T, SingleThreadMessageQueue<T>>;
+class SingleThreadQueueAdapter final : public IMessageQueue<T> {
+private:
+    struct PopCycle {
+        uint64_t cycle = 0;
+        uint64_t min_arrival = 0;
+        size_t count = 0;
+    };
+
+    static constexpr size_t kExpandedHistorySlots = 4;
+
+public:
+    explicit SingleThreadQueueAdapter(
+        size_t capacity = SingleThreadMessageQueue<T>::UNLIMITED_CAPACITY,
+        bool cycle_strict_admission = false)
+        : queue_(capacity),
+          cycle_strict_admission_(cycle_strict_admission),
+          track_admission_(cycle_strict_admission && capacity != unlimitedCapacity_()) {}
+
+    bool push(T data, uint64_t arrive_cycle) override {
+        return queue_.push(std::move(data), arrive_cycle);
+    }
+
+    std::optional<T> tryPop(uint64_t current_cycle) override {
+        if (!track_admission_) return queue_.tryPop(current_cycle);
+
+        return queue_.tryPopWithArrival(current_cycle, [this, current_cycle](uint64_t arrival) {
+            recordPop_(current_cycle, arrival);
+        });
+    }
+
+    std::vector<T> popAll(uint64_t current_cycle) override {
+        std::vector<T> result;
+        popAllInto(result, current_cycle);
+        return result;
+    }
+
+    void popAllInto(std::vector<T>& out, uint64_t current_cycle) override {
+        if (!track_admission_) {
+            queue_.popAllInto(out, current_cycle);
+            return;
+        }
+
+        out.clear();
+        while (auto value = tryPop(current_cycle)) {
+            out.push_back(std::move(*value));
+        }
+    }
+
+    bool hasReady(uint64_t current_cycle) const override { return queue_.hasReady(current_cycle); }
+
+    std::optional<uint64_t> minArrivalCycle() const override { return queue_.minArrivalCycle(); }
+
+    bool empty() const override { return queue_.empty(); }
+    bool full() const override { return queue_.full(); }
+    size_t size() const override { return queue_.size(); }
+    size_t capacity() const noexcept override { return queue_.capacity(); }
+    size_t storageCapacity() const noexcept override { return queue_.capacity(); }
+    size_t available() const override { return queue_.available(); }
+
+    size_t admissionOccupancy(uint64_t send_cycle) const override {
+        if (!track_admission_) return queue_.size();
+        retirePopCyclesBefore_(send_cycle);
+        const size_t live = queue_.size();
+        const size_t pending = pendingPopCount_();
+        return pending > std::numeric_limits<size_t>::max() - live
+                   ? std::numeric_limits<size_t>::max()
+                   : live + pending;
+    }
+
+    std::optional<uint64_t> admissionMinArrivalCycle(uint64_t send_cycle) const override {
+        auto min = queue_.minArrivalCycle();
+        if (!track_admission_) return min;
+
+        retirePopCyclesBefore_(send_cycle);
+        if (const PopCycle* event = oldestPendingPop_()) {
+            if (!min || event->min_arrival < *min) {
+                min = event->min_arrival;
+            }
+        }
+        return min;
+    }
+
+    void setCapacity(size_t capacity) override {
+        queue_.setCapacity(capacity);
+        const bool should_track = cycle_strict_admission_ && capacity != unlimitedCapacity_();
+        if (should_track == track_admission_) return;
+
+        track_admission_ = should_track;
+        resetAdmission_();
+    }
+
+    void clear() override {
+        queue_.clear();
+        resetAdmission_();
+    }
+
+private:
+    static constexpr size_t unlimitedCapacity_() noexcept {
+        return SingleThreadMessageQueue<T>::UNLIMITED_CAPACITY;
+    }
+
+    PopCycle& historyAt_(uint64_t ticket) noexcept {
+        return expanded_history_[static_cast<size_t>(ticket) & pop_history_mask_];
+    }
+
+    const PopCycle& historyAt_(uint64_t ticket) const noexcept {
+        return expanded_history_[static_cast<size_t>(ticket) & pop_history_mask_];
+    }
+
+    size_t pendingPopCount_() const noexcept {
+        return expanded_history_active_ ? outstanding_pop_count_ : inline_pop_.count;
+    }
+
+    const PopCycle* oldestPendingPop_() const noexcept {
+        if (!expanded_history_active_) {
+            return inline_pop_.count == 0 ? nullptr : &inline_pop_;
+        }
+        return pop_history_head_ == pop_history_tail_ ? nullptr : &historyAt_(pop_history_head_);
+    }
+
+    void activateExpandedHistory_(uint64_t cycle, uint64_t arrival) {
+        if (!expanded_history_) {
+            expanded_history_ = std::make_unique<PopCycle[]>(kExpandedHistorySlots);
+            pop_history_mask_ = kExpandedHistorySlots - 1;
+        }
+        expanded_history_[0] = inline_pop_;
+        expanded_history_[1] = PopCycle{cycle, arrival, 1};
+        pop_history_head_ = 0;
+        pop_history_tail_ = 2;
+        outstanding_pop_count_ = inline_pop_.count + 1;
+        inline_pop_ = {};
+        expanded_history_active_ = true;
+    }
+
+    void growHistory_() {
+        const size_t old_size = pop_history_mask_ + 1;
+        if (old_size > std::numeric_limits<size_t>::max() / 2) {
+            throw std::length_error("same-thread admission history is too large");
+        }
+        const size_t new_size = old_size * 2;
+        auto grown = std::make_unique<PopCycle[]>(new_size);
+        const uint64_t live = pop_history_tail_ - pop_history_head_;
+        for (uint64_t i = 0; i < live; ++i) {
+            grown[static_cast<size_t>(i)] = historyAt_(pop_history_head_ + i);
+        }
+        expanded_history_ = std::move(grown);
+        pop_history_mask_ = new_size - 1;
+        pop_history_head_ = 0;
+        pop_history_tail_ = live;
+    }
+
+    void recordPop_(uint64_t cycle, uint64_t arrival) {
+        if (!expanded_history_active_) {
+            if (inline_pop_.count == 0) {
+                inline_pop_ = PopCycle{cycle, arrival, 1};
+                return;
+            }
+            if (inline_pop_.cycle == cycle) {
+                ++inline_pop_.count;
+                inline_pop_.min_arrival = std::min(inline_pop_.min_arrival, arrival);
+                return;
+            }
+            activateExpandedHistory_(cycle, arrival);
+            return;
+        }
+
+        if (pop_history_head_ != pop_history_tail_) {
+            PopCycle& last = historyAt_(pop_history_tail_ - 1);
+            if (last.cycle == cycle) {
+                ++last.count;
+                last.min_arrival = std::min(last.min_arrival, arrival);
+                ++outstanding_pop_count_;
+                return;
+            }
+        }
+
+        if (pop_history_tail_ - pop_history_head_ == pop_history_mask_ + 1) {
+            growHistory_();
+        }
+        historyAt_(pop_history_tail_) = PopCycle{cycle, arrival, 1};
+        ++pop_history_tail_;
+        ++outstanding_pop_count_;
+    }
+
+    void retirePopCyclesBefore_(uint64_t cycle) const noexcept {
+        if (!expanded_history_active_) {
+            if (inline_pop_.count != 0 && inline_pop_.cycle < cycle) {
+                inline_pop_ = {};
+            }
+            return;
+        }
+
+        while (pop_history_head_ != pop_history_tail_) {
+            const PopCycle& event = historyAt_(pop_history_head_);
+            if (event.cycle >= cycle) break;
+            outstanding_pop_count_ -= event.count;
+            ++pop_history_head_;
+        }
+
+        const uint64_t live = pop_history_tail_ - pop_history_head_;
+        if (live <= 1) {
+            inline_pop_ = live == 0 ? PopCycle{} : historyAt_(pop_history_head_);
+            pop_history_head_ = 0;
+            pop_history_tail_ = 0;
+            outstanding_pop_count_ = 0;
+            expanded_history_active_ = false;
+        }
+    }
+
+    void resetAdmission_() noexcept {
+        inline_pop_ = {};
+        expanded_history_active_ = false;
+        pop_history_head_ = 0;
+        pop_history_tail_ = 0;
+        outstanding_pop_count_ = 0;
+    }
+
+    SingleThreadMessageQueue<T> queue_;
+    bool cycle_strict_admission_ = false;
+    bool track_admission_ = false;
+    mutable PopCycle inline_pop_{};
+    std::unique_ptr<PopCycle[]> expanded_history_;
+    mutable bool expanded_history_active_ = false;
+    size_t pop_history_mask_ = kExpandedHistorySlots - 1;
+    mutable uint64_t pop_history_head_ = 0;
+    mutable uint64_t pop_history_tail_ = 0;
+    mutable size_t outstanding_pop_count_ = 0;
+};
 
 /**
  * LockFreeQueueAdapter - Adapts LockFreeMessageQueue to IMessageQueue interface.

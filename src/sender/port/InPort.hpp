@@ -31,6 +31,8 @@
 
 namespace chronon::sender {
 
+struct InPortSelectiveFlushTestAccess;
+
 namespace detail {
 
 template <auto KeyFn, typename T>
@@ -57,6 +59,8 @@ concept SelectiveCancelKeyFn = requires(const T& data) {
  */
 template <typename T>
 class InPort : public PortBase, public IMultiProducerPort {
+    friend struct InPortSelectiveFlushTestAccess;
+
 public:
     using StoredMessage = detail::PortEnvelope<T>;
     static constexpr size_t UNLIMITED_CAPACITY = std::numeric_limits<size_t>::max();
@@ -122,14 +126,15 @@ public:
      *
      * WARNING: Must be called before simulation starts (queue must be empty).
      */
-    void useSingleThreadQueue() {
+    void useSingleThreadQueue(bool cycle_strict_admission = false) {
         if (shared_broadcast_queue_raw_) {
             throw std::logic_error("cannot replace an active shared broadcast transport");
         }
         multi_producer_queue_raw_ = nullptr;
         direct_spsc_queue_raw_ = nullptr;
         lock_free_queue_ = false;
-        queue_ = std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity_);
+        queue_ = std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity_,
+                                                                           cycle_strict_admission);
     }
 
     /// True when this port drains a bounded lock-free SPSC ring (cross-thread,
@@ -527,7 +532,7 @@ public:
                 result.push_back(std::move(msg.data));
             }
         }
-        if (!drain_scratch_.empty()) retireSelectiveFlushesAtCurrentFront_();
+        if (!drain_scratch_.empty()) retireSelectiveFlushesAfterDrain_(current_cycle);
         return result;
     }
 
@@ -548,7 +553,7 @@ public:
                 recv_scratch_.push_back(std::move(msg.data));
             }
         }
-        if (!drain_scratch_.empty()) retireSelectiveFlushesAtCurrentFront_();
+        if (!drain_scratch_.empty()) retireSelectiveFlushesAfterDrain_(current_cycle);
         return recv_scratch_;
     }
     const std::vector<T>& receiveAllBuffered() { return receiveAllBuffered(getCurrentCycle()); }
@@ -651,7 +656,7 @@ private:
             };
             const bool consumed = queue.consumeReady(current_cycle, visit);
             if (!consumed) return std::nullopt;
-            retireSelectiveFlushesAtFront_(queue);
+            retireSelectiveFlushesAtFront_(queue, current_cycle);
             if (result) return result;
         }
     }
@@ -674,7 +679,7 @@ private:
             if (!msg.has_value()) return std::nullopt;
             const bool rejected = detail::isCanceled(*msg) || isReceiverCanceled_(*msg) ||
                                   !std::invoke(filter, std::as_const(msg->data));
-            retireSelectiveFlushesAtFront_(queue);
+            retireSelectiveFlushesAtFront_(queue, current_cycle);
             if (!rejected) {
                 return std::move(msg->data);
             }
@@ -691,21 +696,27 @@ private:
         queue_->popAllInto(out, current_cycle);
     }
 
-    void retireSelectiveFlushesAtCurrentFront_() noexcept {
+    void retireSelectiveFlushesAfterDrain_(uint64_t current_cycle) noexcept {
         if (selective_flush_state_.empty()) return;
         if (shared_broadcast_queue_raw_) {
-            retireSelectiveFlushesAtFront_(*shared_broadcast_queue_raw_);
+            retireSelectiveFlushesAtFront_(*shared_broadcast_queue_raw_, current_cycle);
         } else {
-            retireSelectiveFlushesAtFront_(*queue_);
+            retireSelectiveFlushesAtFront_(*queue_, current_cycle);
         }
     }
 
     template <typename Queue>
-    void retireSelectiveFlushesAtFront_(const Queue& queue) noexcept {
+    void retireSelectiveFlushesAtFront_(const Queue& queue,
+                                        uint64_t drained_through_cycle) noexcept {
         if (selective_flush_state_.empty()) return;
         auto front_arrival = queue.minArrivalCycle();
-        if (!front_arrival ||
-            !selective_flush_state_.hasRetirementCandidate(*front_arrival, max_incoming_delay_))
+        const uint64_t empty_frontier =
+            drained_through_cycle == std::numeric_limits<uint64_t>::max()
+                ? drained_through_cycle
+                : drained_through_cycle + 1;
+        uint64_t retirement_frontier = front_arrival.value_or(empty_frontier);
+        if (!selective_flush_state_.hasRetirementCandidate(retirement_frontier,
+                                                           max_incoming_delay_))
             return;
 
         const auto producer_progress_floor = mpscProducerProgressFloor_();
@@ -715,9 +726,9 @@ private:
             // so an old arrival published between the first head read and the
             // progress read cannot hide behind a stale future head.
             front_arrival = queue.minArrivalCycle();
-            if (!front_arrival) return;
+            retirement_frontier = front_arrival.value_or(empty_frontier);
         }
-        selective_flush_state_.retireBeforeArrival(*front_arrival, max_incoming_delay_,
+        selective_flush_state_.retireBeforeArrival(retirement_frontier, max_incoming_delay_,
                                                    producer_progress_floor);
     }
 

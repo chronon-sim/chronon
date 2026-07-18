@@ -23,6 +23,19 @@
 using namespace chronon;
 using namespace chronon::sender::test;
 
+namespace chronon::sender {
+
+struct InPortSelectiveFlushTestAccess {
+    template <typename T>
+    static size_t activePredicateCount(const InPort<T>& port) noexcept {
+        return port.selective_flush_state_.active_slot_count();
+    }
+};
+
+}  // namespace chronon::sender
+
+using chronon::sender::InPortSelectiveFlushTestAccess;
+
 namespace {
 
 [[noreturn]] void fail(const std::string& message) { throw std::runtime_error(message); }
@@ -146,6 +159,39 @@ void verifyOverlapIsMonotonicAndOrderIndependent() {
     const std::vector<uint64_t> expected{2, 3, 4, 0};
     require(runOverlapCase(true) == expected, "lower-first overlap changed keep intersection");
     require(runOverlapCase(false) == expected, "upper-first overlap changed keep intersection");
+}
+
+void verifyPredicateRetiresWhenDrainEmptiesQueue() {
+    for (const PortPolicy policy : {PortPolicy::LegacyFastPath, PortPolicy::StageSelective}) {
+        ManualUnit producer("producer");
+        ManualUnit consumer("consumer");
+        OutPort<TaggedMessage> out{&producer, "out", 4};
+        InPort<TaggedMessage> in{&consumer, "in", 8, policy};
+        out.connect(&in, 2);
+
+        consumer.setCycle(5);
+        in.flush<&TaggedMessage::keyOf>(FlushRange::youngerThan(uint64_t{50}));
+        require(InPortSelectiveFlushTestAccess::activePredicateCount(in) == 1,
+                "flush predicate was not installed");
+
+        producer.setCycle(5);
+        require(out.send(TaggedMessage{.key = 100}), "failed to enqueue single post-flush message");
+        const auto single = in.tryReceive(7);
+        require(single && single->key == 100, "single post-flush message did not survive");
+        require(InPortSelectiveFlushTestAccess::activePredicateCount(in) == 0,
+                "predicate survived when tryReceive drained the queue to empty");
+
+        consumer.setCycle(10);
+        in.flush<&TaggedMessage::keyOf>(FlushRange::youngerThan(uint64_t{50}));
+        producer.setCycle(10);
+        require(out.send(TaggedMessage{.key = 101}),
+                "failed to enqueue receiveAll retirement message");
+        const auto drained = in.receiveAll(12);
+        require(drained.size() == 1 && drained.front().key == 101,
+                "receiveAll lost the post-flush message");
+        require(InPortSelectiveFlushTestAccess::activePredicateCount(in) == 0,
+                "predicate survived when receiveAll drained the queue to empty");
+    }
 }
 
 void verifyHeterogeneousDelayMpscRetirement() {
@@ -458,6 +504,7 @@ int main() {
         std::cout << "=== Selective FlushRange contract ===\n";
         verifyFullWidthBoundariesAndPolicyParity();
         verifyOverlapIsMonotonicAndOrderIndependent();
+        verifyPredicateRetiresWhenDrainEmptiesQueue();
         verifyHeterogeneousDelayMpscRetirement();
         verifyEpochFreeFlushMatrix();
         std::cout << "Selective FlushRange tests passed.\n";

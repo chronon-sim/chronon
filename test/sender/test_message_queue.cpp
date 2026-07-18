@@ -6,6 +6,7 @@
 // scheduler uses single-thread storage, SPSC rings, or topology-stable MPSC
 // direct lanes.
 
+#include <deque>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -259,6 +260,76 @@ void test_lock_free_adapter_retires_all_admission_histories() {
     std::cout << "PASSED\n";
 }
 
+void test_single_thread_adapter_cycle_strict_admission() {
+    std::cout << "Testing same-thread cycle-strict admission... ";
+
+    SingleThreadQueueAdapter<uint64_t> queue(2, /*cycle_strict_admission=*/true);
+    std::deque<uint64_t> sequential_oracle;
+    constexpr uint64_t kCycles = 2 * LockFreeMessageQueue<uint64_t>::CAPACITY + 17;
+
+    for (uint64_t cycle = 0; cycle < kCycles; ++cycle) {
+        // Deliberately run the consumer first. Epoch-free workers can expose
+        // this order when the producer cluster is temporarily floor-blocked.
+        if ((cycle & 3U) == 0) {
+            while (queue.tryPop(cycle).has_value()) {
+            }
+        }
+
+        const bool expected_send = sequential_oracle.size() < 2;
+        const size_t occupancy = queue.admissionOccupancy(cycle);
+        CHECK((occupancy < 2) == expected_send);
+
+        const auto admission_min = queue.admissionMinArrivalCycle(cycle);
+        if (sequential_oracle.empty()) {
+            CHECK(!admission_min.has_value());
+        } else {
+            CHECK(admission_min.has_value());
+            CHECK(*admission_min == sequential_oracle.front());
+        }
+
+        if (expected_send) {
+            CHECK(queue.push(cycle, cycle + 1));
+            sequential_oracle.push_back(cycle + 1);
+        }
+
+        // Sequential reference order is producer then consumer. Update the
+        // oracle only after its admission decision for this cycle.
+        if ((cycle & 3U) == 0) {
+            while (!sequential_oracle.empty() && sequential_oracle.front() <= cycle) {
+                sequential_oracle.pop_front();
+            }
+        }
+    }
+
+    queue.clear();
+    CHECK(queue.admissionOccupancy(kCycles) == 0);
+    std::cout << "PASSED\n";
+}
+
+void test_single_thread_adapter_expands_admission_history() {
+    std::cout << "Testing same-thread admission history expansion... ";
+
+    SingleThreadQueueAdapter<uint64_t> queue(8, /*cycle_strict_admission=*/true);
+    for (uint64_t cycle = 0; cycle < 6; ++cycle) {
+        CHECK(queue.push(cycle, cycle));
+    }
+    for (uint64_t cycle = 0; cycle < 6; ++cycle) {
+        const auto value = queue.tryPop(cycle);
+        CHECK(value.has_value());
+        CHECK(*value == cycle);
+    }
+
+    CHECK(queue.empty());
+    CHECK(queue.admissionOccupancy(0) == 6);
+    CHECK(queue.admissionMinArrivalCycle(0).value() == 0);
+    CHECK(queue.admissionOccupancy(3) == 3);
+    CHECK(queue.admissionMinArrivalCycle(3).value() == 3);
+    CHECK(queue.admissionOccupancy(6) == 0);
+    CHECK(!queue.admissionMinArrivalCycle(6).has_value());
+
+    std::cout << "PASSED\n";
+}
+
 void test_direct_spsc_adapter_differential_semantics() {
     std::cout << "Testing DirectSPSCQueueAdapter differential semantics... ";
 
@@ -419,6 +490,8 @@ int main() {
     test_capacity_tracking();
     test_lock_free_queue_basic();
     test_lock_free_adapter_retires_all_admission_histories();
+    test_single_thread_adapter_cycle_strict_admission();
+    test_single_thread_adapter_expands_admission_history();
     test_direct_spsc_adapter_differential_semantics();
     test_direct_spsc_adapter_wraparound_and_backpressure();
     test_direct_spsc_consume_ready_discard_path();
