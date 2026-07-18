@@ -77,6 +77,9 @@ public:
     void reserve(size_t events) { events_.reserve(events); }
 
     void record(uint64_t cycle, ModelEventKind kind, uint64_t value0 = 0, uint64_t value1 = 0) {
+        if (last_cycle_ != std::numeric_limits<uint64_t>::max() && cycle < last_cycle_) {
+            throw std::logic_error("canonical Unit event cycle moved backward");
+        }
         if (cycle != last_cycle_) {
             last_cycle_ = cycle;
             next_sequence_ = 0;
@@ -158,6 +161,11 @@ inline uint64_t canonicalDigest(const RunArtifact& artifact) noexcept {
     };
 
     mix(artifact.executed_cycles);
+    mix(artifact.component_names.size());
+    for (const auto& name : artifact.component_names) {
+        mix(name.size());
+        for (unsigned char byte : name) mix(byte);
+    }
     mix(artifact.events.size());
     for (const auto& event : artifact.events) {
         mix(event.cycle);

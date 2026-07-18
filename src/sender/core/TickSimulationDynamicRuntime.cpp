@@ -183,15 +183,15 @@ bool TickSimulation::forceEpochFreeMigrationAtBoundary_(Unit* unit, size_t targe
     }
 
     // run() has joined every persistent worker before this seam is callable.
-    // No remote observer exists, so relaxed publication is sufficient here;
-    // the next worker launch acquires the ownership generation and owner slots.
-    cluster_runtime_owner_[cluster].store(target_thread, std::memory_order_relaxed);
+    // Publish the new owner and generation for the next worker launch, whose
+    // ownership refresh uses acquire loads.
+    cluster_runtime_owner_[cluster].store(target_thread, std::memory_order_release);
     if (cluster < dynamic_cluster_last_migration_cycle_.size()) {
         dynamic_cluster_last_migration_cycle_[cluster] = current_cycle_;
         dynamic_cluster_last_source_thread_[cluster] = source;
         dynamic_cluster_last_target_thread_[cluster] = target_thread;
     }
-    cluster_assignment_generation_.fetch_add(1, std::memory_order_relaxed);
+    cluster_assignment_generation_.fetch_add(1, std::memory_order_release);
     ++rebalance_count_;
     cycles_since_last_actual_rebalance_ = 0;
     rebuildThreadUnitsFromClusterOwners_();
