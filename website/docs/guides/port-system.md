@@ -112,7 +112,9 @@ The contract is deliberately narrow:
 - payload-carrying connections need non-throwing move construction and
   assignment; a non-broadcast fanout additionally needs a non-throwing copy
   constructor. Unconnected and dependency-only ports do not move their no-op
-  payload during publication.
+  payload during publication. Per-connection dependency-only edges may coexist
+  with payload edges on one `OutPort`; their rate credit is reserved and
+  released atomically, but they are skipped when payloads are published.
 
 The transaction handle is stack-backed. Producer-owned claim bookkeeping
 reuses the existing cycle-local admission counters and object padding; a cold

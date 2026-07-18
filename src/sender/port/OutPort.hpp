@@ -405,11 +405,19 @@ private:
     }
 
     [[nodiscard]] bool transactionPayloadSupported_() const noexcept {
+        size_t payload_connections = shared_broadcast_ ? 1 : 0;
+        if (!shared_broadcast_ && !dependency_only_transport_) {
+            for (const auto& connection : connections_) {
+                if (!connection->dependencyOnlyTransport()) ++payload_connections;
+            }
+        }
+        if (payload_connections == 0) return true;
+
         if constexpr (!std::is_nothrow_move_constructible_v<T> ||
                       !std::is_nothrow_move_assignable_v<T>) {
-            return connections_.empty() || dependency_only_transport_;
+            return false;
         }
-        if (!shared_broadcast_ && !dependency_only_transport_ && connections_.size() > 1) {
+        if (payload_connections > 1) {
             if constexpr (!std::is_nothrow_copy_constructible_v<T>) {
                 return false;
             }
@@ -516,16 +524,27 @@ private:
                 std::terminate();
             }
         } else if (!dependency_only_transport_) {
-            if (connections_.size() == 1) {
-                connections_.front()->commitReservedTransfer_(std::move(data), current);
-            } else {
-                if constexpr (std::is_copy_constructible_v<T>) {
-                    for (size_t i = 0; i + 1 < connections_.size(); ++i) {
-                        connections_[i]->commitReservedTransfer_(T{data}, current);
+            Connection<T>* last_payload_connection = nullptr;
+            size_t payload_connections = 0;
+            for (const auto& connection : connections_) {
+                if (connection->dependencyOnlyTransport()) continue;
+                last_payload_connection = connection.get();
+                ++payload_connections;
+            }
+
+            if constexpr (std::is_copy_constructible_v<T>) {
+                for (const auto& connection : connections_) {
+                    if (connection->dependencyOnlyTransport()) continue;
+                    if (connection.get() == last_payload_connection) {
+                        connection->commitReservedTransfer_(std::move(data), current);
+                    } else {
+                        connection->commitReservedTransfer_(T{data}, current);
                     }
-                    connections_.back()->commitReservedTransfer_(std::move(data), current);
-                } else {
-                    std::terminate();
+                }
+            } else {
+                if (payload_connections > 1) std::terminate();
+                if (last_payload_connection) {
+                    last_payload_connection->commitReservedTransfer_(std::move(data), current);
                 }
             }
         }

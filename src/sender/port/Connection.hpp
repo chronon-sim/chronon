@@ -597,13 +597,17 @@ private:
      * for this claim without adding a transaction branch to their hot path.
      */
     bool tryReserveTransfer_(uint64_t send_cycle) {
-        if (dependency_only_transport_ || shared_broadcast_ != nullptr) {
-            return false;
-        }
+        if (shared_broadcast_ != nullptr) return false;
 
         maybeResetPushesCycle_(send_cycle);
         if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
             return false;
+        }
+
+        if (dependency_only_transport_) {
+            ++pushes_this_cycle_;
+            transaction_destination_epoch_ = to_->portTransactionEpoch_();
+            return true;
         }
 
         if (thread_queue_id_ != SIZE_MAX) {
@@ -623,11 +627,13 @@ private:
     /** Validate a previously claimed slot without consuming another credit. */
     bool transactionReservationValid_(uint64_t send_cycle) const {
         if (from_->getCurrentCycle() != send_cycle || last_pushes_cycle_ != send_cycle ||
-            pushes_this_cycle_ == 0 || dependency_only_transport_ || shared_broadcast_ != nullptr ||
+            pushes_this_cycle_ == 0 || shared_broadcast_ != nullptr ||
             transaction_destination_epoch_ != to_->portTransactionEpoch_() ||
             pushes_this_cycle_ > edgeCycleRateLimit_()) {
             return false;
         }
+
+        if (dependency_only_transport_) return true;
 
         if (thread_queue_id_ != SIZE_MAX) {
             return hasMPSCLaneAdmissionForPending_(send_cycle, pushes_this_cycle_) &&
@@ -654,7 +660,8 @@ private:
      * a framework invariant violation, not model backpressure after partial
      * publication.
      */
-    void commitReservedTransfer_(T data, uint64_t send_cycle) {
+    void commitReservedTransfer_(T&& data, uint64_t send_cycle) {
+        if (dependency_only_transport_) return;
         const uint64_t arrive_cycle = send_cycle + delay_;
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
         const uint64_t cancel_epoch = cancel_epoch_.load(std::memory_order_acquire);

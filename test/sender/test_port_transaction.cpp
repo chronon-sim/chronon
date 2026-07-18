@@ -377,6 +377,52 @@ void testNoopThrowingPayloadCannotPartiallyCommit() {
             "unconnected no-op payload changed the real transaction delivery");
 }
 
+void testMixedDependencyOnlyEdgeParticipatesWithoutPayload() {
+    ManualUnit producer("producer");
+    ManualUnit real_sink("real_sink");
+    ManualUnit dependency_sink("dependency_sink");
+    ManualUnit peer_sink("peer_sink");
+    OutPort<int> mixed{&producer, "mixed", 2};
+    OutPort<int> peer{&producer, "peer", 2};
+    InPort<int> real_in{&real_sink, "real_in", 4};
+    InPort<int> dependency_in{&dependency_sink, "dependency_in", 1};
+    InPort<int> peer_in{&peer_sink, "peer_in", 1};
+    auto* real_edge = mixed.connect(&real_in, 0);
+    auto* dependency_edge = mixed.connect(&dependency_in, 0);
+    peer.connect(&peer_in, 0);
+    real_edge->configureRegisteredEdge(std::nullopt, size_t{2});
+    dependency_edge->configureRegisteredEdge(std::nullopt, size_t{1});
+    dependency_edge->setDependencyOnlyTransport(true, 2);
+
+    producer.setCycle(12);
+    auto committed = reserve(mixed, peer);
+    require(static_cast<bool>(committed),
+            "mixed payload/dependency-only OutPort could not reserve");
+    require(committed.commit(120, 121),
+            "mixed payload/dependency-only transaction could not commit");
+    const auto real_value = real_in.tryReceive(12);
+    const auto peer_value = peer_in.tryReceive(12);
+    require(real_value.has_value() && *real_value == 120,
+            "mixed transaction lost its physical payload");
+    require(peer_value.has_value() && *peer_value == 121,
+            "mixed transaction lost its peer payload");
+    requireEmpty(dependency_in, 12, "mixed transaction published on a dependency-only edge");
+    require(!mixed.canSend(),
+            "committed transaction did not account dependency-only edge rate credit");
+
+    producer.setCycle(13);
+    require(peer.send(130), "failed to backpressure the mixed-edge peer destination");
+    auto rejected = reserve(mixed, peer);
+    require(!rejected, "mixed-edge transaction ignored peer backpressure");
+    require(mixed.canSend(),
+            "failed mixed-edge reservation did not release dependency-only credit");
+    require(mixed.send(131), "ordinary send could not reuse a released mixed-edge reservation");
+    const auto retried_value = real_in.tryReceive(13);
+    require(retried_value.has_value() && *retried_value == 131,
+            "released mixed-edge reservation lost the ordinary payload");
+    requireEmpty(dependency_in, 13, "ordinary mixed-edge send published on a dependency-only edge");
+}
+
 void testSharedBoundedDestinationIsRejectedBeforeClaim() {
     ManualUnit producer("producer");
     ManualUnit sink("sink");
@@ -886,6 +932,7 @@ int main() {
         testCycleBoundaryAndExplicitRelease();
         testInvalidPortSetsAreRejected();
         testNoopThrowingPayloadCannotPartiallyCommit();
+        testMixedDependencyOnlyEdgeParticipatesWithoutPayload();
         testSharedBoundedDestinationIsRejectedBeforeClaim();
         testRepeatedBoundedEdgeOnOnePortIsRejected();
         testSharedFiniteSPSCTransportIsRejected();
