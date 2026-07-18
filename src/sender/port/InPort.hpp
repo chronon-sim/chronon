@@ -422,7 +422,10 @@ public:
     detail::ProducerDestinationTransactionState* registerTransactionProducer(
         Unit* producer, ConnectionBase* connection) {
         if (!producer || !connection) return nullptr;
-        for (auto& state : producer_transaction_states_) {
+        if (!producer_transaction_states_) {
+            producer_transaction_states_ = std::make_unique<ProducerTransactionStates>();
+        }
+        for (auto& state : *producer_transaction_states_) {
             if (state->producer != producer) continue;
             state->connections.push_back({.connection = connection});
             return state.get();
@@ -431,7 +434,7 @@ public:
         auto state = std::make_unique<detail::ProducerDestinationTransactionState>(producer);
         state->connections.push_back({.connection = connection});
         auto* result = state.get();
-        producer_transaction_states_.push_back(std::move(state));
+        producer_transaction_states_->push_back(std::move(state));
         return result;
     }
 
@@ -907,15 +910,16 @@ private:
     /// Direct MPSC lane registry, sorted by topology-stable conn_id.
     std::vector<ConnectionBase*> mpsc_connections_;
 
-    /// One cache-line-isolated, producer-owned transaction control block per
-    /// source Unit. Allocated only while the topology is being constructed.
-    std::vector<std::unique_ptr<detail::ProducerDestinationTransactionState>>
-        producer_transaction_states_;
-
     /// Per-connection producer completed_cycle atomics, aligned with
     /// mpsc_connections_. Besides proving scheduler coverage, a live selective
     /// flush uses them to stabilize the heterogeneous-delay arrival frontier.
     std::vector<const std::atomic<uint64_t>*> mpsc_conn_progress_;
+
+    /// Lazily allocated topology-only ownership for cache-line-isolated,
+    /// producer-owned transaction control blocks.
+    using ProducerTransactionStates =
+        std::vector<std::unique_ptr<detail::ProducerDestinationTransactionState>>;
+    std::unique_ptr<ProducerTransactionStates> producer_transaction_states_;
 };
 
 template <typename T>
