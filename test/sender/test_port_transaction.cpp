@@ -313,6 +313,66 @@ void testInvalidPortSetsAreRejected() {
     require(!cross_owner, "transaction accepted ports owned by different Units");
 }
 
+void testSharedBoundedDestinationIsRejectedBeforeClaim() {
+    ManualUnit producer("producer");
+    ManualUnit sink("sink");
+    OutPort<int> out0{&producer, "out0", 2};
+    OutPort<int> out1{&producer, "out1", 2};
+    InPort<int> bounded{&sink, "bounded", 1};
+    out0.connect(&bounded, 0);
+    out1.connect(&bounded, 0);
+
+    producer.setCycle(10);
+    auto tx = reserve(out0, out1);
+    require(!tx, "transaction accepted two claims on one bounded destination");
+    require(out0.sentThisCycle() == 0 && out1.sentThisCycle() == 0,
+            "rejected shared-destination transaction consumed port credit");
+
+    require(out0.send(10), "rejected transaction leaked the first connection's claim");
+    require(!out1.send(11), "bounded destination accepted a second ordinary payload");
+    const auto value = bounded.tryReceive(10);
+    require(value.has_value() && *value == 10,
+            "shared-destination rejection changed the surviving payload");
+    requireEmpty(bounded, 10, "shared-destination rejection partially published a transaction");
+}
+
+void testRepeatedBoundedEdgeOnOnePortIsRejected() {
+    ManualUnit producer("producer");
+    ManualUnit sink("sink");
+    OutPort<int> out{&producer, "out", 2};
+    InPort<int> bounded{&sink, "bounded", 2};
+    out.connect(&bounded, 0);
+    out.connect(&bounded, 0);
+
+    producer.setCycle(11);
+    auto tx = reserve(out);
+    require(!tx, "transaction accepted repeated physical edges to one bounded destination");
+    require(out.sentThisCycle() == 0,
+            "repeated-edge rejection consumed the OutPort's cycle credit");
+}
+
+void testSharedUnboundedDestinationRemainsSupported() {
+    ManualUnit producer("producer");
+    ManualUnit sink("sink");
+    OutPort<int> out0{&producer, "out0", 1};
+    OutPort<int> out1{&producer, "out1", 1};
+    InPort<int> unbounded{&sink, "unbounded"};
+    out0.connect(&unbounded, 0);
+    out1.connect(&unbounded, 0);
+
+    producer.setCycle(12);
+    auto tx = reserve(out0, out1);
+    require(static_cast<bool>(tx) && tx.commit(12, 13),
+            "transaction rejected a shared unbounded destination");
+    const auto first = unbounded.tryReceive(12);
+    const auto second = unbounded.tryReceive(12);
+    require(first.has_value() && *first == 12,
+            "shared unbounded destination lost the first payload");
+    require(second.has_value() && *second == 13,
+            "shared unbounded destination lost the second payload");
+    requireEmpty(unbounded, 12, "shared unbounded transaction duplicated a payload");
+}
+
 void testTransactionSpansSharedBroadcastTransport() {
     ManualUnit producer("producer");
     ManualUnit broadcast_sink0("broadcast_sink0");
@@ -701,6 +761,9 @@ int main() {
         testReceiverFlushDoesNotCancelUnpublishedTransaction();
         testCycleBoundaryAndExplicitRelease();
         testInvalidPortSetsAreRejected();
+        testSharedBoundedDestinationIsRejectedBeforeClaim();
+        testRepeatedBoundedEdgeOnOnePortIsRejected();
+        testSharedUnboundedDestinationRemainsSupported();
         testTransactionSpansSharedBroadcastTransport();
         testTransactionSpansSPSCAndMPSC();
         testEpochFreeDifferentialMatrix();

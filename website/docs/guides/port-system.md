@@ -97,6 +97,10 @@ The contract is deliberately narrow:
 
 - every participating port must be owned by the same `Unit`, and a port may
   appear only once;
+- distinct physical edges in one transaction may not target the same bounded
+  `InPort`; rejecting this topology before the first claim avoids an aggregate
+  receiver-side reservation counter on ordinary port traffic. Shared unbounded
+  destinations remain supported;
 - a reservation is valid only in the producer's current simulated cycle;
 - changing an `OutPort` or destination capacity, changing port topology, or
   calling an enabled `cancelInFlight()` invalidates an outstanding transaction;

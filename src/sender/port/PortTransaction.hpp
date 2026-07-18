@@ -148,7 +148,41 @@ private:
                 if (identities[i] == identities[j]) return false;
             }
         }
-        return true;
+        return boundedDestinationsDisjoint_();
+    }
+
+    /**
+     * Separate Connections account bounded admission independently. Allowing
+     * two of them to claim the same bounded InPort would therefore let both
+     * observe the same occupancy snapshot. Reject that topology before the
+     * first claim instead of adding receiver-shared reservation state to the
+     * ordinary port hot path. Unbounded destinations remain safe because they
+     * have no aggregate model-visible depth to oversubscribe.
+     */
+    [[nodiscard]] bool boundedDestinationsDisjoint_() const {
+        bool disjoint = true;
+        std::apply(
+            [&](const auto*... inspected_ports) {
+                auto inspect = [&](const auto* port) {
+                    port->visitBoundedTransactionDestinations_([&](const void* destination) {
+                        if (!disjoint) return;
+                        size_t matches = 0;
+                        std::apply(
+                            [&](const auto*... candidate_ports) {
+                                (candidate_ports->visitBoundedTransactionDestinations_(
+                                     [&](const void* candidate) {
+                                         if (candidate == destination) ++matches;
+                                     }),
+                                 ...);
+                            },
+                            ports_);
+                        if (matches != 1) disjoint = false;
+                    });
+                };
+                (inspect(inspected_ports), ...);
+            },
+            ports_);
+        return disjoint;
     }
 
     template <size_t I>

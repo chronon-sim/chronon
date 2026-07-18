@@ -382,6 +382,23 @@ private:
         bool counted_cycle_capacity = false;
     };
 
+    /**
+     * Visit every physical bounded destination claimed by a transaction on
+     * this port. Dependency-only and shared-broadcast edges do not consume a
+     * destination queue slot and are intentionally omitted.
+     */
+    template <typename Visitor>
+    void visitBoundedTransactionDestinations_(Visitor&& visitor) const {
+        if (dependency_only_transport_ || shared_broadcast_) return;
+        for (const auto& connection : connections_) {
+            if (connection->dependencyOnlyTransport() ||
+                connection->edgeAdmissionCapacity_() == UNLIMITED_CAPACITY) {
+                continue;
+            }
+            std::forward<Visitor>(visitor)(static_cast<const void*>(connection->to()));
+        }
+    }
+
     [[nodiscard]] bool transactionPayloadSupported_() const noexcept {
         if constexpr (!std::is_nothrow_move_constructible_v<T> ||
                       !std::is_nothrow_move_assignable_v<T>) {
