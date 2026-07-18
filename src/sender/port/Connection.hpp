@@ -201,9 +201,10 @@ namespace detail {
  * Transaction control plane shared by one producer Unit's connections to one
  * destination InPort.
  *
- * Each instance is separately allocated and cache-line aligned. Only the
- * source Unit's worker mutates it after topology construction, so independent
- * producers never write the same line and no lock or atomic is required.
+ * Each instance and its mutable connection snapshots are cache-line aligned.
+ * Only the source Unit's worker mutates them after topology construction, so
+ * independent producers never share a writable line; no lock or atomic is
+ * required.
  * Ordinary send/canSend do not consult this state.
  */
 struct alignas(64) ProducerDestinationTransactionState {
@@ -211,32 +212,46 @@ struct alignas(64) ProducerDestinationTransactionState {
 
     [[nodiscard]] bool tryClaim(ConnectionBase* connection, uint64_t cycle) noexcept {
         if (claimant != nullptr || connection == nullptr) return false;
-        if (!peersIdle_(connection, cycle)) return false;
+
+        for (auto& entry : connections) {
+            entry.pushes_at_claim = entry.connection->transactionPushesAt(cycle);
+            if (entry.connection == connection &&
+                entry.pushes_at_claim == std::numeric_limits<size_t>::max()) {
+                return false;
+            }
+        }
         claimant = connection;
+        claim_cycle = cycle;
         return true;
     }
 
     [[nodiscard]] bool valid(const ConnectionBase* connection, uint64_t cycle) const noexcept {
-        return claimant == connection && peersIdle_(connection, cycle);
+        if (claimant != connection || claim_cycle != cycle) return false;
+        for (const auto& entry : connections) {
+            if (entry.connection->dependencyOnlyTransport()) continue;
+            const size_t expected =
+                entry.pushes_at_claim + (entry.connection == connection ? 1 : 0);
+            if (entry.connection->transactionPushesAt(cycle) != expected) return false;
+        }
+        return true;
     }
 
     void release(const ConnectionBase* connection) noexcept {
         if (claimant == connection) claimant = nullptr;
     }
 
+    struct alignas(64) ConnectionEntry {
+        ConnectionBase* connection = nullptr;
+        size_t pushes_at_claim = 0;
+    };
+    static_assert(sizeof(ConnectionEntry) == 64);
+
     Unit* producer = nullptr;
-    std::vector<ConnectionBase*> connections;
+    std::vector<ConnectionEntry> connections;
 
 private:
-    [[nodiscard]] bool peersIdle_(const ConnectionBase* connection, uint64_t cycle) const noexcept {
-        for (const ConnectionBase* peer : connections) {
-            if (peer == connection || peer->dependencyOnlyTransport()) continue;
-            if (peer->transactionPushesAt(cycle) != 0) return false;
-        }
-        return true;
-    }
-
     ConnectionBase* claimant = nullptr;
+    uint64_t claim_cycle = 0;
 };
 
 }  // namespace detail
@@ -675,17 +690,21 @@ private:
             return true;
         }
 
-        if (thread_queue_id_ != SIZE_MAX) {
-            if (!hasMPSCLaneAdmissionSlot_(send_cycle) ||
-                !to_->canPushToThreadQueue(thread_queue_id_)) {
-                return false;
-            }
-        } else if (!hasDestinationAdmissionSlot_(send_cycle)) {
+        const bool bounded_destination = boundedTransactionDestination_();
+        if (bounded_destination &&
+            (!transaction_group_ || !transaction_group_->tryClaim(this, send_cycle))) {
             return false;
         }
 
-        if (boundedTransactionDestination_() &&
-            (!transaction_group_ || !transaction_group_->tryClaim(this, send_cycle))) {
+        const bool has_admission =
+            thread_queue_id_ != SIZE_MAX
+                ? (bounded_destination ? hasMPSCLaneAdmissionForPending_(send_cycle, 1)
+                                       : hasMPSCLaneAdmissionSlot_(send_cycle)) &&
+                      to_->canPushToThreadQueue(thread_queue_id_)
+                : (bounded_destination ? hasDestinationAdmissionForPending_(send_cycle, 1)
+                                       : hasDestinationAdmissionSlot_(send_cycle));
+        if (!has_admission) {
+            if (transaction_group_) transaction_group_->release(this);
             return false;
         }
 
@@ -710,11 +729,12 @@ private:
             return false;
         }
 
+        const size_t pending_pushes = boundedTransactionDestination_() ? 1 : pushes_this_cycle_;
         if (thread_queue_id_ != SIZE_MAX) {
-            return hasMPSCLaneAdmissionForPending_(send_cycle, pushes_this_cycle_) &&
+            return hasMPSCLaneAdmissionForPending_(send_cycle, pending_pushes) &&
                    to_->canPushToThreadQueue(thread_queue_id_);
         }
-        return hasDestinationAdmissionForPending_(send_cycle, pushes_this_cycle_);
+        return hasDestinationAdmissionForPending_(send_cycle, pending_pushes);
     }
 
     /** Release one uncommitted producer-cycle claim. */
@@ -821,7 +841,7 @@ private:
         if (admission_cap == 0) {
             return false;
         }
-        const size_t occupancy = destinationAdmissionOccupancy_(send_cycle);
+        const size_t occupancy = to_->admissionOccupancy(send_cycle);
         return occupancy <= admission_cap && pending_pushes <= admission_cap - occupancy;
     }
 
@@ -855,7 +875,7 @@ private:
         }
         if (admission_cap == 0) return false;
 
-        const size_t occupancy = mpscAdmissionOccupancy_(send_cycle);
+        const size_t occupancy = to_->threadQueueAdmissionOccupancy(thread_queue_id_, send_cycle);
         return occupancy <= admission_cap && pending_pushes <= admission_cap - occupancy;
     }
 

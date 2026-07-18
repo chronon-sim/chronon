@@ -424,10 +424,8 @@ void testMixedDependencyOnlyEdgeParticipatesWithoutPayload() {
 }
 
 void testSharedBoundedDestinationIsRejectedBeforeClaim() {
-    ManualUnit producer("producer");
-    ManualUnit sink("sink");
-    OutPort<int> out0{&producer, "out0", 2};
-    OutPort<int> out1{&producer, "out1", 2};
+    ManualUnit producer("producer"), sink("sink");
+    OutPort<int> out0{&producer, "out0", 2}, out1{&producer, "out1", 2};
     InPort<int> bounded{&sink, "bounded", 1};
     out0.connect(&bounded, 0);
     out1.connect(&bounded, 0);
@@ -440,6 +438,8 @@ void testSharedBoundedDestinationIsRejectedBeforeClaim() {
 
     require(out0.send(10), "rejected transaction leaked the first connection's claim");
     require(!out1.send(11), "bounded destination accepted a second ordinary payload");
+    auto blocked = reserve(out1);
+    require(!blocked, "transaction ignored an earlier send that exhausted bounded capacity");
     const auto value = bounded.tryReceive(10);
     require(value.has_value() && *value == 10,
             "shared-destination rejection changed the surviving payload");
@@ -450,7 +450,7 @@ void testOrdinarySendInvalidatesClaimedBoundedDestination() {
     ManualUnit sink("sink");
     OutPort<int> transactional{&producer, "transactional", 2};
     OutPort<int> ordinary{&producer, "ordinary", 2};
-    InPort<int> bounded{&sink, "bounded", 1};
+    InPort<int> bounded{&sink, "bounded", 2};
     transactional.connect(&bounded, 0);
     ordinary.connect(&bounded, 0);
     producer.setCycle(14);
@@ -464,13 +464,14 @@ void testOrdinarySendInvalidatesClaimedBoundedDestination() {
             "invalidated transaction changed the ordinary peer payload");
     requireEmpty(bounded, 14, "invalidated transaction overfilled the bounded destination");
     producer.setCycle(15);
+    require(ordinary.send(151), "ordinary peer could not consume the first bounded slot");
     auto retry = reserve(transactional);
     require(static_cast<bool>(retry) && retry.commit(150),
-            "ordinary peer invalidation leaked the destination transaction claim");
-    require(bounded.tryReceive(15) == std::optional<int>{150},
-            "retried bounded transaction lost its payload");
+            "an earlier ordinary send hid the remaining bounded slot");
+    require(bounded.tryReceive(15) == std::optional<int>{151} &&
+                bounded.tryReceive(15) == std::optional<int>{150},
+            "transaction did not preserve earlier ordinary-send ordering");
 }
-
 void testIndependentTransactionsSerializeBoundedDestinationClaims() {
     ManualUnit producer("producer");
     ManualUnit sink("sink");
@@ -493,7 +494,6 @@ void testIndependentTransactionsSerializeBoundedDestinationClaims() {
             "serialized independent transaction lost its payload");
     requireEmpty(bounded, 16, "serialized independent transactions duplicated a payload");
 }
-
 void testRepeatedBoundedEdgeOnOnePortIsRejected() {
     ManualUnit producer("producer");
     ManualUnit sink("sink");

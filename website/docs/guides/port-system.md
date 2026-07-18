@@ -105,7 +105,9 @@ The contract is deliberately narrow:
 - one producer cannot hold independent transaction claims on the same bounded
   destination. An ordinary send through a peer `OutPort` remains branch-free
   and takes precedence, but invalidates the outstanding transaction before it
-  can publish and exceed the shared depth;
+  can publish and exceed the shared depth. Sends completed before the claim are
+  included in its fresh admission snapshot, so remaining multi-issue capacity
+  stays usable;
 - a reservation is valid only in the producer's current simulated cycle;
 - changing an `OutPort` or destination capacity, changing port topology, or
   calling an enabled `cancelInFlight()` invalidates an outstanding transaction;

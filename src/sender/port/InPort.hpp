@@ -424,12 +424,12 @@ public:
         if (!producer || !connection) return nullptr;
         for (auto& state : producer_transaction_states_) {
             if (state->producer != producer) continue;
-            state->connections.push_back(connection);
+            state->connections.push_back({.connection = connection});
             return state.get();
         }
 
         auto state = std::make_unique<detail::ProducerDestinationTransactionState>(producer);
-        state->connections.push_back(connection);
+        state->connections.push_back({.connection = connection});
         auto* result = state.get();
         producer_transaction_states_.push_back(std::move(state));
         return result;
