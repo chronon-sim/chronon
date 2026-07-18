@@ -102,6 +102,10 @@ The contract is deliberately narrow:
   first claim avoids an aggregate receiver-side reservation counter on ordinary
   port traffic. Destinations with unbounded admission and storage remain
   supported, as do independent MPSC ingress lanes;
+- one producer cannot hold independent transaction claims on the same bounded
+  destination. An ordinary send through a peer `OutPort` remains branch-free
+  and takes precedence, but invalidates the outstanding transaction before it
+  can publish and exceed the shared depth;
 - a reservation is valid only in the producer's current simulated cycle;
 - changing an `OutPort` or destination capacity, changing port topology, or
   calling an enabled `cancelInFlight()` invalidates an outstanding transaction;
@@ -116,13 +120,13 @@ The contract is deliberately narrow:
   with payload edges on one `OutPort`; their rate credit is reserved and
   released atomically, but they are skipped when payloads are published.
 
-The transaction handle is stack-backed. Producer-owned claim bookkeeping
-reuses the existing cycle-local admission counters and object padding; a cold
-destination epoch invalidates claims after configuration or cancellation
-changes. Ordinary `send()` and `canSend()` gain no transaction check, lock,
-atomic operation, allocation, or virtual dispatch. MPSC claims target the
-connection's private SPSC lane; receiver activity can only free a claimed slot
-before commit.
+The transaction handle is stack-backed. Each producer/destination pair gets one
+cache-line-isolated control block during topology construction; transaction
+validation scans the existing producer-owned cycle counters, while a cold
+destination epoch covers configuration or cancellation changes. Ordinary
+`send()` and `canSend()` gain no transaction check, lock, atomic operation,
+allocation, or virtual dispatch. MPSC claims target the connection's private
+SPSC lane; receiver activity can only free a claimed slot before commit.
 
 ## InPort
 

@@ -415,6 +415,27 @@ public:
     }
 
     /**
+     * Register one connection in its producer-owned destination transaction
+     * group. Topology construction is single-threaded; after initialization a
+     * group is touched only by its source Unit's worker.
+     */
+    detail::ProducerDestinationTransactionState* registerTransactionProducer(
+        Unit* producer, ConnectionBase* connection) {
+        if (!producer || !connection) return nullptr;
+        for (auto& state : producer_transaction_states_) {
+            if (state->producer != producer) continue;
+            state->connections.push_back(connection);
+            return state.get();
+        }
+
+        auto state = std::make_unique<detail::ProducerDestinationTransactionState>(producer);
+        state->connections.push_back(connection);
+        auto* result = state.get();
+        producer_transaction_states_.push_back(std::move(state));
+        return result;
+    }
+
+    /**
      * Register an MPSC-mode Connection with this InPort. Connections are kept
      * sorted by conn_id for stable topology/progress bookkeeping; payload
      * ordering is handled by the direct-lane frontier.
@@ -885,6 +906,11 @@ private:
 
     /// Direct MPSC lane registry, sorted by topology-stable conn_id.
     std::vector<ConnectionBase*> mpsc_connections_;
+
+    /// One cache-line-isolated, producer-owned transaction control block per
+    /// source Unit. Allocated only while the topology is being constructed.
+    std::vector<std::unique_ptr<detail::ProducerDestinationTransactionState>>
+        producer_transaction_states_;
 
     /// Per-connection producer completed_cycle atomics, aligned with
     /// mpsc_connections_. Besides proving scheduler coverage, a live selective

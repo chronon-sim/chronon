@@ -445,6 +445,54 @@ void testSharedBoundedDestinationIsRejectedBeforeClaim() {
             "shared-destination rejection changed the surviving payload");
     requireEmpty(bounded, 10, "shared-destination rejection partially published a transaction");
 }
+void testOrdinarySendInvalidatesClaimedBoundedDestination() {
+    ManualUnit producer("producer");
+    ManualUnit sink("sink");
+    OutPort<int> transactional{&producer, "transactional", 2};
+    OutPort<int> ordinary{&producer, "ordinary", 2};
+    InPort<int> bounded{&sink, "bounded", 1};
+    transactional.connect(&bounded, 0);
+    ordinary.connect(&bounded, 0);
+    producer.setCycle(14);
+    auto claimed = reserve(transactional);
+    require(static_cast<bool>(claimed), "bounded transaction could not claim an empty destination");
+    require(ordinary.send(141), "ordinary peer send unexpectedly observed the private claim");
+    require(!claimed.commit(140),
+            "transaction ignored an ordinary peer send to its claimed destination");
+    const auto ordinary_value = bounded.tryReceive(14);
+    require(ordinary_value.has_value() && *ordinary_value == 141,
+            "invalidated transaction changed the ordinary peer payload");
+    requireEmpty(bounded, 14, "invalidated transaction overfilled the bounded destination");
+    producer.setCycle(15);
+    auto retry = reserve(transactional);
+    require(static_cast<bool>(retry) && retry.commit(150),
+            "ordinary peer invalidation leaked the destination transaction claim");
+    require(bounded.tryReceive(15) == std::optional<int>{150},
+            "retried bounded transaction lost its payload");
+}
+
+void testIndependentTransactionsSerializeBoundedDestinationClaims() {
+    ManualUnit producer("producer");
+    ManualUnit sink("sink");
+    OutPort<int> out0{&producer, "out0", 2};
+    OutPort<int> out1{&producer, "out1", 2};
+    InPort<int> bounded{&sink, "bounded", 1};
+    out0.connect(&bounded, 0);
+    out1.connect(&bounded, 0);
+    producer.setCycle(16);
+    auto first = reserve(out0);
+    require(static_cast<bool>(first), "first independent transaction could not claim destination");
+    auto overlapping = reserve(out1);
+    require(!overlapping, "independent transaction stole an active destination claim");
+    first.cancel();
+    auto retry = reserve(out1);
+    require(static_cast<bool>(retry) && retry.commit(160),
+            "canceling an independent transaction did not release its destination claim");
+    const auto value = bounded.tryReceive(16);
+    require(value.has_value() && *value == 160,
+            "serialized independent transaction lost its payload");
+    requireEmpty(bounded, 16, "serialized independent transactions duplicated a payload");
+}
 
 void testRepeatedBoundedEdgeOnOnePortIsRejected() {
     ManualUnit producer("producer");
@@ -934,6 +982,8 @@ int main() {
         testNoopThrowingPayloadCannotPartiallyCommit();
         testMixedDependencyOnlyEdgeParticipatesWithoutPayload();
         testSharedBoundedDestinationIsRejectedBeforeClaim();
+        testOrdinarySendInvalidatesClaimedBoundedDestination();
+        testIndependentTransactionsSerializeBoundedDestinationClaims();
         testRepeatedBoundedEdgeOnOnePortIsRejected();
         testSharedFiniteSPSCTransportIsRejected();
         testSharedUnboundedDestinationRemainsSupported();

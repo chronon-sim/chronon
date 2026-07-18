@@ -152,6 +152,16 @@ public:
     virtual uint32_t connId() const noexcept = 0;
 
     /**
+     * Producer-owned pushes already claimed in @p cycle.
+     *
+     * Port transactions use this cold-path view to detect an ordinary send
+     * through another OutPort owned by the same Unit. Every connection in the
+     * queried producer group has the same sole writer, so this remains a
+     * synchronization-free read of the existing per-cycle counter.
+     */
+    virtual size_t transactionPushesAt(uint64_t cycle) const noexcept = 0;
+
+    /**
      * Cancel all in-flight messages on this connection.
      *
      * Advances the cancellation epoch so pending messages are dropped
@@ -185,6 +195,52 @@ public:
     bool isTight() const noexcept { return delay() == 0; }
 };
 
+namespace detail {
+
+/**
+ * Transaction control plane shared by one producer Unit's connections to one
+ * destination InPort.
+ *
+ * Each instance is separately allocated and cache-line aligned. Only the
+ * source Unit's worker mutates it after topology construction, so independent
+ * producers never write the same line and no lock or atomic is required.
+ * Ordinary send/canSend do not consult this state.
+ */
+struct alignas(64) ProducerDestinationTransactionState {
+    explicit ProducerDestinationTransactionState(Unit* owner) noexcept : producer(owner) {}
+
+    [[nodiscard]] bool tryClaim(ConnectionBase* connection, uint64_t cycle) noexcept {
+        if (claimant != nullptr || connection == nullptr) return false;
+        if (!peersIdle_(connection, cycle)) return false;
+        claimant = connection;
+        return true;
+    }
+
+    [[nodiscard]] bool valid(const ConnectionBase* connection, uint64_t cycle) const noexcept {
+        return claimant == connection && peersIdle_(connection, cycle);
+    }
+
+    void release(const ConnectionBase* connection) noexcept {
+        if (claimant == connection) claimant = nullptr;
+    }
+
+    Unit* producer = nullptr;
+    std::vector<ConnectionBase*> connections;
+
+private:
+    [[nodiscard]] bool peersIdle_(const ConnectionBase* connection, uint64_t cycle) const noexcept {
+        for (const ConnectionBase* peer : connections) {
+            if (peer == connection || peer->dependencyOnlyTransport()) continue;
+            if (peer->transactionPushesAt(cycle) != 0) return false;
+        }
+        return true;
+    }
+
+    ConnectionBase* claimant = nullptr;
+};
+
+}  // namespace detail
+
 /**
  * Connection - Typed connection between OutPort and InPort.
  *
@@ -212,7 +268,11 @@ public:
      */
     Connection(OutPort<T>* from, InPort<T>* to, uint32_t delay)
         : from_(from), to_(to), delay_(delay) {
-        if (to_) to_->registerIncomingDelay(delay_);
+        if (to_) {
+            to_->registerIncomingDelay(delay_);
+            transaction_group_ =
+                to_->registerTransactionProducer(from_ ? from_->owner() : nullptr, this);
+        }
     }
 
     bool transparentBroadcastEligible(size_t headroom_cycles) const noexcept override {
@@ -580,6 +640,11 @@ public:
     }
     uint32_t connId() const noexcept override { return conn_id_; }
 
+    size_t transactionPushesAt(uint64_t cycle) const noexcept override {
+        maybeResetPushesCycle_(cycle);
+        return pushes_this_cycle_;
+    }
+
     OutPort<T>* from() const noexcept { return from_; }
     InPort<T>* to() const noexcept { return to_; }
 
@@ -619,6 +684,11 @@ private:
             return false;
         }
 
+        if (boundedTransactionDestination_() &&
+            (!transaction_group_ || !transaction_group_->tryClaim(this, send_cycle))) {
+            return false;
+        }
+
         ++pushes_this_cycle_;
         transaction_destination_epoch_ = to_->portTransactionEpoch_();
         return true;
@@ -635,6 +705,11 @@ private:
 
         if (dependency_only_transport_) return true;
 
+        if (boundedTransactionDestination_() &&
+            (!transaction_group_ || !transaction_group_->valid(this, send_cycle))) {
+            return false;
+        }
+
         if (thread_queue_id_ != SIZE_MAX) {
             return hasMPSCLaneAdmissionForPending_(send_cycle, pushes_this_cycle_) &&
                    to_->canPushToThreadQueue(thread_queue_id_);
@@ -647,6 +722,7 @@ private:
         if (last_pushes_cycle_ == send_cycle && pushes_this_cycle_ != 0) {
             --pushes_this_cycle_;
         }
+        if (transaction_group_) transaction_group_->release(this);
     }
 
     /**
@@ -688,6 +764,7 @@ private:
         if (!ok) {
             std::terminate();
         }
+        if (transaction_group_) transaction_group_->release(this);
         wakeUnitAt(destination(), arrive_cycle);
     }
 
@@ -704,6 +781,15 @@ private:
 
     size_t edgeAdmissionCapacity_() const noexcept {
         return registered_capacity_.value_or(to_->configuredCapacity());
+    }
+
+    bool boundedTransactionDestination_() const noexcept {
+        if (dependency_only_transport_ || shared_broadcast_ != nullptr) return false;
+        const bool bounded_model_admission =
+            edgeAdmissionCapacity_() != InPort<T>::UNLIMITED_CAPACITY;
+        const bool bounded_shared_transport =
+            thread_queue_id_ == SIZE_MAX && to_->storageCapacity() != InPort<T>::UNLIMITED_CAPACITY;
+        return bounded_model_admission || bounded_shared_transport;
     }
 
     static constexpr size_t minCapacity_(size_t lhs, size_t rhs) noexcept {
@@ -884,6 +970,7 @@ private:
     /// Finite producer run-ahead supported by a model-owned external
     /// transport. SIZE_MAX retains the legacy unbounded dependency-only edge.
     size_t dependency_only_headroom_ = std::numeric_limits<size_t>::max();
+    detail::ProducerDestinationTransactionState* transaction_group_ = nullptr;
     // Snapshot of the destination's cold control-plane epoch. This occupies
     // the Connection's pre-existing tail padding, so transactions do not grow
     // the cache-aligned object or perturb ordinary send/canSend fields.
