@@ -440,6 +440,16 @@ public:
         if (dependency_only_transport_) return;
         // One direct SPSC lane per Connection. The InPort owns lane storage
         // and its consumer-only deterministic frontier.
+        //
+        // A registered edge capacity is the destination depth for every
+        // transport selected during initialization.  Propagate it before the
+        // adapter is created so an otherwise-unbounded InPort allocates the
+        // receiver-owned aggregate FIFO instead of treating the value only as
+        // private-lane headroom.  This mirrors the same-thread and SPSC paths
+        // above and remains entirely off the steady-state send/receive path.
+        if (registered_capacity_.has_value()) {
+            to_->setCapacity(*registered_capacity_);
+        }
         const size_t user_cap = edgeAdmissionCapacity_();
         to_->useMultiProducerQueue(user_cap == InPort<T>::UNLIMITED_CAPACITY ? 0 : user_cap);
     }

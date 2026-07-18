@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -95,11 +96,15 @@ private:
 
 class SlowConsumer final : public TickableUnit {
 public:
-    SlowConsumer() : TickableUnit("consumer"), events_(kConsumerComponent) {
+    explicit SlowConsumer(bool use_registered_capacity)
+        : TickableUnit("consumer"),
+          in(this, "in",
+             use_registered_capacity ? InPort<Message>::UNLIMITED_CAPACITY : kSharedDepth),
+          events_(kConsumerComponent) {
         events_.reserve(kRunCycles * 3);
     }
 
-    InPort<Message> in{this, "in", kSharedDepth};
+    InPort<Message> in;
 
     void tick() override {
         const uint64_t cycle = localCycle();
@@ -137,6 +142,8 @@ public:
     }
 
     void validateFinalState() const {
+        require(in.capacity() == kSharedDepth,
+                "effective destination capacity differs from the shared depth");
         require(max_shared_depth_ == kSharedDepth,
                 "slow consumer never saturated the aggregate shared FIFO");
         require(in.sharedFifoHighWatermark() == kSharedDepth,
@@ -169,18 +176,22 @@ private:
 
 class SharedDepthScenario {
 public:
-    explicit SharedDepthScenario(TickSimulation& simulation) {
+    SharedDepthScenario(TickSimulation& simulation, bool use_registered_capacity) {
         for (uint32_t producer = 0; producer < kProducerCount; ++producer) {
             // Producer zero is intentionally heavier so runtime rebalance has
             // a stable, measurable reason to move work.
             const uint32_t work = producer == 0 ? 2400 : 80;
             producers_[producer] = simulation.createUnit<BurstProducer>(producer, work);
         }
-        consumer_ = simulation.createUnit<SlowConsumer>();
+        consumer_ = simulation.createUnit<SlowConsumer>(use_registered_capacity);
 
         constexpr std::array<uint32_t, kProducerCount> delays{1, 2, 3, 4};
         for (size_t producer = 0; producer < kProducerCount; ++producer) {
-            simulation.connect(producers_[producer]->out, consumer_->in, delays[producer]);
+            auto* connection =
+                simulation.connect(producers_[producer]->out, consumer_->in, delays[producer]);
+            if (use_registered_capacity) {
+                connection->configureRegisteredEdge(kSharedDepth, std::nullopt);
+            }
         }
     }
 
@@ -208,7 +219,7 @@ private:
     SlowConsumer* consumer_ = nullptr;
 };
 
-void verifySharedDepthMatrix() {
+RunArtifact verifySharedDepthMatrix(bool use_registered_capacity) {
     TickSimulationConfig base;
     base.max_lookahead_cycles = 8;
     base.enable_weighted_partitioning = true;
@@ -263,11 +274,11 @@ void verifySharedDepthMatrix() {
          .migrations = {}},
     };
 
-    const auto artifacts =
-        runEpochFreeMatrix(base, kRunCycles, std::span<const EpochFreeRunMode>(modes),
-                           [](TickSimulation& simulation, const EpochFreeRunMode&) {
-                               return std::make_unique<SharedDepthScenario>(simulation);
-                           });
+    const auto artifacts = runEpochFreeMatrix(
+        base, kRunCycles, std::span<const EpochFreeRunMode>(modes),
+        [use_registered_capacity](TickSimulation& simulation, const EpochFreeRunMode&) {
+            return std::make_unique<SharedDepthScenario>(simulation, use_registered_capacity);
+        });
     const auto comparison = compareMatrix(artifacts);
     require(comparison.equivalent, comparison.diagnostic);
 
@@ -293,6 +304,7 @@ void verifySharedDepthMatrix() {
                   << " events=" << artifact.events.size()
                   << " rebalances=" << artifact.rebalance_count << '\n';
     }
+    return artifacts.front();
 }
 
 }  // namespace
@@ -300,7 +312,15 @@ void verifySharedDepthMatrix() {
 int main() {
     try {
         std::cout << "=== Bounded MPSC shared-depth contract ===\n";
-        verifySharedDepthMatrix();
+        std::cout << "InPort-declared capacity:\n";
+        const auto declared_capacity = verifySharedDepthMatrix(false);
+        std::cout << "Registered-edge capacity:\n";
+        const auto registered_capacity = verifySharedDepthMatrix(true);
+        const auto capacity_source_comparison =
+            compareArtifacts(declared_capacity, registered_capacity);
+        require(capacity_source_comparison.equivalent,
+                "registered-edge capacity changed model behavior: " +
+                    capacity_source_comparison.diagnostic);
         std::cout << "Bounded MPSC shared-depth tests passed.\n";
         return 0;
     } catch (const std::exception& error) {

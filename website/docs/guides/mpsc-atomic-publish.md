@@ -139,13 +139,16 @@ credits than published payloads. It therefore remains compact and never
 allocates during execution.
 
 For bounded fan-in, the receiver starts each cycle with an admission budget
-equal to the InPort capacity. It repeatedly selects the deterministic minimum
-ready lane head and moves it into a separately allocated power-of-two shared
-ring until either the ring or that cycle's budget is full. A consumer pop may
-open physical room, but it cannot create more than one cycle's aggregate
-credit. A mid-cycle flush likewise drops occupancy without resetting the
-budget. The shared state is cache-line aligned and touched only by the receiver;
-producers neither read it nor contend on a reservation atomic.
+equal to the InPort capacity. A finite capacity registered on an edge (including
+YAML `capacity`) is propagated to an otherwise-unbounded destination before
+MPSC transport selection, so it creates the same aggregate FIFO instead of
+only enlarging private lane storage. The receiver repeatedly selects the
+deterministic minimum ready lane head and moves it into a separately allocated
+power-of-two shared ring until either the ring or that cycle's budget is full.
+A consumer pop may open physical room, but it cannot create more than one
+cycle's aggregate credit. A mid-cycle flush likewise drops occupancy without
+resetting the budget. The shared state is cache-line aligned and touched only
+by the receiver; producers neither read it nor contend on a reservation atomic.
 
 If the shared FIFO remains full, ingress stops draining. Per-Connection lanes
 then fill and return non-blocking backpressure independently. A finite

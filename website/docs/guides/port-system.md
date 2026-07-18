@@ -425,6 +425,9 @@ direct-lane fast path. A bounded InPort has a preallocated, receiver-only shared
 ring. Immediately before the destination Unit ticks, it admits ready lane heads
 into that ring in deterministic merge order. Both aggregate occupancy and new
 admissions in one receiver cycle are capped by `InPort::capacity()`.
+Connection/YAML registered capacity is applied to an otherwise-unbounded
+destination before MPSC transport selection, so it enforces this same aggregate
+depth rather than acting only as per-lane transport headroom.
 
 Private lanes are transport storage, not extra architectural FIFO entries.
 `queuedMessageCount()` reports the shared destination FIFO;
