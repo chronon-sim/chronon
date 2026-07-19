@@ -120,6 +120,10 @@ struct ParsedOptions {
 };
 
 [[nodiscard]] inline uint64_t parseInteger(std::string_view value, std::string_view option) {
+    const size_t first_character = value.find_first_not_of(" \t\n\r\f\v");
+    if (first_character == std::string_view::npos || value[first_character] == '-') {
+        throw std::invalid_argument("invalid value for " + std::string(option));
+    }
     size_t consumed = 0;
     const uint64_t result = std::stoull(std::string(value), &consumed, 0);
     if (consumed != value.size()) {
@@ -329,7 +333,11 @@ inline void printHelp(const char* program) {
         } else if (option == "--active-sources") {
             overrides.active_source_count = parseU32(requireValue(i, option), option);
         } else if (option == "--fixed-delay") {
-            overrides.forced_delay = parseU32(requireValue(i, option), option);
+            const uint32_t delay = parseU32(requireValue(i, option), option);
+            if (delay == std::numeric_limits<uint32_t>::max()) {
+                throw std::invalid_argument("value for --fixed-delay is reserved");
+            }
+            overrides.forced_delay = delay;
         } else if (option == "--max-fanout") {
             overrides.max_fanout = parseU32(requireValue(i, option), option);
         } else if (option == "--send-ppm") {

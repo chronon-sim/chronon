@@ -140,6 +140,22 @@ void testUint32CliBounds() {
         parseArgs({"benchmark", "--queue-capacity", "4294967295", "--describe-only"});
     require(maximum.overrides.queue_capacity == std::numeric_limits<uint32_t>::max(),
             "UINT32_MAX was rejected");
+
+    require(rejects({"benchmark", "--fixed-delay", "4294967295"}),
+            "reserved fixed-delay sentinel was accepted");
+    const auto largest_delay =
+        parseArgs({"benchmark", "--fixed-delay", "4294967294", "--describe-only"});
+    require(largest_delay.overrides.forced_delay == std::numeric_limits<uint32_t>::max() - 1,
+            "largest valid fixed delay was rejected");
+}
+
+void testUnsignedCliRejectsNegativeValues() {
+    constexpr std::array unsigned_options = {"--seed", "--scenario-offset", "--cycles", "--warmup"};
+    for (const char* option : unsigned_options) {
+        require(rejects({"benchmark", option, "-1"}), "negative unsigned value was accepted");
+        require(rejects({"benchmark", option, " -1"}),
+                "whitespace-prefixed negative unsigned value was accepted");
+    }
 }
 
 }  // namespace
@@ -150,6 +166,7 @@ int main() {
         testTopologyAndLoadInvariants();
         testRandomProfileResamplingAndOverrides();
         testUint32CliBounds();
+        testUnsignedCliRejectsNegativeValues();
         std::cout << "Representative workload generator tests passed\n";
         return 0;
     } catch (const std::exception& error) {
