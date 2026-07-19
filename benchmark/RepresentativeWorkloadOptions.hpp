@@ -289,7 +289,9 @@ inline void printHelp(const char* program) {
               << "  --queue-capacity N          finite depth (0=unlimited, max "
               << MAX_FINITE_QUEUE_CAPACITY << ")\n"
               << "  --drain-limit N --work N --unit-sigma N\n"
-              << "  --cycle-sigma N --working-set N --payload-weights a,b,c,d,e,f\n"
+              << "  --cycle-sigma N --working-set N (aggregate scratch max "
+              << MAX_TOTAL_WORKING_SET_BYTES / (1024 * 1024) << " MiB)\n"
+              << "  --payload-weights a,b,c,d,e,f\n"
               << "Other: --max-lookahead N --verbose --quick --help\n";
 }
 

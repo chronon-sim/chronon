@@ -99,7 +99,8 @@ distributions, whose generation algorithms are implementation-defined. Work
 and send schedules are generated before timing; the hot path only reads those
 tables. Each derived `random` scenario resamples both its parameter envelope
 and generated graph from its derived seed; explicit CLI overrides are then
-reapplied to every scenario.
+reapplied to every scenario. Per-unit scratch working sets are conservatively
+bounded to a 256 MiB aggregate maximum before simulation storage is allocated.
 
 Every scenario prints:
 

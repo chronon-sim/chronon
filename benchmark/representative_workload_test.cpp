@@ -16,6 +16,8 @@ namespace {
 
 using chronon::benchmark::generateScenario;
 using chronon::benchmark::MAX_FINITE_QUEUE_CAPACITY;
+using chronon::benchmark::MAX_TOTAL_WORKING_SET_BYTES;
+using chronon::benchmark::MAX_WORKING_SET_SCALE;
 using chronon::benchmark::parseCommandLine;
 using chronon::benchmark::ParsedOptions;
 using chronon::benchmark::PayloadClass;
@@ -91,6 +93,16 @@ ParsedOptions parseArgs(std::vector<std::string> arguments) {
 bool rejects(std::vector<std::string> arguments) {
     try {
         (void)parseArgs(std::move(arguments));
+        return false;
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+}
+
+bool rejectsScenario(std::vector<std::string> arguments) {
+    try {
+        const auto options = parseArgs(std::move(arguments));
+        (void)generateScenario(scenarioConfigFor(options, 0));
         return false;
     } catch (const std::invalid_argument&) {
         return true;
@@ -174,6 +186,21 @@ void testQueueCapacityBounds() {
     }
 }
 
+void testWorkingSetBudget() {
+    ScenarioConfig config;
+    config.num_units = 64;
+    config.working_set_bytes = static_cast<uint32_t>(MAX_TOTAL_WORKING_SET_BYTES /
+                                                     (config.num_units * MAX_WORKING_SET_SCALE));
+    const auto scenario = generateScenario(config);
+    uint64_t generated_bytes = 0;
+    for (const auto& unit : scenario.units) generated_bytes += unit.working_set_bytes;
+    require(generated_bytes <= MAX_TOTAL_WORKING_SET_BYTES,
+            "accepted scenario exceeded aggregate working-set budget");
+
+    require(rejectsScenario({"benchmark", "--working-set", "268435456"}),
+            "oversized aggregate working set was accepted");
+}
+
 void testCompleteReplayCommand() {
     const auto options = parseArgs({"benchmark",
                                     "--profile",
@@ -228,6 +255,7 @@ int main() {
         testRandomProfileResamplingAndOverrides();
         testUint32CliBounds();
         testQueueCapacityBounds();
+        testWorkingSetBudget();
         testCompleteReplayCommand();
         testUnsignedCliRejectsNegativeValues();
         std::cout << "Representative workload generator tests passed\n";

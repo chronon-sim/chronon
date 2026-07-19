@@ -19,6 +19,11 @@ inline constexpr uint32_t PROBABILITY_SCALE = 1'000'000;
 // benchmark bound at the transport's standard ring size; zero remains the
 // explicit unlimited-capacity mode.
 inline constexpr uint32_t MAX_FINITE_QUEUE_CAPACITY = 4'096;
+inline constexpr uint32_t WORKING_SET_SCALE_COUNT = 3;
+inline constexpr uint32_t MAX_WORKING_SET_SCALE = 1U << (WORKING_SET_SCALE_COUNT - 1);
+// Scratch vectors are materialized for every unit in a run. Validate their
+// worst-case aggregate before any scenario or simulation storage is reserved.
+inline constexpr uint64_t MAX_TOTAL_WORKING_SET_BYTES = uint64_t{256} * 1024 * 1024;
 inline constexpr std::array<uint32_t, 6> PAYLOAD_BYTES = {8, 16, 32, 64, 144, 256};
 
 enum class PayloadClass : uint8_t { Bytes8, Bytes16, Bytes32, Bytes64, Bytes144, Bytes256 };
@@ -271,6 +276,13 @@ inline void validateConfig(const ScenarioConfig& config) {
     if (config.working_set_bytes > (uint32_t{1} << 28)) {
         throw std::invalid_argument("base working set is too large");
     }
+    const uint64_t scaled_working_set =
+        static_cast<uint64_t>(config.working_set_bytes) * MAX_WORKING_SET_SCALE;
+    const uint32_t max_working_set_per_unit =
+        roundUpPowerOfTwo(static_cast<uint32_t>(scaled_working_set));
+    if (config.num_units > MAX_TOTAL_WORKING_SET_BYTES / max_working_set_per_unit) {
+        throw std::invalid_argument("generated working sets exceed aggregate memory limit");
+    }
     if (config.queue_capacity > MAX_FINITE_QUEUE_CAPACITY) {
         throw std::invalid_argument("finite queue capacity exceeds benchmark limit");
     }
@@ -363,7 +375,8 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
                    config.drain_limit,
                    detail::lognormalQ16(config.seed, kUnitLoadDomain + 32, unit_id, 180, 1'500)));
         const uint32_t working_set_scale =
-            1U << bounded(randomWord(config.seed, kWorkingSetDomain, unit_id), 3);
+            1U << bounded(randomWord(config.seed, kWorkingSetDomain, unit_id),
+                          WORKING_SET_SCALE_COUNT);
         unit.working_set_bytes =
             detail::roundUpPowerOfTwo(config.working_set_bytes * working_set_scale);
         unit.work_schedule.reserve(config.work_period);
