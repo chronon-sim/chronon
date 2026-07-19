@@ -16,6 +16,7 @@ namespace {
 
 using chronon::benchmark::generateScenario;
 using chronon::benchmark::MAX_FINITE_QUEUE_CAPACITY;
+using chronon::benchmark::MAX_SCENARIO_UNITS;
 using chronon::benchmark::MAX_TOTAL_WORKING_SET_BYTES;
 using chronon::benchmark::MAX_WORKING_SET_SCALE;
 using chronon::benchmark::parseCommandLine;
@@ -201,6 +202,53 @@ void testWorkingSetBudget() {
             "oversized aggregate working set was accepted");
 }
 
+void testFixedDelayOverridesAllChannels() {
+    ScenarioConfig config;
+    config.num_units = 8;
+    config.channels_per_unit = 2;
+    config.forced_delay = 5;
+    const auto delayed = generateScenario(config);
+    for (const auto& channel : delayed.channels) {
+        require(channel.delay == 5, "ring channel ignored positive fixed delay");
+    }
+
+    config.forced_delay = 0;
+    config.active_source_count = config.num_units - 1;
+    const auto zero_delay = generateScenario(config);
+    for (const auto& channel : zero_delay.channels) {
+        require(channel.delay == 0, "channel ignored zero fixed delay");
+        for (uint32_t destination : channel.destinations) {
+            require(channel.source < destination, "fixed zero-delay topology is cyclic");
+        }
+    }
+
+    config.active_source_count = 0;
+    try {
+        (void)generateScenario(config);
+        require(false, "cyclic all-source zero fixed delay was accepted");
+    } catch (const std::invalid_argument&) {
+    }
+}
+
+void testScenarioResourceBounds() {
+    require(rejectsScenario(
+                {"benchmark", "--units", "2", "--channels", "4294967295", "--describe-only"}),
+            "oversized generated channel count was accepted");
+    require(rejectsScenario({"benchmark", "--units", std::to_string(MAX_SCENARIO_UNITS + 1),
+                             "--channels", "0", "--describe-only"}),
+            "oversized unit count was accepted");
+
+    ScenarioConfig schedule_heavy;
+    schedule_heavy.num_units = 2;
+    schedule_heavy.channels_per_unit = 1;
+    schedule_heavy.send_period = std::numeric_limits<uint32_t>::max();
+    try {
+        (void)generateScenario(schedule_heavy);
+        require(false, "oversized generated schedule was accepted");
+    } catch (const std::invalid_argument&) {
+    }
+}
+
 void testCompleteReplayCommand() {
     const auto options = parseArgs({"benchmark",
                                     "--profile",
@@ -256,6 +304,8 @@ int main() {
         testUint32CliBounds();
         testQueueCapacityBounds();
         testWorkingSetBudget();
+        testFixedDelayOverridesAllChannels();
+        testScenarioResourceBounds();
         testCompleteReplayCommand();
         testUnsignedCliRejectsNegativeValues();
         std::cout << "Representative workload generator tests passed\n";

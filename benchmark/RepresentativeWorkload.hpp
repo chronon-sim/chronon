@@ -24,6 +24,11 @@ inline constexpr uint32_t MAX_WORKING_SET_SCALE = 1U << (WORKING_SET_SCALE_COUNT
 // Scratch vectors are materialized for every unit in a run. Validate their
 // worst-case aggregate before any scenario or simulation storage is reserved.
 inline constexpr uint64_t MAX_TOTAL_WORKING_SET_BYTES = uint64_t{256} * 1024 * 1024;
+inline constexpr uint32_t MAX_SCENARIO_UNITS = 4'096;
+inline constexpr uint64_t MAX_SCENARIO_CHANNELS = 65'536;
+inline constexpr uint64_t MAX_SCENARIO_EDGES = 1'048'576;
+inline constexpr uint64_t MAX_SCENARIO_SCHEDULE_SAMPLES = uint64_t{64} * 1024 * 1024;
+inline constexpr uint64_t MAX_SCENARIO_SCHEDULE_BYTES = uint64_t{64} * 1024 * 1024;
 inline constexpr std::array<uint32_t, 6> PAYLOAD_BYTES = {8, 16, 32, 64, 144, 256};
 
 enum class PayloadClass : uint8_t { Bytes8, Bytes16, Bytes32, Bytes64, Bytes144, Bytes256 };
@@ -266,12 +271,49 @@ private:
     uint64_t hash_ = 1'469'598'103'934'665'603ULL;
 };
 
+[[nodiscard]] inline uint32_t sourceCount(const ScenarioConfig& config) noexcept {
+    return config.active_source_count == 0 ? config.num_units
+                                           : std::min(config.num_units, config.active_source_count);
+}
+
 inline void validateConfig(const ScenarioConfig& config) {
     if (config.num_units == 0 || (config.num_units == 1 && config.channels_per_unit != 0)) {
         throw std::invalid_argument("at least two units are required when channels are enabled");
     }
+    if (config.num_units > MAX_SCENARIO_UNITS) {
+        throw std::invalid_argument("unit count exceeds benchmark limit");
+    }
     if (config.work_period == 0 || config.send_period == 0 || config.drain_limit == 0) {
         throw std::invalid_argument("periods and drain limit must be positive");
+    }
+    const uint32_t source_count = sourceCount(config);
+    const uint64_t total_channels = static_cast<uint64_t>(source_count) * config.channels_per_unit;
+    if (total_channels > MAX_SCENARIO_CHANNELS) {
+        throw std::invalid_argument("generated channel count exceeds benchmark limit");
+    }
+    if (config.forced_delay == 0 && total_channels != 0 && source_count == config.num_units) {
+        throw std::invalid_argument("zero fixed delay requires at least one inactive sink unit");
+    }
+    const uint64_t max_destinations =
+        config.num_units > 1
+            ? std::max<uint64_t>(1, std::min(config.max_fanout, config.num_units - 1))
+            : 0;
+    if (max_destinations != 0 && total_channels > MAX_SCENARIO_EDGES / max_destinations) {
+        throw std::invalid_argument("generated edge count exceeds benchmark limit");
+    }
+    const uint64_t unit_schedule_samples =
+        static_cast<uint64_t>(config.num_units) * config.work_period;
+    const uint64_t channel_schedule_samples = total_channels * config.send_period;
+    if (unit_schedule_samples > MAX_SCENARIO_SCHEDULE_SAMPLES ||
+        channel_schedule_samples > MAX_SCENARIO_SCHEDULE_SAMPLES - unit_schedule_samples) {
+        throw std::invalid_argument("generated schedule length exceeds benchmark limit");
+    }
+    const uint64_t unit_schedule_bytes = unit_schedule_samples * sizeof(uint32_t);
+    const uint64_t send_schedule_words = (static_cast<uint64_t>(config.send_period) + 63) / 64;
+    const uint64_t channel_schedule_bytes = total_channels * send_schedule_words * sizeof(uint64_t);
+    if (unit_schedule_bytes > MAX_SCENARIO_SCHEDULE_BYTES ||
+        channel_schedule_bytes > MAX_SCENARIO_SCHEDULE_BYTES - unit_schedule_bytes) {
+        throw std::invalid_argument("generated schedules exceed aggregate memory limit");
     }
     if (config.working_set_bytes > (uint32_t{1} << 28)) {
         throw std::invalid_argument("base working set is too large");
@@ -359,6 +401,8 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
     Scenario scenario;
     scenario.config = config;
     scenario.units.reserve(config.num_units);
+    const uint32_t source_count = detail::sourceCount(config);
+    scenario.channels.reserve(static_cast<size_t>(source_count) * config.channels_per_unit);
 
     constexpr uint64_t kUnitLoadDomain = 0x554e49544c4f4144ULL;
     constexpr uint64_t kCycleLoadDomain = 0x4359434c454c4f41ULL;
@@ -394,9 +438,7 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
     constexpr uint64_t kDelayDomain = 0x44454c4159ULL;
     constexpr uint64_t kFanoutDomain = 0x46414e4f5554ULL;
     constexpr uint64_t kRateDomain = 0x52415445ULL;
-    const uint32_t source_count = config.active_source_count == 0
-                                      ? config.num_units
-                                      : std::min(config.num_units, config.active_source_count);
+    const bool has_forced_delay = config.forced_delay != std::numeric_limits<uint32_t>::max();
     for (uint32_t source = 0; source < source_count; ++source) {
         for (uint32_t local = 0; local < config.channels_per_unit; ++local) {
             ChannelSpec channel;
@@ -407,10 +449,10 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
 
             const bool ring = config.ensure_ring && local == 0;
             if (ring) {
-                channel.delay = 1;
+                channel.delay = has_forced_delay ? config.forced_delay : 1;
                 channel.destinations.push_back((source + 1) % config.num_units);
             } else {
-                if (config.forced_delay != std::numeric_limits<uint32_t>::max()) {
+                if (has_forced_delay) {
                     channel.delay = config.forced_delay;
                 } else {
                     const bool wants_zero =
