@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "RepresentativeWorkload.hpp"
+#include "RepresentativeWorkloadOptions.hpp"
 #include "sender/core/TickSimulation.hpp"
 #include "sender/core/TickableUnit.hpp"
 #include "sender/port/InPort.hpp"
@@ -416,14 +417,6 @@ struct RunResult {
     uint64_t transport_overflows = 0;
 };
 
-struct RunOptions {
-    uint64_t warmup_cycles = 8192;
-    uint64_t measured_cycles = 50'000;
-    bool dynamic_rebalance = false;
-    bool precomputed_costs = true;
-    uint32_t max_lookahead = 32;
-};
-
 [[nodiscard]] RunResult runOnce(const Scenario& scenario, size_t workers,
                                 const RunOptions& options) {
     const auto setup_begin = std::chrono::steady_clock::now();
@@ -486,269 +479,6 @@ struct RunOptions {
     return result;
 }
 
-struct CliOptions {
-    std::string profile = "nucleus";
-    uint64_t seed = 0x4348524f4e4f4eULL;
-    bool random_seed = false;
-    uint64_t scenario_offset = 0;
-    uint32_t scenario_count = 1;
-    uint32_t repetitions = 5;
-    std::vector<size_t> workers = {1, 2, 4, 8};
-    RunOptions run;
-    bool describe_only = false;
-    bool verbose = false;
-};
-
-[[nodiscard]] uint64_t parseInteger(std::string_view value, std::string_view option) {
-    size_t consumed = 0;
-    const uint64_t result = std::stoull(std::string(value), &consumed, 0);
-    if (consumed != value.size()) {
-        throw std::invalid_argument("invalid value for " + std::string(option));
-    }
-    return result;
-}
-
-[[nodiscard]] std::vector<uint32_t> parseU32List(std::string_view text) {
-    std::vector<uint32_t> result;
-    std::stringstream stream{std::string(text)};
-    std::string item;
-    while (std::getline(stream, item, ',')) {
-        result.push_back(static_cast<uint32_t>(parseInteger(item, "list")));
-    }
-    return result;
-}
-
-[[nodiscard]] std::vector<size_t> parseWorkers(std::string_view text) {
-    const auto values = parseU32List(text);
-    std::vector<size_t> workers(values.begin(), values.end());
-    if (workers.empty() || std::find(workers.begin(), workers.end(), 0) != workers.end()) {
-        throw std::invalid_argument("worker counts must be positive");
-    }
-    std::sort(workers.begin(), workers.end());
-    workers.erase(std::unique(workers.begin(), workers.end()), workers.end());
-    return workers;
-}
-
-[[nodiscard]] ScenarioConfig profileConfig(std::string_view profile, uint64_t seed) {
-    ScenarioConfig config;
-    config.seed = seed;
-    if (profile == "nucleus") return config;
-    if (profile == "scheduler") {
-        config.channels_per_unit = 0;
-        config.ensure_ring = false;
-        config.median_work = 16;
-        config.working_set_bytes = 4096;
-        config.drain_limit = 1;
-        return config;
-    }
-    if (profile == "port") {
-        config.channels_per_unit = 3;
-        config.median_work = 1;
-        config.unit_sigma_milli = 100;
-        config.cycle_sigma_milli = 0;
-        config.send_probability_ppm = 450'000;
-        config.drain_limit = 32;
-        config.queue_capacity = 1024;
-        return config;
-    }
-    if (profile == "hotspot") {
-        config.channels_per_unit = 3;
-        config.hotspot_probability_ppm = 750'000;
-        config.send_probability_ppm = 300'000;
-        config.queue_capacity = 128;
-        config.drain_limit = 4;
-        return config;
-    }
-    if (profile == "broadcast") {
-        config.channels_per_unit = 1;
-        config.active_source_count = 1;
-        config.ensure_ring = false;
-        config.broadcast_probability_ppm = 1'000'000;
-        config.hotspot_probability_ppm = 0;
-        config.max_fanout = 16;
-        config.forced_delay = 1;
-        config.zero_delay_probability_ppm = 0;
-        config.send_probability_ppm = 250'000;
-        config.queue_capacity = 0;
-        config.drain_limit = 32;
-        return config;
-    }
-    if (profile == "backpressure") {
-        config.channels_per_unit = 3;
-        config.send_probability_ppm = 500'000;
-        config.burst_probability_ppm = 15'000;
-        config.burst_length = 8;
-        config.hotspot_probability_ppm = 500'000;
-        config.queue_capacity = 64;
-        config.drain_limit = 2;
-        return config;
-    }
-    if (profile == "saturation") {
-        config.channels_per_unit = 3;
-        config.send_probability_ppm = 700'000;
-        config.burst_probability_ppm = 30'000;
-        config.burst_length = 8;
-        config.hotspot_probability_ppm = 600'000;
-        config.queue_capacity = 32;
-        config.drain_limit = 1;
-        return config;
-    }
-    if (profile == "random") {
-        config.num_units = 32 + bounded(randomWord(seed, 1, 0), 97);
-        // Keep one ring channel for connectivity and at least one independently
-        // generated channel for topology, hotspot, and fan-out coverage.
-        config.channels_per_unit = 2 + bounded(randomWord(seed, 1, 1), 3);
-        config.max_fanout = 2 + bounded(randomWord(seed, 1, 2), 7);
-        config.send_probability_ppm = 50'000 + bounded(randomWord(seed, 1, 3), 600'001);
-        config.hotspot_probability_ppm = bounded(randomWord(seed, 1, 4), 700'001);
-        config.broadcast_probability_ppm = bounded(randomWord(seed, 1, 5), 600'001);
-        config.zero_delay_probability_ppm = bounded(randomWord(seed, 1, 6), 150'001);
-        constexpr std::array<uint32_t, 4> capacities = {32, 128, 512, 0};
-        config.queue_capacity = capacities[bounded(randomWord(seed, 1, 7), capacities.size())];
-        config.median_work = 4 + bounded(randomWord(seed, 1, 8), 61);
-        config.unit_sigma_milli = 250 + bounded(randomWord(seed, 1, 9), 651);
-        config.cycle_sigma_milli = 50 + bounded(randomWord(seed, 1, 10), 351);
-        config.drain_limit = 1 + bounded(randomWord(seed, 1, 11), 16);
-        return config;
-    }
-    throw std::invalid_argument("unknown profile: " + std::string(profile));
-}
-
-void printHelp(const char* program) {
-    std::cout << "Usage: " << program << " [options]\n\n"
-              << "Profiles: nucleus, scheduler, port, hotspot, broadcast, backpressure, "
-                 "saturation, random\n"
-              << "Core options:\n"
-              << "  --profile NAME              scenario profile (default nucleus)\n"
-              << "  --seed N | --random-seed    reproducible or newly sampled base seed\n"
-              << "  --scenario-offset N         first derived scenario index (default 0)\n"
-              << "  --scenario-count N          independent derived scenarios (default 1)\n"
-              << "  --threads 1,2,4,8           worker sweep; CPU affinity is external\n"
-              << "  --cycles N --warmup N       measured and warmup cycles\n"
-              << "  --repetitions N             interleaved repetitions (default 5)\n"
-              << "  --rebalance                 enable runtime dynamic rebalance\n"
-              << "  --no-precomputed-costs      start from uniform unit costs\n"
-              << "  --describe-only             generate/validate without running\n"
-              << "Scenario overrides:\n"
-              << "  --units N --channels N --max-fanout N --send-ppm N --burst-ppm N\n"
-              << "  --active-sources N --fixed-delay N\n"
-              << "  --hotspot-ppm N --broadcast-ppm N --zero-delay-ppm N\n"
-              << "  --queue-capacity N --drain-limit N --work N --unit-sigma N\n"
-              << "  --cycle-sigma N --working-set N --payload-weights a,b,c,d,e,f\n"
-              << "Other: --max-lookahead N --verbose --quick --help\n";
-}
-
-struct ParsedOptions {
-    CliOptions cli;
-    ScenarioConfig scenario;
-};
-
-[[nodiscard]] ParsedOptions parseCommandLine(int argc, char** argv) {
-    CliOptions cli;
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view option = argv[i];
-        if (option == "--profile" && i + 1 < argc)
-            cli.profile = argv[++i];
-        else if (option == "--seed" && i + 1 < argc)
-            cli.seed = parseInteger(argv[++i], option);
-        else if (option == "--random-seed")
-            cli.random_seed = true;
-    }
-    if (cli.random_seed) {
-        std::random_device device;
-        cli.seed = (static_cast<uint64_t>(device()) << 32) ^ device();
-    }
-    ScenarioConfig scenario = profileConfig(cli.profile, cli.seed);
-
-    auto requireValue = [&](int& index, std::string_view option) -> std::string_view {
-        if (index + 1 >= argc)
-            throw std::invalid_argument("missing value for " + std::string(option));
-        return argv[++index];
-    };
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view option = argv[i];
-        if (option == "--help") {
-            printHelp(argv[0]);
-            std::exit(0);
-        } else if (option == "--profile" || option == "--seed") {
-            ++i;
-        } else if (option == "--random-seed") {
-        } else if (option == "--scenario-offset") {
-            cli.scenario_offset = parseInteger(requireValue(i, option), option);
-        } else if (option == "--scenario-count") {
-            cli.scenario_count = parseInteger(requireValue(i, option), option);
-        } else if (option == "--threads") {
-            cli.workers = parseWorkers(requireValue(i, option));
-        } else if (option == "--cycles") {
-            cli.run.measured_cycles = parseInteger(requireValue(i, option), option);
-        } else if (option == "--warmup") {
-            cli.run.warmup_cycles = parseInteger(requireValue(i, option), option);
-        } else if (option == "--repetitions") {
-            cli.repetitions = parseInteger(requireValue(i, option), option);
-        } else if (option == "--max-lookahead") {
-            cli.run.max_lookahead = parseInteger(requireValue(i, option), option);
-        } else if (option == "--rebalance") {
-            cli.run.dynamic_rebalance = true;
-        } else if (option == "--no-precomputed-costs") {
-            cli.run.precomputed_costs = false;
-        } else if (option == "--describe-only") {
-            cli.describe_only = true;
-        } else if (option == "--verbose") {
-            cli.verbose = true;
-        } else if (option == "--quick") {
-            cli.run.warmup_cycles = 256;
-            cli.run.measured_cycles = 2'000;
-            cli.repetitions = 1;
-        } else if (option == "--units") {
-            scenario.num_units = parseInteger(requireValue(i, option), option);
-        } else if (option == "--channels") {
-            scenario.channels_per_unit = parseInteger(requireValue(i, option), option);
-        } else if (option == "--active-sources") {
-            scenario.active_source_count = parseInteger(requireValue(i, option), option);
-        } else if (option == "--fixed-delay") {
-            scenario.forced_delay = parseInteger(requireValue(i, option), option);
-        } else if (option == "--max-fanout") {
-            scenario.max_fanout = parseInteger(requireValue(i, option), option);
-        } else if (option == "--send-ppm") {
-            scenario.send_probability_ppm = parseInteger(requireValue(i, option), option);
-        } else if (option == "--burst-ppm") {
-            scenario.burst_probability_ppm = parseInteger(requireValue(i, option), option);
-        } else if (option == "--hotspot-ppm") {
-            scenario.hotspot_probability_ppm = parseInteger(requireValue(i, option), option);
-        } else if (option == "--broadcast-ppm") {
-            scenario.broadcast_probability_ppm = parseInteger(requireValue(i, option), option);
-        } else if (option == "--zero-delay-ppm") {
-            scenario.zero_delay_probability_ppm = parseInteger(requireValue(i, option), option);
-        } else if (option == "--queue-capacity") {
-            scenario.queue_capacity = parseInteger(requireValue(i, option), option);
-        } else if (option == "--drain-limit") {
-            scenario.drain_limit = parseInteger(requireValue(i, option), option);
-        } else if (option == "--work") {
-            scenario.median_work = parseInteger(requireValue(i, option), option);
-        } else if (option == "--unit-sigma") {
-            scenario.unit_sigma_milli = parseInteger(requireValue(i, option), option);
-        } else if (option == "--cycle-sigma") {
-            scenario.cycle_sigma_milli = parseInteger(requireValue(i, option), option);
-        } else if (option == "--working-set") {
-            scenario.working_set_bytes = parseInteger(requireValue(i, option), option);
-        } else if (option == "--payload-weights") {
-            const auto weights = parseU32List(requireValue(i, option));
-            if (weights.size() != scenario.payload_weights.size()) {
-                throw std::invalid_argument(
-                    "--payload-weights requires six comma-separated values");
-            }
-            std::copy(weights.begin(), weights.end(), scenario.payload_weights.begin());
-        } else {
-            throw std::invalid_argument("unknown option: " + std::string(option));
-        }
-    }
-    if (cli.scenario_count == 0 || cli.repetitions == 0 || cli.run.measured_cycles == 0) {
-        throw std::invalid_argument(
-            "scenario count, repetitions, and measured cycles must be positive");
-    }
-    return {std::move(cli), std::move(scenario)};
-}
-
 void printScenario(const Scenario& scenario, std::string_view profile, uint64_t scenario_index) {
     uint64_t edges = 0;
     for (const auto& channel : scenario.channels) edges += channel.destinations.size();
@@ -776,36 +506,6 @@ void printScenario(const Scenario& scenario, std::string_view profile, uint64_t 
         std::cout << scenario.config.payload_weights[i];
     }
     std::cout << '\n';
-}
-
-void printScenarioOverrides(const ScenarioConfig& config, const ScenarioConfig& profile) {
-    const auto scalar = [&](std::string_view option, auto value, auto default_value) {
-        if (value != default_value) std::cout << ' ' << option << ' ' << value;
-    };
-    scalar("--units", config.num_units, profile.num_units);
-    scalar("--channels", config.channels_per_unit, profile.channels_per_unit);
-    scalar("--active-sources", config.active_source_count, profile.active_source_count);
-    scalar("--fixed-delay", config.forced_delay, profile.forced_delay);
-    scalar("--max-fanout", config.max_fanout, profile.max_fanout);
-    scalar("--send-ppm", config.send_probability_ppm, profile.send_probability_ppm);
-    scalar("--burst-ppm", config.burst_probability_ppm, profile.burst_probability_ppm);
-    scalar("--hotspot-ppm", config.hotspot_probability_ppm, profile.hotspot_probability_ppm);
-    scalar("--broadcast-ppm", config.broadcast_probability_ppm, profile.broadcast_probability_ppm);
-    scalar("--zero-delay-ppm", config.zero_delay_probability_ppm,
-           profile.zero_delay_probability_ppm);
-    scalar("--queue-capacity", config.queue_capacity, profile.queue_capacity);
-    scalar("--drain-limit", config.drain_limit, profile.drain_limit);
-    scalar("--work", config.median_work, profile.median_work);
-    scalar("--unit-sigma", config.unit_sigma_milli, profile.unit_sigma_milli);
-    scalar("--cycle-sigma", config.cycle_sigma_milli, profile.cycle_sigma_milli);
-    scalar("--working-set", config.working_set_bytes, profile.working_set_bytes);
-    if (config.payload_weights != profile.payload_weights) {
-        std::cout << " --payload-weights ";
-        for (size_t i = 0; i < config.payload_weights.size(); ++i) {
-            if (i != 0) std::cout << ',';
-            std::cout << config.payload_weights[i];
-        }
-    }
 }
 
 [[nodiscard]] double percentile(std::vector<double> values, double quantile) {
@@ -909,17 +609,13 @@ int main(int argc, char** argv) {
              ++scenario_index) {
             const uint64_t global_scenario_index =
                 parsed.cli.scenario_offset + static_cast<uint64_t>(scenario_index);
-            ScenarioConfig config = parsed.scenario;
-            config.seed = global_scenario_index == 0
-                              ? parsed.cli.seed
-                              : splitMix64(parsed.cli.seed + global_scenario_index);
+            const ScenarioConfig config = scenarioConfigFor(parsed, global_scenario_index);
             const Scenario scenario = generateScenario(config);
             printScenario(scenario, parsed.cli.profile, global_scenario_index);
             std::cout << "  scenario-replay: " << argv[0] << " --profile " << parsed.cli.profile
                       << " --seed " << parsed.cli.seed << " --scenario-offset "
                       << global_scenario_index << " --scenario-count 1";
-            printScenarioOverrides(parsed.scenario,
-                                   profileConfig(parsed.cli.profile, parsed.cli.seed));
+            parsed.overrides.print(std::cout);
             std::cout << '\n';
             if (parsed.cli.describe_only) continue;
 

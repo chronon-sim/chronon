@@ -3,15 +3,22 @@
 
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "RepresentativeWorkload.hpp"
+#include "RepresentativeWorkloadOptions.hpp"
 
 namespace {
 
 using chronon::benchmark::generateScenario;
+using chronon::benchmark::parseCommandLine;
+using chronon::benchmark::ParsedOptions;
 using chronon::benchmark::PayloadClass;
 using chronon::benchmark::ScenarioConfig;
+using chronon::benchmark::scenarioConfigFor;
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -71,12 +78,78 @@ void testTopologyAndLoadInvariants() {
     }
 }
 
+ParsedOptions parseArgs(std::vector<std::string> arguments) {
+    std::vector<char*> argv;
+    argv.reserve(arguments.size());
+    for (auto& argument : arguments) argv.push_back(argument.data());
+    return parseCommandLine(static_cast<int>(argv.size()), argv.data());
+}
+
+bool rejects(std::vector<std::string> arguments) {
+    try {
+        (void)parseArgs(std::move(arguments));
+        return false;
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+}
+
+void testRandomProfileResamplingAndOverrides() {
+    ParsedOptions options;
+    options.cli.profile = "random";
+    options.cli.seed = 20260719;
+    const auto first = scenarioConfigFor(options, 0);
+    const auto second = scenarioConfigFor(options, 1);
+    require(first.seed != second.seed, "derived scenario reused the base seed");
+    require(first.num_units != second.num_units ||
+                first.channels_per_unit != second.channels_per_unit ||
+                first.max_fanout != second.max_fanout ||
+                first.send_probability_ppm != second.send_probability_ppm ||
+                first.queue_capacity != second.queue_capacity ||
+                first.median_work != second.median_work,
+            "random scenario did not resample its parameter envelope");
+
+    options.overrides.num_units = 17;
+    options.overrides.send_probability_ppm = 123'456;
+    options.overrides.queue_capacity = 64;
+    for (uint64_t index = 0; index < 3; ++index) {
+        const auto overridden = scenarioConfigFor(options, index);
+        require(overridden.num_units == 17, "unit override was not replayed");
+        require(overridden.send_probability_ppm == 123'456, "send override was not replayed");
+        require(overridden.queue_capacity == 64, "capacity override was not replayed");
+    }
+}
+
+void testUint32CliBounds() {
+    constexpr const char* too_large = "4294967296";
+    constexpr std::array scalar_options = {
+        "--scenario-count", "--repetitions",    "--max-lookahead", "--units",
+        "--channels",       "--active-sources", "--fixed-delay",   "--max-fanout",
+        "--send-ppm",       "--burst-ppm",      "--hotspot-ppm",   "--broadcast-ppm",
+        "--zero-delay-ppm", "--queue-capacity", "--drain-limit",   "--work",
+        "--unit-sigma",     "--cycle-sigma",    "--working-set"};
+    for (const char* option : scalar_options) {
+        require(rejects({"benchmark", option, too_large}), "uint32 scalar overflow was accepted");
+    }
+    require(rejects({"benchmark", "--threads", "1,4294967296"}),
+            "worker-list overflow was accepted");
+    require(rejects({"benchmark", "--payload-weights", "1,2,3,4,5,4294967296"}),
+            "payload-list overflow was accepted");
+
+    const auto maximum =
+        parseArgs({"benchmark", "--queue-capacity", "4294967295", "--describe-only"});
+    require(maximum.overrides.queue_capacity == std::numeric_limits<uint32_t>::max(),
+            "UINT32_MAX was rejected");
+}
+
 }  // namespace
 
 int main() {
     try {
         testStableFingerprint();
         testTopologyAndLoadInvariants();
+        testRandomProfileResamplingAndOverrides();
+        testUint32CliBounds();
         std::cout << "Representative workload generator tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -77,7 +77,7 @@ Run `--help` for individual overrides. Useful examples:
 ./build-release/benchmark/chronon_representative_workload_benchmark \
   --profile random --random-seed --describe-only
 
-# Replay three deterministic random graphs derived from one base seed.
+# Replay three deterministic random scenarios derived from one base seed.
 ./build-release/benchmark/chronon_representative_workload_benchmark \
   --profile random --seed 4815162342 --scenario-count 3 --threads 1,8
 
@@ -97,7 +97,9 @@ Scenario generation uses a counter-based SplitMix64 mapping and integer-only
 bounded-lognormal approximation. It does not use C++ standard random
 distributions, whose generation algorithms are implementation-defined. Work
 and send schedules are generated before timing; the hot path only reads those
-tables.
+tables. Each derived `random` scenario resamples both its parameter envelope
+and generated graph from its derived seed; explicit CLI overrides are then
+reapplied to every scenario.
 
 Every scenario prints:
 
