@@ -28,7 +28,9 @@ Each unit has two independent cost components:
 2. per-cycle jitter around that baseline.
 
 Both are truncated at a configurable normal quantile (2.58 by default) so the
-profile has Nucleus-like skew without an artificial extreme tail. The timed
+profile has Nucleus-like skew without an artificial extreme tail. Generated
+unit baselines and final per-cycle samples are additionally capped at 4096 work
+iterations, so compounded variance cannot bypass the execution bound. The timed
 work kernel mixes a serial integer dependency chain with data-dependent reads
 and writes to a per-unit power-of-two working set. It is not an empty spin loop.
 

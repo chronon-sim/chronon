@@ -20,7 +20,8 @@ inline constexpr uint32_t PROBABILITY_SCALE = 1'000'000;
 // explicit unlimited-capacity mode.
 inline constexpr uint32_t MAX_FINITE_QUEUE_CAPACITY = 4'096;
 inline constexpr uint32_t MAX_DRAIN_LIMIT = 65'536;
-inline constexpr uint32_t MAX_MEDIAN_WORK = 4'096;
+inline constexpr uint32_t MAX_GENERATED_WORK = 4'096;
+inline constexpr uint32_t MAX_MEDIAN_WORK = MAX_GENERATED_WORK;
 // Port storage includes bounded receive scratch and shared FIFOs plus the
 // worst-case cross-thread SPSC lane for every connection. The benchmark binary
 // statically verifies the conservative per-slot estimates against the current
@@ -475,14 +476,17 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
     for (uint32_t unit_id = 0; unit_id < config.num_units; ++unit_id) {
         UnitSpec unit;
         unit.id = unit_id;
-        unit.base_work = detail::scaleByQ16(
-            config.median_work,
-            detail::lognormalQ16(config.seed, kUnitLoadDomain, unit_id, config.unit_sigma_milli,
-                                 config.normal_cap_milli));
-        unit.drain_limit = std::max<uint32_t>(
-            1, detail::scaleByQ16(
-                   config.drain_limit,
-                   detail::lognormalQ16(config.seed, kUnitLoadDomain + 32, unit_id, 180, 1'500)));
+        unit.base_work =
+            std::min(MAX_GENERATED_WORK,
+                     detail::scaleByQ16(
+                         config.median_work,
+                         detail::lognormalQ16(config.seed, kUnitLoadDomain, unit_id,
+                                              config.unit_sigma_milli, config.normal_cap_milli)));
+        unit.drain_limit = std::clamp(
+            detail::scaleByQ16(
+                config.drain_limit,
+                detail::lognormalQ16(config.seed, kUnitLoadDomain + 32, unit_id, 180, 1'500)),
+            uint32_t{1}, MAX_DRAIN_LIMIT);
         const uint32_t working_set_scale =
             1U << bounded(randomWord(config.seed, kWorkingSetDomain, unit_id),
                           WORKING_SET_SCALE_COUNT);
@@ -491,10 +495,12 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
         unit.work_schedule.reserve(config.work_period);
         for (uint32_t slot = 0; slot < config.work_period; ++slot) {
             const uint64_t index = static_cast<uint64_t>(unit_id) * config.work_period + slot;
-            unit.work_schedule.push_back(detail::scaleByQ16(
-                unit.base_work,
-                detail::lognormalQ16(config.seed, kCycleLoadDomain, index, config.cycle_sigma_milli,
-                                     config.normal_cap_milli)));
+            unit.work_schedule.push_back(std::min(
+                MAX_GENERATED_WORK,
+                detail::scaleByQ16(
+                    unit.base_work,
+                    detail::lognormalQ16(config.seed, kCycleLoadDomain, index,
+                                         config.cycle_sigma_milli, config.normal_cap_milli))));
         }
         scenario.units.push_back(std::move(unit));
     }

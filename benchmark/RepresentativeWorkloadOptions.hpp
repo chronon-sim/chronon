@@ -309,8 +309,8 @@ inline void printHelp(const char* program) {
               << MAX_FINITE_QUEUE_CAPACITY << "; aggregate port storage max "
               << MAX_TOTAL_PORT_STORAGE_BYTES / (1024 * 1024) << " MiB)\n"
               << "  --drain-limit N             max " << MAX_DRAIN_LIMIT << " messages/tick\n"
-              << "  --work N                    median iterations/tick (max " << MAX_MEDIAN_WORK
-              << ")\n"
+              << "  --work N                    median iterations/tick; generated max "
+              << MAX_GENERATED_WORK << "\n"
               << "  --unit-sigma N\n"
               << "  --cycle-sigma N --working-set N (aggregate scratch max "
               << MAX_TOTAL_WORKING_SET_BYTES / (1024 * 1024) << " MiB)\n"

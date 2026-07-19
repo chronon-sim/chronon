@@ -25,6 +25,7 @@ using chronon::benchmark::MAX_BENCHMARK_WORKERS;
 using chronon::benchmark::MAX_DRAIN_LIMIT;
 using chronon::benchmark::MAX_FINITE_QUEUE_CAPACITY;
 using chronon::benchmark::MAX_FORCED_DELAY;
+using chronon::benchmark::MAX_GENERATED_WORK;
 using chronon::benchmark::MAX_MEDIAN_WORK;
 using chronon::benchmark::MAX_SCENARIO_UNITS;
 using chronon::benchmark::MAX_TOTAL_PORT_STORAGE_BYTES;
@@ -362,6 +363,27 @@ void testWorkAndDrainBounds() {
         require(false, "programmatic oversized drain limit was accepted");
     } catch (const std::invalid_argument&) {
     }
+
+    config.num_units = 16;
+    config.median_work = MAX_MEDIAN_WORK;
+    config.drain_limit = MAX_DRAIN_LIMIT;
+    config.unit_sigma_milli = 2'000;
+    config.cycle_sigma_milli = 2'000;
+    config.work_period = 64;
+    const auto bounded = generateScenario(config);
+    bool observed_work_cap = false;
+    for (const auto& unit : bounded.units) {
+        require(unit.base_work <= MAX_GENERATED_WORK,
+                "unit variance exceeded generated base-work limit");
+        require(unit.drain_limit <= MAX_DRAIN_LIMIT,
+                "unit variance exceeded generated drain limit");
+        for (uint32_t work : unit.work_schedule) {
+            require(work <= MAX_GENERATED_WORK,
+                    "cycle variance exceeded generated work-sample limit");
+            observed_work_cap = observed_work_cap || work == MAX_GENERATED_WORK;
+        }
+    }
+    require(observed_work_cap, "extreme variance did not exercise generated work cap");
 }
 
 void testWorkingSetBudget() {
