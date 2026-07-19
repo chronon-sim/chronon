@@ -17,8 +17,13 @@ namespace {
 
 using chronon::benchmark::generateScenario;
 using chronon::benchmark::inputScratchBytesPerSlot;
+using chronon::benchmark::MAX_BENCHMARK_CYCLES;
+using chronon::benchmark::MAX_BENCHMARK_REPETITIONS;
+using chronon::benchmark::MAX_BENCHMARK_SCENARIOS;
 using chronon::benchmark::MAX_BENCHMARK_WORKERS;
+using chronon::benchmark::MAX_DRAIN_LIMIT;
 using chronon::benchmark::MAX_FINITE_QUEUE_CAPACITY;
+using chronon::benchmark::MAX_MEDIAN_WORK;
 using chronon::benchmark::MAX_SCENARIO_UNITS;
 using chronon::benchmark::MAX_TOTAL_WORKING_SET_BYTES;
 using chronon::benchmark::MAX_WORKING_SET_SCALE;
@@ -250,6 +255,85 @@ void testWorkerBounds() {
             "UINT32_MAX worker count was accepted");
 }
 
+void testExecutionBounds() {
+    const auto maximum_scenarios =
+        parseArgs({"benchmark", "--scenario-count", std::to_string(MAX_BENCHMARK_SCENARIOS)});
+    require(maximum_scenarios.cli.scenario_count == MAX_BENCHMARK_SCENARIOS,
+            "maximum scenario count was rejected");
+    require(rejects({"benchmark", "--scenario-count", std::to_string(MAX_BENCHMARK_SCENARIOS + 1)}),
+            "oversized scenario count was accepted");
+    require(rejects({"benchmark", "--scenario-count", "4294967295"}),
+            "UINT32_MAX scenario count was accepted");
+
+    const auto maximum_repetitions =
+        parseArgs({"benchmark", "--repetitions", std::to_string(MAX_BENCHMARK_REPETITIONS)});
+    require(maximum_repetitions.cli.repetitions == MAX_BENCHMARK_REPETITIONS,
+            "maximum repetition count was rejected");
+    require(rejects({"benchmark", "--repetitions", std::to_string(MAX_BENCHMARK_REPETITIONS + 1)}),
+            "oversized repetition count was accepted");
+
+    const auto maximum_cycles =
+        parseArgs({"benchmark", "--cycles", std::to_string(MAX_BENCHMARK_CYCLES), "--warmup",
+                   std::to_string(MAX_BENCHMARK_CYCLES)});
+    require(maximum_cycles.cli.run.measured_cycles == MAX_BENCHMARK_CYCLES &&
+                maximum_cycles.cli.run.warmup_cycles == MAX_BENCHMARK_CYCLES,
+            "maximum cycle count was rejected");
+    require(rejects({"benchmark", "--cycles", std::to_string(MAX_BENCHMARK_CYCLES + 1)}),
+            "oversized measured cycle count was accepted");
+    require(rejects({"benchmark", "--warmup", std::to_string(MAX_BENCHMARK_CYCLES + 1)}),
+            "oversized warmup cycle count was accepted");
+
+    require(rejects({"benchmark", "--scenario-count", "0"}), "zero scenario count was accepted");
+    require(rejects({"benchmark", "--repetitions", "0"}), "zero repetition count was accepted");
+    require(rejects({"benchmark", "--cycles", "0"}), "zero measured cycle count was accepted");
+
+    const std::string max_u64 = std::to_string(std::numeric_limits<uint64_t>::max());
+    const auto maximum_offset =
+        parseArgs({"benchmark", "--scenario-offset", max_u64, "--scenario-count", "1"});
+    require(maximum_offset.cli.scenario_offset == std::numeric_limits<uint64_t>::max(),
+            "maximum single scenario offset was rejected");
+    require(rejects({"benchmark", "--scenario-offset", max_u64, "--scenario-count", "2"}),
+            "overflowing scenario index range was accepted");
+}
+
+void testWorkAndDrainBounds() {
+    const auto maximum = parseArgs({"benchmark", "--work", std::to_string(MAX_MEDIAN_WORK),
+                                    "--drain-limit", std::to_string(MAX_DRAIN_LIMIT)});
+    require(maximum.overrides.median_work == MAX_MEDIAN_WORK, "maximum median work was rejected");
+    require(maximum.overrides.drain_limit == MAX_DRAIN_LIMIT, "maximum drain limit was rejected");
+    require(rejects({"benchmark", "--work", std::to_string(MAX_MEDIAN_WORK + 1)}),
+            "oversized median work was accepted");
+    require(rejects({"benchmark", "--drain-limit", std::to_string(MAX_DRAIN_LIMIT + 1)}),
+            "oversized drain limit was accepted");
+    require(rejects({"benchmark", "--work", "0"}), "zero median work was accepted");
+    require(rejects({"benchmark", "--drain-limit", "0"}), "zero drain limit was accepted");
+
+    ScenarioConfig config;
+    config.num_units = 1;
+    config.channels_per_unit = 0;
+    config.ensure_ring = false;
+    config.work_period = 1;
+    config.send_period = 1;
+    config.median_work = MAX_MEDIAN_WORK;
+    config.drain_limit = MAX_DRAIN_LIMIT;
+    (void)generateScenario(config);
+
+    config.median_work = MAX_MEDIAN_WORK + 1;
+    try {
+        (void)generateScenario(config);
+        require(false, "programmatic oversized median work was accepted");
+    } catch (const std::invalid_argument&) {
+    }
+
+    config.median_work = 1;
+    config.drain_limit = MAX_DRAIN_LIMIT + 1;
+    try {
+        (void)generateScenario(config);
+        require(false, "programmatic oversized drain limit was accepted");
+    } catch (const std::invalid_argument&) {
+    }
+}
+
 void testWorkingSetBudget() {
     ScenarioConfig config;
     config.num_units = 64;
@@ -368,6 +452,8 @@ int main() {
         testQueueCapacityBounds();
         testInputScratchBudget();
         testWorkerBounds();
+        testExecutionBounds();
+        testWorkAndDrainBounds();
         testWorkingSetBudget();
         testFixedDelayOverridesAllChannels();
         testScenarioResourceBounds();

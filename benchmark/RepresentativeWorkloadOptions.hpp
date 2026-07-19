@@ -22,7 +22,10 @@
 
 namespace chronon::benchmark {
 
+inline constexpr uint32_t MAX_BENCHMARK_SCENARIOS = 256;
+inline constexpr uint32_t MAX_BENCHMARK_REPETITIONS = 1'024;
 inline constexpr uint32_t MAX_BENCHMARK_WORKERS = 256;
+inline constexpr uint64_t MAX_BENCHMARK_CYCLES = 1'000'000'000;
 
 struct RunOptions {
     uint64_t warmup_cycles = 8192;
@@ -281,11 +284,14 @@ inline void printHelp(const char* program) {
               << "  --profile NAME              scenario profile (default nucleus)\n"
               << "  --seed N | --random-seed    reproducible or newly sampled base seed\n"
               << "  --scenario-offset N         first derived scenario index (default 0)\n"
-              << "  --scenario-count N          independent derived scenarios (default 1)\n"
+              << "  --scenario-count N          independent derived scenarios (default 1, max "
+              << MAX_BENCHMARK_SCENARIOS << ")\n"
               << "  --threads 1,2,4,8           worker sweep (max " << MAX_BENCHMARK_WORKERS
               << "); CPU affinity is external\n"
-              << "  --cycles N --warmup N       measured and warmup cycles\n"
-              << "  --repetitions N             interleaved repetitions (default 5)\n"
+              << "  --cycles N --warmup N       measured and warmup cycles (max "
+              << MAX_BENCHMARK_CYCLES << " each)\n"
+              << "  --repetitions N             interleaved repetitions (default 5, max "
+              << MAX_BENCHMARK_REPETITIONS << ")\n"
               << "  --rebalance                 enable runtime dynamic rebalance\n"
               << "  --no-precomputed-costs      start from uniform unit costs\n"
               << "  --describe-only             generate/validate without running\n"
@@ -298,7 +304,10 @@ inline void printHelp(const char* program) {
               << "  --queue-capacity N          finite depth (0=unlimited, max "
               << MAX_FINITE_QUEUE_CAPACITY << "; aggregate scratch max "
               << MAX_TOTAL_INPUT_SCRATCH_BYTES / (1024 * 1024) << " MiB)\n"
-              << "  --drain-limit N --work N --unit-sigma N\n"
+              << "  --drain-limit N             max " << MAX_DRAIN_LIMIT << " messages/tick\n"
+              << "  --work N                    median iterations/tick (max " << MAX_MEDIAN_WORK
+              << ")\n"
+              << "  --unit-sigma N\n"
               << "  --cycle-sigma N --working-set N (aggregate scratch max "
               << MAX_TOTAL_WORKING_SET_BYTES / (1024 * 1024) << " MiB)\n"
               << "  --payload-weights a,b,c,d,e,f\n"
@@ -393,9 +402,17 @@ inline void printHelp(const char* program) {
             }
             overrides.queue_capacity = capacity;
         } else if (option == "--drain-limit") {
-            overrides.drain_limit = parseU32(requireValue(i, option), option);
+            const uint32_t drain_limit = parseU32(requireValue(i, option), option);
+            if (drain_limit == 0 || drain_limit > MAX_DRAIN_LIMIT) {
+                throw std::invalid_argument("value for --drain-limit exceeds benchmark limit");
+            }
+            overrides.drain_limit = drain_limit;
         } else if (option == "--work") {
-            overrides.median_work = parseU32(requireValue(i, option), option);
+            const uint32_t median_work = parseU32(requireValue(i, option), option);
+            if (median_work == 0 || median_work > MAX_MEDIAN_WORK) {
+                throw std::invalid_argument("value for --work exceeds benchmark limit");
+            }
+            overrides.median_work = median_work;
         } else if (option == "--unit-sigma") {
             overrides.unit_sigma_milli = parseU32(requireValue(i, option), option);
         } else if (option == "--cycle-sigma") {
@@ -418,6 +435,19 @@ inline void printHelp(const char* program) {
     if (cli.scenario_count == 0 || cli.repetitions == 0 || cli.run.measured_cycles == 0) {
         throw std::invalid_argument(
             "scenario count, repetitions, and measured cycles must be positive");
+    }
+    if (cli.scenario_count > MAX_BENCHMARK_SCENARIOS) {
+        throw std::invalid_argument("scenario count exceeds benchmark limit");
+    }
+    if (cli.repetitions > MAX_BENCHMARK_REPETITIONS) {
+        throw std::invalid_argument("repetition count exceeds benchmark limit");
+    }
+    if (cli.run.measured_cycles > MAX_BENCHMARK_CYCLES ||
+        cli.run.warmup_cycles > MAX_BENCHMARK_CYCLES) {
+        throw std::invalid_argument("cycle count exceeds benchmark limit");
+    }
+    if (cli.scenario_offset > std::numeric_limits<uint64_t>::max() - (cli.scenario_count - 1)) {
+        throw std::invalid_argument("scenario index range overflows uint64_t");
     }
     return {std::move(cli), std::move(overrides)};
 }

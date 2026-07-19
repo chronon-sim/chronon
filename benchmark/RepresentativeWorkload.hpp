@@ -19,6 +19,8 @@ inline constexpr uint32_t PROBABILITY_SCALE = 1'000'000;
 // per-port bound at the transport's standard ring size; zero remains the
 // explicit unlimited-capacity mode.
 inline constexpr uint32_t MAX_FINITE_QUEUE_CAPACITY = 4'096;
+inline constexpr uint32_t MAX_DRAIN_LIMIT = 65'536;
+inline constexpr uint32_t MAX_MEDIAN_WORK = 4'096;
 // A bounded InPort reserves both PortEnvelope<T> and T receive scratch. The
 // per-slot estimate below includes 64 bytes for envelope metadata/padding; the
 // benchmark binary statically verifies that this covers every payload layout.
@@ -303,6 +305,12 @@ inline void validateConfig(const ScenarioConfig& config) {
     }
     if (config.work_period == 0 || config.send_period == 0 || config.drain_limit == 0) {
         throw std::invalid_argument("periods and drain limit must be positive");
+    }
+    if (config.drain_limit > MAX_DRAIN_LIMIT) {
+        throw std::invalid_argument("drain limit exceeds benchmark limit");
+    }
+    if (config.median_work == 0 || config.median_work > MAX_MEDIAN_WORK) {
+        throw std::invalid_argument("median work must be within benchmark limits");
     }
     const uint32_t source_count = sourceCount(config);
     const uint64_t total_channels = static_cast<uint64_t>(source_count) * config.channels_per_unit;
