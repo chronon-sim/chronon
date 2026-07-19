@@ -52,6 +52,24 @@ static_assert(sizeof(Payload<64>) == 64);
 static_assert(sizeof(Payload<144>) == 144);
 static_assert(sizeof(Payload<256>) == 256);
 
+template <size_t Bytes>
+consteval uint64_t actualInputScratchBytesPerSlot() {
+    return sizeof(typename InPort<Payload<Bytes>>::StoredMessage) + sizeof(Payload<Bytes>);
+}
+
+static_assert(inputScratchBytesPerSlot(PayloadClass::Bytes8) >=
+              actualInputScratchBytesPerSlot<8>());
+static_assert(inputScratchBytesPerSlot(PayloadClass::Bytes16) >=
+              actualInputScratchBytesPerSlot<16>());
+static_assert(inputScratchBytesPerSlot(PayloadClass::Bytes32) >=
+              actualInputScratchBytesPerSlot<32>());
+static_assert(inputScratchBytesPerSlot(PayloadClass::Bytes64) >=
+              actualInputScratchBytesPerSlot<64>());
+static_assert(inputScratchBytesPerSlot(PayloadClass::Bytes144) >=
+              actualInputScratchBytesPerSlot<144>());
+static_assert(inputScratchBytesPerSlot(PayloadClass::Bytes256) >=
+              actualInputScratchBytesPerSlot<256>());
+
 struct alignas(64) UnitCounters {
     uint64_t ticks = 0;
     uint64_t work_iterations = 0;
@@ -218,9 +236,30 @@ private:
 
     template <size_t Bytes>
     [[nodiscard]] size_t inputCapacity_() const noexcept {
-        (void)Bytes;
-        return scenario_->config.queue_capacity == 0 ? InPort<Payload<Bytes>>::UNLIMITED_CAPACITY
-                                                     : scenario_->config.queue_capacity;
+        const bool has_incoming_type =
+            (spec_->incoming_payload_mask & payloadMask(payloadClass_<Bytes>())) != 0;
+        if (scenario_->config.queue_capacity == 0 || !has_incoming_type) {
+            return InPort<Payload<Bytes>>::UNLIMITED_CAPACITY;
+        }
+        return scenario_->config.queue_capacity;
+    }
+
+    template <size_t Bytes>
+    [[nodiscard]] static consteval PayloadClass payloadClass_() noexcept {
+        if constexpr (Bytes == 8) {
+            return PayloadClass::Bytes8;
+        } else if constexpr (Bytes == 16) {
+            return PayloadClass::Bytes16;
+        } else if constexpr (Bytes == 32) {
+            return PayloadClass::Bytes32;
+        } else if constexpr (Bytes == 64) {
+            return PayloadClass::Bytes64;
+        } else if constexpr (Bytes == 144) {
+            return PayloadClass::Bytes144;
+        } else {
+            static_assert(Bytes == 256, "unsupported benchmark payload size");
+            return PayloadClass::Bytes256;
+        }
     }
 
     template <size_t Bytes>
@@ -499,7 +538,9 @@ void printScenario(const Scenario& scenario, std::string_view profile, uint64_t 
     std::cout << "  offered publications/cycle=" << scenario.summary.scheduled_slots / period
               << " deliveries/cycle=" << scenario.summary.scheduled_deliveries / period
               << " payload-KiB/cycle=" << scenario.summary.scheduled_payload_bytes / period / 1024.0
-              << " queue-capacity=" << scenario.config.queue_capacity << '\n';
+              << " queue-capacity=" << scenario.config.queue_capacity
+              << " input-scratch-reserve-MiB="
+              << scenario.summary.estimated_input_scratch_reserve_bytes / (1024.0 * 1024.0) << '\n';
     std::cout << "  payload weights [8,16,32,64,144,256]=";
     for (size_t i = 0; i < scenario.config.payload_weights.size(); ++i) {
         if (i != 0) std::cout << ',';

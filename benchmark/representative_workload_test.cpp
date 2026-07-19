@@ -1,6 +1,7 @@
 // Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
 // SPDX-License-Identifier: MPL-2.0
 
+#include <array>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -15,13 +16,17 @@
 namespace {
 
 using chronon::benchmark::generateScenario;
+using chronon::benchmark::inputScratchBytesPerSlot;
+using chronon::benchmark::MAX_BENCHMARK_WORKERS;
 using chronon::benchmark::MAX_FINITE_QUEUE_CAPACITY;
 using chronon::benchmark::MAX_SCENARIO_UNITS;
 using chronon::benchmark::MAX_TOTAL_WORKING_SET_BYTES;
 using chronon::benchmark::MAX_WORKING_SET_SCALE;
 using chronon::benchmark::parseCommandLine;
 using chronon::benchmark::ParsedOptions;
+using chronon::benchmark::PAYLOAD_BYTES;
 using chronon::benchmark::PayloadClass;
+using chronon::benchmark::payloadMask;
 using chronon::benchmark::printReplayCommand;
 using chronon::benchmark::ScenarioConfig;
 using chronon::benchmark::scenarioConfigFor;
@@ -77,11 +82,26 @@ void testTopologyAndLoadInvariants() {
             "invalid payload class");
         for (uint32_t destination : channel.destinations) {
             require(destination != channel.source, "self edge generated");
+            require((scenario.units[destination].incoming_payload_mask &
+                     payloadMask(channel.payload)) != 0,
+                    "destination payload mask omitted a connected type");
             if (channel.delay == 0) {
                 require(channel.source < destination, "zero-delay graph is not a DAG");
             }
         }
     }
+
+    uint64_t expected_input_scratch = 0;
+    for (const auto& unit : scenario.units) {
+        for (size_t payload = 0; payload < PAYLOAD_BYTES.size(); ++payload) {
+            const auto payload_class = static_cast<PayloadClass>(payload);
+            if ((unit.incoming_payload_mask & payloadMask(payload_class)) == 0) continue;
+            expected_input_scratch += static_cast<uint64_t>(config.queue_capacity) *
+                                      inputScratchBytesPerSlot(payload_class);
+        }
+    }
+    require(scenario.summary.estimated_input_scratch_reserve_bytes == expected_input_scratch,
+            "input scratch estimate did not match connected payload types");
 }
 
 ParsedOptions parseArgs(std::vector<std::string> arguments) {
@@ -185,6 +205,49 @@ void testQueueCapacityBounds() {
         require(false, "programmatic oversized queue capacity was accepted");
     } catch (const std::invalid_argument&) {
     }
+}
+
+void testInputScratchBudget() {
+    ScenarioConfig disconnected;
+    disconnected.num_units = MAX_SCENARIO_UNITS;
+    disconnected.channels_per_unit = 0;
+    disconnected.ensure_ring = false;
+    disconnected.queue_capacity = MAX_FINITE_QUEUE_CAPACITY;
+    disconnected.working_set_bytes = 64;
+    disconnected.work_period = 1;
+    disconnected.send_period = 1;
+    const auto accepted = generateScenario(disconnected);
+    require(accepted.summary.estimated_input_scratch_reserve_bytes == 0,
+            "disconnected units reserved finite input scratch");
+    for (const auto& unit : accepted.units) {
+        require(unit.incoming_payload_mask == 0,
+                "disconnected unit advertised an incoming payload type");
+    }
+
+    ScenarioConfig oversized;
+    oversized.num_units = 1'024;
+    oversized.channels_per_unit = 1;
+    oversized.max_fanout = 1;
+    oversized.queue_capacity = MAX_FINITE_QUEUE_CAPACITY;
+    oversized.working_set_bytes = 64;
+    oversized.work_period = 1;
+    oversized.send_period = 1;
+    try {
+        (void)generateScenario(oversized);
+        require(false, "oversized aggregate input scratch was accepted");
+    } catch (const std::invalid_argument&) {
+    }
+}
+
+void testWorkerBounds() {
+    const auto maximum =
+        parseArgs({"benchmark", "--threads", std::to_string(MAX_BENCHMARK_WORKERS)});
+    require(maximum.cli.workers == std::vector<size_t>{MAX_BENCHMARK_WORKERS},
+            "maximum benchmark worker count was rejected");
+    require(rejects({"benchmark", "--threads", std::to_string(MAX_BENCHMARK_WORKERS + 1)}),
+            "oversized benchmark worker count was accepted");
+    require(rejects({"benchmark", "--threads", "4294967295"}),
+            "UINT32_MAX worker count was accepted");
 }
 
 void testWorkingSetBudget() {
@@ -303,6 +366,8 @@ int main() {
         testRandomProfileResamplingAndOverrides();
         testUint32CliBounds();
         testQueueCapacityBounds();
+        testInputScratchBudget();
+        testWorkerBounds();
         testWorkingSetBudget();
         testFixedDelayOverridesAllChannels();
         testScenarioResourceBounds();

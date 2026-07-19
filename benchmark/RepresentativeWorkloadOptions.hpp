@@ -22,6 +22,8 @@
 
 namespace chronon::benchmark {
 
+inline constexpr uint32_t MAX_BENCHMARK_WORKERS = 256;
+
 struct RunOptions {
     uint64_t warmup_cycles = 8192;
     uint64_t measured_cycles = 50'000;
@@ -177,6 +179,10 @@ inline void printReplayCommand(std::ostream& output, std::string_view program,
     if (workers.empty() || std::find(workers.begin(), workers.end(), 0) != workers.end()) {
         throw std::invalid_argument("worker counts must be positive");
     }
+    if (std::any_of(workers.begin(), workers.end(),
+                    [](size_t workers) { return workers > MAX_BENCHMARK_WORKERS; })) {
+        throw std::invalid_argument("worker count exceeds benchmark limit");
+    }
     std::sort(workers.begin(), workers.end());
     workers.erase(std::unique(workers.begin(), workers.end()), workers.end());
     return workers;
@@ -276,7 +282,8 @@ inline void printHelp(const char* program) {
               << "  --seed N | --random-seed    reproducible or newly sampled base seed\n"
               << "  --scenario-offset N         first derived scenario index (default 0)\n"
               << "  --scenario-count N          independent derived scenarios (default 1)\n"
-              << "  --threads 1,2,4,8           worker sweep; CPU affinity is external\n"
+              << "  --threads 1,2,4,8           worker sweep (max " << MAX_BENCHMARK_WORKERS
+              << "); CPU affinity is external\n"
               << "  --cycles N --warmup N       measured and warmup cycles\n"
               << "  --repetitions N             interleaved repetitions (default 5)\n"
               << "  --rebalance                 enable runtime dynamic rebalance\n"
@@ -289,7 +296,8 @@ inline void printHelp(const char* program) {
               << "  --active-sources N --fixed-delay N (zero requires a sink unit)\n"
               << "  --hotspot-ppm N --broadcast-ppm N --zero-delay-ppm N\n"
               << "  --queue-capacity N          finite depth (0=unlimited, max "
-              << MAX_FINITE_QUEUE_CAPACITY << ")\n"
+              << MAX_FINITE_QUEUE_CAPACITY << "; aggregate scratch max "
+              << MAX_TOTAL_INPUT_SCRATCH_BYTES / (1024 * 1024) << " MiB)\n"
               << "  --drain-limit N --work N --unit-sigma N\n"
               << "  --cycle-sigma N --working-set N (aggregate scratch max "
               << MAX_TOTAL_WORKING_SET_BYTES / (1024 * 1024) << " MiB)\n"

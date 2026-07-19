@@ -16,9 +16,13 @@ namespace chronon::benchmark {
 inline constexpr uint32_t REPRESENTATIVE_WORKLOAD_VERSION = 2;
 inline constexpr uint32_t PROBABILITY_SCALE = 1'000'000;
 // Finite queues are allocated per connected unit and payload type. Keep the
-// benchmark bound at the transport's standard ring size; zero remains the
+// per-port bound at the transport's standard ring size; zero remains the
 // explicit unlimited-capacity mode.
 inline constexpr uint32_t MAX_FINITE_QUEUE_CAPACITY = 4'096;
+// A bounded InPort reserves both PortEnvelope<T> and T receive scratch. The
+// per-slot estimate below includes 64 bytes for envelope metadata/padding; the
+// benchmark binary statically verifies that this covers every payload layout.
+inline constexpr uint64_t MAX_TOTAL_INPUT_SCRATCH_BYTES = uint64_t{256} * 1024 * 1024;
 inline constexpr uint32_t WORKING_SET_SCALE_COUNT = 3;
 inline constexpr uint32_t MAX_WORKING_SET_SCALE = 1U << (WORKING_SET_SCALE_COUNT - 1);
 // Scratch vectors are materialized for every unit in a run. Validate their
@@ -32,6 +36,18 @@ inline constexpr uint64_t MAX_SCENARIO_SCHEDULE_BYTES = uint64_t{64} * 1024 * 10
 inline constexpr std::array<uint32_t, 6> PAYLOAD_BYTES = {8, 16, 32, 64, 144, 256};
 
 enum class PayloadClass : uint8_t { Bytes8, Bytes16, Bytes32, Bytes64, Bytes144, Bytes256 };
+
+static_assert(PAYLOAD_BYTES.size() <= std::numeric_limits<uint8_t>::digits);
+
+[[nodiscard]] constexpr uint8_t payloadMask(PayloadClass payload) noexcept {
+    return static_cast<uint8_t>(uint8_t{1} << static_cast<uint8_t>(payload));
+}
+
+[[nodiscard]] constexpr uint64_t inputScratchBytesPerSlot(PayloadClass payload) noexcept {
+    constexpr uint64_t kConservativeEnvelopeMetadataBytes = 64;
+    return uint64_t{2} * PAYLOAD_BYTES[static_cast<size_t>(payload)] +
+           kConservativeEnvelopeMetadataBytes;
+}
 
 struct ScenarioConfig {
     uint64_t seed = 0x4348524f4e4f4eULL;
@@ -66,6 +82,7 @@ struct UnitSpec {
     uint32_t base_work = 0;
     uint32_t drain_limit = 0;
     uint32_t working_set_bytes = 0;
+    uint8_t incoming_payload_mask = 0;
     std::vector<uint32_t> work_schedule;
 
     friend bool operator==(const UnitSpec&, const UnitSpec&) = default;
@@ -96,6 +113,7 @@ struct ScenarioSummary {
     uint32_t broadcast_channels = 0;
     uint32_t max_indegree = 0;
     uint32_t max_outdegree = 0;
+    uint64_t estimated_input_scratch_reserve_bytes = 0;
 
     friend bool operator==(const ScenarioSummary&, const ScenarioSummary&) = default;
 };
@@ -504,7 +522,24 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
         scenario.summary.scheduled_deliveries += slots * channel.destinations.size();
         scenario.summary.scheduled_payload_bytes +=
             slots * channel.destinations.size() * payloadBytes(channel.payload);
-        for (uint32_t destination : channel.destinations) ++indegree[destination];
+        const uint8_t incoming_payload_bit = payloadMask(channel.payload);
+        for (uint32_t destination : channel.destinations) {
+            ++indegree[destination];
+            auto& mask = scenario.units[destination].incoming_payload_mask;
+            if ((mask & incoming_payload_bit) != 0) continue;
+            mask = static_cast<uint8_t>(mask | incoming_payload_bit);
+            if (config.queue_capacity == 0) continue;
+
+            const uint64_t binding_bytes = static_cast<uint64_t>(config.queue_capacity) *
+                                           inputScratchBytesPerSlot(channel.payload);
+            if (binding_bytes > MAX_TOTAL_INPUT_SCRATCH_BYTES ||
+                scenario.summary.estimated_input_scratch_reserve_bytes >
+                    MAX_TOTAL_INPUT_SCRATCH_BYTES - binding_bytes) {
+                throw std::invalid_argument(
+                    "finite input scratch buffers exceed aggregate memory limit");
+            }
+            scenario.summary.estimated_input_scratch_reserve_bytes += binding_bytes;
+        }
     }
     scenario.summary.max_indegree = *std::max_element(indegree.begin(), indegree.end());
     scenario.summary.max_outdegree = *std::max_element(outdegree.begin(), outdegree.end());

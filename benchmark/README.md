@@ -101,6 +101,10 @@ tables. Each derived `random` scenario resamples both its parameter envelope
 and generated graph from its derived seed; explicit CLI overrides are then
 reapplied to every scenario. Per-unit scratch working sets are conservatively
 bounded to a 256 MiB aggregate maximum before simulation storage is allocated.
+Finite input queues reserve receive scratch only for payload classes that are
+actually connected to each unit, and their conservatively estimated aggregate
+scratch is independently capped at 256 MiB. Worker sweeps are capped at 256 so
+malformed CLI input cannot request an impractical thread pool.
 Unit, channel, fan-out edge, and generated schedule counts also have explicit
 pre-allocation limits; `--help` reports the user-facing topology limits.
 
