@@ -1,0 +1,138 @@
+# Chronon benchmarks
+
+The small queue benchmarks in this directory isolate individual transport hot
+paths. `chronon_representative_workload_benchmark` complements them with a full
+`TickSimulation`: variable-cost units execute real memory-dependent work while
+typed ports carry physically different payload sizes through a generated graph.
+
+## Representative workload benchmark
+
+The workload combines three established benchmark ideas:
+
+- PHOLD's parameterized control of logical processes, communication rate,
+  lookahead, and event population;
+- Graph500's seeded scalable graph generation, untimed input generation, and
+  separate correctness validation; and
+- repeated, interleaved timing with median, percentiles, and coefficient of
+  variation instead of selecting the best run.
+
+The default `nucleus` profile is based on the port types in Nucleus. Its payload
+classes are 8, 16, 32, 64, 144, and 256 bytes. The 144-byte class exactly models
+Nucleus `InstData`; the smaller classes cover scalars, smart pointers, wakeups,
+flushes, and fetched-instruction records. The default weights are explicit in
+the output and can be replaced without changing the benchmark implementation.
+
+Each unit has two independent cost components:
+
+1. a per-unit baseline sampled from a lognormal-like distribution; and
+2. per-cycle jitter around that baseline.
+
+Both are truncated at a configurable normal quantile (2.58 by default) so the
+profile has Nucleus-like skew without an artificial extreme tail. The timed
+work kernel mixes a serial integer dependency chain with data-dependent reads
+and writes to a per-unit power-of-two working set. It is not an empty spin loop.
+
+Each generated channel has a typed `OutPort`, one or more destinations, a delay,
+a send-rate schedule, and optional bursts. Receivers have independently varied
+drain rates. Failed sends remain pending and are retried, making queue capacity
+real architectural backpressure rather than packet loss. The generator creates
+fan-in, fan-out, hotspots, delay-zero DAG edges, and longer-delay edges.
+
+### Build and run
+
+```bash
+cmake -S . -B build-release \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCHRONON_BUILD_BENCHMARKS=ON
+cmake --build build-release \
+  --target chronon_representative_workload_benchmark -j$(nproc)
+
+taskset -c 16-31 \
+  ./build-release/benchmark/chronon_representative_workload_benchmark \
+  --profile nucleus --seed 20260719 --threads 1,2,4,8,16 \
+  --warmup 8192 --cycles 50000 --repetitions 5
+```
+
+CPU affinity is deliberately external. On hybrid or SMT machines, select a
+homogeneous set of physical cores and record that set with the result. Do not
+compare a run that mixes core classes with one that does not.
+
+Profiles provide stable starting points:
+
+| Profile | Primary stress |
+| --- | --- |
+| `nucleus` | mixed unit cost, topology, payload, and moderate traffic |
+| `scheduler` | variable unit work without connections |
+| `port` | high message rate with almost no unit work |
+| `hotspot` | high-indegree MPSC destinations |
+| `broadcast` | wide fan-out and transparent shared broadcast eligibility |
+| `backpressure` | small queues, bursts, slow receivers, and reliable retry |
+| `saturation` | adversarial queue saturation and strict cross-mode validation |
+| `random` | seeded randomization of the main scenario parameters |
+
+Run `--help` for individual overrides. Useful examples:
+
+```bash
+# Generate a fresh random scenario, printing the resolved replay seed.
+./build-release/benchmark/chronon_representative_workload_benchmark \
+  --profile random --random-seed --describe-only
+
+# Replay three deterministic random graphs derived from one base seed.
+./build-release/benchmark/chronon_representative_workload_benchmark \
+  --profile random --seed 4815162342 --scenario-count 3 --threads 1,8
+
+# Replay only derived scenario index 2 (the benchmark prints this normalized form).
+./build-release/benchmark/chronon_representative_workload_benchmark \
+  --profile random --seed 4815162342 --scenario-offset 2 \
+  --scenario-count 1 --describe-only
+
+# Port-heavy 144-byte traffic only.
+./build-release/benchmark/chronon_representative_workload_benchmark \
+  --profile port --payload-weights 0,0,0,0,1,0 --threads 1,8
+```
+
+### Reproducibility and validation
+
+Scenario generation uses a counter-based SplitMix64 mapping and integer-only
+bounded-lognormal approximation. It does not use C++ standard random
+distributions, whose generation algorithms are implementation-defined. Work
+and send schedules are generated before timing; the hot path only reads those
+tables.
+
+Every scenario prints:
+
+- the resolved seed and generator version;
+- a fingerprint over all generated units, edges, payload classes, delays, work
+  schedules, and send schedules; and
+- a complete replay command.
+
+The generator unit test pins a known fingerprint. Changing generated output
+requires an intentional generator-version bump and fixture update.
+
+For every timed run the benchmark also checks:
+
+- the exact expected unit-tick count;
+- message conservation, including bounded-MPSC ingress lanes;
+- zero physical transport overflow; and
+- an identical final state digest across repetitions and worker counts.
+
+An equivalence failure exits nonzero. This is intentional: a faster run that
+changes cycle-visible backpressure or message ordering is not a valid Chronon
+performance result. `saturation` is specifically intended to find these
+boundary-condition bugs.
+
+Scenario creation, graph connection, simulation initialization, deterministic
+cost placement, and warmup are excluded from wall time. Repetition order is
+seeded and interleaved across worker counts. The report includes median,
+10th/90th percentiles, coefficient of variation, unit-ticks/s, messages/s,
+payload GiB/s, blocked-send percentage, and speedup.
+
+Primary design references:
+
+- [ROSS PHOLD parameters](https://ross-org.github.io/setup/running-sim.html)
+- [Fujimoto et al., *The PHOLD Benchmark: A Critical Review*](https://informs-sim.org/wsc17papers/includes/files/019.pdf)
+- [Graph500 benchmark specification](https://graph500.org/?page_id=12)
+- [Google Benchmark timing and repetition guidance](https://github.com/google/benchmark/blob/main/docs/user_guide.md)
+- [WG21 P3791R0, reproducible random-number generation](https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2025/p3791r0.html)
+- [Mytkowicz et al., *Producing Wrong Data Without Doing Anything Obviously Wrong*](https://sape.inf.usi.ch/publications/asplos09.html)
+- [Kalibera and Jones, *Rigorous Benchmarking in Reasonable Time*](https://kar.kent.ac.uk/33611/)
