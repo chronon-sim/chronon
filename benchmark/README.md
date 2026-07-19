@@ -65,12 +65,36 @@ Profiles provide stable starting points:
 | --- | --- |
 | `nucleus` | mixed unit cost, topology, payload, and moderate traffic |
 | `scheduler` | variable unit work without connections |
+| `scheduler-floor` | port-free independent clusters for scheduler floor/progress overhead |
 | `port` | high message rate with almost no unit work |
 | `hotspot` | high-indegree MPSC destinations |
 | `broadcast` | wide fan-out and transparent shared broadcast eligibility |
 | `backpressure` | small queues, bursts, slow receivers, and reliable retry |
 | `saturation` | adversarial queue saturation and strict cross-mode validation |
 | `random` | seeded randomization of the main scenario parameters |
+
+`scheduler-floor` replaces the former `examples/bench_parallel_scheduler`
+program. Its Unit type owns no ports and runs only a fixed serial arithmetic
+chain, while retaining the representative runner's warmup, interleaved
+repetitions, robust timing statistics, and cross-worker digest checks.
+
+### Standalone microbenchmarks
+
+All profiling-only executables live under `benchmark/` and are enabled by
+`CHRONON_BUILD_BENCHMARKS`. They intentionally complement rather than replace
+the correctness tests under `test/`:
+
+| Executable | Isolated signal |
+| --- | --- |
+| `chronon_direct_spsc_benchmark` | legacy/direct local cost and real two-thread DirectSPSC envelope handoff for 8/64/144/256-byte payloads |
+| `chronon_mpsc_lane_frontier_benchmark` | sparse and active-lane MPSC frontier scaling |
+| `chronon_typed_mpsc_dispatch_benchmark` | typed InPort empty-fan-in dispatch cost |
+| `chronon_weighted_dependency_reduction_benchmark` | dependency reducer construction and retained fan-in |
+| `chronon_counter_periodic_benchmark` | counter update and periodic snapshot overhead |
+
+The two-thread SPSC cases supersede the former
+`examples/bench_message_queue`; they exercise the current
+`DirectSPSCQueueAdapter<PortEnvelope<T>>` production layout and admission path.
 
 Run `--help` for individual overrides. Useful examples:
 

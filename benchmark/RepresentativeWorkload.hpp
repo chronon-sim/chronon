@@ -46,6 +46,7 @@ inline constexpr uint64_t MAX_SCENARIO_SCHEDULE_BYTES = uint64_t{64} * 1024 * 10
 inline constexpr std::array<uint32_t, 6> PAYLOAD_BYTES = {8, 16, 32, 64, 144, 256};
 
 enum class PayloadClass : uint8_t { Bytes8, Bytes16, Bytes32, Bytes64, Bytes144, Bytes256 };
+enum class UnitKernel : uint8_t { Representative, SchedulerFloor };
 
 static_assert(PAYLOAD_BYTES.size() <= std::numeric_limits<uint8_t>::digits);
 
@@ -109,6 +110,7 @@ struct ScenarioConfig {
     uint32_t work_period = 256;
     uint32_t send_period = 1024;
     bool ensure_ring = true;
+    UnitKernel unit_kernel = UnitKernel::Representative;
     std::array<uint32_t, PAYLOAD_BYTES.size()> payload_weights = {18, 22, 10, 13, 32, 5};
 
     friend bool operator==(const ScenarioConfig&, const ScenarioConfig&) = default;
@@ -353,6 +355,9 @@ inline void validateConfig(const ScenarioConfig& config) {
     if (total_channels > MAX_SCENARIO_CHANNELS) {
         throw std::invalid_argument("generated channel count exceeds benchmark limit");
     }
+    if (config.unit_kernel == UnitKernel::SchedulerFloor && total_channels != 0) {
+        throw std::invalid_argument("scheduler-floor units cannot have channels");
+    }
     if (config.forced_delay == 0 && total_channels != 0 && source_count == config.num_units) {
         throw std::invalid_argument("zero fixed delay requires at least one inactive sink unit");
     }
@@ -435,6 +440,12 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
     hash.add(c.work_period);
     hash.add(c.send_period);
     hash.add(c.ensure_ring);
+    if (c.unit_kernel != UnitKernel::Representative) {
+        // Preserve all version-2 fingerprints for existing profiles while
+        // giving newly added execution kernels an explicit domain tag.
+        hash.add(uint64_t{0x554e49544b45524e});
+        hash.add(static_cast<uint8_t>(c.unit_kernel));
+    }
     for (uint32_t weight : c.payload_weights) hash.add(weight);
     for (const auto& unit : scenario.units) {
         hash.add(unit.id);

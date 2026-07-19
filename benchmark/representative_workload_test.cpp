@@ -41,6 +41,7 @@ using chronon::benchmark::ScenarioConfig;
 using chronon::benchmark::scenarioConfigFor;
 using chronon::benchmark::transportFifoStorageBytes;
 using chronon::benchmark::transportLaneStorageBytes;
+using chronon::benchmark::UnitKernel;
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -174,6 +175,38 @@ void testRandomProfileResamplingAndOverrides() {
         require(overridden.num_units == 17, "unit override was not replayed");
         require(overridden.send_probability_ppm == 123'456, "send override was not replayed");
         require(overridden.queue_capacity == 64, "capacity override was not replayed");
+    }
+}
+
+void testSchedulerFloorProfile() {
+    ParsedOptions options;
+    options.cli.profile = "scheduler-floor";
+    options.cli.seed = 24;
+    const auto config = scenarioConfigFor(options, 0);
+    require(config.unit_kernel == UnitKernel::SchedulerFloor,
+            "scheduler-floor profile selected the representative unit kernel");
+    require(config.channels_per_unit == 0 && !config.ensure_ring,
+            "scheduler-floor profile enabled port topology");
+    require(
+        config.unit_sigma_milli == 0 && config.cycle_sigma_milli == 0 && config.work_period == 1,
+        "scheduler-floor profile generated variable work");
+
+    const auto scenario = generateScenario(config);
+    require(scenario.channels.empty(), "scheduler-floor scenario generated channels");
+    require(scenario.summary.estimated_input_scratch_reserve_bytes == 0 &&
+                scenario.summary.estimated_transport_reserve_bytes == 0,
+            "scheduler-floor scenario reserved port storage");
+    for (const auto& unit : scenario.units) {
+        require(unit.work_schedule == std::vector<uint32_t>{config.median_work},
+                "scheduler-floor unit did not preserve fixed work");
+    }
+
+    ScenarioConfig invalid = config;
+    invalid.channels_per_unit = 1;
+    try {
+        (void)generateScenario(invalid);
+        require(false, "scheduler-floor scenario accepted channels");
+    } catch (const std::invalid_argument&) {
     }
 }
 
@@ -508,6 +541,7 @@ int main() {
         testStableFingerprint();
         testTopologyAndLoadInvariants();
         testRandomProfileResamplingAndOverrides();
+        testSchedulerFloorProfile();
         testUint32CliBounds();
         testQueueCapacityBounds();
         testPortStorageBudget();
