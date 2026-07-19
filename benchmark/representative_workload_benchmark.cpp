@@ -470,7 +470,59 @@ private:
     UnitCounters counters_;
 };
 
-[[nodiscard]] Totals collectTotals(const std::vector<WorkloadUnit*>& units) {
+/**
+ * Port-free compatibility kernel for the former issue #24 scheduler benchmark.
+ * Every unit remains an independent cluster, and tick() contains only a fixed,
+ * serial arithmetic dependency chain plus accounting. This keeps scheduler
+ * floor/progress overhead visible instead of diluting it with empty-port polls.
+ */
+class alignas(64) SchedulerFloorUnit final : public TickableUnit {
+public:
+    SchedulerFloorUnit(uint32_t id, const Scenario* scenario)
+        : TickableUnit("floor_unit_" + std::to_string(id)),
+          id_(id),
+          spec_(&scenario->units.at(id)),
+          state_(0x1234567ULL + static_cast<uint64_t>(id) * 2654435761ULL) {
+        if (scenario->config.unit_kernel != UnitKernel::SchedulerFloor ||
+            !scenario->channels.empty()) {
+            throw std::invalid_argument("scheduler-floor kernel requires a port-free scenario");
+        }
+    }
+
+    void tick() override {
+        const uint32_t work = spec_->work_schedule[localCycle() % spec_->work_schedule.size()];
+        uint64_t state = state_;
+        for (uint32_t iteration = 0; iteration < work; ++iteration) {
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        }
+        state_ = state;
+        counters_.work_iterations += work;
+        ++counters_.ticks;
+    }
+
+    void connectChannels(TickSimulation&, const std::vector<SchedulerFloorUnit*>&) const noexcept {}
+
+    [[nodiscard]] const UnitCounters& counters() const noexcept { return counters_; }
+    [[nodiscard]] uint64_t queued() const noexcept { return 0; }
+    [[nodiscard]] uint64_t pendingPublications() const noexcept { return 0; }
+    [[nodiscard]] uint64_t digest() const noexcept {
+        return splitMix64(state_ ^ counters_.ticks ^ id_);
+    }
+    [[nodiscard]] double modeledCost() const {
+        const double sum =
+            std::accumulate(spec_->work_schedule.begin(), spec_->work_schedule.end(), 0.0);
+        return 20.0 + 2.0 * sum / static_cast<double>(spec_->work_schedule.size());
+    }
+
+private:
+    uint32_t id_;
+    const UnitSpec* spec_;
+    uint64_t state_;
+    UnitCounters counters_;
+};
+
+template <typename UnitType>
+[[nodiscard]] Totals collectTotals(const std::vector<UnitType*>& units) {
     Totals totals;
     for (const auto* unit : units) {
         const auto& c = unit->counters();
@@ -506,8 +558,9 @@ struct RunResult {
     uint64_t transport_overflows = 0;
 };
 
-[[nodiscard]] RunResult runOnce(const Scenario& scenario, size_t workers,
-                                const RunOptions& options) {
+template <typename UnitType>
+[[nodiscard]] RunResult runOnceWithUnit(const Scenario& scenario, size_t workers,
+                                        const RunOptions& options) {
     const auto setup_begin = std::chrono::steady_clock::now();
     TickSimulationConfig config;
     config.num_threads = workers;
@@ -518,10 +571,10 @@ struct RunResult {
     config.max_lookahead_cycles = options.max_lookahead;
 
     TickSimulation simulation(config);
-    std::vector<WorkloadUnit*> units;
+    std::vector<UnitType*> units;
     units.reserve(scenario.units.size());
     for (uint32_t id = 0; id < scenario.units.size(); ++id) {
-        units.push_back(simulation.createUnit<WorkloadUnit>(id, &scenario));
+        units.push_back(simulation.createUnit<UnitType>(id, &scenario));
     }
     for (auto* unit : units) unit->connectChannels(simulation, units);
     if (options.precomputed_costs) {
@@ -568,6 +621,14 @@ struct RunResult {
     return result;
 }
 
+[[nodiscard]] RunResult runOnce(const Scenario& scenario, size_t workers,
+                                const RunOptions& options) {
+    if (scenario.config.unit_kernel == UnitKernel::SchedulerFloor) {
+        return runOnceWithUnit<SchedulerFloorUnit>(scenario, workers, options);
+    }
+    return runOnceWithUnit<WorkloadUnit>(scenario, workers, options);
+}
+
 void printScenario(const Scenario& scenario, std::string_view profile, uint64_t scenario_index) {
     uint64_t edges = 0;
     for (const auto& channel : scenario.channels) edges += channel.destinations.size();
@@ -580,7 +641,10 @@ void printScenario(const Scenario& scenario, std::string_view profile, uint64_t 
               << " broadcasts=" << scenario.summary.broadcast_channels
               << " max-in/out=" << scenario.summary.max_indegree << '/'
               << scenario.summary.max_outdegree << '\n';
-    std::cout << "  work median=" << scenario.config.median_work
+    std::cout << "  unit-kernel="
+              << (scenario.config.unit_kernel == UnitKernel::SchedulerFloor ? "scheduler-floor"
+                                                                            : "representative")
+              << " work median=" << scenario.config.median_work
               << " unit-sigma=" << scenario.config.unit_sigma_milli / 1000.0
               << " cycle-sigma=" << scenario.config.cycle_sigma_milli / 1000.0
               << " z-cap=" << scenario.config.normal_cap_milli / 1000.0

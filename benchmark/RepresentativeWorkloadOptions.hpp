@@ -206,6 +206,19 @@ inline void printReplayCommand(std::ostream& output, std::string_view program,
         config.drain_limit = 1;
         return config;
     }
+    if (profile == "scheduler-floor") {
+        config.channels_per_unit = 0;
+        config.ensure_ring = false;
+        config.median_work = 8;
+        config.unit_sigma_milli = 0;
+        config.cycle_sigma_milli = 0;
+        config.working_set_bytes = 64;
+        config.work_period = 1;
+        config.send_period = 1;
+        config.drain_limit = 1;
+        config.unit_kernel = UnitKernel::SchedulerFloor;
+        return config;
+    }
     if (profile == "port") {
         config.channels_per_unit = 3;
         config.median_work = 1;
@@ -281,8 +294,8 @@ inline void printReplayCommand(std::ostream& output, std::string_view program,
 
 inline void printHelp(const char* program) {
     std::cout << "Usage: " << program << " [options]\n\n"
-              << "Profiles: nucleus, scheduler, port, hotspot, broadcast, backpressure, "
-                 "saturation, random\n"
+              << "Profiles: nucleus, scheduler, scheduler-floor, port, hotspot, broadcast, "
+                 "backpressure, saturation, random\n"
               << "Core options:\n"
               << "  --profile NAME              scenario profile (default nucleus)\n"
               << "  --seed N | --random-seed    reproducible or newly sampled base seed\n"

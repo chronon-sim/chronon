@@ -41,6 +41,7 @@ target_include_directories(chronon_direct_spsc_benchmark PRIVATE
 
 target_link_libraries(chronon_direct_spsc_benchmark PRIVATE
     chronon_compile_options
+    Threads::Threads
 )
 
 target_compile_features(chronon_direct_spsc_benchmark PRIVATE cxx_std_20)
@@ -91,6 +92,9 @@ target_link_libraries(chronon_representative_workload_benchmark PRIVATE
 target_compile_features(chronon_representative_workload_benchmark PRIVATE cxx_std_20)
 
 if(CHRONON_BUILD_TESTS)
+    add_test(NAME benchmark_direct_spsc_smoke
+        COMMAND chronon_direct_spsc_benchmark 10000 1)
+
     add_executable(chronon_representative_workload_test
         representative_workload_test.cpp
     )
@@ -115,5 +119,9 @@ if(CHRONON_BUILD_TESTS)
         COMMAND chronon_representative_workload_benchmark
             --profile random --seed 20260719 --scenario-count 2
             --units 12 --channels 2 --max-fanout 4 --threads 1,2
+            --warmup 16 --cycles 64 --repetitions 1)
+    add_test(NAME benchmark_representative_scheduler_floor
+        COMMAND chronon_representative_workload_benchmark
+            --profile scheduler-floor --seed 24 --units 8 --threads 1,2
             --warmup 16 --cycles 64 --repetitions 1)
 endif()
