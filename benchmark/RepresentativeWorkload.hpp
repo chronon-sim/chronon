@@ -21,10 +21,14 @@ inline constexpr uint32_t PROBABILITY_SCALE = 1'000'000;
 inline constexpr uint32_t MAX_FINITE_QUEUE_CAPACITY = 4'096;
 inline constexpr uint32_t MAX_DRAIN_LIMIT = 65'536;
 inline constexpr uint32_t MAX_MEDIAN_WORK = 4'096;
-// A bounded InPort reserves both PortEnvelope<T> and T receive scratch. The
-// per-slot estimate below includes 64 bytes for envelope metadata/padding; the
-// benchmark binary statically verifies that this covers every payload layout.
-inline constexpr uint64_t MAX_TOTAL_INPUT_SCRATCH_BYTES = uint64_t{256} * 1024 * 1024;
+// Port storage includes bounded receive scratch and shared FIFOs plus the
+// worst-case cross-thread SPSC lane for every connection. The benchmark binary
+// statically verifies the conservative per-slot estimates against the current
+// transport layouts.
+inline constexpr uint64_t MAX_TOTAL_PORT_STORAGE_BYTES = uint64_t{256} * 1024 * 1024;
+inline constexpr uint32_t DEFAULT_TRANSPORT_RING_SLOTS = 4'096;
+inline constexpr uint64_t TRANSPORT_LANE_FIXED_BYTES = 2'048;
+inline constexpr uint64_t TRANSPORT_FIFO_FIXED_BYTES = 2'048;
 inline constexpr uint32_t WORKING_SET_SCALE_COUNT = 3;
 inline constexpr uint32_t MAX_WORKING_SET_SCALE = 1U << (WORKING_SET_SCALE_COUNT - 1);
 // Scratch vectors are materialized for every unit in a run. Validate their
@@ -49,6 +53,33 @@ static_assert(PAYLOAD_BYTES.size() <= std::numeric_limits<uint8_t>::digits);
     constexpr uint64_t kConservativeEnvelopeMetadataBytes = 64;
     return uint64_t{2} * PAYLOAD_BYTES[static_cast<size_t>(payload)] +
            kConservativeEnvelopeMetadataBytes;
+}
+
+[[nodiscard]] constexpr uint64_t transportLaneBytesPerSlot(PayloadClass payload) noexcept {
+    constexpr uint64_t kConservativeLaneMetadataBytes = 128;
+    return PAYLOAD_BYTES[static_cast<size_t>(payload)] + kConservativeLaneMetadataBytes;
+}
+
+[[nodiscard]] constexpr uint64_t transportFifoBytesPerSlot(PayloadClass payload) noexcept {
+    constexpr uint64_t kConservativeFifoMetadataBytes = 96;
+    return PAYLOAD_BYTES[static_cast<size_t>(payload)] + kConservativeFifoMetadataBytes;
+}
+
+[[nodiscard]] constexpr uint64_t transportRingSlots(uint32_t queue_capacity) noexcept {
+    if (queue_capacity == 0) return DEFAULT_TRANSPORT_RING_SLOTS;
+    return std::bit_ceil(std::max(queue_capacity, uint32_t{2}));
+}
+
+[[nodiscard]] constexpr uint64_t transportLaneStorageBytes(PayloadClass payload,
+                                                           uint32_t queue_capacity) noexcept {
+    return TRANSPORT_LANE_FIXED_BYTES +
+           transportRingSlots(queue_capacity) * transportLaneBytesPerSlot(payload);
+}
+
+[[nodiscard]] constexpr uint64_t transportFifoStorageBytes(PayloadClass payload,
+                                                           uint32_t queue_capacity) noexcept {
+    return TRANSPORT_FIFO_FIXED_BYTES +
+           transportRingSlots(queue_capacity) * transportFifoBytesPerSlot(payload);
 }
 
 struct ScenarioConfig {
@@ -116,6 +147,7 @@ struct ScenarioSummary {
     uint32_t max_indegree = 0;
     uint32_t max_outdegree = 0;
     uint64_t estimated_input_scratch_reserve_bytes = 0;
+    uint64_t estimated_transport_reserve_bytes = 0;
 
     friend bool operator==(const ScenarioSummary&, const ScenarioSummary&) = default;
 };
@@ -520,6 +552,15 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
 
     std::vector<uint32_t> indegree(config.num_units, 0);
     std::vector<uint32_t> outdegree(config.num_units, 0);
+    const auto reservePortStorage = [&](uint64_t bytes, uint64_t& category) {
+        const uint64_t reserved = scenario.summary.estimated_input_scratch_reserve_bytes +
+                                  scenario.summary.estimated_transport_reserve_bytes;
+        if (bytes > MAX_TOTAL_PORT_STORAGE_BYTES ||
+            reserved > MAX_TOTAL_PORT_STORAGE_BYTES - bytes) {
+            throw std::invalid_argument("generated port storage exceeds aggregate memory limit");
+        }
+        category += bytes;
+    };
     for (const auto& channel : scenario.channels) {
         if (channel.delay == 0) ++scenario.summary.zero_delay_channels;
         if (channel.destinations.size() > 1) ++scenario.summary.broadcast_channels;
@@ -533,20 +574,19 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
         const uint8_t incoming_payload_bit = payloadMask(channel.payload);
         for (uint32_t destination : channel.destinations) {
             ++indegree[destination];
+            reservePortStorage(transportLaneStorageBytes(channel.payload, config.queue_capacity),
+                               scenario.summary.estimated_transport_reserve_bytes);
+
             auto& mask = scenario.units[destination].incoming_payload_mask;
             if ((mask & incoming_payload_bit) != 0) continue;
             mask = static_cast<uint8_t>(mask | incoming_payload_bit);
             if (config.queue_capacity == 0) continue;
 
-            const uint64_t binding_bytes = static_cast<uint64_t>(config.queue_capacity) *
-                                           inputScratchBytesPerSlot(channel.payload);
-            if (binding_bytes > MAX_TOTAL_INPUT_SCRATCH_BYTES ||
-                scenario.summary.estimated_input_scratch_reserve_bytes >
-                    MAX_TOTAL_INPUT_SCRATCH_BYTES - binding_bytes) {
-                throw std::invalid_argument(
-                    "finite input scratch buffers exceed aggregate memory limit");
-            }
-            scenario.summary.estimated_input_scratch_reserve_bytes += binding_bytes;
+            reservePortStorage(static_cast<uint64_t>(config.queue_capacity) *
+                                   inputScratchBytesPerSlot(channel.payload),
+                               scenario.summary.estimated_input_scratch_reserve_bytes);
+            reservePortStorage(transportFifoStorageBytes(channel.payload, config.queue_capacity),
+                               scenario.summary.estimated_transport_reserve_bytes);
         }
     }
     scenario.summary.max_indegree = *std::max_element(indegree.begin(), indegree.end());

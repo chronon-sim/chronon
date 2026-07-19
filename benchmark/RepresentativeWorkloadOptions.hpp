@@ -302,8 +302,8 @@ inline void printHelp(const char* program) {
               << "  --active-sources N --fixed-delay N (zero requires a sink unit)\n"
               << "  --hotspot-ppm N --broadcast-ppm N --zero-delay-ppm N\n"
               << "  --queue-capacity N          finite depth (0=unlimited, max "
-              << MAX_FINITE_QUEUE_CAPACITY << "; aggregate scratch max "
-              << MAX_TOTAL_INPUT_SCRATCH_BYTES / (1024 * 1024) << " MiB)\n"
+              << MAX_FINITE_QUEUE_CAPACITY << "; aggregate port storage max "
+              << MAX_TOTAL_PORT_STORAGE_BYTES / (1024 * 1024) << " MiB)\n"
               << "  --drain-limit N             max " << MAX_DRAIN_LIMIT << " messages/tick\n"
               << "  --work N                    median iterations/tick (max " << MAX_MEDIAN_WORK
               << ")\n"

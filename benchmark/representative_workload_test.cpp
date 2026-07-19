@@ -25,6 +25,7 @@ using chronon::benchmark::MAX_DRAIN_LIMIT;
 using chronon::benchmark::MAX_FINITE_QUEUE_CAPACITY;
 using chronon::benchmark::MAX_MEDIAN_WORK;
 using chronon::benchmark::MAX_SCENARIO_UNITS;
+using chronon::benchmark::MAX_TOTAL_PORT_STORAGE_BYTES;
 using chronon::benchmark::MAX_TOTAL_WORKING_SET_BYTES;
 using chronon::benchmark::MAX_WORKING_SET_SCALE;
 using chronon::benchmark::parseCommandLine;
@@ -35,6 +36,8 @@ using chronon::benchmark::payloadMask;
 using chronon::benchmark::printReplayCommand;
 using chronon::benchmark::ScenarioConfig;
 using chronon::benchmark::scenarioConfigFor;
+using chronon::benchmark::transportFifoStorageBytes;
+using chronon::benchmark::transportLaneStorageBytes;
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -97,16 +100,26 @@ void testTopologyAndLoadInvariants() {
     }
 
     uint64_t expected_input_scratch = 0;
+    uint64_t expected_transport = 0;
+    for (const auto& channel : scenario.channels) {
+        expected_transport += channel.destinations.size() *
+                              transportLaneStorageBytes(channel.payload, config.queue_capacity);
+    }
     for (const auto& unit : scenario.units) {
         for (size_t payload = 0; payload < PAYLOAD_BYTES.size(); ++payload) {
             const auto payload_class = static_cast<PayloadClass>(payload);
             if ((unit.incoming_payload_mask & payloadMask(payload_class)) == 0) continue;
             expected_input_scratch += static_cast<uint64_t>(config.queue_capacity) *
                                       inputScratchBytesPerSlot(payload_class);
+            expected_transport += transportFifoStorageBytes(payload_class, config.queue_capacity);
         }
     }
     require(scenario.summary.estimated_input_scratch_reserve_bytes == expected_input_scratch,
             "input scratch estimate did not match connected payload types");
+    require(scenario.summary.estimated_transport_reserve_bytes == expected_transport,
+            "transport estimate did not match connections and bounded input FIFOs");
+    require(expected_input_scratch + expected_transport <= MAX_TOTAL_PORT_STORAGE_BYTES,
+            "accepted scenario exceeded aggregate port storage budget");
 }
 
 ParsedOptions parseArgs(std::vector<std::string> arguments) {
@@ -212,7 +225,7 @@ void testQueueCapacityBounds() {
     }
 }
 
-void testInputScratchBudget() {
+void testPortStorageBudget() {
     ScenarioConfig disconnected;
     disconnected.num_units = MAX_SCENARIO_UNITS;
     disconnected.channels_per_unit = 0;
@@ -224,22 +237,26 @@ void testInputScratchBudget() {
     const auto accepted = generateScenario(disconnected);
     require(accepted.summary.estimated_input_scratch_reserve_bytes == 0,
             "disconnected units reserved finite input scratch");
+    require(accepted.summary.estimated_transport_reserve_bytes == 0,
+            "disconnected units reserved transport storage");
     for (const auto& unit : accepted.units) {
         require(unit.incoming_payload_mask == 0,
                 "disconnected unit advertised an incoming payload type");
     }
 
     ScenarioConfig oversized;
-    oversized.num_units = 1'024;
-    oversized.channels_per_unit = 1;
+    oversized.num_units = 16;
+    oversized.channels_per_unit = 64;
     oversized.max_fanout = 1;
+    oversized.broadcast_probability_ppm = 0;
+    oversized.payload_weights = {1, 0, 0, 0, 0, 0};
     oversized.queue_capacity = MAX_FINITE_QUEUE_CAPACITY;
     oversized.working_set_bytes = 64;
     oversized.work_period = 1;
     oversized.send_period = 1;
     try {
         (void)generateScenario(oversized);
-        require(false, "oversized aggregate input scratch was accepted");
+        require(false, "oversized aggregate port storage was accepted");
     } catch (const std::invalid_argument&) {
     }
 }
@@ -450,7 +467,7 @@ int main() {
         testRandomProfileResamplingAndOverrides();
         testUint32CliBounds();
         testQueueCapacityBounds();
-        testInputScratchBudget();
+        testPortStorageBudget();
         testWorkerBounds();
         testExecutionBounds();
         testWorkAndDrainBounds();

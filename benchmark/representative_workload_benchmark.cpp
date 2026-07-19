@@ -32,6 +32,7 @@
 namespace chronon::benchmark {
 namespace {
 
+using sender::DirectSPSCQueueAdapter;
 using sender::InPort;
 using sender::OutPort;
 using sender::PlatformMetrics;
@@ -57,6 +58,29 @@ consteval uint64_t actualInputScratchBytesPerSlot() {
     return sizeof(typename InPort<Payload<Bytes>>::StoredMessage) + sizeof(Payload<Bytes>);
 }
 
+template <size_t Bytes>
+struct TransportLaneEntryLayout {
+    typename InPort<Payload<Bytes>>::StoredMessage data;
+    uint64_t arrive_cycle;
+    uint32_t sender_id;
+};
+
+struct TransportLanePopEventLayout {
+    uint64_t cycle;
+    uint64_t arrive_cycle;
+};
+
+template <size_t Bytes>
+consteval uint64_t actualTransportLaneBytesPerSlot() {
+    return sizeof(TransportLaneEntryLayout<Bytes>) + sizeof(TransportLanePopEventLayout);
+}
+
+template <size_t Bytes>
+struct TransportFifoEntryLayout {
+    typename InPort<Payload<Bytes>>::StoredMessage data;
+    uint64_t arrive_cycle;
+};
+
 static_assert(inputScratchBytesPerSlot(PayloadClass::Bytes8) >=
               actualInputScratchBytesPerSlot<8>());
 static_assert(inputScratchBytesPerSlot(PayloadClass::Bytes16) >=
@@ -69,6 +93,32 @@ static_assert(inputScratchBytesPerSlot(PayloadClass::Bytes144) >=
               actualInputScratchBytesPerSlot<144>());
 static_assert(inputScratchBytesPerSlot(PayloadClass::Bytes256) >=
               actualInputScratchBytesPerSlot<256>());
+static_assert(transportLaneBytesPerSlot(PayloadClass::Bytes8) >=
+              actualTransportLaneBytesPerSlot<8>());
+static_assert(transportLaneBytesPerSlot(PayloadClass::Bytes16) >=
+              actualTransportLaneBytesPerSlot<16>());
+static_assert(transportLaneBytesPerSlot(PayloadClass::Bytes32) >=
+              actualTransportLaneBytesPerSlot<32>());
+static_assert(transportLaneBytesPerSlot(PayloadClass::Bytes64) >=
+              actualTransportLaneBytesPerSlot<64>());
+static_assert(transportLaneBytesPerSlot(PayloadClass::Bytes144) >=
+              actualTransportLaneBytesPerSlot<144>());
+static_assert(transportLaneBytesPerSlot(PayloadClass::Bytes256) >=
+              actualTransportLaneBytesPerSlot<256>());
+static_assert(transportFifoBytesPerSlot(PayloadClass::Bytes8) >=
+              sizeof(TransportFifoEntryLayout<8>));
+static_assert(transportFifoBytesPerSlot(PayloadClass::Bytes16) >=
+              sizeof(TransportFifoEntryLayout<16>));
+static_assert(transportFifoBytesPerSlot(PayloadClass::Bytes32) >=
+              sizeof(TransportFifoEntryLayout<32>));
+static_assert(transportFifoBytesPerSlot(PayloadClass::Bytes64) >=
+              sizeof(TransportFifoEntryLayout<64>));
+static_assert(transportFifoBytesPerSlot(PayloadClass::Bytes144) >=
+              sizeof(TransportFifoEntryLayout<144>));
+static_assert(transportFifoBytesPerSlot(PayloadClass::Bytes256) >=
+              sizeof(TransportFifoEntryLayout<256>));
+static_assert(TRANSPORT_LANE_FIXED_BYTES >=
+              sizeof(DirectSPSCQueueAdapter<typename InPort<Payload<256>>::StoredMessage>));
 
 struct alignas(64) UnitCounters {
     uint64_t ticks = 0;
@@ -539,8 +589,14 @@ void printScenario(const Scenario& scenario, std::string_view profile, uint64_t 
               << " deliveries/cycle=" << scenario.summary.scheduled_deliveries / period
               << " payload-KiB/cycle=" << scenario.summary.scheduled_payload_bytes / period / 1024.0
               << " queue-capacity=" << scenario.config.queue_capacity
-              << " input-scratch-reserve-MiB="
-              << scenario.summary.estimated_input_scratch_reserve_bytes / (1024.0 * 1024.0) << '\n';
+              << " port-storage-reserve-MiB="
+              << (scenario.summary.estimated_input_scratch_reserve_bytes +
+                  scenario.summary.estimated_transport_reserve_bytes) /
+                     (1024.0 * 1024.0)
+              << " (scratch="
+              << scenario.summary.estimated_input_scratch_reserve_bytes / (1024.0 * 1024.0)
+              << ", transport="
+              << scenario.summary.estimated_transport_reserve_bytes / (1024.0 * 1024.0) << ")\n";
     std::cout << "  payload weights [8,16,32,64,144,256]=";
     for (size_t i = 0; i < scenario.config.payload_weights.size(); ++i) {
         if (i != 0) std::cout << ',';
