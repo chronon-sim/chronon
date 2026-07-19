@@ -73,3 +73,47 @@ target_link_libraries(chronon_mpsc_lane_frontier_benchmark PRIVATE
 )
 
 target_compile_features(chronon_mpsc_lane_frontier_benchmark PRIVATE cxx_std_20)
+
+add_executable(chronon_representative_workload_benchmark
+    representative_workload_benchmark.cpp
+)
+
+target_include_directories(chronon_representative_workload_benchmark PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(chronon_representative_workload_benchmark PRIVATE
+    chronon::core
+    chronon_compile_options
+)
+
+target_compile_features(chronon_representative_workload_benchmark PRIVATE cxx_std_20)
+
+if(CHRONON_BUILD_TESTS)
+    add_executable(chronon_representative_workload_test
+        representative_workload_test.cpp
+    )
+
+    target_include_directories(chronon_representative_workload_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    target_link_libraries(chronon_representative_workload_test PRIVATE
+        chronon_compile_options
+    )
+
+    target_compile_features(chronon_representative_workload_test PRIVATE cxx_std_20)
+
+    add_test(NAME benchmark_representative_workload_generator
+        COMMAND chronon_representative_workload_test)
+    add_test(NAME benchmark_representative_workload_end_to_end
+        COMMAND chronon_representative_workload_benchmark
+            --profile nucleus --seed 12345 --units 8 --threads 1,2
+            --warmup 32 --cycles 128 --repetitions 1)
+    add_test(NAME benchmark_representative_workload_random_sweep
+        COMMAND chronon_representative_workload_benchmark
+            --profile random --seed 20260719 --scenario-count 2
+            --units 12 --channels 2 --max-fanout 4 --threads 1,2
+            --warmup 16 --cycles 64 --repetitions 1)
+endif()
