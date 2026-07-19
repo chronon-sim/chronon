@@ -27,6 +27,9 @@ inline constexpr uint32_t MAX_MEDIAN_WORK = 4'096;
 // transport layouts.
 inline constexpr uint64_t MAX_TOTAL_PORT_STORAGE_BYTES = uint64_t{256} * 1024 * 1024;
 inline constexpr uint32_t DEFAULT_TRANSPORT_RING_SLOTS = 4'096;
+// Benchmark producers publish at most once per cycle. Reserving half the
+// default lane for delay leaves the other half for scheduler lookahead.
+inline constexpr uint32_t MAX_FORCED_DELAY = DEFAULT_TRANSPORT_RING_SLOTS / 2;
 inline constexpr uint64_t TRANSPORT_LANE_FIXED_BYTES = 2'048;
 inline constexpr uint64_t TRANSPORT_FIFO_FIXED_BYTES = 2'048;
 inline constexpr uint32_t WORKING_SET_SCALE_COUNT = 3;
@@ -351,6 +354,10 @@ inline void validateConfig(const ScenarioConfig& config) {
     }
     if (config.forced_delay == 0 && total_channels != 0 && source_count == config.num_units) {
         throw std::invalid_argument("zero fixed delay requires at least one inactive sink unit");
+    }
+    if (config.forced_delay != std::numeric_limits<uint32_t>::max() &&
+        config.forced_delay > MAX_FORCED_DELAY) {
+        throw std::invalid_argument("fixed delay exceeds benchmark transport limit");
     }
     const uint64_t max_destinations =
         config.num_units > 1

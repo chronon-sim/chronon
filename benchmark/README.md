@@ -108,7 +108,9 @@ MiB aggregate cap. Worker sweeps are capped at 256 so malformed CLI input cannot
 request an impractical thread pool.
 Scenario sweeps, repetitions, cycle counts, drain limits, and median unit work
 also have explicit execution bounds so a mistyped but syntactically valid
-integer cannot create an effectively unbounded benchmark run.
+integer cannot create an effectively unbounded benchmark run. Lookahead and
+fixed-delay overrides share the default transport ring's headroom budget, so
+transport setup cannot resize every cross-thread lane from an extreme CLI value.
 Unit, channel, fan-out edge, and generated schedule counts also have explicit
 pre-allocation limits; `--help` reports the user-facing topology limits.
 

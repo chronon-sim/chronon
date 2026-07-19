@@ -26,6 +26,9 @@ inline constexpr uint32_t MAX_BENCHMARK_SCENARIOS = 256;
 inline constexpr uint32_t MAX_BENCHMARK_REPETITIONS = 1'024;
 inline constexpr uint32_t MAX_BENCHMARK_WORKERS = 256;
 inline constexpr uint64_t MAX_BENCHMARK_CYCLES = 1'000'000'000;
+inline constexpr uint32_t MAX_BENCHMARK_LOOKAHEAD = DEFAULT_TRANSPORT_RING_SLOTS / 2;
+static_assert(static_cast<uint64_t>(MAX_BENCHMARK_LOOKAHEAD) + MAX_FORCED_DELAY - 1 <=
+              DEFAULT_TRANSPORT_RING_SLOTS);
 
 struct RunOptions {
     uint64_t warmup_cycles = 8192;
@@ -299,7 +302,8 @@ inline void printHelp(const char* program) {
               << "  --units N --channels N      max " << MAX_SCENARIO_UNITS << " units / "
               << MAX_SCENARIO_CHANNELS << " total channels\n"
               << "  --max-fanout N --send-ppm N --burst-ppm N\n"
-              << "  --active-sources N --fixed-delay N (zero requires a sink unit)\n"
+              << "  --active-sources N --fixed-delay N (max " << MAX_FORCED_DELAY
+              << "; zero requires a sink unit)\n"
               << "  --hotspot-ppm N --broadcast-ppm N --zero-delay-ppm N\n"
               << "  --queue-capacity N          finite depth (0=unlimited, max "
               << MAX_FINITE_QUEUE_CAPACITY << "; aggregate port storage max "
@@ -311,7 +315,8 @@ inline void printHelp(const char* program) {
               << "  --cycle-sigma N --working-set N (aggregate scratch max "
               << MAX_TOTAL_WORKING_SET_BYTES / (1024 * 1024) << " MiB)\n"
               << "  --payload-weights a,b,c,d,e,f\n"
-              << "Other: --max-lookahead N --verbose --quick --help\n";
+              << "Other: --max-lookahead N (max " << MAX_BENCHMARK_LOOKAHEAD
+              << ") --verbose --quick --help\n";
 }
 
 [[nodiscard]] inline ParsedOptions parseCommandLine(int argc, char** argv) {
@@ -379,8 +384,8 @@ inline void printHelp(const char* program) {
             overrides.active_source_count = parseU32(requireValue(i, option), option);
         } else if (option == "--fixed-delay") {
             const uint32_t delay = parseU32(requireValue(i, option), option);
-            if (delay == std::numeric_limits<uint32_t>::max()) {
-                throw std::invalid_argument("value for --fixed-delay is reserved");
+            if (delay > MAX_FORCED_DELAY) {
+                throw std::invalid_argument("value for --fixed-delay exceeds benchmark limit");
             }
             overrides.forced_delay = delay;
         } else if (option == "--max-fanout") {
@@ -445,6 +450,9 @@ inline void printHelp(const char* program) {
     if (cli.run.measured_cycles > MAX_BENCHMARK_CYCLES ||
         cli.run.warmup_cycles > MAX_BENCHMARK_CYCLES) {
         throw std::invalid_argument("cycle count exceeds benchmark limit");
+    }
+    if (cli.run.max_lookahead > MAX_BENCHMARK_LOOKAHEAD) {
+        throw std::invalid_argument("max lookahead exceeds benchmark transport limit");
     }
     if (cli.scenario_offset > std::numeric_limits<uint64_t>::max() - (cli.scenario_count - 1)) {
         throw std::invalid_argument("scenario index range overflows uint64_t");

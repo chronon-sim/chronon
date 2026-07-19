@@ -18,11 +18,13 @@ namespace {
 using chronon::benchmark::generateScenario;
 using chronon::benchmark::inputScratchBytesPerSlot;
 using chronon::benchmark::MAX_BENCHMARK_CYCLES;
+using chronon::benchmark::MAX_BENCHMARK_LOOKAHEAD;
 using chronon::benchmark::MAX_BENCHMARK_REPETITIONS;
 using chronon::benchmark::MAX_BENCHMARK_SCENARIOS;
 using chronon::benchmark::MAX_BENCHMARK_WORKERS;
 using chronon::benchmark::MAX_DRAIN_LIMIT;
 using chronon::benchmark::MAX_FINITE_QUEUE_CAPACITY;
+using chronon::benchmark::MAX_FORCED_DELAY;
 using chronon::benchmark::MAX_MEDIAN_WORK;
 using chronon::benchmark::MAX_SCENARIO_UNITS;
 using chronon::benchmark::MAX_TOTAL_PORT_STORAGE_BYTES;
@@ -195,11 +197,13 @@ void testUint32CliBounds() {
             "UINT32_MAX was rejected by generic uint32 parsing");
 
     require(rejects({"benchmark", "--fixed-delay", "4294967295"}),
-            "reserved fixed-delay sentinel was accepted");
-    const auto largest_delay =
-        parseArgs({"benchmark", "--fixed-delay", "4294967294", "--describe-only"});
-    require(largest_delay.overrides.forced_delay == std::numeric_limits<uint32_t>::max() - 1,
-            "largest valid fixed delay was rejected");
+            "oversized fixed delay was accepted");
+    const auto largest_delay = parseArgs(
+        {"benchmark", "--fixed-delay", std::to_string(MAX_FORCED_DELAY), "--describe-only"});
+    require(largest_delay.overrides.forced_delay == MAX_FORCED_DELAY,
+            "largest benchmark fixed delay was rejected");
+    require(rejects({"benchmark", "--fixed-delay", std::to_string(MAX_FORCED_DELAY + 1)}),
+            "fixed delay above the transport headroom budget was accepted");
 }
 
 void testQueueCapacityBounds() {
@@ -300,6 +304,15 @@ void testExecutionBounds() {
     require(rejects({"benchmark", "--warmup", std::to_string(MAX_BENCHMARK_CYCLES + 1)}),
             "oversized warmup cycle count was accepted");
 
+    const auto maximum_lookahead =
+        parseArgs({"benchmark", "--max-lookahead", std::to_string(MAX_BENCHMARK_LOOKAHEAD)});
+    require(maximum_lookahead.cli.run.max_lookahead == MAX_BENCHMARK_LOOKAHEAD,
+            "maximum benchmark lookahead was rejected");
+    require(rejects({"benchmark", "--max-lookahead", std::to_string(MAX_BENCHMARK_LOOKAHEAD + 1)}),
+            "lookahead above the transport headroom budget was accepted");
+    require(rejects({"benchmark", "--max-lookahead", "4294967295"}),
+            "UINT32_MAX lookahead was accepted");
+
     require(rejects({"benchmark", "--scenario-count", "0"}), "zero scenario count was accepted");
     require(rejects({"benchmark", "--repetitions", "0"}), "zero repetition count was accepted");
     require(rejects({"benchmark", "--cycles", "0"}), "zero measured cycle count was accepted");
@@ -390,6 +403,14 @@ void testFixedDelayOverridesAllChannels() {
     try {
         (void)generateScenario(config);
         require(false, "cyclic all-source zero fixed delay was accepted");
+    } catch (const std::invalid_argument&) {
+    }
+
+    config.forced_delay = MAX_FORCED_DELAY + 1;
+    config.active_source_count = 1;
+    try {
+        (void)generateScenario(config);
+        require(false, "programmatic fixed delay above transport budget was accepted");
     } catch (const std::invalid_argument&) {
     }
 }
