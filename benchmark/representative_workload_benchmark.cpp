@@ -612,10 +612,8 @@ int main(int argc, char** argv) {
             const ScenarioConfig config = scenarioConfigFor(parsed, global_scenario_index);
             const Scenario scenario = generateScenario(config);
             printScenario(scenario, parsed.cli.profile, global_scenario_index);
-            std::cout << "  scenario-replay: " << argv[0] << " --profile " << parsed.cli.profile
-                      << " --seed " << parsed.cli.seed << " --scenario-offset "
-                      << global_scenario_index << " --scenario-count 1";
-            parsed.overrides.print(std::cout);
+            std::cout << "  scenario-replay: ";
+            printReplayCommand(std::cout, argv[0], parsed, global_scenario_index);
             std::cout << '\n';
             if (parsed.cli.describe_only) continue;
 

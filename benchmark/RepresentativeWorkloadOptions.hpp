@@ -41,6 +41,20 @@ struct CliOptions {
     RunOptions run;
     bool describe_only = false;
     bool verbose = false;
+
+    void printRuntimeOptions(std::ostream& output) const {
+        output << " --threads ";
+        for (size_t i = 0; i < workers.size(); ++i) {
+            if (i != 0) output << ',';
+            output << workers[i];
+        }
+        output << " --warmup " << run.warmup_cycles << " --cycles " << run.measured_cycles
+               << " --repetitions " << repetitions << " --max-lookahead " << run.max_lookahead;
+        if (run.dynamic_rebalance) output << " --rebalance";
+        if (!run.precomputed_costs) output << " --no-precomputed-costs";
+        if (describe_only) output << " --describe-only";
+        if (verbose) output << " --verbose";
+    }
 };
 
 struct ScenarioOverrides {
@@ -118,6 +132,14 @@ struct ParsedOptions {
     CliOptions cli;
     ScenarioOverrides overrides;
 };
+
+inline void printReplayCommand(std::ostream& output, std::string_view program,
+                               const ParsedOptions& options, uint64_t scenario_index) {
+    output << program << " --profile " << options.cli.profile << " --seed " << options.cli.seed
+           << " --scenario-offset " << scenario_index << " --scenario-count 1";
+    options.cli.printRuntimeOptions(output);
+    options.overrides.print(output);
+}
 
 [[nodiscard]] inline uint64_t parseInteger(std::string_view value, std::string_view option) {
     const size_t first_character = value.find_first_not_of(" \t\n\r\f\v");
@@ -264,7 +286,9 @@ inline void printHelp(const char* program) {
               << "  --units N --channels N --max-fanout N --send-ppm N --burst-ppm N\n"
               << "  --active-sources N --fixed-delay N\n"
               << "  --hotspot-ppm N --broadcast-ppm N --zero-delay-ppm N\n"
-              << "  --queue-capacity N --drain-limit N --work N --unit-sigma N\n"
+              << "  --queue-capacity N          finite depth (0=unlimited, max "
+              << MAX_FINITE_QUEUE_CAPACITY << ")\n"
+              << "  --drain-limit N --work N --unit-sigma N\n"
               << "  --cycle-sigma N --working-set N --payload-weights a,b,c,d,e,f\n"
               << "Other: --max-lookahead N --verbose --quick --help\n";
 }
@@ -351,7 +375,11 @@ inline void printHelp(const char* program) {
         } else if (option == "--zero-delay-ppm") {
             overrides.zero_delay_probability_ppm = parseU32(requireValue(i, option), option);
         } else if (option == "--queue-capacity") {
-            overrides.queue_capacity = parseU32(requireValue(i, option), option);
+            const uint32_t capacity = parseU32(requireValue(i, option), option);
+            if (capacity > MAX_FINITE_QUEUE_CAPACITY) {
+                throw std::invalid_argument("value for --queue-capacity exceeds benchmark limit");
+            }
+            overrides.queue_capacity = capacity;
         } else if (option == "--drain-limit") {
             overrides.drain_limit = parseU32(requireValue(i, option), option);
         } else if (option == "--work") {

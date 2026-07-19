@@ -15,6 +15,10 @@ namespace chronon::benchmark {
 
 inline constexpr uint32_t REPRESENTATIVE_WORKLOAD_VERSION = 2;
 inline constexpr uint32_t PROBABILITY_SCALE = 1'000'000;
+// Finite queues are allocated per connected unit and payload type. Keep the
+// benchmark bound at the transport's standard ring size; zero remains the
+// explicit unlimited-capacity mode.
+inline constexpr uint32_t MAX_FINITE_QUEUE_CAPACITY = 4'096;
 inline constexpr std::array<uint32_t, 6> PAYLOAD_BYTES = {8, 16, 32, 64, 144, 256};
 
 enum class PayloadClass : uint8_t { Bytes8, Bytes16, Bytes32, Bytes64, Bytes144, Bytes256 };
@@ -266,6 +270,9 @@ inline void validateConfig(const ScenarioConfig& config) {
     }
     if (config.working_set_bytes > (uint32_t{1} << 28)) {
         throw std::invalid_argument("base working set is too large");
+    }
+    if (config.queue_capacity > MAX_FINITE_QUEUE_CAPACITY) {
+        throw std::invalid_argument("finite queue capacity exceeds benchmark limit");
     }
     if (config.normal_cap_milli > 6'000 || config.unit_sigma_milli > 2'000 ||
         config.cycle_sigma_milli > 2'000) {

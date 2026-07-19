@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,9 +15,11 @@
 namespace {
 
 using chronon::benchmark::generateScenario;
+using chronon::benchmark::MAX_FINITE_QUEUE_CAPACITY;
 using chronon::benchmark::parseCommandLine;
 using chronon::benchmark::ParsedOptions;
 using chronon::benchmark::PayloadClass;
+using chronon::benchmark::printReplayCommand;
 using chronon::benchmark::ScenarioConfig;
 using chronon::benchmark::scenarioConfigFor;
 
@@ -136,10 +139,9 @@ void testUint32CliBounds() {
     require(rejects({"benchmark", "--payload-weights", "1,2,3,4,5,4294967296"}),
             "payload-list overflow was accepted");
 
-    const auto maximum =
-        parseArgs({"benchmark", "--queue-capacity", "4294967295", "--describe-only"});
-    require(maximum.overrides.queue_capacity == std::numeric_limits<uint32_t>::max(),
-            "UINT32_MAX was rejected");
+    require(chronon::benchmark::parseU32("4294967295", "--test") ==
+                std::numeric_limits<uint32_t>::max(),
+            "UINT32_MAX was rejected by generic uint32 parsing");
 
     require(rejects({"benchmark", "--fixed-delay", "4294967295"}),
             "reserved fixed-delay sentinel was accepted");
@@ -147,6 +149,65 @@ void testUint32CliBounds() {
         parseArgs({"benchmark", "--fixed-delay", "4294967294", "--describe-only"});
     require(largest_delay.overrides.forced_delay == std::numeric_limits<uint32_t>::max() - 1,
             "largest valid fixed delay was rejected");
+}
+
+void testQueueCapacityBounds() {
+    const auto maximum =
+        parseArgs({"benchmark", "--queue-capacity", std::to_string(MAX_FINITE_QUEUE_CAPACITY)});
+    require(maximum.overrides.queue_capacity == MAX_FINITE_QUEUE_CAPACITY,
+            "maximum finite queue capacity was rejected");
+    require(
+        rejects({"benchmark", "--queue-capacity", std::to_string(MAX_FINITE_QUEUE_CAPACITY + 1)}),
+        "oversized finite queue capacity was accepted");
+
+    const auto unlimited = parseArgs({"benchmark", "--queue-capacity", "0"});
+    require(
+        unlimited.overrides.queue_capacity.has_value() && *unlimited.overrides.queue_capacity == 0,
+        "unlimited queue capacity was not preserved");
+
+    ScenarioConfig config;
+    config.queue_capacity = MAX_FINITE_QUEUE_CAPACITY + 1;
+    try {
+        (void)generateScenario(config);
+        require(false, "programmatic oversized queue capacity was accepted");
+    } catch (const std::invalid_argument&) {
+    }
+}
+
+void testCompleteReplayCommand() {
+    const auto options = parseArgs({"benchmark",
+                                    "--profile",
+                                    "port",
+                                    "--seed",
+                                    "123",
+                                    "--scenario-offset",
+                                    "7",
+                                    "--scenario-count",
+                                    "3",
+                                    "--threads",
+                                    "8,2,8",
+                                    "--warmup",
+                                    "32",
+                                    "--cycles",
+                                    "128",
+                                    "--repetitions",
+                                    "1",
+                                    "--max-lookahead",
+                                    "4",
+                                    "--rebalance",
+                                    "--no-precomputed-costs",
+                                    "--describe-only",
+                                    "--verbose",
+                                    "--queue-capacity",
+                                    "64"});
+    std::ostringstream replay;
+    printReplayCommand(replay, "benchmark", options, 9);
+    require(replay.str() ==
+                "benchmark --profile port --seed 123 --scenario-offset 9 --scenario-count 1"
+                " --threads 2,8 --warmup 32 --cycles 128 --repetitions 1 --max-lookahead 4"
+                " --rebalance --no-precomputed-costs --describe-only --verbose"
+                " --queue-capacity 64",
+            "replay command omitted or reordered effective options");
 }
 
 void testUnsignedCliRejectsNegativeValues() {
@@ -166,6 +227,8 @@ int main() {
         testTopologyAndLoadInvariants();
         testRandomProfileResamplingAndOverrides();
         testUint32CliBounds();
+        testQueueCapacityBounds();
+        testCompleteReplayCommand();
         testUnsignedCliRejectsNegativeValues();
         std::cout << "Representative workload generator tests passed\n";
         return 0;
