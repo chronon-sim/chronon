@@ -33,6 +33,25 @@ class TickSimulation;
 
 enum class UnitState { Created, Initialized };
 
+namespace detail {
+
+struct alignas(64) ActivitySchedulingState {
+    void publish() noexcept {
+        // A cluster leaf owns root; the global root leaves it null. Publishing
+        // leaf first makes an acquire of root=true sufficient for leaf lookup.
+        enabled.store(true, std::memory_order_release);
+        if (root != nullptr) {
+            root->store(true, std::memory_order_release);
+        }
+    }
+
+    std::atomic<bool> enabled{false};
+    std::atomic<bool>* root = nullptr;
+};
+static_assert(sizeof(ActivitySchedulingState) % 64 == 0);
+
+}  // namespace detail
+
 /**
  * Base class for simulation components.
  *
@@ -293,10 +312,10 @@ protected:
     }
 
 private:
-    void bindActivitySchedulingFlag_(std::atomic<bool>* any_activity_scheduling) noexcept {
-        any_activity_scheduling_ = any_activity_scheduling;
+    void bindActivitySchedulingState_(detail::ActivitySchedulingState* state) noexcept {
+        activity_scheduling_ = state;
         if (port_wake_enabled_.load(std::memory_order_relaxed)) {
-            any_activity_scheduling_->store(true, std::memory_order_release);
+            publishActivityScheduling_();
         }
     }
 
@@ -308,8 +327,12 @@ private:
 
     void enableActivityScheduling_() noexcept {
         port_wake_enabled_.store(true, std::memory_order_release);
-        if (any_activity_scheduling_ != nullptr) {
-            any_activity_scheduling_->store(true, std::memory_order_release);
+        publishActivityScheduling_();
+    }
+
+    void publishActivityScheduling_() noexcept {
+        if (activity_scheduling_ != nullptr) {
+            activity_scheduling_->publish();
         }
     }
 
@@ -385,10 +408,9 @@ private:
     /// Owner-side relaxed reads require only a non-RMW load; cross-thread port
     /// producers use acceptsPortWakeups()'s acquire load.
     std::atomic<bool> port_wake_enabled_{false};
-    /// Bound by TickSimulation immediately after construction. This monotone
-    /// simulation-wide flag lets the scheduler bypass idle-discovery only when
-    /// no Unit has ever opted into activity scheduling.
-    std::atomic<bool>* any_activity_scheduling_ = nullptr;
+    /// Hierarchical monotone summary bound by TickSimulation. One indirection
+    /// publishes the cache-line-isolated cluster leaf before the global root.
+    detail::ActivitySchedulingState* activity_scheduling_ = nullptr;
     std::atomic<bool> wake_tracking_enabled_{false};
     uint32_t id_;
     std::vector<PortBase*> ports_;

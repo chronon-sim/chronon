@@ -868,7 +868,7 @@ void printResults(const std::vector<size_t>& workers,
                                    ? 0.0
                                    : 100.0 * counters.blocked_attempts / counters.send_attempts;
         const auto& first = results[index].front();
-        const char* mode = !first.parallel ? "seq" : (first.epoch_free ? "epoch" : "barrier");
+        const char* mode = !first.parallel ? "seq" : (first.epoch_free ? "epoch-free" : "barrier");
         std::printf(
             "%7zu | %9.4f | %7.4f..%-7.4f | %6.2f%% | %9.4f | %12.2f | %8.2f | %6.2f | "
             "%5.2f | %6.2f%% | %7.2fx | %s\n",

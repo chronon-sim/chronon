@@ -17,11 +17,14 @@ struct ModeConfig {
     bool enable_lookahead;
 };
 
+constexpr int PARALLEL_TEST_UNIT_COUNT = 10;
+
 TickSimulationConfig makeConfig(const ModeConfig& mode) {
     TickSimulationConfig config;
     config.num_threads = 2;
     config.enable_parallel = mode.enable_parallel;
     config.enable_lookahead = mode.enable_lookahead;
+    config.enable_epoch_free_lookahead = true;
     config.enable_weighted_partitioning = false;
     config.enable_dynamic_rebalance = false;
     config.epoch_size = 8;
@@ -249,7 +252,7 @@ void test_sleep_forever_advances_cycle(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<SleepForeverUnit>();
     (void)unit;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 1; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
 
@@ -263,7 +266,7 @@ void test_tick_interval(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<IntervalUnit>();
     (void)unit;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 1; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
 
@@ -277,11 +280,15 @@ void test_runtime_opt_in_leaves_always_active_fast_path(const ModeConfig& mode) 
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<RuntimeOptInUnit>();
     std::vector<PassiveUnit*> passive;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 1; ++i) {
         passive.push_back(sim.createUnit<PassiveUnit>("passive_" + std::to_string(i)));
     }
 
     sim.run(10);
+
+    if (mode.enable_parallel && mode.enable_lookahead) {
+        assert(sim.epochFreeRunCount() > 0);
+    }
 
     assert((unit->tick_cycles == std::vector<uint64_t>{0, 1, 2}));
     assert(unit->localCycle() == 10);
@@ -295,11 +302,15 @@ void test_initial_sleep_until_defers_first_tick(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<InitiallyDeferredUnit>();
     (void)unit;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 1; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
 
     sim.run(8);
+
+    if (mode.enable_parallel && mode.enable_lookahead) {
+        assert(sim.epochFreeRunCount() > 0);
+    }
 
     assert(unit->ticks == 3);  // cycles 5, 6, 7
     assert((unit->tick_cycles == std::vector<uint64_t>{5, 6, 7}));
@@ -310,7 +321,7 @@ void test_tick_interval_preserves_constructor_sleep_target(const ModeConfig& mod
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<InitiallyDeferredUnit>();
     unit->setTickInterval(3);
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 1; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
 
@@ -325,7 +336,7 @@ void test_tick_interval_preserves_constructor_sleep_forever(const ModeConfig& mo
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<InitiallyDeferredForeverUnit>();
     unit->setTickInterval(3);
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 1; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
 
@@ -339,7 +350,7 @@ void test_tick_interval_preserves_constructor_sleep_forever(const ModeConfig& mo
 void test_future_wake_survives_sleep_after_initial_tick(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<FutureWakeSleepUnit>();
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 1; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
 
@@ -354,7 +365,7 @@ void test_future_wake_survives_sleep_after_initial_tick(const ModeConfig& mode) 
 void test_multiple_future_wake_requests_survive_sleep_after_initial_tick(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<FutureWakeSleepUnit>();
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 1; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
 
@@ -371,7 +382,7 @@ void test_later_sleep_overrides_prior_sleep_target_in_same_tick(const ModeConfig
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<OverrideSleepTargetUnit>();
     (void)unit;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 1; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
 
@@ -386,7 +397,7 @@ void test_explicit_wake_survives_later_sleep_override_in_same_tick(const ModeCon
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<OverrideSleepTargetUnit>();
     (void)unit;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 1; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
 
@@ -402,7 +413,7 @@ void test_port_arrival_wakes_sleeping_receiver(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* driver = sim.createUnit<DriverUnit>();
     auto* receiver = sim.createUnit<SleepingReceiverUnit>();
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 2; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
     sim.connect(driver->out, receiver->in, 1);
@@ -421,7 +432,7 @@ void test_multiple_future_port_arrivals_keep_later_wake(const ModeConfig& mode) 
     TickSimulation sim(makeConfig(mode));
     auto* driver = sim.createUnit<TwoMessageDriverUnit>();
     auto* receiver = sim.createUnit<SleepingReceiverUnit>();
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 2; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
     sim.connect(driver->out, receiver->in, 5);
@@ -438,7 +449,7 @@ void test_delayed_port_arrival_before_first_sleep_is_preserved(const ModeConfig&
     TickSimulation sim(makeConfig(mode));
     auto* driver = sim.createUnit<EarlyMessageDriverUnit>();
     auto* receiver = sim.createUnit<LateSleepingReceiverUnit>();
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 2; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
     sim.connect(driver->out, receiver->in, 5);
@@ -455,7 +466,7 @@ void test_interval_port_wake_is_consumed_before_sleep(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* driver = sim.createUnit<EarlyMessageDriverUnit>();
     auto* receiver = sim.createUnit<IntervalSleepingReceiverUnit>();
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 2; ++i) {
         sim.createUnit<SleepForeverUnit>("filler_" + std::to_string(i));
     }
     sim.connect(driver->out, receiver->in, 1);
@@ -473,7 +484,7 @@ int main() {
     const ModeConfig modes[] = {
         {"sequential", false, false},
         {"barrier", true, false},
-        {"lookahead", true, true},
+        {"epoch-free", true, true},
     };
 
     for (const auto& mode : modes) {

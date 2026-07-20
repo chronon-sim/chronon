@@ -86,6 +86,7 @@ void TickSimulation::initialize() {
     transparent_broadcast_connection_count_ = optimizeTransparentBroadcasts_();
 
     selectExecutionMode_();
+    initClusterActivityScheduling_();
     traceExecutionMode_();
 
     // Counter snapshot ownership follows stable scheduler clusters rather
