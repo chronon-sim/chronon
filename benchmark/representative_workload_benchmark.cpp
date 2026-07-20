@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -120,9 +121,11 @@ static_assert(transportFifoBytesPerSlot(PayloadClass::Bytes256) >=
 static_assert(TRANSPORT_LANE_FIXED_BYTES >=
               sizeof(DirectSPSCQueueAdapter<typename InPort<Payload<256>>::StoredMessage>));
 
-struct alignas(64) UnitCounters {
+struct alignas(CACHE_LINE_BYTES) UnitCounters {
     uint64_t ticks = 0;
     uint64_t work_iterations = 0;
+    uint64_t memory_reads = 0;
+    uint64_t memory_writes = 0;
     uint64_t offered = 0;
     uint64_t suppressed_offers = 0;
     uint64_t send_attempts = 0;
@@ -134,7 +137,7 @@ struct alignas(64) UnitCounters {
     uint64_t received_bytes = 0;
     uint64_t receive_checksum = 0;
 };
-static_assert(sizeof(UnitCounters) % 64 == 0);
+static_assert(sizeof(UnitCounters) % CACHE_LINE_BYTES == 0);
 
 struct Totals : UnitCounters {
     uint64_t queued = 0;
@@ -146,6 +149,8 @@ struct Totals : UnitCounters {
     UnitCounters result;
     result.ticks = after.ticks - before.ticks;
     result.work_iterations = after.work_iterations - before.work_iterations;
+    result.memory_reads = after.memory_reads - before.memory_reads;
+    result.memory_writes = after.memory_writes - before.memory_writes;
     result.offered = after.offered - before.offered;
     result.suppressed_offers = after.suppressed_offers - before.suppressed_offers;
     result.send_attempts = after.send_attempts - before.send_attempts;
@@ -157,6 +162,31 @@ struct Totals : UnitCounters {
     result.received_bytes = after.received_bytes - before.received_bytes;
     return result;
 }
+
+class AlignedWorkingSet {
+    struct Deleter {
+        void operator()(uint64_t* data) const noexcept {
+            ::operator delete(data, std::align_val_t{CACHE_LINE_BYTES});
+        }
+    };
+
+public:
+    explicit AlignedWorkingSet(size_t bytes)
+        : words_(bytes / sizeof(uint64_t)),
+          data_(static_cast<uint64_t*>(::operator new(bytes, std::align_val_t{CACHE_LINE_BYTES}))) {
+    }
+
+    AlignedWorkingSet(const AlignedWorkingSet&) = delete;
+    AlignedWorkingSet& operator=(const AlignedWorkingSet&) = delete;
+
+    [[nodiscard]] size_t size() const noexcept { return words_; }
+    [[nodiscard]] uint64_t& operator[](size_t index) noexcept { return data_[index]; }
+    [[nodiscard]] const uint64_t& operator[](size_t index) const noexcept { return data_[index]; }
+
+private:
+    size_t words_;
+    std::unique_ptr<uint64_t[], Deleter> data_;
+};
 
 template <size_t Bytes>
 struct TxChannel {
@@ -171,8 +201,10 @@ struct TxChannel {
     uint64_t next_sequence = 0;
 };
 
-class alignas(64) WorkloadUnit final : public TickableUnit {
+class alignas(CACHE_LINE_BYTES) WorkloadUnit final : public TickableUnit {
 public:
+    static constexpr uint64_t MIN_UNTIMED_INITIALIZATION_CYCLES = 1;
+
     WorkloadUnit(uint32_t id, const Scenario* scenario)
         : TickableUnit("bench_unit_" + std::to_string(id)),
           id_(id),
@@ -184,12 +216,8 @@ public:
           in64_(this, "rx64", inputCapacity_<64>()),
           in144_(this, "rx144", inputCapacity_<144>()),
           in256_(this, "rx256", inputCapacity_<256>()),
-          scratch_(std::max<size_t>(8, spec_->working_set_bytes / sizeof(uint64_t))) {
+          scratch_(spec_->working_set_bytes) {
         state_ = splitMix64(scenario_->config.seed ^ id_);
-        for (size_t i = 0; i < scratch_.size(); ++i) {
-            scratch_[i] = randomWord(scenario_->config.seed, 0x53435241544348ULL,
-                                     static_cast<uint64_t>(id_) * scratch_.size() + i);
-        }
         for (const auto& channel : scenario_->channels) {
             if (channel.source != id_) continue;
             switch (channel.payload) {
@@ -267,10 +295,19 @@ public:
     [[nodiscard]] double modeledCost() const {
         const double sum =
             std::accumulate(spec_->work_schedule.begin(), spec_->work_schedule.end(), 0.0);
-        return 20.0 + 2.0 * sum / static_cast<double>(spec_->work_schedule.size());
+        double memory_cost = 2.25;
+        if (spec_->memory_pattern == MemoryAccessPattern::StreamingRmw) memory_cost = 1.25;
+        if (spec_->memory_pattern == MemoryAccessPattern::PointerChase) memory_cost = 4.0;
+        if (spec_->memory_pattern == MemoryAccessPattern::HotColdRmw) memory_cost = 2.0;
+        const int cache_steps =
+            std::max(0, static_cast<int>(std::bit_width(spec_->working_set_bytes)) - 16);
+        memory_cost *= 1.0 + 0.08 * cache_steps;
+        return 20.0 + memory_cost * sum / static_cast<double>(spec_->work_schedule.size());
     }
 
 private:
+    static constexpr size_t WORDS_PER_CACHE_LINE = CACHE_LINE_BYTES / sizeof(uint64_t);
+
     template <size_t Bytes>
     [[nodiscard]] static uint64_t queuedOn_(const InPort<Payload<Bytes>>& port) noexcept {
         uint64_t queued = port.queuedMessageCount();
@@ -410,18 +447,84 @@ private:
         }
     }
 
+    [[nodiscard]] static uint64_t reverseBits_(uint64_t value) noexcept {
+        value = ((value & 0x5555555555555555ULL) << 1) | ((value >> 1) & 0x5555555555555555ULL);
+        value = ((value & 0x3333333333333333ULL) << 2) | ((value >> 2) & 0x3333333333333333ULL);
+        value = ((value & 0x0f0f0f0f0f0f0f0fULL) << 4) | ((value >> 4) & 0x0f0f0f0f0f0f0f0fULL);
+        value = ((value & 0x00ff00ff00ff00ffULL) << 8) | ((value >> 8) & 0x00ff00ff00ff00ffULL);
+        value = ((value & 0x0000ffff0000ffffULL) << 16) | ((value >> 16) & 0x0000ffff0000ffffULL);
+        return (value << 32) | (value >> 32);
+    }
+
+    void initializeWorkingSet_() noexcept {
+        if (working_set_initialized_) return;
+        const size_t mask = scratch_.size() - 1;
+        if (spec_->memory_pattern == MemoryAccessPattern::PointerChase) {
+            const unsigned index_bits = std::bit_width(mask);
+            const size_t xor_key =
+                static_cast<size_t>(randomWord(scenario_->config.seed, 0x5054524b4559ULL, id_)) &
+                mask;
+            const auto permute = [&](size_t ordinal) {
+                return static_cast<size_t>(reverseBits_(ordinal) >> (64 - index_bits)) ^ xor_key;
+            };
+            for (size_t ordinal = 0; ordinal < scratch_.size(); ++ordinal) {
+                scratch_[permute(ordinal)] = permute((ordinal + 1) & mask);
+            }
+            pointer_index_ = permute(0);
+        } else {
+            uint64_t value = randomWord(scenario_->config.seed, 0x53435241544348ULL, id_);
+            for (size_t index = 0; index < scratch_.size(); ++index) {
+                value = splitMix64(value + index);
+                scratch_[index] = value;
+            }
+        }
+        stream_index_ =
+            static_cast<size_t>(randomWord(scenario_->config.seed, 0x53545245414dULL, id_)) & mask &
+            ~(WORDS_PER_CACHE_LINE - 1);
+        working_set_initialized_ = true;
+    }
+
     void runWork_() noexcept {
+        initializeWorkingSet_();
         const uint32_t work = spec_->work_schedule[localCycle() % spec_->work_schedule.size()];
         const size_t mask = scratch_.size() - 1;
         uint64_t state = state_;
-        for (uint32_t iteration = 0; iteration < work; ++iteration) {
-            const size_t index = static_cast<size_t>(state ^ (state >> 23U) ^ iteration) & mask;
-            const uint64_t value = scratch_[index];
-            state = std::rotl(state + value + 0x9e3779b97f4a7c15ULL, 17) * 0xbf58476d1ce4e5b9ULL;
-            scratch_[index] = state ^ std::rotl(value, 11);
+        bool writes = true;
+
+        if (spec_->memory_pattern == MemoryAccessPattern::StreamingRmw) {
+            size_t index = stream_index_;
+            for (uint32_t iteration = 0; iteration < work; ++iteration) {
+                const uint64_t value = scratch_[index];
+                state = std::rotl(state + value + iteration, 17) * 0xbf58476d1ce4e5b9ULL;
+                scratch_[index] = state ^ std::rotl(value, 11);
+                index = (index + WORDS_PER_CACHE_LINE) & mask;
+            }
+            stream_index_ = index;
+        } else if (spec_->memory_pattern == MemoryAccessPattern::PointerChase) {
+            size_t index = pointer_index_;
+            for (uint32_t iteration = 0; iteration < work; ++iteration) {
+                index = static_cast<size_t>(scratch_[index]);
+                state = std::rotl(state ^ index ^ iteration, 13) * 0x94d049bb133111ebULL;
+            }
+            pointer_index_ = index;
+            writes = false;
+        } else {
+            const size_t hot_mask = spec_->hot_set_bytes / sizeof(uint64_t) - 1;
+            for (uint32_t iteration = 0; iteration < work; ++iteration) {
+                const uint64_t mixed = state ^ (state >> 23U) ^ iteration;
+                const bool use_hot = spec_->memory_pattern == MemoryAccessPattern::HotColdRmw &&
+                                     chance(mixed, scenario_->config.hot_access_probability_ppm);
+                const size_t index = static_cast<size_t>(mixed) & (use_hot ? hot_mask : mask);
+                const uint64_t value = scratch_[index];
+                state =
+                    std::rotl(state + value + 0x9e3779b97f4a7c15ULL, 17) * 0xbf58476d1ce4e5b9ULL;
+                scratch_[index] = state ^ std::rotl(value, 11);
+            }
         }
         state_ = state;
         counters_.work_iterations += work;
+        counters_.memory_reads += work;
+        if (writes) counters_.memory_writes += work;
     }
 
     template <size_t Bytes>
@@ -465,8 +568,11 @@ private:
     std::vector<TxChannel<64>> tx64_;
     std::vector<TxChannel<144>> tx144_;
     std::vector<TxChannel<256>> tx256_;
-    std::vector<uint64_t> scratch_;
+    AlignedWorkingSet scratch_;
+    size_t stream_index_ = 0;
+    size_t pointer_index_ = 0;
     uint64_t state_ = 0;
+    bool working_set_initialized_ = false;
     UnitCounters counters_;
 };
 
@@ -476,8 +582,10 @@ private:
  * serial arithmetic dependency chain plus accounting. This keeps scheduler
  * floor/progress overhead visible instead of diluting it with empty-port polls.
  */
-class alignas(64) SchedulerFloorUnit final : public TickableUnit {
+class alignas(CACHE_LINE_BYTES) SchedulerFloorUnit final : public TickableUnit {
 public:
+    static constexpr uint64_t MIN_UNTIMED_INITIALIZATION_CYCLES = 0;
+
     SchedulerFloorUnit(uint32_t id, const Scenario* scenario)
         : TickableUnit("floor_unit_" + std::to_string(id)),
           id_(id),
@@ -528,6 +636,8 @@ template <typename UnitType>
         const auto& c = unit->counters();
         totals.ticks += c.ticks;
         totals.work_iterations += c.work_iterations;
+        totals.memory_reads += c.memory_reads;
+        totals.memory_writes += c.memory_writes;
         totals.offered += c.offered;
         totals.suppressed_offers += c.suppressed_offers;
         totals.send_attempts += c.send_attempts;
@@ -547,6 +657,7 @@ template <typename UnitType>
 
 struct RunResult {
     size_t workers = 1;
+    uint64_t untimed_cycles = 0;
     double setup_seconds = 0.0;
     double warmup_seconds = 0.0;
     double wall_seconds = 0.0;
@@ -587,7 +698,13 @@ template <typename UnitType>
     const auto setup_end = std::chrono::steady_clock::now();
 
     const auto warmup_begin = std::chrono::steady_clock::now();
-    simulation.run(options.warmup_cycles);
+    // Representative units allocate without touching their backing pages, then
+    // initialize on their execution worker's first tick. Preserve that
+    // first-touch placement even when the user requests zero warmup, while
+    // keeping initialization and page faults outside measured wall time.
+    const uint64_t untimed_cycles =
+        std::max(options.warmup_cycles, UnitType::MIN_UNTIMED_INITIALIZATION_CYCLES);
+    simulation.run(untimed_cycles);
     const auto warmup_end = std::chrono::steady_clock::now();
     const Totals before = collectTotals(units);
 
@@ -598,6 +715,7 @@ template <typename UnitType>
 
     RunResult result;
     result.workers = workers;
+    result.untimed_cycles = untimed_cycles;
     result.setup_seconds = std::chrono::duration<double>(setup_end - setup_begin).count();
     result.warmup_seconds = std::chrono::duration<double>(warmup_end - warmup_begin).count();
     result.wall_seconds = std::chrono::duration<double>(measured_end - measured_begin).count();
@@ -629,6 +747,10 @@ template <typename UnitType>
     return runOnceWithUnit<WorkloadUnit>(scenario, workers, options);
 }
 
+inline constexpr std::array<std::string_view, 4> MEMORY_PATTERN_NAMES = {"random-rmw", "stream-rmw",
+                                                                         "pointer", "hot/cold-rmw"};
+static_assert(MEMORY_PATTERN_NAMES.size() == MEMORY_ACCESS_PATTERN_COUNT);
+
 void printScenario(const Scenario& scenario, std::string_view profile, uint64_t scenario_index) {
     uint64_t edges = 0;
     for (const auto& channel : scenario.channels) edges += channel.destinations.size();
@@ -647,8 +769,26 @@ void printScenario(const Scenario& scenario, std::string_view profile, uint64_t 
               << " work median=" << scenario.config.median_work
               << " unit-sigma=" << scenario.config.unit_sigma_milli / 1000.0
               << " cycle-sigma=" << scenario.config.cycle_sigma_milli / 1000.0
-              << " z-cap=" << scenario.config.normal_cap_milli / 1000.0
-              << " working-set-base=" << scenario.config.working_set_bytes << "B\n";
+              << " z-cap=" << scenario.config.normal_cap_milli / 1000.0 << '\n';
+    if (scenario.summary.unit_working_set_bytes == 0) {
+        std::cout << "  unit-memory=disabled\n";
+    } else {
+        std::cout << "  unit-memory median-target=" << scenario.config.working_set_bytes / 1024.0
+                  << "KiB sigma=" << scenario.config.working_set_sigma_milli / 1000.0
+                  << " total=" << scenario.summary.unit_working_set_bytes / (1024.0 * 1024.0)
+                  << "MiB min/p50/p90/max=" << scenario.summary.min_unit_working_set_bytes / 1024.0
+                  << '/' << scenario.summary.median_unit_working_set_bytes / 1024.0 << '/'
+                  << scenario.summary.p90_unit_working_set_bytes / 1024.0 << '/'
+                  << scenario.summary.max_unit_working_set_bytes / 1024.0
+                  << "KiB first-touch=first-unit-tick\n  memory-patterns ";
+        for (size_t pattern = 0; pattern < MEMORY_PATTERN_NAMES.size(); ++pattern) {
+            if (pattern != 0) std::cout << ' ';
+            std::cout << MEMORY_PATTERN_NAMES[pattern] << '='
+                      << scenario.summary.memory_pattern_counts[pattern];
+        }
+        std::cout << " hot-access=" << scenario.config.hot_access_probability_ppm / 10'000.0
+                  << "%\n";
+    }
     std::cout << "  offered publications/cycle=" << scenario.summary.scheduled_slots / period
               << " deliveries/cycle=" << scenario.summary.scheduled_deliveries / period
               << " payload-KiB/cycle=" << scenario.summary.scheduled_payload_bytes / period / 1024.0
@@ -693,7 +833,9 @@ void validateEquivalent(const RunResult& reference, const RunResult& candidate) 
         reference.final.received != candidate.final.received ||
         reference.final.queued != candidate.final.queued ||
         reference.final.pending_publications != candidate.final.pending_publications ||
-        reference.measured.work_iterations != candidate.measured.work_iterations) {
+        reference.measured.work_iterations != candidate.measured.work_iterations ||
+        reference.measured.memory_reads != candidate.measured.memory_reads ||
+        reference.measured.memory_writes != candidate.measured.memory_writes) {
         throw std::runtime_error("determinism check failed across repetitions/worker counts");
     }
 }
@@ -701,10 +843,11 @@ void validateEquivalent(const RunResult& reference, const RunResult& candidate) 
 void printResults(const std::vector<size_t>& workers,
                   const std::vector<std::vector<RunResult>>& results, uint32_t num_units,
                   uint64_t cycles) {
-    std::cout << "\nworkers | median(s) | p10..p90(s)     | CV     | Munit-tick/s | Mmsg/s | GiB/s "
-                 "| blocked | speedup | mode\n";
-    std::cout << "--------+-----------+-----------------+--------+--------------+--------+-------+-"
-                 "--------+---------+------\n";
+    std::cout << "\nworkers | median(s) | p10..p90(s)     | CV     | Mcycles/s | Munit-tick/s | "
+                 "Gmemop/s | Mmsg/s | GiB/s | blocked | speedup | mode\n";
+    std::cout
+        << "--------+-----------+-----------------+--------+-----------+--------------+----------"
+           "+--------+-------+---------+---------+------\n";
     double baseline = 0.0;
     for (size_t index = 0; index < workers.size(); ++index) {
         std::vector<double> walls;
@@ -714,7 +857,10 @@ void printResults(const std::vector<size_t>& workers,
         const double p90 = percentile(walls, 0.9);
         if (workers[index] == 1 || baseline == 0.0) baseline = median;
         const auto& counters = results[index].front().measured;
+        const double mcycles = static_cast<double>(cycles) / median / 1e6;
         const double mticks = static_cast<double>(num_units) * cycles / median / 1e6;
+        const double memory_ops =
+            static_cast<double>(counters.memory_reads + counters.memory_writes) / median / 1e9;
         const double messages = static_cast<double>(counters.received) / median / 1e6;
         const double gib =
             static_cast<double>(counters.received_bytes) / median / (1024.0 * 1024.0 * 1024.0);
@@ -724,10 +870,10 @@ void printResults(const std::vector<size_t>& workers,
         const auto& first = results[index].front();
         const char* mode = !first.parallel ? "seq" : (first.epoch_free ? "epoch" : "barrier");
         std::printf(
-            "%7zu | %9.4f | %7.4f..%-7.4f | %6.2f%% | %12.2f | %6.2f | %5.2f | %6.2f%% | %7.2fx | "
-            "%s\n",
-            workers[index], median, p10, p90, 100.0 * coefficientOfVariation(walls), mticks,
-            messages, gib, blocked, baseline / median, mode);
+            "%7zu | %9.4f | %7.4f..%-7.4f | %6.2f%% | %9.4f | %12.2f | %8.2f | %6.2f | "
+            "%5.2f | %6.2f%% | %7.2fx | %s\n",
+            workers[index], median, p10, p90, 100.0 * coefficientOfVariation(walls), mcycles,
+            mticks, memory_ops, messages, gib, blocked, baseline / median, mode);
     }
     const auto& representative = results.front().front();
     std::cout << "  digest=0x" << std::hex << representative.final.state_digest << std::dec
@@ -735,6 +881,8 @@ void printResults(const std::vector<size_t>& workers,
               << " received=" << representative.final.received
               << " queued=" << representative.final.queued
               << " pending-publishes=" << representative.final.pending_publications
+              << " memory-r/w=" << representative.measured.memory_reads << '/'
+              << representative.measured.memory_writes
               << " transparent-broadcast-edges=" << representative.transparent_broadcast_connections
               << '\n';
 }
@@ -792,8 +940,11 @@ int main(int argc, char** argv) {
                     }
                     RunResult result = runOnce(scenario, workers, parsed.cli.run);
                     if (parsed.cli.verbose) {
-                        std::cout << " wall=" << result.wall_seconds << "s digest=0x" << std::hex
-                                  << result.final.state_digest << std::dec << '\n';
+                        std::cout << " setup=" << result.setup_seconds
+                                  << "s warmup=" << result.warmup_seconds << "s/"
+                                  << result.untimed_cycles << "cy wall=" << result.wall_seconds
+                                  << "s digest=0x" << std::hex << result.final.state_digest
+                                  << std::dec << '\n';
                     }
                     if (reference)
                         validateEquivalent(*reference, result);

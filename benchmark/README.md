@@ -22,17 +22,29 @@ Nucleus `InstData`; the smaller classes cover scalars, smart pointers, wakeups,
 flushes, and fetched-instruction records. The default weights are explicit in
 the output and can be replaced without changing the benchmark implementation.
 
-Each unit has two independent cost components:
+Each unit has independent compute and memory components:
 
 1. a per-unit baseline sampled from a lognormal-like distribution; and
-2. per-cycle jitter around that baseline.
+2. per-cycle jitter around that baseline;
+3. a separately sampled, bounded-lognormal resident footprint; and
+4. a seeded memory access pattern: random read/modify/write, cache-line
+   streaming, dependent pointer chasing, or a hot/cold read/modify/write mix.
 
-Both are truncated at a configurable normal quantile (2.58 by default) so the
-profile has Nucleus-like skew without an artificial extreme tail. Generated
+The compute distributions are truncated at a configurable normal quantile
+(2.58 by default) so the profile has Nucleus-like skew without an artificial
+extreme tail. Generated
 unit baselines and final per-cycle samples are additionally capped at 4096 work
-iterations, so compounded variance cannot bypass the execution bound. The timed
-work kernel mixes a serial integer dependency chain with data-dependent reads
-and writes to a per-unit power-of-two working set. It is not an empty spin loop.
+iterations, so compounded variance cannot bypass the execution bound. Footprint
+variance uses the same bounded integer-only generator and is independently
+configurable. Each footprint is a real 64-byte-aligned allocation. Its contents
+are initialized on that unit's first untimed tick, giving the operating system
+a worker-local first-touch opportunity. A requested `--warmup 0` still executes
+this single initialization tick before measured timing, so page faults and the
+pointer permutation never contaminate throughput. The timed work is never an
+empty spin loop: every iteration performs a modeled load, and all patterns
+except pointer chasing also perform a store. Hot/cold units direct the
+configured fraction of accesses (90% by default) to a seeded region that is
+1/4, 1/8, or 1/16 of that unit's full footprint.
 
 Each generated channel has a typed `OutPort`, one or more destinations, a delay,
 a send-rate schedule, and optional bursts. Receivers have independently varied
@@ -66,6 +78,7 @@ Profiles provide stable starting points:
 | `nucleus` | mixed unit cost, topology, payload, and moderate traffic |
 | `scheduler` | variable unit work without connections |
 | `scheduler-floor` | port-free independent clusters for scheduler floor/progress overhead |
+| `memory` | mixed locality over a large, connection-free bounded-lognormal footprint |
 | `port` | high message rate with almost no unit work |
 | `hotspot` | high-indegree MPSC destinations |
 | `broadcast` | wide fan-out and transparent shared broadcast eligibility |
@@ -115,6 +128,11 @@ Run `--help` for individual overrides. Useful examples:
 # Port-heavy 144-byte traffic only.
 ./build-release/benchmark/chronon_representative_workload_benchmark \
   --profile port --payload-weights 0,0,0,0,1,0 --threads 1,8
+
+# LLC/DRAM pressure with an explicit 1 MiB median footprint and mixed locality.
+./build-release/benchmark/chronon_representative_workload_benchmark \
+  --profile memory --working-set 1048576 --working-set-sigma 650 \
+  --memory-pattern-weights 45,20,20,15 --threads 1,8,16
 ```
 
 ### Reproducibility and validation
@@ -123,10 +141,11 @@ Scenario generation uses a counter-based SplitMix64 mapping and integer-only
 bounded-lognormal approximation. It does not use C++ standard random
 distributions, whose generation algorithms are implementation-defined. Work
 and send schedules are generated before timing; the hot path only reads those
-tables. Each derived `random` scenario resamples both its parameter envelope
-and generated graph from its derived seed; explicit CLI overrides are then
-reapplied to every scenario. Per-unit scratch working sets are conservatively
-bounded to a 256 MiB aggregate maximum before simulation storage is allocated.
+tables. Each derived `random` scenario resamples its compute, footprint,
+locality, traffic, and graph parameter envelopes from its derived seed; explicit
+CLI overrides are then reapplied to every scenario. Generated per-unit
+footprints are summed exactly and rejected above a 256 MiB aggregate maximum
+before simulation storage is allocated.
 Finite input queues reserve receive scratch only for payload classes that are
 actually connected to each unit. That scratch, bounded shared FIFOs, and
 worst-case per-connection cross-thread transport lanes share a conservative 256
@@ -143,8 +162,8 @@ pre-allocation limits; `--help` reports the user-facing topology limits.
 Every scenario prints:
 
 - the resolved seed and generator version;
-- a fingerprint over all generated units, edges, payload classes, delays, work
-  schedules, and send schedules; and
+- a fingerprint over all generated units, footprints, memory patterns, edges,
+  payload classes, delays, work schedules, and send schedules;
 - a complete replay command.
 
 The generator unit test pins a known fingerprint. Changing generated output
@@ -165,8 +184,12 @@ boundary-condition bugs.
 Scenario creation, graph connection, simulation initialization, deterministic
 cost placement, and warmup are excluded from wall time. Repetition order is
 seeded and interleaved across worker counts. The report includes median,
-10th/90th percentiles, coefficient of variation, unit-ticks/s, messages/s,
-payload GiB/s, blocked-send percentage, and speedup.
+10th/90th percentiles, coefficient of variation, simulated cycles/s,
+unit-ticks/s, memory operations/s, messages/s, payload GiB/s, blocked-send
+percentage, and speedup. `Mcycles/s` is the primary global simulation
+throughput and does not scale with the number of units; `Munit-tick/s` retains
+the aggregate unit-work rate for comparing scenarios with different unit
+counts.
 
 Primary design references:
 

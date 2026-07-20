@@ -124,4 +124,9 @@ if(CHRONON_BUILD_TESTS)
         COMMAND chronon_representative_workload_benchmark
             --profile scheduler-floor --seed 24 --units 8 --threads 1,2
             --warmup 16 --cycles 64 --repetitions 1)
+    add_test(NAME benchmark_representative_memory_footprint
+        COMMAND chronon_representative_workload_benchmark
+            --profile memory --seed 42 --units 16 --working-set 65536
+            --memory-pattern-weights 1,1,1,1 --threads 1,2
+            --warmup 0 --cycles 32 --repetitions 1)
 endif()

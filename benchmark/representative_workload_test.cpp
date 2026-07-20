@@ -1,6 +1,7 @@
 // Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
 // SPDX-License-Identifier: MPL-2.0
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <iostream>
@@ -30,7 +31,8 @@ using chronon::benchmark::MAX_MEDIAN_WORK;
 using chronon::benchmark::MAX_SCENARIO_UNITS;
 using chronon::benchmark::MAX_TOTAL_PORT_STORAGE_BYTES;
 using chronon::benchmark::MAX_TOTAL_WORKING_SET_BYTES;
-using chronon::benchmark::MAX_WORKING_SET_SCALE;
+using chronon::benchmark::MEMORY_ACCESS_PATTERN_COUNT;
+using chronon::benchmark::MemoryAccessPattern;
 using chronon::benchmark::parseCommandLine;
 using chronon::benchmark::ParsedOptions;
 using chronon::benchmark::PAYLOAD_BYTES;
@@ -57,7 +59,7 @@ void testStableFingerprint() {
     const auto first = generateScenario(config);
     const auto second = generateScenario(config);
     require(first == second, "same config did not produce the same scenario");
-    require(first.fingerprint == 0xbc3249d0d072cc13ULL,
+    require(first.fingerprint == 0xd0c1ef7aa6cccc29ULL,
             "generator output changed without a version bump");
 
     config.seed ^= 1;
@@ -78,13 +80,39 @@ void testTopologyAndLoadInvariants() {
     require(scenario.units.size() == config.num_units, "wrong unit count");
     require(scenario.channels.size() == config.num_units * config.channels_per_unit,
             "wrong channel count");
+    uint64_t expected_unit_working_set = 0;
+    std::array<uint32_t, MEMORY_ACCESS_PATTERN_COUNT> expected_pattern_counts{};
+    std::vector<uint32_t> working_sets;
     for (const auto& unit : scenario.units) {
         require(unit.work_schedule.size() == config.work_period, "wrong work period");
         require(unit.working_set_bytes >= 64, "working set too small");
         require((unit.working_set_bytes & (unit.working_set_bytes - 1)) == 0,
                 "working set is not a power of two");
+        require(unit.hot_set_bytes >= 64 && unit.hot_set_bytes <= unit.working_set_bytes,
+                "hot set is outside the unit footprint");
+        require(static_cast<size_t>(unit.memory_pattern) < MEMORY_ACCESS_PATTERN_COUNT,
+                "invalid memory access pattern");
+        if (unit.memory_pattern != MemoryAccessPattern::HotColdRmw) {
+            require(unit.hot_set_bytes == unit.working_set_bytes,
+                    "non-hot/cold unit generated a smaller hot set");
+        }
+        expected_unit_working_set += unit.working_set_bytes;
+        ++expected_pattern_counts[static_cast<size_t>(unit.memory_pattern)];
+        working_sets.push_back(unit.working_set_bytes);
         for (uint32_t work : unit.work_schedule) require(work > 0, "zero work sample");
     }
+    std::sort(working_sets.begin(), working_sets.end());
+    require(scenario.summary.unit_working_set_bytes == expected_unit_working_set,
+            "unit footprint total is inaccurate");
+    require(scenario.summary.min_unit_working_set_bytes == working_sets.front() &&
+                scenario.summary.median_unit_working_set_bytes ==
+                    working_sets[(working_sets.size() + 1) / 2 - 1] &&
+                scenario.summary.p90_unit_working_set_bytes ==
+                    working_sets[(9 * working_sets.size() + 9) / 10 - 1] &&
+                scenario.summary.max_unit_working_set_bytes == working_sets.back(),
+            "unit footprint distribution summary is inaccurate");
+    require(scenario.summary.memory_pattern_counts == expected_pattern_counts,
+            "memory pattern summary is inaccurate");
     for (const auto& channel : scenario.channels) {
         require(!channel.destinations.empty(), "channel has no destination");
         require(channel.send_schedule.size() == (config.send_period + 63) / 64,
@@ -164,17 +192,28 @@ void testRandomProfileResamplingAndOverrides() {
                 first.max_fanout != second.max_fanout ||
                 first.send_probability_ppm != second.send_probability_ppm ||
                 first.queue_capacity != second.queue_capacity ||
-                first.median_work != second.median_work,
+                first.median_work != second.median_work ||
+                first.working_set_bytes != second.working_set_bytes ||
+                first.working_set_sigma_milli != second.working_set_sigma_milli ||
+                first.memory_pattern_weights != second.memory_pattern_weights,
             "random scenario did not resample its parameter envelope");
 
     options.overrides.num_units = 17;
     options.overrides.send_probability_ppm = 123'456;
     options.overrides.queue_capacity = 64;
+    options.overrides.working_set_bytes = 32 * 1024;
+    options.overrides.working_set_sigma_milli = 333;
+    options.overrides.memory_pattern_weights = std::array<uint32_t, 4>{1, 2, 3, 4};
     for (uint64_t index = 0; index < 3; ++index) {
         const auto overridden = scenarioConfigFor(options, index);
         require(overridden.num_units == 17, "unit override was not replayed");
         require(overridden.send_probability_ppm == 123'456, "send override was not replayed");
         require(overridden.queue_capacity == 64, "capacity override was not replayed");
+        require(
+            overridden.working_set_bytes == 32 * 1024 && overridden.working_set_sigma_milli == 333,
+            "working-set override was not replayed");
+        require(overridden.memory_pattern_weights == std::array<uint32_t, 4>{1, 2, 3, 4},
+                "memory-pattern override was not replayed");
     }
 }
 
@@ -196,9 +235,14 @@ void testSchedulerFloorProfile() {
     require(scenario.summary.estimated_input_scratch_reserve_bytes == 0 &&
                 scenario.summary.estimated_transport_reserve_bytes == 0,
             "scheduler-floor scenario reserved port storage");
+    require(scenario.summary.unit_working_set_bytes == 0,
+            "scheduler-floor scenario materialized a unit footprint");
     for (const auto& unit : scenario.units) {
         require(unit.work_schedule == std::vector<uint32_t>{config.median_work},
                 "scheduler-floor unit did not preserve fixed work");
+        require(unit.working_set_bytes == 0 && unit.hot_set_bytes == 0 &&
+                    unit.memory_pattern == MemoryAccessPattern::None,
+                "scheduler-floor unit enabled the memory model");
     }
 
     ScenarioConfig invalid = config;
@@ -210,6 +254,81 @@ void testSchedulerFloorProfile() {
     }
 }
 
+void testMemoryFootprintModel() {
+    ParsedOptions profile_options;
+    profile_options.cli.profile = "memory";
+    const auto memory_profile = scenarioConfigFor(profile_options, 0);
+    require(memory_profile.channels_per_unit == 0 && !memory_profile.ensure_ring &&
+                memory_profile.working_set_bytes == 1024 * 1024,
+            "memory profile did not select its connection-free large footprint");
+
+    ScenarioConfig config;
+    config.seed = 0x4d454d4f5259ULL;
+    config.num_units = 256;
+    config.channels_per_unit = 0;
+    config.ensure_ring = false;
+    config.working_set_bytes = 64 * 1024;
+    config.working_set_sigma_milli = 650;
+    config.work_period = 1;
+    config.send_period = 1;
+    const auto first = generateScenario(config);
+    const auto second = generateScenario(config);
+    require(first == second, "memory footprint generation is not reproducible");
+
+    bool observed_below_median = false;
+    bool observed_above_median = false;
+    uint32_t pattern_kinds = 0;
+    for (uint32_t count : first.summary.memory_pattern_counts) pattern_kinds += count != 0;
+    for (const auto& unit : first.units) {
+        observed_below_median =
+            observed_below_median || unit.working_set_bytes < config.working_set_bytes;
+        observed_above_median =
+            observed_above_median || unit.working_set_bytes > config.working_set_bytes;
+    }
+    require(observed_below_median && observed_above_median,
+            "bounded lognormal footprint did not vary around its median");
+    require(pattern_kinds == MEMORY_ACCESS_PATTERN_COUNT,
+            "mixed memory model did not generate every access pattern");
+    require(first.summary.unit_working_set_bytes <= MAX_TOTAL_WORKING_SET_BYTES,
+            "memory model exceeded its aggregate footprint budget");
+    require(first.summary.min_unit_working_set_bytes >= config.working_set_bytes / 8 &&
+                first.summary.max_unit_working_set_bytes <= config.working_set_bytes * 8,
+            "bounded footprint distribution developed an extreme tail");
+
+    config.num_units = 8;
+    config.working_set_bytes = 4 * 1024;
+    config.working_set_sigma_milli = 0;
+    config.memory_pattern_weights = {0, 0, 1, 0};
+    const auto pointer_only = generateScenario(config);
+    for (const auto& unit : pointer_only.units) {
+        require(unit.working_set_bytes == config.working_set_bytes &&
+                    unit.memory_pattern == MemoryAccessPattern::PointerChase,
+                "forced pointer-chase footprint was not preserved");
+    }
+
+    config.memory_pattern_weights = {0, 0, 0, 0};
+    try {
+        (void)generateScenario(config);
+        require(false, "zero memory-pattern weights were accepted");
+    } catch (const std::invalid_argument&) {
+    }
+
+    config.memory_pattern_weights = {1, 1, 1, 1};
+    config.working_set_sigma_milli = 2'001;
+    try {
+        (void)generateScenario(config);
+        require(false, "oversized working-set sigma was accepted");
+    } catch (const std::invalid_argument&) {
+    }
+    config.working_set_sigma_milli = 0;
+    config.hot_access_probability_ppm = 1'000'001;
+    try {
+        (void)generateScenario(config);
+        require(false, "oversized hot-access probability was accepted");
+    } catch (const std::invalid_argument&) {
+    }
+}
+
 void testUint32CliBounds() {
     constexpr const char* too_large = "4294967296";
     constexpr std::array scalar_options = {
@@ -217,7 +336,8 @@ void testUint32CliBounds() {
         "--channels",       "--active-sources", "--fixed-delay",   "--max-fanout",
         "--send-ppm",       "--burst-ppm",      "--hotspot-ppm",   "--broadcast-ppm",
         "--zero-delay-ppm", "--queue-capacity", "--drain-limit",   "--work",
-        "--unit-sigma",     "--cycle-sigma",    "--working-set"};
+        "--unit-sigma",     "--cycle-sigma",    "--working-set",   "--working-set-sigma",
+        "--hot-access-ppm"};
     for (const char* option : scalar_options) {
         require(rejects({"benchmark", option, too_large}), "uint32 scalar overflow was accepted");
     }
@@ -225,6 +345,10 @@ void testUint32CliBounds() {
             "worker-list overflow was accepted");
     require(rejects({"benchmark", "--payload-weights", "1,2,3,4,5,4294967296"}),
             "payload-list overflow was accepted");
+    require(rejects({"benchmark", "--memory-pattern-weights", "1,2,3,4294967296"}),
+            "memory-pattern-list overflow was accepted");
+    require(rejects({"benchmark", "--memory-pattern-weights", "1,2,3"}),
+            "short memory-pattern list was accepted");
 
     require(chronon::benchmark::parseU32("4294967295", "--test") ==
                 std::numeric_limits<uint32_t>::max(),
@@ -421,17 +545,28 @@ void testWorkAndDrainBounds() {
 
 void testWorkingSetBudget() {
     ScenarioConfig config;
-    config.num_units = 64;
-    config.working_set_bytes = static_cast<uint32_t>(MAX_TOTAL_WORKING_SET_BYTES /
-                                                     (config.num_units * MAX_WORKING_SET_SCALE));
+    config.num_units = 2;
+    config.channels_per_unit = 0;
+    config.ensure_ring = false;
+    config.working_set_bytes = static_cast<uint32_t>(MAX_TOTAL_WORKING_SET_BYTES / 2);
+    config.working_set_sigma_milli = 0;
+    config.work_period = 1;
+    config.send_period = 1;
     const auto scenario = generateScenario(config);
-    uint64_t generated_bytes = 0;
-    for (const auto& unit : scenario.units) generated_bytes += unit.working_set_bytes;
-    require(generated_bytes <= MAX_TOTAL_WORKING_SET_BYTES,
-            "accepted scenario exceeded aggregate working-set budget");
+    require(scenario.summary.unit_working_set_bytes == MAX_TOTAL_WORKING_SET_BYTES,
+            "exact aggregate working-set budget was rejected or misreported");
+
+    config.num_units = 3;
+    try {
+        (void)generateScenario(config);
+        require(false, "oversized exact aggregate working set was accepted");
+    } catch (const std::invalid_argument&) {
+    }
 
     require(rejectsScenario({"benchmark", "--working-set", "268435456"}),
             "oversized aggregate working set was accepted");
+    require(rejectsScenario({"benchmark", "--working-set", "0"}),
+            "zero representative working set was accepted");
 }
 
 void testFixedDelayOverridesAllChannels() {
@@ -514,14 +649,23 @@ void testCompleteReplayCommand() {
                                     "--describe-only",
                                     "--verbose",
                                     "--queue-capacity",
-                                    "64"});
+                                    "64",
+                                    "--working-set",
+                                    "4096",
+                                    "--working-set-sigma",
+                                    "333",
+                                    "--hot-access-ppm",
+                                    "800000",
+                                    "--memory-pattern-weights",
+                                    "1,2,3,4"});
     std::ostringstream replay;
     printReplayCommand(replay, "benchmark", options, 9);
     require(replay.str() ==
                 "benchmark --profile port --seed 123 --scenario-offset 9 --scenario-count 1"
                 " --threads 2,8 --warmup 32 --cycles 128 --repetitions 1 --max-lookahead 4"
                 " --rebalance --no-precomputed-costs --describe-only --verbose"
-                " --queue-capacity 64",
+                " --queue-capacity 64 --working-set 4096 --working-set-sigma 333"
+                " --hot-access-ppm 800000 --memory-pattern-weights 1,2,3,4",
             "replay command omitted or reordered effective options");
 }
 
@@ -542,6 +686,7 @@ int main() {
         testTopologyAndLoadInvariants();
         testRandomProfileResamplingAndOverrides();
         testSchedulerFloorProfile();
+        testMemoryFootprintModel();
         testUint32CliBounds();
         testQueueCapacityBounds();
         testPortStorageBudget();

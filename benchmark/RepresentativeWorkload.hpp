@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -13,7 +14,7 @@
 
 namespace chronon::benchmark {
 
-inline constexpr uint32_t REPRESENTATIVE_WORKLOAD_VERSION = 2;
+inline constexpr uint32_t REPRESENTATIVE_WORKLOAD_VERSION = 3;
 inline constexpr uint32_t PROBABILITY_SCALE = 1'000'000;
 // Finite queues are allocated per connected unit and payload type. Keep the
 // per-port bound at the transport's standard ring size; zero remains the
@@ -33,11 +34,12 @@ inline constexpr uint32_t DEFAULT_TRANSPORT_RING_SLOTS = 4'096;
 inline constexpr uint32_t MAX_FORCED_DELAY = DEFAULT_TRANSPORT_RING_SLOTS / 2;
 inline constexpr uint64_t TRANSPORT_LANE_FIXED_BYTES = 2'048;
 inline constexpr uint64_t TRANSPORT_FIFO_FIXED_BYTES = 2'048;
-inline constexpr uint32_t WORKING_SET_SCALE_COUNT = 3;
-inline constexpr uint32_t MAX_WORKING_SET_SCALE = 1U << (WORKING_SET_SCALE_COUNT - 1);
-// Scratch vectors are materialized for every unit in a run. Validate their
-// worst-case aggregate before any scenario or simulation storage is reserved.
+// Working-set allocations are materialized for every representative unit in a
+// run. Validate their exact generated aggregate before simulation allocation.
 inline constexpr uint64_t MAX_TOTAL_WORKING_SET_BYTES = uint64_t{256} * 1024 * 1024;
+inline constexpr uint32_t CACHE_LINE_BYTES = 64;
+inline constexpr uint32_t MIN_WORKING_SET_BYTES = CACHE_LINE_BYTES;
+static_assert(std::has_single_bit(CACHE_LINE_BYTES));
 inline constexpr uint32_t MAX_SCENARIO_UNITS = 4'096;
 inline constexpr uint64_t MAX_SCENARIO_CHANNELS = 65'536;
 inline constexpr uint64_t MAX_SCENARIO_EDGES = 1'048'576;
@@ -47,6 +49,17 @@ inline constexpr std::array<uint32_t, 6> PAYLOAD_BYTES = {8, 16, 32, 64, 144, 25
 
 enum class PayloadClass : uint8_t { Bytes8, Bytes16, Bytes32, Bytes64, Bytes144, Bytes256 };
 enum class UnitKernel : uint8_t { Representative, SchedulerFloor };
+enum class MemoryAccessPattern : uint8_t {
+    RandomRmw,
+    StreamingRmw,
+    PointerChase,
+    HotColdRmw,
+    Count,
+    None = 0xff
+};
+
+inline constexpr size_t MEMORY_ACCESS_PATTERN_COUNT =
+    static_cast<size_t>(MemoryAccessPattern::Count);
 
 static_assert(PAYLOAD_BYTES.size() <= std::numeric_limits<uint8_t>::digits);
 
@@ -107,10 +120,13 @@ struct ScenarioConfig {
     uint32_t cycle_sigma_milli = 180;
     uint32_t normal_cap_milli = 2'580;
     uint32_t working_set_bytes = 8 * 1024;
+    uint32_t working_set_sigma_milli = 650;
+    uint32_t hot_access_probability_ppm = 900'000;
     uint32_t work_period = 256;
     uint32_t send_period = 1024;
     bool ensure_ring = true;
     UnitKernel unit_kernel = UnitKernel::Representative;
+    std::array<uint32_t, MEMORY_ACCESS_PATTERN_COUNT> memory_pattern_weights = {45, 20, 20, 15};
     std::array<uint32_t, PAYLOAD_BYTES.size()> payload_weights = {18, 22, 10, 13, 32, 5};
 
     friend bool operator==(const ScenarioConfig&, const ScenarioConfig&) = default;
@@ -121,6 +137,8 @@ struct UnitSpec {
     uint32_t base_work = 0;
     uint32_t drain_limit = 0;
     uint32_t working_set_bytes = 0;
+    uint32_t hot_set_bytes = 0;
+    MemoryAccessPattern memory_pattern = MemoryAccessPattern::None;
     uint8_t incoming_payload_mask = 0;
     std::vector<uint32_t> work_schedule;
 
@@ -152,6 +170,12 @@ struct ScenarioSummary {
     uint32_t broadcast_channels = 0;
     uint32_t max_indegree = 0;
     uint32_t max_outdegree = 0;
+    uint64_t unit_working_set_bytes = 0;
+    uint32_t min_unit_working_set_bytes = 0;
+    uint32_t median_unit_working_set_bytes = 0;
+    uint32_t p90_unit_working_set_bytes = 0;
+    uint32_t max_unit_working_set_bytes = 0;
+    std::array<uint32_t, MEMORY_ACCESS_PATTERN_COUNT> memory_pattern_counts{};
     uint64_t estimated_input_scratch_reserve_bytes = 0;
     uint64_t estimated_transport_reserve_bytes = 0;
 
@@ -237,11 +261,13 @@ namespace detail {
     return static_cast<uint32_t>(std::clamp<uint64_t>(scaled, 1, UINT32_MAX));
 }
 
-[[nodiscard]] inline uint32_t roundUpPowerOfTwo(uint32_t value) noexcept {
+[[nodiscard]] inline uint32_t roundToPowerOfTwo(uint32_t value) noexcept {
     value = std::max<uint32_t>(value, 64);
     if (std::has_single_bit(value)) return value;
     if (value > (uint32_t{1} << 30)) return uint32_t{1} << 30;
-    return std::bit_ceil(value);
+    const uint32_t lower = std::bit_floor(value);
+    const uint32_t upper = lower << 1;
+    return value - lower < upper - value ? lower : upper;
 }
 
 [[nodiscard]] inline PayloadClass choosePayload(const ScenarioConfig& config, uint64_t word) {
@@ -254,6 +280,21 @@ namespace detail {
         draw -= config.payload_weights[i];
     }
     return PayloadClass::Bytes256;
+}
+
+[[nodiscard]] inline MemoryAccessPattern chooseMemoryAccessPattern(const ScenarioConfig& config,
+                                                                   uint64_t word) {
+    uint64_t total = 0;
+    for (uint32_t weight : config.memory_pattern_weights) total += weight;
+    if (total == 0) throw std::invalid_argument("memory pattern weights must not all be zero");
+    uint64_t draw = word % total;
+    for (size_t i = 0; i < config.memory_pattern_weights.size(); ++i) {
+        if (draw < config.memory_pattern_weights[i]) {
+            return static_cast<MemoryAccessPattern>(i);
+        }
+        draw -= config.memory_pattern_weights[i];
+    }
+    return MemoryAccessPattern::HotColdRmw;
 }
 
 [[nodiscard]] inline uint32_t payloadBytes(PayloadClass payload) noexcept {
@@ -386,31 +427,32 @@ inline void validateConfig(const ScenarioConfig& config) {
         channel_schedule_bytes > MAX_SCENARIO_SCHEDULE_BYTES - unit_schedule_bytes) {
         throw std::invalid_argument("generated schedules exceed aggregate memory limit");
     }
-    if (config.working_set_bytes > (uint32_t{1} << 28)) {
-        throw std::invalid_argument("base working set is too large");
-    }
-    const uint64_t scaled_working_set =
-        static_cast<uint64_t>(config.working_set_bytes) * MAX_WORKING_SET_SCALE;
-    const uint32_t max_working_set_per_unit =
-        roundUpPowerOfTwo(static_cast<uint32_t>(scaled_working_set));
-    if (config.num_units > MAX_TOTAL_WORKING_SET_BYTES / max_working_set_per_unit) {
-        throw std::invalid_argument("generated working sets exceed aggregate memory limit");
+    if (config.unit_kernel == UnitKernel::Representative &&
+        (config.working_set_bytes < MIN_WORKING_SET_BYTES ||
+         config.working_set_bytes > MAX_TOTAL_WORKING_SET_BYTES)) {
+        throw std::invalid_argument("median working set is outside benchmark limits");
     }
     if (config.queue_capacity > MAX_FINITE_QUEUE_CAPACITY) {
         throw std::invalid_argument("finite queue capacity exceeds benchmark limit");
     }
     if (config.normal_cap_milli > 6'000 || config.unit_sigma_milli > 2'000 ||
-        config.cycle_sigma_milli > 2'000) {
+        config.cycle_sigma_milli > 2'000 || config.working_set_sigma_milli > 2'000) {
         throw std::invalid_argument("load distribution parameters exceed deterministic range");
     }
     const std::array probabilities = {
-        config.send_probability_ppm, config.burst_probability_ppm, config.hotspot_probability_ppm,
-        config.broadcast_probability_ppm, config.zero_delay_probability_ppm};
+        config.send_probability_ppm,       config.burst_probability_ppm,
+        config.hotspot_probability_ppm,    config.broadcast_probability_ppm,
+        config.zero_delay_probability_ppm, config.hot_access_probability_ppm};
     for (uint32_t probability : probabilities) {
         if (probability > PROBABILITY_SCALE) {
             throw std::invalid_argument(
                 "probabilities are expressed in ppm and must be <= 1000000");
         }
+    }
+    if (config.unit_kernel == UnitKernel::Representative &&
+        std::all_of(config.memory_pattern_weights.begin(), config.memory_pattern_weights.end(),
+                    [](uint32_t weight) { return weight == 0; })) {
+        throw std::invalid_argument("memory pattern weights must not all be zero");
     }
 }
 
@@ -437,21 +479,21 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
     hash.add(c.cycle_sigma_milli);
     hash.add(c.normal_cap_milli);
     hash.add(c.working_set_bytes);
+    hash.add(c.working_set_sigma_milli);
+    hash.add(c.hot_access_probability_ppm);
     hash.add(c.work_period);
     hash.add(c.send_period);
     hash.add(c.ensure_ring);
-    if (c.unit_kernel != UnitKernel::Representative) {
-        // Preserve all version-2 fingerprints for existing profiles while
-        // giving newly added execution kernels an explicit domain tag.
-        hash.add(uint64_t{0x554e49544b45524e});
-        hash.add(static_cast<uint8_t>(c.unit_kernel));
-    }
+    hash.add(static_cast<uint8_t>(c.unit_kernel));
+    for (uint32_t weight : c.memory_pattern_weights) hash.add(weight);
     for (uint32_t weight : c.payload_weights) hash.add(weight);
     for (const auto& unit : scenario.units) {
         hash.add(unit.id);
         hash.add(unit.base_work);
         hash.add(unit.drain_limit);
         hash.add(unit.working_set_bytes);
+        hash.add(unit.hot_set_bytes);
+        hash.add(static_cast<uint8_t>(unit.memory_pattern));
         for (uint32_t work : unit.work_schedule) hash.add(work);
     }
     for (const auto& channel : scenario.channels) {
@@ -484,6 +526,8 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
     constexpr uint64_t kUnitLoadDomain = 0x554e49544c4f4144ULL;
     constexpr uint64_t kCycleLoadDomain = 0x4359434c454c4f41ULL;
     constexpr uint64_t kWorkingSetDomain = 0x574f524b534554ULL;
+    constexpr uint64_t kMemoryPatternDomain = 0x4d454d504154544eULL;
+    constexpr uint64_t kHotSetDomain = 0x484f54534554ULL;
     for (uint32_t unit_id = 0; unit_id < config.num_units; ++unit_id) {
         UnitSpec unit;
         unit.id = unit_id;
@@ -498,11 +542,37 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
                 config.drain_limit,
                 detail::lognormalQ16(config.seed, kUnitLoadDomain + 32, unit_id, 180, 1'500)),
             uint32_t{1}, MAX_DRAIN_LIMIT);
-        const uint32_t working_set_scale =
-            1U << bounded(randomWord(config.seed, kWorkingSetDomain, unit_id),
-                          WORKING_SET_SCALE_COUNT);
-        unit.working_set_bytes =
-            detail::roundUpPowerOfTwo(config.working_set_bytes * working_set_scale);
+        if (config.unit_kernel == UnitKernel::Representative) {
+            const uint32_t working_set_multiplier =
+                detail::lognormalQ16(config.seed, kWorkingSetDomain, unit_id,
+                                     config.working_set_sigma_milli, config.normal_cap_milli);
+            unit.working_set_bytes = detail::roundToPowerOfTwo(
+                detail::scaleByQ16(config.working_set_bytes, working_set_multiplier));
+            unit.memory_pattern = detail::chooseMemoryAccessPattern(
+                config, randomWord(config.seed, kMemoryPatternDomain, unit_id));
+            unit.hot_set_bytes = unit.working_set_bytes;
+            if (unit.memory_pattern == MemoryAccessPattern::HotColdRmw) {
+                const uint32_t hot_set_shift =
+                    2 + bounded(randomWord(config.seed, kHotSetDomain, unit_id), 3);
+                unit.hot_set_bytes =
+                    detail::roundToPowerOfTwo(unit.working_set_bytes >> hot_set_shift);
+            }
+
+            if (unit.working_set_bytes >
+                MAX_TOTAL_WORKING_SET_BYTES - scenario.summary.unit_working_set_bytes) {
+                throw std::invalid_argument("generated working sets exceed aggregate memory limit");
+            }
+            scenario.summary.unit_working_set_bytes += unit.working_set_bytes;
+            if (scenario.summary.min_unit_working_set_bytes == 0) {
+                scenario.summary.min_unit_working_set_bytes = unit.working_set_bytes;
+            } else {
+                scenario.summary.min_unit_working_set_bytes =
+                    std::min(scenario.summary.min_unit_working_set_bytes, unit.working_set_bytes);
+            }
+            scenario.summary.max_unit_working_set_bytes =
+                std::max(scenario.summary.max_unit_working_set_bytes, unit.working_set_bytes);
+            ++scenario.summary.memory_pattern_counts[static_cast<size_t>(unit.memory_pattern)];
+        }
         unit.work_schedule.reserve(config.work_period);
         for (uint32_t slot = 0; slot < config.work_period; ++slot) {
             const uint64_t index = static_cast<uint64_t>(unit_id) * config.work_period + slot;
@@ -514,6 +584,17 @@ inline uint64_t fingerprintScenario(const Scenario& scenario) noexcept {
                                          config.cycle_sigma_milli, config.normal_cap_milli))));
         }
         scenario.units.push_back(std::move(unit));
+    }
+
+    if (scenario.summary.unit_working_set_bytes != 0) {
+        std::vector<uint32_t> working_sets;
+        working_sets.reserve(scenario.units.size());
+        for (const auto& unit : scenario.units) working_sets.push_back(unit.working_set_bytes);
+        std::sort(working_sets.begin(), working_sets.end());
+        const size_t median_index = (working_sets.size() + 1) / 2 - 1;
+        const size_t p90_index = (9 * working_sets.size() + 9) / 10 - 1;
+        scenario.summary.median_unit_working_set_bytes = working_sets[median_index];
+        scenario.summary.p90_unit_working_set_bytes = working_sets[p90_index];
     }
 
     constexpr uint64_t kPayloadDomain = 0x5041594c4f4144ULL;
