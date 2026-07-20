@@ -22,6 +22,7 @@ using chronon::benchmark::MAX_BENCHMARK_CYCLES;
 using chronon::benchmark::MAX_BENCHMARK_LOOKAHEAD;
 using chronon::benchmark::MAX_BENCHMARK_REPETITIONS;
 using chronon::benchmark::MAX_BENCHMARK_SCENARIOS;
+using chronon::benchmark::MAX_BENCHMARK_TARGET_SECONDS;
 using chronon::benchmark::MAX_BENCHMARK_WORKERS;
 using chronon::benchmark::MAX_DRAIN_LIMIT;
 using chronon::benchmark::MAX_FINITE_QUEUE_CAPACITY;
@@ -435,6 +436,10 @@ void testWorkerBounds() {
 }
 
 void testExecutionBounds() {
+    const auto defaults = parseArgs({"benchmark"});
+    require(defaults.cli.run.target_seconds == std::optional<double>{1.0},
+            "default benchmark duration is not one second");
+
     const auto maximum_scenarios =
         parseArgs({"benchmark", "--scenario-count", std::to_string(MAX_BENCHMARK_SCENARIOS)});
     require(maximum_scenarios.cli.scenario_count == MAX_BENCHMARK_SCENARIOS,
@@ -455,12 +460,30 @@ void testExecutionBounds() {
         parseArgs({"benchmark", "--cycles", std::to_string(MAX_BENCHMARK_CYCLES), "--warmup",
                    std::to_string(MAX_BENCHMARK_CYCLES)});
     require(maximum_cycles.cli.run.measured_cycles == MAX_BENCHMARK_CYCLES &&
-                maximum_cycles.cli.run.warmup_cycles == MAX_BENCHMARK_CYCLES,
+                maximum_cycles.cli.run.warmup_cycles == MAX_BENCHMARK_CYCLES &&
+                !maximum_cycles.cli.run.target_seconds,
             "maximum cycle count was rejected");
     require(rejects({"benchmark", "--cycles", std::to_string(MAX_BENCHMARK_CYCLES + 1)}),
             "oversized measured cycle count was accepted");
     require(rejects({"benchmark", "--warmup", std::to_string(MAX_BENCHMARK_CYCLES + 1)}),
             "oversized warmup cycle count was accepted");
+
+    const auto maximum_target =
+        parseArgs({"benchmark", "--target-seconds", std::to_string(MAX_BENCHMARK_TARGET_SECONDS)});
+    require(maximum_target.cli.run.target_seconds ==
+                std::optional<double>{MAX_BENCHMARK_TARGET_SECONDS},
+            "maximum target duration was rejected");
+    require(rejects({"benchmark", "--target-seconds",
+                     std::to_string(MAX_BENCHMARK_TARGET_SECONDS + 1.0)}),
+            "oversized target duration was accepted");
+    for (const char* invalid : {"0", "-1", "nan", "inf"}) {
+        require(rejects({"benchmark", "--target-seconds", invalid}),
+                "invalid target duration was accepted");
+    }
+    const auto quick = parseArgs({"benchmark", "--quick"});
+    require(!quick.cli.run.target_seconds && quick.cli.run.measured_cycles == 2'000 &&
+                quick.cli.repetitions == 1,
+            "quick mode did not select its fixed-cycle smoke configuration");
 
     const auto maximum_lookahead =
         parseArgs({"benchmark", "--max-lookahead", std::to_string(MAX_BENCHMARK_LOOKAHEAD)});
