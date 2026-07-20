@@ -41,7 +41,10 @@ template <typename RunProbe>
             probe_options.target_seconds.reset();
             probe_options.measured_cycles = probe_cycles;
             wall_seconds = run_probe(worker_count, probe_options);
-            if (wall_seconds >= sample_seconds || probe_cycles == MAX_BENCHMARK_CYCLES) break;
+            if (wall_seconds >= sample_seconds || probe_cycles == MAX_BENCHMARK_CYCLES ||
+                attempt + 1 == MAX_PROBE_ATTEMPTS) {
+                break;
+            }
 
             const double scale =
                 std::max(2.0, sample_seconds / std::max(wall_seconds, 1e-9) * 1.10);

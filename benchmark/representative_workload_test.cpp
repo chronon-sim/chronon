@@ -12,10 +12,12 @@
 #include <vector>
 
 #include "RepresentativeWorkload.hpp"
+#include "RepresentativeWorkloadCalibration.hpp"
 #include "RepresentativeWorkloadOptions.hpp"
 
 namespace {
 
+using chronon::benchmark::calibrateMeasuredCycles;
 using chronon::benchmark::generateScenario;
 using chronon::benchmark::inputScratchBytesPerSlot;
 using chronon::benchmark::MAX_BENCHMARK_CYCLES;
@@ -40,6 +42,7 @@ using chronon::benchmark::PAYLOAD_BYTES;
 using chronon::benchmark::PayloadClass;
 using chronon::benchmark::payloadMask;
 using chronon::benchmark::printReplayCommand;
+using chronon::benchmark::RunOptions;
 using chronon::benchmark::ScenarioConfig;
 using chronon::benchmark::scenarioConfigFor;
 using chronon::benchmark::transportFifoStorageBytes;
@@ -507,6 +510,26 @@ void testExecutionBounds() {
             "overflowing scenario index range was accepted");
 }
 
+void testCalibrationUsesMeasuredProbe() {
+    RunOptions options;
+    options.target_seconds = 0.1;
+    uint64_t last_measured_cycles = 0;
+    uint32_t probe_count = 0;
+    constexpr double PROBE_SECONDS = 0.009;
+    const auto calibration = calibrateMeasuredCycles(
+        std::vector<size_t>{1}, options, false,
+        [&](size_t workers, const RunOptions& probe_options) {
+            require(workers == 1, "calibration changed the requested worker count");
+            last_measured_cycles = probe_options.measured_cycles;
+            ++probe_count;
+            return PROBE_SECONDS;
+        });
+    const double expected_rate = static_cast<double>(last_measured_cycles) / PROBE_SECONDS;
+    require(probe_count == 3, "calibration did not exhaust the short-probe attempts");
+    require(std::abs(calibration.fastest_cycles_per_second - expected_rate) < 1e-9,
+            "calibration used an unmeasured cycle count for its rate");
+}
+
 void testWorkAndDrainBounds() {
     const auto maximum = parseArgs({"benchmark", "--work", std::to_string(MAX_MEDIAN_WORK),
                                     "--drain-limit", std::to_string(MAX_DRAIN_LIMIT)});
@@ -715,6 +738,7 @@ int main() {
         testPortStorageBudget();
         testWorkerBounds();
         testExecutionBounds();
+        testCalibrationUsesMeasuredProbe();
         testWorkAndDrainBounds();
         testWorkingSetBudget();
         testFixedDelayOverridesAllChannels();
