@@ -8,20 +8,17 @@
 
 // test_epoch_free_lookahead_determinism.cpp
 //
-// Correctness gate for the epoch-free lookahead scheduler
-// (TickSimulationConfig::enable_epoch_free_lookahead). Removing the per-epoch
-// std::barrier must NOT change results: the run-ahead bound moves from the
-// epoch boundary to lookahead_floor_ + max_lookahead_cycles, and MPSC delivery
-// relies on per-connection consumer-driven draining plus a single end-of-run
-// flush instead of a per-epoch central flush.
+// Correctness gate for the epoch-free lookahead scheduler. Run-ahead is bounded
+// by lookahead_floor_ + max_lookahead_cycles, and MPSC delivery relies on
+// per-connection consumer-driven draining.
 //
 // The topology is the heterogeneous-delay feedback loop from
 // test_mpsc_mixed_delay_determinism.cpp — the case most sensitive to a message
 // arriving one cycle early/late. We assert the epoch-free path reproduces the
 // sequential reference bit-for-bit across worker counts and across a
 // max_lookahead sweep (including 1, the tightest gate), AND that it actually
-// engaged (epochFreeRunCount() > 0) rather than silently falling back to the
-// barrier path. This also provides scheduler-level coverage for the
+// engaged (epochFreeRunCount() > 0) rather than selecting Sequential. This
+// also provides scheduler-level coverage for the
 // worker-local predecessor-progress cache in both the fixed-layout and dynamic
 // EpochFree driver; test_predecessor_cycle_cache.cpp owns its direct semantics.
 
@@ -160,6 +157,7 @@ struct RunResult {
     uint64_t checksum;
     uint64_t epoch_free_runs;
     uint64_t rebalances;
+    bool parallel;
 };
 
 // A and B fan in to C with delays (dA, dB); C -> D -> {A, B} closes a feedback
@@ -200,7 +198,7 @@ RunResult runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, 
     sim.initialize();
     sim.run(cycles);
     return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount(),
-            sim.rebalanceCount()};
+            sim.rebalanceCount(), sim.useParallelExecution()};
 }
 
 void verify_scheduler_timeline_does_not_veto_epoch_free(uint64_t cycles, unsigned hw) {
@@ -330,15 +328,10 @@ void verify(uint32_t dA, uint32_t dB, uint64_t cycles, unsigned hw) {
             const std::string label =
                 base + " nw=" + std::to_string(nw) + " la=" + std::to_string(la);
 
-            // Sanity: barrier lookahead still matches (our edits must not perturb it).
-            RunResult barrier =
-                runOnce(dA, dB, nw, /*lookahead=*/true, /*epoch_free=*/false, la, cycles);
-            check(barrier.checksum == ref, label + " barrier-lookahead == ref");
-
-            // The actual gate: epoch-free must match AND must have engaged.
             RunResult ef = runOnce(dA, dB, nw, /*lookahead=*/true, /*epoch_free=*/true, la, cycles);
             check(ef.checksum == ref, label + " epoch-free == ref");
             check(ef.epoch_free_runs > 0, label + " epoch-free actually engaged");
+            check(ef.parallel, label + " selected epoch-free execution");
         }
     }
 }
@@ -364,8 +357,7 @@ void verify_transport_headroom(uint64_t cycles, unsigned hw) {
           "transport-clamp keeps epoch-free past configured ring capacity");
 
     // (1b) A one-entry DFF-style edge is still epoch-free safe. The scheduler
-    //      represents it as a zero-slack reverse dependency instead of falling
-    //      back to per-epoch progress barriers.
+    //      represents it as a zero-slack reverse dependency.
     const uint64_t ref_cap1 =
         runOnce(1, 1, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
                 /*max_lookahead=*/100, cycles, /*out_rate=*/1, /*scheduler_timeline=*/false,
@@ -385,6 +377,7 @@ void verify_transport_headroom(uint64_t cycles, unsigned hw) {
                                  /*max_lookahead=*/64, cycles, /*out_rate=*/kUnlimited);
     check(uncapped.checksum == ref, "transport unproven default-rate == ref");
     check(uncapped.epoch_free_runs == 0, "transport unproven default-rate vetoes epoch-free");
+    check(!uncapped.parallel, "transport unproven default-rate selects sequential");
     RunResult declared = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
                                  /*max_lookahead=*/64, cycles, /*out_rate=*/kUnlimited,
                                  /*scheduler_timeline=*/false, /*dynamic_rebalance=*/false,
@@ -394,7 +387,7 @@ void verify_transport_headroom(uint64_t cycles, unsigned hw) {
 
     // (3) Long edge delay: the consumer can't drain not-yet-due entries, so even a
     //     small max_lookahead exceeds the default ring headroom. The scheduler
-    //     should grow that ring instead of falling back to epochs.
+    //     should grow that ring and retain epoch-free execution.
     const uint64_t ref_d =
         runOnce(5000, 5, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
                 /*max_lookahead=*/100, cycles)
@@ -431,7 +424,7 @@ RunResult runCycle(size_t num_threads, bool epoch_free, uint32_t max_lookahead, 
     sim.initialize();
     sim.run(cycles);
     return {A->checksum() ^ B->checksum() ^ C->checksum() ^ D->checksum(), sim.epochFreeRunCount(),
-            sim.rebalanceCount()};
+            sim.rebalanceCount(), sim.useParallelExecution()};
 }
 
 // The SPSC lock-free ring (USABLE_CAPACITY, 4096) is bounded even for unlimited
@@ -486,7 +479,7 @@ void verify_dynamic_rebalance_clamps_headroom(uint64_t cycles, unsigned hw) {
                                /*max_lookahead=*/64, cycles, /*out_rate=*/1,
                                /*scheduler_timeline=*/false, /*dynamic_rebalance=*/true);
     check(unsafe.checksum == ref_d, "dynamic-rebalance headroom resize == ref");
-    check(unsafe.epoch_free_runs > 0, "dynamic rebalance avoids epoch fallback for long delay");
+    check(unsafe.epoch_free_runs > 0, "dynamic rebalance keeps epoch-free for long delay");
 
     const size_t kUnlimited = OutPort<uint64_t>::UNLIMITED_CAPACITY;
     RunResult uncapped = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
@@ -495,6 +488,8 @@ void verify_dynamic_rebalance_clamps_headroom(uint64_t cycles, unsigned hw) {
     check(uncapped.checksum == ref, "dynamic-rebalance unproven default-rate == ref");
     check(uncapped.epoch_free_runs == 0,
           "dynamic rebalance unproven default-rate vetoes epoch-free");
+    check(!uncapped.parallel,
+          "dynamic rebalance unproven default-rate selects sequential execution");
     RunResult declared = runOnce(2, 5, /*threads=*/2, /*lookahead=*/true, /*epoch_free=*/true,
                                  /*max_lookahead=*/64, cycles, /*out_rate=*/kUnlimited,
                                  /*scheduler_timeline=*/false, /*dynamic_rebalance=*/true,
@@ -570,20 +565,17 @@ std::vector<uint64_t> readCounterColumn(const std::filesystem::path& csv,
     return values;
 }
 
-void verify_all_scheduler_modes_use_spsc_periodic_snapshots(unsigned hw) {
+void verify_remaining_schedulers_use_spsc_periodic_snapshots(unsigned hw) {
     namespace fs = std::filesystem;
     struct Mode {
         const char* name;
         bool parallel;
-        bool lookahead;
         bool direct_run;
         bool idle;
     };
-    const std::array modes{Mode{"sequential", false, false, false, false},
-                           Mode{"sequential-run", false, false, true, false},
-                           Mode{"barrier", hw >= 2, false, false, false},
-                           Mode{"progress", hw >= 2, true, false, false},
-                           Mode{"progress-idle", hw >= 2, true, false, true}};
+    const std::array modes{
+        Mode{"sequential", false, false, false}, Mode{"sequential-run", false, true, false},
+        Mode{"epoch-free", hw >= 2, false, false}, Mode{"epoch-free-idle", hw >= 2, false, true}};
     for (const auto& mode : modes) {
         const fs::path output =
             fs::temp_directory_path() / (std::string("chronon-periodic-") + mode.name);
@@ -597,8 +589,8 @@ void verify_all_scheduler_modes_use_spsc_periodic_snapshots(unsigned hw) {
         TickSimulationConfig cfg;
         cfg.num_threads = 2;
         cfg.enable_parallel = mode.parallel;
-        cfg.enable_lookahead = mode.lookahead;
-        cfg.enable_epoch_free_lookahead = false;
+        cfg.enable_lookahead = true;
+        cfg.enable_epoch_free_lookahead = true;
         cfg.enable_dynamic_rebalance = false;
         cfg.max_lookahead_cycles = 64;
         cfg.initial_partition_sync_cost_ns = 0.0;
@@ -615,6 +607,8 @@ void verify_all_scheduler_modes_use_spsc_periodic_snapshots(unsigned hw) {
             node->setObservationContext(context);
         }
         sim.initialize();
+        check(sim.useParallelExecution() == mode.parallel,
+              std::string(mode.name) + " selected the expected scheduler");
         manager.reregisterAllCounters();
         nodes.front()->info<"runtime observation after counter registration">();
         manager.startBackend();
@@ -943,7 +937,7 @@ int main() {
     verify_run_until_termination_uses_epoch_free(hw);
     verify_run_until_termination_default_max_after_warmup(hw);
     verify_run_until_termination_accounts_nonzero_worker(hw);
-    verify_all_scheduler_modes_use_spsc_periodic_snapshots(hw);
+    verify_remaining_schedulers_use_spsc_periodic_snapshots(hw);
     verify_epoch_free_pushes_periodic_snapshots_without_reentry(hw, false);
     verify_epoch_free_pushes_periodic_snapshots_without_reentry(hw, true);
     verify_periodic_snapshots_follow_dynamic_migration(hw);

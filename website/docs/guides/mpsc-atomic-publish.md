@@ -13,7 +13,7 @@ Port transport is part of the simulation's timing contract, not just a generic
 container. The implementation must preserve all of these properties:
 
 - `arrive_cycle = send_cycle + connection.delay`;
-- identical results for sequential, barrier, and lookahead execution;
+- identical results for sequential and epoch-free lookahead execution;
 - deterministic fan-in order independent of host-thread interleaving;
 - non-blocking `send()` with model-visible back pressure;
 - no allocation, lock, or reclamation on the steady-state data path;
@@ -39,7 +39,7 @@ There is one producer publication. Unbounded InPorts consume the selected lane
 slot in place. Bounded InPorts perform one receiver-owned move into a
 preallocated shared ring, then consume from that ring; they do not copy the
 payload. A producer no longer writes a `Connection` staging ring for a scheduler
-arbiter, and the scheduler does not scan all ports at barriers or epoch
+arbiter, and the scheduler does not scan all ports at synchronization
 boundaries. Only Units owning bounded MPSC destinations keep a compact list of
 cycle-prepared ports and invoke it immediately before `tick()`.
 

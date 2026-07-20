@@ -16,7 +16,7 @@ simulation:
     num_workers: 2
     enable_lookahead: true
     max_lookahead_cycles: 256
-    epoch_size: 1024
+    epoch_size: 1024 # Host predicate / Sequential polling interval
     run_cycles: 0 # 0 = run until completion
 
     # Observation configuration (automatic setup)

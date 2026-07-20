@@ -155,9 +155,13 @@ int SimulationApp::run(int argc, char* argv[]) {
             std::cout << "\nConfiguration loaded successfully:\n";
             std::cout << "  Name:        " << result.config.name << "\n";
             std::cout << "  Workers:     " << result.config.num_workers << "\n";
-            std::cout << "  Lookahead:   "
-                      << (result.config.enable_lookahead ? "enabled" : "disabled") << "\n";
-            std::cout << "  Epoch size:  " << result.config.epoch_size << "\n";
+            std::cout << "  Epoch-free:  "
+                      << (result.config.enable_parallel && result.config.enable_lookahead &&
+                                  result.config.enable_epoch_free_lookahead
+                              ? "requested"
+                              : "disabled (Sequential)")
+                      << "\n";
+            std::cout << "  Sequential poll interval: " << result.config.epoch_size << "\n";
             std::cout << "  Units:       " << result.units_created << "\n";
             std::cout << "  Ports:       " << result.ports_registered << "\n";
             std::cout << "  Connections: " << result.connections_made << "\n";
@@ -489,7 +493,7 @@ void SimulationApp::printUsage(std::ostream& os, const char* program) {
     os << "  -o, --output-dir <path>   Override observation output directory\n";
     os << "  -n, --run-cycles <N>      Override simulation run cycles (0 = until completion)\n";
     os << "  -t, --threads <N>         Override number of worker threads\n";
-    os << "  --epoch-size <N>          Override simulation epoch size in cycles\n";
+    os << "  --epoch-size <N>          Set host/Sequential polling interval (compatibility)\n";
     os << "  --no-observe              Disable observation system\n";
     os << "  -v, --verbose             Increase output verbosity\n";
     os << "  -h, --help                Show this help message\n";

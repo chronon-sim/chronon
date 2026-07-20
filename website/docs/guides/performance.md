@@ -240,8 +240,8 @@ YAML and CLI equivalents:
 ```yaml
 simulation:
   max_lookahead_cycles: 256              # uint32_t
-  enable_epoch_free_lookahead: true      # Drop the per-epoch barrier when safe
-  epoch_size: 1024                       # Deprecated: fallback-only
+  enable_epoch_free_lookahead: true      # Request the epoch-free parallel path
+  epoch_size: 1024                       # Host predicate / Sequential polling interval
   enable_weighted_partitioning: true     # Cluster-aware thread assignment (default)
   partition_solver: SA                   # Initial solver: SA or Weighted
   initial_partition_sync_cost_ns: 8.0    # Locality weight for deterministic placement
@@ -263,14 +263,12 @@ frequent migrations.
 ./examples/cpu_pipeline_yaml_example config.yaml --param simulation.max_lookahead_cycles=256
 ```
 
-When the transport-headroom gate is satisfied, `enable_epoch_free_lookahead`
-(default on) removes the per-epoch barrier entirely instead of just widening it:
-run-ahead is then bounded only by dependency progress and
-`max_lookahead_cycles`. If the gate rejects the topology, Chronon falls back to
-the deprecated per-epoch path. Treat that fallback warning as a topology or
-capacity issue to fix before the fallback is removed. Dynamic rebalance remains
-opt-in and can run on the epoch-free dynamic driver when its gate holds; see
-[Epoch-Free Lookahead](scheduling.md) for the
+When the transport-headroom gate is satisfied, the epoch-free workers use one
+run-spanning window: run-ahead is bounded only by dependency progress and
+`max_lookahead_cycles`. If the gate rejects the topology, Chronon selects
+Sequential and logs the reason; there is no barrier-based parallel fallback.
+Dynamic rebalance remains opt-in and can run on the epoch-free dynamic driver
+when its gate holds; see [Epoch-Free Lookahead](scheduling.md) for the
 conditions and direct-lane MPSC requirements.
 
 Notes:

@@ -405,8 +405,8 @@ void test_mpsc_epoch_free_headroom_sizes_destination_queue() {
     std::cout << "PASSED\n";
 }
 
-void test_zero_slack_feedback_falls_back_to_barrier() {
-    std::cout << "Testing zero-slack feedback falls back to barrier... ";
+void test_zero_slack_feedback_falls_back_to_sequential() {
+    std::cout << "Testing zero-slack feedback falls back to sequential... ";
 
     TickSimulationConfig config;
     config.num_threads = 2;
@@ -436,14 +436,15 @@ void test_zero_slack_feedback_falls_back_to_barrier() {
     sim.connect(b->peer_out, a->peer_in, 1);
 
     sim.initialize();
-    require(sim.useParallelExecution(), "zero-slack feedback test did not enter parallel mode");
+    require(!sim.useParallelExecution(),
+            "zero-slack feedback must not enter the epoch-free scheduler");
 
     sim.run(8);
 
     require(sim.epochFreeRunCount() == 0,
             "zero-slack feedback cycle should veto epoch-free lookahead");
     require(a->ticks() == 8 && b->ticks() == 8,
-            "barrier fallback did not execute zero-slack feedback units");
+            "sequential fallback did not execute zero-slack feedback units");
 
     std::cout << "PASSED\n";
 }
@@ -907,15 +908,15 @@ void test_parallel_fallback_warns_via_observe() {
     std::cout << "PASSED\n";
 }
 
-void test_deprecated_epoch_fallback_warns_via_observe() {
-    std::cout << "Testing deprecated epoch fallback emits observe warning... ";
+void test_epoch_free_disabled_falls_back_to_sequential() {
+    std::cout << "Testing disabled epoch-free mode falls back to sequential... ";
 
     auto& obs_mgr = observe::ObservationManager::instance();
     obs_mgr.reset();
 
     const std::filesystem::path out_dir =
         std::filesystem::temp_directory_path() /
-        ("chronon_deprecated_epoch_fallback_warn_" + std::to_string(getpid()));
+        ("chronon_epoch_free_disabled_warn_" + std::to_string(getpid()));
     std::filesystem::remove_all(out_dir);
 
     observe::ObservationYAMLConfig obs_config;
@@ -944,7 +945,8 @@ void test_deprecated_epoch_fallback_warns_via_observe() {
         createMixedDelayFeedbackGraph(sim);
 
         sim.initialize();
-        require(sim.useParallelExecution(), "deprecated fallback test did not enter parallel mode");
+        require(!sim.useParallelExecution(),
+                "disabled epoch-free mode unexpectedly entered parallel execution");
 
         obs_mgr.startBackend();
         warn_log = obs_mgr.backend()->outputDir() / "warn.log";
@@ -953,13 +955,13 @@ void test_deprecated_epoch_fallback_warns_via_observe() {
     }
 
     const std::string content = readTextFile(warn_log);
-    require(content.find("[ WARN] simulation: DEPRECATED: per-epoch lookahead fallback") !=
-                std::string::npos,
-            "deprecated epoch fallback warning was not written through observe");
+    require(content.find("[ WARN] simulation: parallel execution requested but falling back to "
+                         "sequential") != std::string::npos,
+            "sequential fallback warning was not written through observe");
     require(content.find("reason=enable_epoch_free_lookahead=false") != std::string::npos,
-            "deprecated epoch fallback warning omitted veto reason");
-    require(countOccurrences(content, "per-epoch lookahead fallback") == 1,
-            "deprecated epoch fallback warning emitted more than once");
+            "sequential fallback warning omitted epoch-free veto reason");
+    require(countOccurrences(content, "falling back to sequential") == 1,
+            "sequential fallback warning emitted more than once");
 
     obs_mgr.reset();
     std::filesystem::remove_all(out_dir);
@@ -977,7 +979,7 @@ int main() {
     test_registered_mpsc_capacity_sizes_destination_queue();
     test_mpsc_epoch_free_headroom_respects_user_capacity();
     test_mpsc_epoch_free_headroom_sizes_destination_queue();
-    test_zero_slack_feedback_falls_back_to_barrier();
+    test_zero_slack_feedback_falls_back_to_sequential();
     test_registered_capacity_only_uses_source_rate_for_headroom();
     test_registered_capacity_only_does_not_throttle_rate();
     test_registered_edge_rate_throttles_mpsc_pushes();
@@ -991,7 +993,7 @@ int main() {
     test_spsc_capacity_receive_all_returns_prior_cycle_credit();
     test_small_non_tight_graph_parallel_fallback();
     test_parallel_fallback_warns_via_observe();
-    test_deprecated_epoch_fallback_warns_via_observe();
+    test_epoch_free_disabled_falls_back_to_sequential();
 
     std::cout << "\n=== Thread queue hardening tests PASSED ===\n";
     return 0;

@@ -56,12 +56,11 @@ Chronon is a high-performance tick-based simulation framework for CPU microarchi
 | Configuration | `src/sender/config/` | SenderConfigLoader, SenderSimulationBuilder for YAML parsing |
 | App | `src/sender/app/` | SimulationApp unified entry point with CLI support |
 
-**Execution modes** (selected automatically; all cycle-accurate, differ only in speed):
-- **Sequential** — single thread, or when parallelism isn't beneficial
-- **Barrier** — parallel, per-cycle `sync_wait`; used when tight (`delay=0`) edges cross thread clusters
-- **Lookahead** — parallel, per-cluster progress atoms, one `sync_wait` per epoch (default fast path)
+**Execution paths** (selected automatically; both are cycle-accurate):
+- **Sequential** — selected when parallelism is disabled, not beneficial, or fails the epoch-free safety gate
+- **Epoch-free lookahead** — persistent parallel workers advance tight clusters against dependency-progress atomics, with no per-cycle or per-epoch barrier
 
-There is no separate scheduler class; all three live in `TickSimulation` (`TickSimulation.cpp`, `TickSimulationParallel.cpp`).
+There is no separate scheduler class; both paths live in `TickSimulation` (`TickSimulation.cpp`, `TickSimulationParallel.cpp`).
 
 ### Detailed Documentation
 

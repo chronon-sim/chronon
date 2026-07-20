@@ -165,43 +165,28 @@ combinational logic into a single unit with explicit internal ordering.
 
 ## TickSimulation Execution Model
 
-TickSimulation uses stdexec::static_thread_pool for parallel execution. All scheduling logic (sequential, barrier, and lookahead modes) lives inside `TickSimulation` — there is no separate scheduler class.
+TickSimulation uses `stdexec::static_thread_pool` for epoch-free parallel
+execution. The epoch-free scheduler and the sequential reference path both live
+inside `TickSimulation`; there is no separate scheduler class.
 
 ```cpp
 // TickSimulation uses stdexec
 ::exec::static_thread_pool pool_{num_threads};
 
-// Barrier mode: per-cycle sync
-auto work = stdexec::bulk(
-    stdexec::just(),
-    stdexec::par,
-    units_.size(),
-    [this](std::size_t idx) {
-        unit_ptrs_[idx]->executeTick();
-    }
-);
-auto scheduled_work = stdexec::starts_on(sched, std::move(work));
-stdexec::sync_wait(std::move(scheduled_work));
-
-// Lookahead mode: iterate until convergence
-while (made_progress) {
-    compute_targets_for_all_units();
-    stdexec::bulk(...);  // Execute units to targets
-    stdexec::sync_wait(...);
-    update_progress();
-}
+// Epoch-free: one persistent worker launch for the complete run.
+auto work = stdexec::bulk(stdexec::just(), stdexec::par, worker_count,
+                          [this](size_t worker) { executeThreadRun_(worker); });
+stdexec::sync_wait(stdexec::starts_on(pool_.get_scheduler(), std::move(work)));
 ```
 
 ### Execution Modes
 
-TickSimulation selects execution mode based on topology:
+TickSimulation selects one of two execution paths during initialization:
 
 | Mode | Condition | Description |
 |------|-----------|-------------|
-| Sequential | Single-threaded or not beneficial | Units execute in order per cycle |
-| Barrier | Tight connections present | Per-cycle sync with stdexec::bulk |
-| Lookahead | No tight connections | Units run ahead within safe boundaries |
-| Cluster-aware | Tight intra-cluster only | Groups on same thread, lookahead between |
+| Sequential | Single-threaded, parallelism not beneficial, or an epoch-free safety gate fails | Units execute in topological order per cycle |
+| Epoch-free lookahead | Parallelism is beneficial and every dependency/transport gate is proven | Persistent workers advance tight clusters from predecessor progress |
 
 ### Lazy Wakeup And Multi-Rate Ticks
 
@@ -272,19 +257,12 @@ the wake at its next scheduled opportunity.
 
 ### Epoch-Free Lookahead
 
-The persistent-worker lookahead path can either synchronize all worker threads
-at a `std::barrier` every `epoch_size` cycles, or use epoch-free lookahead. The
-per-epoch barrier is a conservative fallback: within an epoch, clusters advance
-out of order on their own predecessor dependencies, but every thread still waits
-for the slowest one at each boundary.
-
-`enable_epoch_free_lookahead` (default **on**) removes that barrier when the
-runtime can prove it is safe: the whole run becomes a single window in which
-run-ahead is bounded solely by
+Epoch-free lookahead launches persistent workers once for the complete run.
+The run is a single window in which run-ahead is bounded by
 `lookahead_floor_ + max_lookahead_cycles` (refreshed lazily as the global-minimum
 cluster advances), dependency progress, and direct-lane transport headroom.
-MPSC payloads need neither per-epoch arbitration nor a run-end flush. Results
-stay bit-identical to every other mode; only wall-clock changes.
+MPSC payloads need neither centralized arbitration nor a run-end flush. Results
+remain bit-identical to Sequential; only wall-clock behavior changes.
 
 #### Normative scheduler-equivalence contract
 
@@ -314,22 +292,16 @@ declared cycles and move a complete cluster while all workers are quiescent;
 this exercises live queues and receiver filters without adding a callback or
 branch to the production worker loop.
 
-The per-epoch lookahead fallback is deprecated and will be removed in a future
-release. It remains only as a compatibility/safety fallback while epoch-free
-coverage is hardened. Keep `enable_epoch_free_lookahead` enabled and treat any
-runtime fallback warning as a topology or headroom issue to fix. `epoch_size`
-only affects the deprecated fallback; epoch-free lookahead ignores it.
+The old per-cycle and per-epoch barrier schedulers have been removed. If the
+safety gate rejects epoch-free execution, Chronon selects Sequential during
+initialization and reports the veto reason. `epoch_size` is now only a host
+predicate and Sequential `runUntilTermination()` polling interval.
+Scheduler timeline tracing does not veto epoch-free execution.
 
-If the safety gate rejects epoch-free execution, Chronon transparently falls
-back to the per-epoch path. Scheduler timeline tracing does not veto epoch-free
-lookahead; idle fast paths are then paced by dependency progress and
-`max_lookahead_cycles`, not by `epoch_size`.
-
-Dynamic rebalance does not veto epoch-free lookahead. Rebalance remains opt-in,
-but when `enable_dynamic_rebalance: true` and the epoch-free dependency gate
-holds, Chronon uses the epoch-free dynamic driver and commits whole-cluster
-migrations only at scheduler fence points. If the epoch-free gate is rejected,
-the dynamic path falls back to the explicit per-epoch driver.
+Dynamic rebalance remains opt-in. When `enable_dynamic_rebalance: true` and the
+epoch-free dependency gate holds, Chronon commits whole-cluster migrations only
+at scheduler fence points. A safety-gate rejection selects Sequential and does
+not run dynamic migration.
 
 Each EpochFree worker keeps a private shadow of the last acquired progress value
 for every predecessor cluster. Cluster progress is release-published and
@@ -341,19 +313,16 @@ lookahead floor has a separate reserved slot. Dynamic migration needs no cache
 invalidation because cluster ids and their progress slots remain stable and the
 published cycle never moves backward.
 
-**When it engages.** The dispatch gate keeps the per-epoch barrier path unless
-*all* of the following hold; otherwise it transparently falls back (no result
-change):
+**When it engages.** Epoch-free is selected only when all of the following
+hold; otherwise Chronon selects Sequential without changing model results:
 
 - `enable_epoch_free_lookahead` is set and `max_lookahead_cycles > 0`;
-- the run uses the persistent path — reached via `TickSimulation::run()` or
-  `runUntilTermination()`;
 - every MPSC input port has fully-resolved per-connection producer progress;
-- when dynamic rebalance is disabled, **cross-thread buffer headroom suffices
-  for every connection** (see below).
+- **cross-thread buffer headroom suffices for every connection** (see below);
+- the dependency/headroom graph contains no zero-slack cluster cycle.
 
-**Cross-thread buffer headroom.** In fixed-layout epoch-free lookahead, without
-the per-epoch drain, a producer can run ahead of a consumer and leave entries
+**Cross-thread buffer headroom.** In epoch-free lookahead, a producer can run
+ahead of a consumer and leave entries
 buffered in the connection's cross-thread ring — a direct per-Connection SPSC
 lane for a multi-producer port, or the SPSC lock-free ring for a single-producer
 cross-thread edge. For bounded `InPort`s, these rings are sized at
@@ -372,8 +341,8 @@ where `per_cycle_send_rate` is the source `OutPort`'s per-cycle send cap (an
 uncapped source forces a veto), `ring slots` is the usable physical ring
 capacity, and `edge_delay` accounts for not-yet-due entries the consumer cannot
 drain. Same-thread connections drain synchronously and impose no bound. If any
-cross-thread connection's headroom is `<= max_lookahead_cycles`, the
-fixed-layout run falls back to the barrier path. To use fixed-layout epoch-free
+cross-thread connection cannot expose a safe progress dependency, the
+simulation selects Sequential. To use epoch-free
 with unlimited-capacity cross-thread edges, give the producing `OutPort` a
 per-cycle send cap and keep `max_lookahead_cycles + edge_delay` within the
 default physical ring, or use an explicit bounded `InPort` capacity large enough
@@ -430,18 +399,17 @@ struct TickSimulationConfig {
     // Thread pool configuration
     size_t num_threads = std::thread::hardware_concurrency();
 
-    // Scheduler selection (placement is always cluster-aware: cluster.size()==1
-    // is the no-tight-coupling fallback).
-    //   enable_parallel=false              -> Sequential
-    //   enable_parallel && !enable_lookahead -> Barrier (per-cycle sync across clusters)
-    //   enable_parallel &&  enable_lookahead -> Lookahead (per-cluster progress atomics)
+    // Scheduler selection (placement is always cluster-aware).
+    //   enable_parallel=false -> Sequential
+    //   all epoch-free gates proven -> Epoch-free
+    //   any epoch-free gate rejected -> Sequential
     bool enable_parallel = true;
-    bool enable_lookahead = true;
+    bool enable_lookahead = true;  // false is a compatibility request for Sequential
 
     // Lookahead configuration
     uint32_t max_lookahead_cycles = 100;    // Max cycles a unit can run ahead
-    uint64_t epoch_size = 64;               // Deprecated: fallback-only
-    bool enable_epoch_free_lookahead = true;  // Drop the per-epoch barrier when safe
+    uint64_t epoch_size = 64;               // Host predicate / Sequential poll interval
+    bool enable_epoch_free_lookahead = true;  // false forces Sequential
 
     // Debug options
     bool trace_execution = false;           // Log execution mode selection
@@ -460,7 +428,9 @@ struct TickSimulationConfig {
 };
 ```
 
-These settings can be configured via YAML (`enable_parallel`, `enable_lookahead`) or set directly in code. All scheduling modes produce identical cycle-accurate results — they differ only in wall-clock performance.
+These settings can be configured via YAML or set directly in code. Sequential
+and epoch-free execution produce identical cycle-accurate model behavior; they
+differ only in wall-clock performance and scheduler diagnostics.
 
 Dynamic rebalance is enabled by default. It samples unit tick cost periodically, combines
 measured active cost with dependency topology and wait attribution, and migrates
@@ -474,13 +444,12 @@ rebalances.
 
 ### Exception Handling in Execution Paths
 
-All execution modes wrap tick calls with try-catch to capture exceptions with crash context:
+Both execution paths capture exceptions with crash context:
 
 | Mode | Strategy | Overhead |
 |------|----------|----------|
 | Sequential | try-catch outside outer loop | Zero (Itanium zero-cost ABI) |
-| Parallel (bulk) | try-catch inside each lambda body; stdexec propagates exceptions natively via `set_error` / `sync_wait` | Zero per non-exception iteration |
-| Progress-based (stdexec::bulk) | try-catch around inner loop; on exception, calls `stop_source_->request_stop()` to break spin-waits, then rethrows for stdexec native propagation | Zero per non-exception iteration |
+| Epoch-free (`stdexec::bulk`) | try-catch around each worker loop; requests stop to break peer spin-waits, then rethrows through stdexec | Zero per non-exception iteration |
 
 A unified `stdexec::inplace_stop_source` handles both exception-driven abort and unit-initiated termination. Worker spin-waits check `token.stop_requested()` to exit promptly on either condition. Exceptions are wrapped as `TickException` with unit name and cycle, then rethrown on the main thread by `stdexec::sync_wait`.
 
@@ -534,7 +503,7 @@ max_thread_cost * 1.10 < total_sequential_cost
 
 The 10% overhead factor accounts for synchronization costs. This heuristic correctly accepts parallelization at moderate imbalance (e.g., 1.75x speedup) while rejecting extreme cases where one thread dominates.
 
-### Fallback Paths
+### Placement Fallbacks
 
 When weighted partitioning is disabled or fewer than 4 units exist:
 

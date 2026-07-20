@@ -20,8 +20,8 @@ Perfetto timeline:
 
 - `SchedulerTimelineTraceConfig` stores YAML/C++ configuration.
 - `SchedulerTimelineTrace` buffers per-stream events.
-- `TickSimulation` records events in the existing progress-based and barrier
-  scheduler paths.
+- `TickSimulation` records events in the Sequential and epoch-free scheduler
+  paths.
 - When the observation backend is running with a timeline sink, the recorded
   scheduler slices merge into the unified `timeline.pftrace` (written during
   backend shutdown), alongside simulation trace events and counter tracks.

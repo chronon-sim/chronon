@@ -33,34 +33,29 @@ struct TickSimulationConfig {
     size_t num_threads = std::thread::hardware_concurrency();
 
     /// Scheduler selection:
-    /// - !enable_parallel                      → Sequential (single-thread)
-    /// - enable_parallel && !enable_lookahead  → Barrier    (per-cycle sync)
-    /// - enable_parallel &&  enable_lookahead  → Lookahead  (per-cluster atomics)
+    /// - !enable_parallel                         → Sequential
+    /// - all epoch-free safety gates are satisfied → Epoch-free lookahead
+    /// - otherwise                                → Sequential fallback
     bool enable_parallel = true;
+    /// Compatibility switch. False now forces Sequential; the removed
+    /// per-cycle barrier scheduler is no longer selectable.
     bool enable_lookahead = true;
 
     uint32_t max_lookahead_cycles = 100;
-    /// Deprecated compatibility knob for the per-epoch lookahead fallback.
-    /// Epoch-free lookahead ignores this value; it will be removed or ignored
-    /// once the fallback scheduler is removed.
+    /// Host predicate and Sequential termination polling interval. Epoch-free
+    /// runUntilTermination ignores this value because stop propagates directly.
     uint64_t epoch_size = 64;
 
-    /// Epoch-free lookahead: in the persistent-worker lookahead path, collapse
-    /// the per-epoch std::barrier into a single
-    /// run-spanning window. Run-ahead is then bounded by lookahead_floor_ +
+    /// Epoch-free lookahead uses one persistent-worker, run-spanning window.
+    /// Run-ahead is bounded by lookahead_floor_ +
     /// max_lookahead_cycles plus per-edge queue-headroom dependencies. MPSC
     /// lanes require neither centralized scheduler arbitration nor a run-end
     /// flush. Bounded destinations perform aggregate admission on their owning
     /// Unit immediately before its tick.
-    /// Engaged by runParallel() only when the persistent path is eligible,
-    /// max_lookahead_cycles is positive, and every MPSC port has fully resolved
-    /// per-connection progress; otherwise it falls back to the barrier path.
-    /// Results are identical to the barrier path — it trades per-epoch straggler
-    /// idle for lookahead-window slack.
-    ///
-    /// Setting this to false selects the deprecated per-epoch lookahead
-    /// fallback. That fallback is retained for compatibility and will be
-    /// removed in a future release.
+    /// Engaged only when max_lookahead_cycles is positive and every MPSC port
+    /// has fully resolved per-connection progress and queue headroom. A failed
+    /// safety gate selects Sequential; no barrier-based fallback remains.
+    /// Setting this compatibility switch to false also forces Sequential.
     bool enable_epoch_free_lookahead = true;
 
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< 1 GHz default.

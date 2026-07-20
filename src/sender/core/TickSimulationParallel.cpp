@@ -7,10 +7,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 /// @file
-/// TickSimulation parallel runtime: progress-based epoch execution,
-/// cross-thread dependency spin-waits, and progress-sync initialization.
+/// TickSimulation parallel runtime: epoch-free execution, cross-thread
+/// dependency spin-waits, and progress-sync initialization.
 
-#include <barrier>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -128,7 +127,7 @@ void TickSimulation::initProgressSync() {
         // Synthetic dep: cluster cannot advance past lookahead_floor_ + max_lookahead_cycles.
         // num_clusters is its reserved cache slot; blocker diagnostics map it
         // back to SIZE_MAX because it is not a real predecessor cluster.
-        // Skip when max_lookahead_cycles == 0 (no limit — epoch boundary is the only cap).
+        // A zero window disables epoch-free execution before progress setup.
         if (config_.max_lookahead_cycles > 0) {
             thread_resolved_deps_[c].push_back(
                 {&lookahead_floor_, config_.max_lookahead_cycles, /*pred_id=*/num_clusters});
@@ -155,28 +154,10 @@ void TickSimulation::initProgressSync() {
 
     cluster_unit_ptrs_.clear();
     cluster_unit_ptrs_.resize(num_clusters);
-    cluster_thread_unit_positions_.clear();
-    cluster_thread_unit_positions_.resize(num_clusters);
-
-    std::vector<std::unordered_map<size_t, size_t>> thread_unit_pos(num_threads);
-    for (size_t t = 0; t < num_threads; ++t) {
-        for (size_t pos = 0; pos < thread_units_[t].size(); ++pos) {
-            thread_unit_pos[t][thread_units_[t][pos]] = pos;
-        }
-    }
 
     for (size_t c = 0; c < num_clusters; ++c) {
-        size_t thread = c < cluster_to_thread_.size() ? cluster_to_thread_[c] : SIZE_MAX;
         for (size_t unit_idx : clusters_.clusters[c]) {
             cluster_unit_ptrs_[c].push_back(unit_ptrs_[unit_idx]);
-            size_t pos = 0;
-            if (thread < thread_unit_pos.size()) {
-                auto it = thread_unit_pos[thread].find(unit_idx);
-                if (it != thread_unit_pos[thread].end()) {
-                    pos = it->second;
-                }
-            }
-            cluster_thread_unit_positions_[c].push_back(pos);
         }
     }
 
@@ -188,143 +169,6 @@ void TickSimulation::initProgressSync() {
     if (config_.enable_dynamic_rebalance) {
         initDynamicMigrationRuntime_();
     }
-}
-
-// ---------------------------------------------------------------------------
-// Progress-based parallel execution
-// ---------------------------------------------------------------------------
-
-void TickSimulation::executeEpochProgressBased(uint64_t epoch_cycles) {
-    uint64_t start_cycle =
-        thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
-    uint64_t end_cycle = start_cycle + epoch_cycles;
-    lookahead_floor_.store(start_cycle, std::memory_order_relaxed);
-    const bool trace_epoch = timeline_trace_.traceEpochs();
-    SchedulerTimelineTrace::TimePoint epoch_begin{};
-    if (trace_epoch) {
-        epoch_begin = SchedulerTimelineTrace::Clock::now();
-    }
-
-    auto token = stop_source_->get_token();
-    auto& obs_mgr = observe::ObservationManager::instance();
-    const bool push_periodic_counters = obs_mgr.periodicCounterSnapshotsEnabled();
-    const uint64_t counter_period = push_periodic_counters ? obs_mgr.periodicDumpCycles() : 0;
-
-    auto sched = pool_.get_scheduler();
-    auto work =
-        stdexec::bulk(stdexec::just(), stdexec::par, thread_units_.size(),
-                      [this, start_cycle, end_cycle, push_periodic_counters, counter_period,
-                       token](std::size_t thread_idx) {
-                          // The try-catch is NOT for exception
-                          // capture (stdexec handles that natively);
-                          // it solely requests stop so other threads
-                          // exit their dependency spin-waits.
-                          try {
-                              if (push_periodic_counters) {
-                                  executeThreadEpochWithPeriodicCounters_(
-                                      thread_idx, end_cycle, start_cycle, counter_period, token);
-                              } else {
-                                  executeThreadEpoch_(thread_idx, end_cycle, token);
-                              }
-                          } catch (...) {
-                              stop_source_->request_stop();
-                              throw;
-                          }
-                      });
-
-    auto scheduled_work = stdexec::starts_on(sched, std::move(work));
-    stdexec::sync_wait(std::move(scheduled_work));
-
-    for (size_t i = 0; i < units_.size(); ++i) {
-        unit_progress_[i].store(unit_ptrs_[i]->localCycle(), std::memory_order_release);
-    }
-
-    if (trace_epoch) {
-        auto epoch_end = SchedulerTimelineTrace::Clock::now();
-        timeline_trace_.recordDuration(timeline_trace_.schedulerStream(), "scheduler",
-                                       "progress epoch", start_cycle, epoch_begin, epoch_end,
-                                       "cycles=" + std::to_string(epoch_cycles));
-    }
-}
-
-uint64_t TickSimulation::executeRunProgressBased(uint64_t total_cycles) {
-    const size_t nthreads = thread_units_.size();
-    if (nthreads == 0 || total_cycles == 0) return 0;
-
-    auto token = stop_source_->get_token();
-    auto sched = pool_.get_scheduler();
-
-    const uint64_t run_start =
-        thread_progress_array_[0].completed_cycle.load(std::memory_order_relaxed);
-    const uint64_t run_target = saturatingCycleAdd(run_start, total_cycles);
-    auto& obs_mgr = observe::ObservationManager::instance();
-    const bool push_periodic_counters = obs_mgr.periodicCounterSnapshotsEnabled();
-    const uint64_t counter_period = push_periodic_counters ? obs_mgr.periodicDumpCycles() : 0;
-
-    // Shared with the barrier completion. Written only in the completion (one
-    // thread, peers parked) or before launch; the barrier supplies the
-    // happens-before, so no atomics are needed.
-    uint64_t epoch_start = run_start;
-    uint64_t epoch_end = run_start + std::min<uint64_t>(config_.epoch_size, total_cycles);
-    bool run_done = false;
-    std::exception_ptr captured;
-    std::atomic_flag captured_set = ATOMIC_FLAG_INIT;
-
-    lookahead_floor_.store(run_start, std::memory_order_relaxed);
-
-    // Serial epoch tail, run once when all workers have arrived. Must be nothrow
-    // (std::barrier completion contract).
-    auto on_epoch_complete = [&]() noexcept {
-        if (epoch_end >= run_target || token.stop_requested()) {
-            run_done = true;
-            return;
-        }
-        const uint64_t next_cycles = std::min<uint64_t>(config_.epoch_size, run_target - epoch_end);
-        lookahead_floor_.store(epoch_end, std::memory_order_relaxed);
-        epoch_start = epoch_end;
-        epoch_end += next_cycles;
-    };
-
-    std::barrier sync_point(static_cast<std::ptrdiff_t>(nthreads), on_epoch_complete);
-
-    auto work =
-        stdexec::bulk(stdexec::just(), stdexec::par, nthreads, [&, token](std::size_t thread_idx) {
-            const std::vector<size_t>& my_units = thread_units_[thread_idx];
-            for (;;) {
-                const uint64_t start = epoch_start;  // published by init / prior barrier
-                const uint64_t end = epoch_end;      // published by init / prior barrier
-                try {
-                    if (push_periodic_counters) {
-                        executeThreadEpochWithPeriodicCounters_(thread_idx, end, start,
-                                                                counter_period, token);
-                    } else {
-                        executeThreadEpoch_(thread_idx, end, token);
-                    }
-                } catch (...) {
-                    // Capture once and request stop, but still fall through to the
-                    // barrier so no peer deadlocks waiting on this worker.
-                    if (!captured_set.test_and_set(std::memory_order_relaxed)) {
-                        captured = std::current_exception();
-                    }
-                    stop_source_->request_stop();
-                }
-                // Publish only this thread's own units (release): each localCycle is
-                // read by the thread that wrote it, so there is no cross-thread plain
-                // read in the completion.
-                for (size_t unit_idx : my_units) {
-                    unit_progress_[unit_idx].store(unit_ptrs_[unit_idx]->localCycle(),
-                                                   std::memory_order_release);
-                }
-                sync_point.arrive_and_wait();  // -> on_epoch_complete (once)
-                if (run_done) break;
-            }
-        });
-
-    stdexec::sync_wait(stdexec::starts_on(sched, std::move(work)));
-
-    if (captured) std::rethrow_exception(captured);
-
-    return completedCyclesForRun_(run_start, run_target);
 }
 
 bool TickSimulation::allMultiProducerPortsHaveProgress_() const noexcept {
@@ -433,10 +277,10 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
             // dependency spin-waits; sync_wait below is the sole join.
             try {
                 if (push_periodic_counters) {
-                    executeThreadEpochWithPeriodicCounters_(thread_idx, run_target, run_start,
-                                                            counter_period, token);
+                    executeThreadRunWithPeriodicCounters_(thread_idx, run_target, run_start,
+                                                          counter_period, token);
                 } else {
-                    executeThreadEpoch_(thread_idx, run_target, token);
+                    executeThreadRun_(thread_idx, run_target, token);
                 }
             } catch (...) {
                 if (!captured_set.test_and_set(std::memory_order_relaxed)) {
@@ -465,13 +309,13 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-thread epoch driver
+// Per-thread run driver
 // ---------------------------------------------------------------------------
 
 template <bool PushPeriodicCounters>
-void TickSimulation::executeThreadEpochImpl_(size_t thread_idx, uint64_t end_cycle,
-                                             uint64_t run_start, uint64_t period,
-                                             stdexec::inplace_stop_token token) {
+void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle,
+                                           uint64_t run_start, uint64_t period,
+                                           stdexec::inplace_stop_token token) {
     const auto& clusters = thread_clusters_[thread_idx];
     const bool trace_units = timeline_trace_.traceUnits();
     // This cache spans the worker invocation (the entire run in EpochFree mode),
@@ -570,7 +414,7 @@ void TickSimulation::executeThreadEpochImpl_(size_t thread_idx, uint64_t end_cyc
         if (made_progress) {
             // A worker advancing one cluster while another is stuck at the
             // ceiling never reaches the spin-wait; refresh here so the blocked
-            // cluster isn't pinned to the epoch-start ceiling all epoch.
+            // cluster is not pinned to a stale global-floor ceiling.
             // blocker.cluster is set iff some cluster failed clusterCanAdvance_;
             // this fires at most once per executed cycle, so it needs no throttle.
             if (blocker.cluster != SIZE_MAX) {
@@ -626,15 +470,15 @@ void TickSimulation::executeThreadEpochImpl_(size_t thread_idx, uint64_t end_cyc
     }
 }
 
-void TickSimulation::executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
-                                         stdexec::inplace_stop_token token) {
-    executeThreadEpochImpl_<false>(thread_idx, end_cycle, 0, 0, token);
+void TickSimulation::executeThreadRun_(size_t thread_idx, uint64_t end_cycle,
+                                       stdexec::inplace_stop_token token) {
+    executeThreadRunImpl_<false>(thread_idx, end_cycle, 0, 0, token);
 }
 
-void TickSimulation::executeThreadEpochWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
-                                                             uint64_t run_start, uint64_t period,
-                                                             stdexec::inplace_stop_token token) {
-    executeThreadEpochImpl_<true>(thread_idx, end_cycle, run_start, period, token);
+void TickSimulation::executeThreadRunWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
+                                                           uint64_t run_start, uint64_t period,
+                                                           stdexec::inplace_stop_token token) {
+    executeThreadRunImpl_<true>(thread_idx, end_cycle, run_start, period, token);
 }
 
 // ---------------------------------------------------------------------------
@@ -830,22 +674,10 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
             (*cpu_points)[0] = threadTraceCpuPoint_();
         }
         for (size_t u = 0; u < num_units; ++u) {
-            const bool sample_tick =
-                config_.enable_dynamic_rebalance &&
-                !epoch_free_dynamic_runtime_active_.load(std::memory_order_relaxed) &&
-                (cycle & 1023u) == 0;
             active[u] = executeUnitCycle_(units[u], cycle);
             points[u + 1] = SchedulerTimelineTrace::Clock::now();
             if (cpu_points) {
                 (*cpu_points)[u + 1] = threadTraceCpuPoint_();
-            }
-
-            if (__builtin_expect(sample_tick, 0)) {
-                uint64_t elapsed_ns = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(points[u + 1] - points[u])
-                        .count());
-                recordTickSample_(thread_idx, cluster_thread_unit_positions_[cluster][u],
-                                  elapsed_ns, active[u]);
             }
         }
         for (size_t u = 0; u < num_units; ++u) {
@@ -854,20 +686,6 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
                                 trace_thread_cpu,
                                 cpu_points ? (*cpu_points)[u] : ThreadTraceCpuPoint{},
                                 cpu_points ? (*cpu_points)[u + 1] : ThreadTraceCpuPoint{});
-        }
-    } else if (__builtin_expect(
-                   config_.enable_dynamic_rebalance &&
-                       !epoch_free_dynamic_runtime_active_.load(std::memory_order_relaxed) &&
-                       (cycle & 1023u) == 0,
-                   0)) {
-        for (size_t u = 0; u < num_units; ++u) {
-            auto tp0 = std::chrono::steady_clock::now();
-            bool active = executeUnitCycle_(units[u], cycle);
-            auto tp1 = std::chrono::steady_clock::now();
-            uint64_t elapsed_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(tp1 - tp0).count());
-            recordTickSample_(thread_idx, cluster_thread_unit_positions_[cluster][u], elapsed_ns,
-                              active);
         }
     } else {
         for (size_t u = 0; u < num_units; ++u) {

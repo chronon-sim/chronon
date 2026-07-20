@@ -18,7 +18,6 @@
 #include <set>
 #include <sstream>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 
 #include "../../observe/ObservableUnit.hpp"
@@ -56,8 +55,8 @@ void TickSimulation::initialize() {
         precomputed_unit_costs_ = std::move(remapped);
     }
 
-    // With tight (delay=0) connections, lookahead degenerates to per-cycle
-    // and barrier mode has less sync overhead.
+    // Tight (delay=0) connections are grouped into indivisible scheduler
+    // clusters so epoch-free workers preserve same-cycle producer order.
     has_tight_connections_ = hasTightConnections();
 
     auto& obs_mgr = observe::ObservationManager::instance();
@@ -87,7 +86,6 @@ void TickSimulation::initialize() {
 
     selectExecutionMode_();
     initClusterActivityScheduling_();
-    traceExecutionMode_();
 
     // Counter snapshot ownership follows stable scheduler clusters rather
     // than worker IDs, so runtime cluster migration does not invalidate the
@@ -119,13 +117,25 @@ void TickSimulation::initialize() {
         unit_progress_[i].store(unit_ptrs_[i]->localCycle(), std::memory_order_relaxed);
     }
 
-    // Progress-based sync is Lookahead-only; Sequential / Barrier ignore
-    // thread_progress_array_.
+    // Progress state exists only for the epoch-free scheduler. Sequential
+    // execution does not publish or consume cluster progress.
     if (config_.enable_lookahead && shouldUseParallelExecution_() && has_thread_assignment_ &&
         !thread_units_.empty()) {
         initProgressSync();
         installMultiProducerProgress_();
     }
+
+    // Barrier-based fallbacks no longer exist. Resolve the complete epoch-free
+    // safety gate once initialization has wired queue and producer progress;
+    // unsupported topologies execute on the sequential reference path.
+    // Keep the already-selected adapters: Unit::initialize() may have queued
+    // data, and every parallel-safe adapter is also safe for one-thread use.
+    if (shouldUseParallelExecution_() && !epochFreeLookaheadEligible_()) {
+        parallel_fallback_reason_ = epochFreeVetoReason_();
+        execution_mode_ = ExecutionMode::Sequential;
+    }
+
+    traceExecutionMode_();
 
     timeline_trace_.start(thread_units_, unit_ptrs_);
     initTimelineTraceScratch_();
@@ -146,28 +156,8 @@ uint64_t TickSimulation::run(uint64_t num_cycles) {
         return 0;
     }
 
-    uint64_t executed = 0;
-
-    if (shouldUseParallelExecution_() && config_.enable_dynamic_rebalance &&
-        !epochFreeLookaheadEligible_()) {
-        while (executed < num_cycles) {
-            uint64_t step_cycles = std::min(config_.epoch_size, num_cycles - executed);
-            uint64_t epoch_executed = runParallelEpoch(step_cycles, executed);
-            executed += epoch_executed;
-            current_cycle_ += epoch_executed;
-            maybeRebalanceAfterEpoch_(epoch_executed);
-            if (epoch_executed < step_cycles) {
-                break;
-            }
-        }
-        return executed;
-    }
-
-    if (shouldUseParallelExecution_()) {
-        executed = runParallel(num_cycles);
-    } else {
-        executed = runSequential(num_cycles);
-    }
+    const uint64_t executed =
+        shouldUseParallelExecution_() ? runEpochFree(num_cycles) : runSequential(num_cycles);
 
     current_cycle_ += executed;
     return executed;
@@ -191,33 +181,17 @@ uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
             break;
         }
 
-        const bool use_epoch_free_chunk = use_parallel && epochFreeLookaheadEligible_();
         uint64_t step_cycles = max_cycles - executed;
-        if (!use_epoch_free_chunk) {
-            step_cycles = std::min(step_cycles, config_.epoch_size);
+        if (!use_parallel) {
+            step_cycles = std::min(step_cycles, std::max<uint64_t>(1, config_.epoch_size));
         }
-        uint64_t epoch_executed = 0;
+        const uint64_t step_executed =
+            use_parallel ? runEpochFree(step_cycles) : runSequential(step_cycles);
 
-        if (use_parallel) {
-            if (config_.enable_dynamic_rebalance && !use_epoch_free_chunk) {
-                // Dynamic rebalance on the non-epoch-free fallback commits at
-                // explicit epoch boundaries.
-                epoch_executed = runParallelEpoch(step_cycles, 0);
-            } else {
-                epoch_executed = runParallel(step_cycles);
-            }
-        } else {
-            epoch_executed = runSequentialEpoch(step_cycles);
-        }
+        executed += step_executed;
+        current_cycle_ += step_executed;
 
-        executed += epoch_executed;
-        current_cycle_ += epoch_executed;
-
-        if (config_.enable_dynamic_rebalance && use_parallel && !use_epoch_free_chunk) {
-            maybeRebalanceAfterEpoch_(epoch_executed);
-        }
-
-        if (epoch_executed < step_cycles) {
+        if (step_executed < step_cycles) {
             break;
         }
     }
@@ -243,16 +217,32 @@ void TickSimulation::resolveSolver_() {
             partition_solver_ = &SimulatedAnnealingPartitioner::partition;
             break;
     }
-    // SA v1 is validated for initial partitioning only; dynamic rebalance
-    // stays on Weighted until SA has end-to-end rebalance coverage.
-    rebalance_solver_ = &WeightedPartitioner::partition;
 }
 
 void TickSimulation::selectExecutionMode_() {
     execution_mode_ = ExecutionMode::Sequential;
     parallel_beneficial_ = false;
+    parallel_fallback_reason_.clear();
 
     if (!(config_.enable_parallel && units_.size() > 1)) {
+        optimizeAllQueuesForSingleThread();
+        return;
+    }
+
+    // Compatibility switches that previously selected a barrier-based
+    // scheduler now select the remaining safe fallback: Sequential.
+    if (!config_.enable_lookahead) {
+        parallel_fallback_reason_ = "enable_lookahead=false";
+        optimizeAllQueuesForSingleThread();
+        return;
+    }
+    if (!config_.enable_epoch_free_lookahead) {
+        parallel_fallback_reason_ = "enable_epoch_free_lookahead=false";
+        optimizeAllQueuesForSingleThread();
+        return;
+    }
+    if (config_.max_lookahead_cycles == 0) {
+        parallel_fallback_reason_ = "max_lookahead_cycles=0";
         optimizeAllQueuesForSingleThread();
         return;
     }
@@ -272,10 +262,11 @@ void TickSimulation::selectExecutionMode_() {
     }
 
     if (parallel_beneficial_) {
-        execution_mode_ = ExecutionMode::Parallel;
+        execution_mode_ = ExecutionMode::EpochFree;
     } else {
         // Even when parallel was requested, fall back to the single-thread
         // queue/counter optimizations.
+        parallel_fallback_reason_ = "parallel execution not beneficial";
         optimizeAllQueuesForSingleThread();
     }
 }
@@ -285,7 +276,7 @@ void TickSimulation::traceExecutionMode_() {
         observe::log_info<
             "Execution policy: mode={} (parallel_requested={}, tight_connections={}, "
             "parallel_beneficial={})">(
-            observe_ctx_, shouldUseParallelExecution_() ? "parallel" : "sequential",
+            observe_ctx_, shouldUseParallelExecution_() ? "epoch-free" : "sequential",
             config_.enable_parallel ? "yes" : "no", has_tight_connections_ ? "yes" : "no",
             parallel_beneficial_ ? "yes" : "no");
     }
@@ -300,10 +291,12 @@ void TickSimulation::warnParallelFallbackIfNeeded_() {
     parallel_fallback_warned_ = true;
     const uint64_t units = static_cast<uint64_t>(units_.size());
     const uint64_t threads = static_cast<uint64_t>(config_.num_threads);
+    const char* reason = parallel_fallback_reason_.empty() ? "parallel execution unavailable"
+                                                           : parallel_fallback_reason_.c_str();
     observe::log_warn<
         "parallel execution requested but falling back to sequential "
-        "(units={}, num_threads={}, tight_connections={}, parallel_beneficial={})">(
-        observe_ctx_, units, threads, has_tight_connections_ ? "yes" : "no",
+        "(reason={}, units={}, num_threads={}, tight_connections={}, parallel_beneficial={})">(
+        observe_ctx_, reason, units, threads, has_tight_connections_ ? "yes" : "no",
         parallel_beneficial_ ? "yes" : "no");
 }
 
@@ -354,50 +347,28 @@ uint64_t TickSimulation::runSequential(uint64_t num_cycles) {
     return runSequentialImpl_<false>(num_cycles);
 }
 
-uint64_t TickSimulation::runSequentialEpoch(uint64_t epoch_cycles) {
-    return runSequential(epoch_cycles);
-}
-
-uint64_t TickSimulation::runParallelEpoch(uint64_t epoch_cycles, uint64_t /*executed_offset*/) {
-    // Lookahead is usable as long as no tight edges cross cluster
-    // boundaries. Intra-cluster tight edges are safe because units inside
-    // a cluster run sequentially on the same thread.
-    const bool use_lookahead = config_.enable_lookahead && !has_tight_inter_cluster_ &&
-                               !has_zero_delay_cross_thread_cycle_;
-
-    if (use_lookahead && thread_progress_count_ > 0) {
-        warnDeprecatedEpochLookaheadFallback_(epochFreeVetoReason_());
-        executeEpochProgressBased(epoch_cycles);
-    } else {
-        auto sched = pool_.get_scheduler();
-        executeEpochBarrier(sched, epoch_cycles);
-    }
-
-    return epoch_cycles;
-}
-
-bool TickSimulation::persistentLookaheadEligible_() const {
-    const bool use_lookahead = config_.enable_lookahead && !has_tight_inter_cluster_ &&
-                               !has_zero_delay_cross_thread_cycle_;
-    return use_lookahead && thread_progress_count_ > 0 &&
-           thread_units_.size() <= pool_.available_parallelism();
-}
-
 bool TickSimulation::epochFreeLookaheadEligible_() const {
-    return persistentLookaheadEligible_() && config_.enable_epoch_free_lookahead &&
-           config_.max_lookahead_cycles > 0 && allMultiProducerPortsHaveProgress_() &&
-           crossThreadHeadroomAllowsEpochFree_();
+    return config_.enable_parallel && config_.enable_lookahead &&
+           config_.enable_epoch_free_lookahead && config_.max_lookahead_cycles > 0 &&
+           !has_tight_inter_cluster_ && !has_zero_delay_cross_thread_cycle_ &&
+           thread_progress_count_ > 0 && thread_units_.size() <= pool_.available_parallelism() &&
+           allMultiProducerPortsHaveProgress_() && crossThreadHeadroomAllowsEpochFree_();
 }
 
 std::string TickSimulation::epochFreeVetoReason_() const {
-    if (!persistentLookaheadEligible_()) {
-        return "persistent lookahead unavailable";
-    }
+    if (!config_.enable_parallel) return "enable_parallel=false";
+    if (!config_.enable_lookahead) return "enable_lookahead=false";
     if (!config_.enable_epoch_free_lookahead) {
         return "enable_epoch_free_lookahead=false";
     }
     if (config_.max_lookahead_cycles == 0) {
         return "max_lookahead_cycles=0";
+    }
+    if (has_tight_inter_cluster_) return "zero-delay inter-cluster dependency";
+    if (has_zero_delay_cross_thread_cycle_) return "zero-delay cross-thread cycle";
+    if (thread_progress_count_ == 0) return "cluster progress unavailable";
+    if (thread_units_.size() > pool_.available_parallelism()) {
+        return "worker count exceeds pool parallelism";
     }
     if (!allMultiProducerPortsHaveProgress_()) {
         return "MPSC producer progress unresolved";
@@ -414,59 +385,12 @@ std::string TickSimulation::epochFreeVetoReason_() const {
     return "unknown";
 }
 
-void TickSimulation::warnDeprecatedEpochLookaheadFallback_(std::string_view reason) {
-    if (!observe_ctx_) return;
-
-    static std::atomic<bool> warned{false};
-    bool expected = false;
-    if (!warned.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
-
-    std::string reason_str(reason);
-    observe::log_warn<
-        "DEPRECATED: per-epoch lookahead fallback is deprecated and will be removed in a "
-        "future release; enable epoch-free lookahead and satisfy its safety gate. reason={}">(
-        observe_ctx_, reason_str.c_str());
-}
-
-uint64_t TickSimulation::runParallel(uint64_t num_cycles) {
-    // Persistent-worker fast path (see executeRunProgressBased). The
-    // epoch-free driver is the default when its dependency/queue safety gate
-    // holds; otherwise fixed-layout lookahead falls back to reusable epochs.
-    const bool can_persist = persistentLookaheadEligible_();
-    if (can_persist) {
-        const bool epoch_free = epochFreeLookaheadEligible_();
-        if (config_.enable_epoch_free_lookahead && !epoch_free && observe_ctx_ &&
-            !epoch_free_veto_logged_) {
-            const std::string reason = epochFreeVetoReason_();
-            observe::log_info<
-                "epoch-free lookahead requested but vetoed "
-                "(reason={}, max_lookahead={}, mpsc_progress_full={}, headroom={}); using "
-                "deprecated per-epoch lookahead fallback">(
-                observe_ctx_, reason.c_str(), config_.max_lookahead_cycles,
-                allMultiProducerPortsHaveProgress_(), crossThreadHeadroomLimit_());
-            epoch_free_veto_logged_ = true;
-        }
-        if (epoch_free) {
-            epoch_free_veto_logged_ = false;
-            ++epoch_free_run_count_;
-            if (config_.enable_dynamic_rebalance) {
-                return executeRunEpochFreeDynamic_(num_cycles);
-            }
-            return executeRunEpochFree_(num_cycles);
-        }
-        if (!config_.enable_dynamic_rebalance) {
-            warnDeprecatedEpochLookaheadFallback_(epochFreeVetoReason_());
-            return executeRunProgressBased(num_cycles);
-        }
+uint64_t TickSimulation::runEpochFree(uint64_t num_cycles) {
+    ++epoch_free_run_count_;
+    if (config_.enable_dynamic_rebalance) {
+        return executeRunEpochFreeDynamic_(num_cycles);
     }
-
-    uint64_t executed = 0;
-    while (executed < num_cycles) {
-        uint64_t epoch_cycles = std::min(config_.epoch_size, num_cycles - executed);
-        runParallelEpoch(epoch_cycles, executed);
-        executed += epoch_cycles;
-    }
-    return executed;
+    return executeRunEpochFree_(num_cycles);
 }
 
 // ---------------------------------------------------------------------------
@@ -608,10 +532,6 @@ PartitionResult TickSimulation::runPartitionSolver_(const PartitionInput& input)
     return partition_solver_(input);
 }
 
-PartitionResult TickSimulation::runRebalanceSolver_(const PartitionInput& input) {
-    return rebalance_solver_(input);
-}
-
 // ---------------------------------------------------------------------------
 // Queue optimization
 // ---------------------------------------------------------------------------
@@ -732,7 +652,7 @@ void TickSimulation::optimizeConnectionQueuesForThreads() {
                 // Epoch-free workers may skip a floor-blocked producer cluster
                 // and run its local consumer first in the same sweep. Preserve
                 // cycle-start admission without charging same-cluster or
-                // barrier-only edges for bookkeeping they cannot need.
+                // same-cluster edges for bookkeeping they cannot need.
                 const size_t src_cluster = getClusterForUnit(conns[0]->source());
                 const size_t dst_cluster = getClusterForUnit(dst);
                 const bool cycle_strict_admission =
@@ -935,8 +855,8 @@ void TickSimulation::buildThreadAssignment() {
 
     optimizeConnectionQueuesForThreads();
 
-    // Safe in spin-barrier mode: all units complete cycle N before any
-    // starts N+1, so localCycle() is only read between barriers.
+    // Each Unit has exactly one scheduler owner; inter-cluster visibility is
+    // published through the separate progress atomics.
     for (auto* unit : unit_ptrs_) {
         unit->useFastCycleCounter();
     }

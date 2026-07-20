@@ -40,11 +40,11 @@ cycle,alu0.ops,alu1.ops,alu2.ops
 
 Each periodic dump appends one row, so the file can be monitored during simulation (like log files). Column names are discovered from the first dump and written as the CSV header.
 
-All schedulers use one owner-based push implementation. Sequential and barrier
-execution publish at the exact boundary. Lookahead workers snapshot and reset
-the counters owned by their scheduler clusters when local progress crosses the
+Both schedulers use one owner-based push implementation. Sequential execution
+publishes at the exact boundary. Epoch-free workers snapshot and reset the
+counters owned by their scheduler clusters when local progress crosses the
 boundary, then publish records through their lock-free SPSC observation queue.
-Rows use the nominal periodic cycle; lookahead contributors may be sampled
+Rows use the nominal periodic cycle; epoch-free contributors may be sampled
 within one configured run-ahead window. Periodic output never introduces a run
 split, intermediate MPSC port flush, or worker relaunch.
 

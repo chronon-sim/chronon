@@ -610,10 +610,10 @@ uint64_t TickSimulation::executeRunEpochFreeDynamic_(uint64_t total_cycles) {
         stdexec::bulk(stdexec::just(), stdexec::par, nthreads, [&, token](std::size_t thread_idx) {
             try {
                 if (push_periodic_counters) {
-                    executeThreadEpochDynamicWithPeriodicCounters_(
-                        thread_idx, run_target, run_start, counter_period, token);
+                    executeThreadRunDynamicWithPeriodicCounters_(thread_idx, run_target, run_start,
+                                                                 counter_period, token);
                 } else {
-                    executeThreadEpochDynamic_(thread_idx, run_target, token);
+                    executeThreadRunDynamic_(thread_idx, run_target, token);
                 }
             } catch (...) {
                 if (!captured_set.test_and_set(std::memory_order_relaxed)) {
@@ -648,9 +648,9 @@ uint64_t TickSimulation::executeRunEpochFreeDynamic_(uint64_t total_cycles) {
 }
 
 template <bool PushPeriodicCounters>
-void TickSimulation::executeThreadEpochDynamicImpl_(size_t thread_idx, uint64_t end_cycle,
-                                                    uint64_t run_start, uint64_t period,
-                                                    stdexec::inplace_stop_token token) {
+void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t end_cycle,
+                                                  uint64_t run_start, uint64_t period,
+                                                  stdexec::inplace_stop_token token) {
     const bool trace_units = timeline_trace_.traceUnits();
     const bool trace_waits = timeline_trace_.traceWaits();
     const size_t num_clusters = dynamic_runtime_cluster_count_;
@@ -944,15 +944,15 @@ void TickSimulation::executeThreadEpochDynamicImpl_(size_t thread_idx, uint64_t 
     }
 }
 
-void TickSimulation::executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_cycle,
-                                                stdexec::inplace_stop_token token) {
-    executeThreadEpochDynamicImpl_<false>(thread_idx, end_cycle, 0, 0, token);
+void TickSimulation::executeThreadRunDynamic_(size_t thread_idx, uint64_t end_cycle,
+                                              stdexec::inplace_stop_token token) {
+    executeThreadRunDynamicImpl_<false>(thread_idx, end_cycle, 0, 0, token);
 }
 
-void TickSimulation::executeThreadEpochDynamicWithPeriodicCounters_(
+void TickSimulation::executeThreadRunDynamicWithPeriodicCounters_(
     size_t thread_idx, uint64_t end_cycle, uint64_t run_start, uint64_t period,
     stdexec::inplace_stop_token token) {
-    executeThreadEpochDynamicImpl_<true>(thread_idx, end_cycle, run_start, period, token);
+    executeThreadRunDynamicImpl_<true>(thread_idx, end_cycle, run_start, period, token);
 }
 
 }  // namespace chronon::sender

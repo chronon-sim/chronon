@@ -14,7 +14,6 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <unordered_map>
 #include <vector>
 
 #include "TickSimulation.hpp"
@@ -120,25 +119,6 @@ void TickSimulation::rebuildThreadUnitsFromClusterOwners_() {
         thread_unit_ptrs_[t].reserve(thread_units_[t].size());
         for (size_t idx : thread_units_[t]) {
             thread_unit_ptrs_[t].push_back(unit_ptrs_[idx]);
-        }
-    }
-
-    std::vector<std::unordered_map<size_t, size_t>> thread_unit_pos(num_threads);
-    for (size_t t = 0; t < num_threads; ++t) {
-        for (size_t pos = 0; pos < thread_units_[t].size(); ++pos) {
-            thread_unit_pos[t][thread_units_[t][pos]] = pos;
-        }
-    }
-
-    cluster_thread_unit_positions_.assign(dynamic_runtime_cluster_count_, {});
-    for (size_t c = 0; c < dynamic_runtime_cluster_count_; ++c) {
-        size_t owner = cluster_runtime_owner_[c].load(std::memory_order_acquire);
-        if (owner >= num_threads || c >= clusters_.clusters.size()) continue;
-        auto& positions = cluster_thread_unit_positions_[c];
-        positions.reserve(clusters_.clusters[c].size());
-        for (size_t unit_idx : clusters_.clusters[c]) {
-            auto it = thread_unit_pos[owner].find(unit_idx);
-            positions.push_back(it == thread_unit_pos[owner].end() ? 0 : it->second);
         }
     }
 }

@@ -249,13 +249,12 @@ Phase 4: Multi-Unit Relocate
 | 1 | 1× | Tight spin-waiting every cycle |
 | N > 1 | 1/N | Higher delay = less frequent sync |
 
-**Three parallel execution modes**:
+**Two execution paths**:
 
 | Mode | Mechanism | When Used |
 |------|-----------|-----------|
-| Barrier | `stdexec::bulk` with per-cycle sync | Tight connections present |
-| Lookahead | Progress atomics, units advance within safe boundaries | No tight connections |
-| Cluster-aware | Tight clusters on same thread, lookahead between clusters | Mixed topology |
+| Sequential | Direct ordered ticks with no worker synchronization | Parallelism is disabled, not beneficial, or cannot pass the safety gate |
+| Epoch-free lookahead | Cluster-aware workers advance against progress atomics within safe bounds | The topology and port headroom satisfy the epoch-free gate |
 
 **Dynamic rebalancing** at scheduler fence points (configurable interval, default 8192 cycles) adapts to changing workload patterns by migrating tight clusters between threads.
 
@@ -519,7 +518,7 @@ This is not an accidental optimization — it is the direct consequence of choos
 | **Scaling** | Multi-thread with cost-aware partitioning | Limited multi-queue parallelism | Single-threaded only |
 | **Idle efficiency** | Every unit ticks every cycle (potential waste) | Sparse — only active components consume time | Every component ticks every cycle |
 | **Memory overhead** | Per-unit message queues | Per-event allocation/deallocation | Explicit per-component buffers |
-| **Sync overhead** | Epoch barriers + lookahead atomics (~100 ns/epoch) | Quantum barriers + async event mutex | None (single-threaded) |
+| **Sync overhead** | Direct-predecessor progress atomics; no global or epoch barrier | Quantum barriers + async event mutex | None (single-threaded) |
 
 ## 8. Architectural Implications
 
@@ -600,7 +599,7 @@ Among all the frameworks above, **SST** and **Manifold** are architecturally clo
 | **Partitioning** | 5 built-in strategies; `simple` partitioner maximizes cross-cut latency via pairwise swap; balances component *count*, not computational *cost* | Manual only — user specifies LP assignment per component in driver code | Cluster-aware solver: models per-unit compute cost + sync cost scaled by delay (100x penalty for delay=0, 1/N for delay=N); default SA solver and optional Weighted solver minimize max thread execution time |
 | **Synchronization protocol** | Barrier-based with skip-ahead: `MPI_Allreduce` computes global min next-activity time, then advances by the static lookahead period; no null messages | Chandy-Misra-Bryant null-message protocol with multiple variants (basic CMB, tick-optimized, Forecast Null-Message for dynamic lookahead, LBTS barrier, quantum) | No runtime protocol. Lookahead bounds are precomputed from the dependency graph; progress tracking uses cache-line-aligned atomics. Each unit checks only its direct predecessors' progress — no global barrier or null-message exchange |
 | **Lookahead exploitation** | Single global value (min cross-partition latency); all components sync at the same interval regardless of local topology | Global or pairwise; FNM variant allows runtime forecast-based dynamic lookahead per LP pair | Per-unit direct-edge lookahead: each unit independently advances based on its immediate predecessors' progress. Transitive closure penalties do not propagate — if A→B (delay=5) and B→C (delay=3), C uses 3 from B directly, not min(5,3) from the transitive path |
-| **Execution model adaptation** | Fixed: always event-driven PDES regardless of topology | Fixed: always null-message PDES (choice of 5 variants, but always PDES) | Adaptive: automatically selects Sequential (when parallel overhead exceeds benefit), Barrier (tight connections present), or Lookahead (loose connections dominate) based on topology analysis |
+| **Execution model adaptation** | Fixed: always event-driven PDES regardless of topology | Fixed: always null-message PDES (choice of 5 variants, but always PDES) | Adaptive: selects Sequential when parallelism is not worthwhile or safe; otherwise uses epoch-free lookahead with cluster-aware placement |
 | **Queue implementation** | Fixed per-link type (polling or callback); no adaptation to thread placement | Fixed per-link; event delivery via LP-local event queue | Topology-aware polymorphism: `InPort` auto-selects LockFreeQueue (SPSC, zero mutex) for single-source or MultiProducerQueue (per-source SPSC rings with deterministic k-way merge) for multi-source, based on thread assignment |
 | **Dynamic rebalancing** | None — partitioning is one-time at initialization | None — LP assignment is fixed | Continuous: per-unit tick costs, dependency topology, and wait attribution are sampled; at scheduler fence points, candidate whole-cluster moves are scored and committed only if gain exceeds minimum |
 | **Parallelism granularity** | MPI rank (inter-process) + pthreads (intra-rank); typically one simulated core or memory controller per thread | MPI rank; one LP per MPI process; typically pairs of cores+caches per LP | Shared-memory threads via stdexec thread pool; parallelism down to individual pipeline stages within a single core |
@@ -676,7 +675,7 @@ Beyond SST and Manifold, four other projects tackle subsets of the problems Chro
 
 | Aspect | P-GAS/CRAW/P | Virtual Time III | POSE/CharmDES | DDA-DES | Chronon |
 |--------|-------------|-----------------|---------------|---------|---------|
-| **Mode selection** | Fixed: P-GAS always uses null-message; CRAW/P always uses dual-quantum barrier. The "adaptive" in ALWP/CRAW/P refers to partitioning, not synchronization mode | Per-event: each event independently processed conservatively or optimistically based on CVT comparison. The choice is topology-derived (CVT computed from channel lookahead), but the mechanism is runtime, not init-time | Per-object: each poser's time leash (adapt4/adapt5) adapts independently based on its own rollback history. Objects with frequent rollbacks get tighter leashes; objects with no rollbacks get wider ones | N/A | Per-topology: statically selects Sequential (parallel overhead > benefit), Barrier (tight connections present), or Lookahead (loose connections dominate) at initialization; re-evaluates at rebalancing epochs |
+| **Mode selection** | Fixed: P-GAS always uses null-message; CRAW/P always uses dual-quantum barrier. The "adaptive" in ALWP/CRAW/P refers to partitioning, not synchronization mode | Per-event: each event independently processed conservatively or optimistically based on CVT comparison. The choice is topology-derived (CVT computed from channel lookahead), but the mechanism is runtime, not init-time | Per-object: each poser's time leash (adapt4/adapt5) adapts independently based on its own rollback history. Objects with frequent rollbacks get tighter leashes; objects with no rollbacks get wider ones | N/A | Per-topology: selects Sequential when parallel overhead exceeds benefit or the epoch-free safety gate rejects the topology; otherwise selects epoch-free lookahead. Dynamic rebalancing changes placement, not synchronization protocol |
 | **What drives adaptation** | Workload imbalance (measured per-tile simulation time) | Lookahead availability: channels with good lookahead → conservative; channels with no/poor lookahead → optimistic | Rollback frequency: adapt4 sets leash = avg rollback offset on rollback, expands on success. adapt5 uses sliding window of 16 most recent committed event timestamp differences, discards outliers | Data-dependence structure of event types (static) | Topology structure: dependency graph connectivity and delay distribution (static); workload phase shifts (dynamic) |
 
 #### Performance and Scale

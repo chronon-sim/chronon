@@ -10,7 +10,7 @@
 //
 // Regression test for heterogeneous-delay direct MPSC lanes. A consumer with
 // fan-in from producers at DIFFERENT edge delays, inside a feedback loop, must
-// produce a result identical across worker counts and match barrier/sequential.
+// produce a result identical across worker counts and match Sequential.
 // This pins the per-Connection progress dependencies that make every lane head
 // for the consumer's current cycle visible before it performs the merge.
 
@@ -71,11 +71,12 @@ private:
 // Topology: A and B fan in to C with delays (dA, dB); C -> D -> {A, B} closes a
 // feedback loop so producer rates are coupled. `work` spreads units across
 // threads so producers/consumer actually land on different workers.
-uint64_t runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, uint64_t cycles) {
+uint64_t runOnce(uint32_t dA, uint32_t dB, size_t num_threads, uint64_t cycles) {
     TickSimulationConfig cfg;
     cfg.num_threads = num_threads;
     cfg.enable_parallel = (num_threads > 1);
-    cfg.enable_lookahead = lookahead;
+    cfg.enable_lookahead = true;
+    cfg.enable_epoch_free_lookahead = true;
     cfg.enable_dynamic_rebalance = false;
     cfg.max_lookahead_cycles = 100;
     cfg.epoch_size = 64;
@@ -102,14 +103,10 @@ uint64_t runOnce(uint32_t dA, uint32_t dB, size_t num_threads, bool lookahead, u
 
 void verify(uint32_t dA, uint32_t dB, uint64_t cycles) {
     const std::string label = "dA=" + std::to_string(dA) + " dB=" + std::to_string(dB);
-    const uint64_t ref = runOnce(dA, dB, /*threads=*/1, /*lookahead=*/false, cycles);
-    for (size_t nw : {1u, 2u, 4u}) {
-        for (bool lookahead : {false, true}) {
-            if (nw == 1 && !lookahead) continue;  // that is the reference
-            uint64_t got = runOnce(dA, dB, nw, lookahead, cycles);
-            check(got == ref,
-                  label + " nw=" + std::to_string(nw) + (lookahead ? " lookahead" : " barrier"));
-        }
+    const uint64_t ref = runOnce(dA, dB, /*threads=*/1, cycles);
+    for (size_t nw : {2u, 4u}) {
+        uint64_t got = runOnce(dA, dB, nw, cycles);
+        check(got == ref, label + " nw=" + std::to_string(nw) + " epoch-free");
     }
 }
 

@@ -4,11 +4,9 @@
 
 // test_rebalance_calibration.cpp
 //
-// Verifies that the dynamic rebalance fires and produces meaningful
-// unit costs. Topology: 5 units with deliberately imbalanced tick costs
-// so that shouldRebalance_() triggers. rebalance_check_interval_cycles
-// is set low (64) to ensure a rebalance occurs within the test's run
-// budget.
+// Verifies that epoch-free dynamic rebalance fires and produces meaningful
+// unit costs. Topology: 5 units with deliberately imbalanced tick costs;
+// rebalance_check_interval_cycles is low enough to migrate within the budget.
 
 #include <algorithm>
 #include <cassert>
@@ -119,17 +117,16 @@ constexpr uint64_t kGuardCycles = 4096;
 }  // namespace
 
 int run_rebalance_calibration(bool use_run_until_termination, uint64_t chunk_cycles = 0,
-                              uint64_t check_interval = 64, uint64_t total_cycles = 16384,
-                              bool enable_epoch_free = true) {
+                              uint64_t check_interval = 64, uint64_t total_cycles = 16384) {
     std::cout << (use_run_until_termination ? "Testing runUntilTermination rebalance"
                                             : "Testing run() rebalance")
-              << (enable_epoch_free ? " (epoch-free)... " : " (epoch-boundary fallback)... ");
+              << " (epoch-free)... ";
 
     TickSimulationConfig cfg;
     cfg.num_threads = 3;
     cfg.enable_parallel = true;
     cfg.enable_lookahead = true;
-    cfg.enable_epoch_free_lookahead = enable_epoch_free;
+    cfg.enable_epoch_free_lookahead = true;
     cfg.epoch_size = 64;
     cfg.enable_dynamic_rebalance = true;
     cfg.rebalance_check_interval_cycles = check_interval;
@@ -190,12 +187,8 @@ int run_rebalance_calibration(bool use_run_until_termination, uint64_t chunk_cyc
         return 1;
     }
 
-    if (enable_epoch_free && sim.epochFreeRunCount() == 0) {
+    if (sim.epochFreeRunCount() == 0) {
         std::cerr << "FAIL: dynamic rebalance did not use epoch-free lookahead\n";
-        return 1;
-    }
-    if (!enable_epoch_free && sim.epochFreeRunCount() != 0) {
-        std::cerr << "FAIL: epoch-boundary fallback unexpectedly used epoch-free lookahead\n";
         return 1;
     }
 
@@ -287,10 +280,6 @@ int main() {
         return 1;
     }
     if (run_rebalance_calibration(false, 64, 64, kChunkBoundaryCycles) != 0) {
-        return 1;
-    }
-    if (run_rebalance_calibration(false, 0, 64, kRunUntilCycles,
-                                  /*enable_epoch_free=*/false) != 0) {
         return 1;
     }
     if (run_tight_cluster_migration_guard() != 0) {
