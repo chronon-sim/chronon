@@ -82,6 +82,9 @@ struct ScenarioOverrides {
     std::optional<uint32_t> unit_sigma_milli;
     std::optional<uint32_t> cycle_sigma_milli;
     std::optional<uint32_t> working_set_bytes;
+    std::optional<uint32_t> working_set_sigma_milli;
+    std::optional<uint32_t> hot_access_probability_ppm;
+    std::optional<std::array<uint32_t, MEMORY_ACCESS_PATTERN_COUNT>> memory_pattern_weights;
     std::optional<std::array<uint32_t, PAYLOAD_BYTES.size()>> payload_weights;
 
     void apply(ScenarioConfig& config) const noexcept {
@@ -103,6 +106,10 @@ struct ScenarioOverrides {
         if (unit_sigma_milli) config.unit_sigma_milli = *unit_sigma_milli;
         if (cycle_sigma_milli) config.cycle_sigma_milli = *cycle_sigma_milli;
         if (working_set_bytes) config.working_set_bytes = *working_set_bytes;
+        if (working_set_sigma_milli) config.working_set_sigma_milli = *working_set_sigma_milli;
+        if (hot_access_probability_ppm)
+            config.hot_access_probability_ppm = *hot_access_probability_ppm;
+        if (memory_pattern_weights) config.memory_pattern_weights = *memory_pattern_weights;
         if (payload_weights) config.payload_weights = *payload_weights;
     }
 
@@ -126,6 +133,15 @@ struct ScenarioOverrides {
         scalar("--unit-sigma", unit_sigma_milli);
         scalar("--cycle-sigma", cycle_sigma_milli);
         scalar("--working-set", working_set_bytes);
+        scalar("--working-set-sigma", working_set_sigma_milli);
+        scalar("--hot-access-ppm", hot_access_probability_ppm);
+        if (memory_pattern_weights) {
+            output << " --memory-pattern-weights ";
+            for (size_t i = 0; i < memory_pattern_weights->size(); ++i) {
+                if (i != 0) output << ',';
+                output << (*memory_pattern_weights)[i];
+            }
+        }
         if (payload_weights) {
             output << " --payload-weights ";
             for (size_t i = 0; i < payload_weights->size(); ++i) {
@@ -219,11 +235,24 @@ inline void printReplayCommand(std::ostream& output, std::string_view program,
         config.unit_kernel = UnitKernel::SchedulerFloor;
         return config;
     }
+    if (profile == "memory") {
+        config.channels_per_unit = 0;
+        config.ensure_ring = false;
+        config.median_work = 96;
+        config.unit_sigma_milli = 550;
+        config.cycle_sigma_milli = 180;
+        config.working_set_bytes = 1024 * 1024;
+        config.working_set_sigma_milli = 650;
+        config.drain_limit = 1;
+        return config;
+    }
     if (profile == "port") {
         config.channels_per_unit = 3;
         config.median_work = 1;
         config.unit_sigma_milli = 100;
         config.cycle_sigma_milli = 0;
+        config.working_set_bytes = 64;
+        config.working_set_sigma_milli = 0;
         config.send_probability_ppm = 450'000;
         config.drain_limit = 32;
         config.queue_capacity = 1024;
@@ -287,6 +316,16 @@ inline void printReplayCommand(std::ostream& output, std::string_view program,
         config.unit_sigma_milli = 250 + bounded(randomWord(seed, 1, 9), 651);
         config.cycle_sigma_milli = 50 + bounded(randomWord(seed, 1, 10), 351);
         config.drain_limit = 1 + bounded(randomWord(seed, 1, 11), 16);
+        constexpr std::array<uint32_t, 4> working_sets = {4 * 1024, 16 * 1024, 64 * 1024,
+                                                          256 * 1024};
+        config.working_set_bytes =
+            working_sets[bounded(randomWord(seed, 1, 12), working_sets.size())];
+        config.working_set_sigma_milli = 250 + bounded(randomWord(seed, 1, 13), 551);
+        config.hot_access_probability_ppm = 700'000 + bounded(randomWord(seed, 1, 14), 280'001);
+        for (size_t pattern = 0; pattern < config.memory_pattern_weights.size(); ++pattern) {
+            config.memory_pattern_weights[pattern] =
+                1 + bounded(randomWord(seed, 1, 15 + pattern), 100);
+        }
         return config;
     }
     throw std::invalid_argument("unknown profile: " + std::string(profile));
@@ -294,8 +333,8 @@ inline void printReplayCommand(std::ostream& output, std::string_view program,
 
 inline void printHelp(const char* program) {
     std::cout << "Usage: " << program << " [options]\n\n"
-              << "Profiles: nucleus, scheduler, scheduler-floor, port, hotspot, broadcast, "
-                 "backpressure, saturation, random\n"
+              << "Profiles: nucleus, scheduler, scheduler-floor, memory, port, hotspot, "
+                 "broadcast, backpressure, saturation, random\n"
               << "Core options:\n"
               << "  --profile NAME              scenario profile (default nucleus)\n"
               << "  --seed N | --random-seed    reproducible or newly sampled base seed\n"
@@ -324,9 +363,11 @@ inline void printHelp(const char* program) {
               << "  --drain-limit N             max " << MAX_DRAIN_LIMIT << " messages/tick\n"
               << "  --work N                    median iterations/tick; generated max "
               << MAX_GENERATED_WORK << "\n"
-              << "  --unit-sigma N\n"
-              << "  --cycle-sigma N --working-set N (aggregate scratch max "
+              << "  --unit-sigma N --cycle-sigma N\n"
+              << "  --working-set N --working-set-sigma N (aggregate unit footprint max "
               << MAX_TOTAL_WORKING_SET_BYTES / (1024 * 1024) << " MiB)\n"
+              << "  --hot-access-ppm N          hot-region probability for hot/cold units\n"
+              << "  --memory-pattern-weights a,b,c,d (random,stream,pointer,hot/cold)\n"
               << "  --payload-weights a,b,c,d,e,f\n"
               << "Other: --max-lookahead N (max " << MAX_BENCHMARK_LOOKAHEAD
               << ") --verbose --quick --help\n";
@@ -437,6 +478,19 @@ inline void printHelp(const char* program) {
             overrides.cycle_sigma_milli = parseU32(requireValue(i, option), option);
         } else if (option == "--working-set") {
             overrides.working_set_bytes = parseU32(requireValue(i, option), option);
+        } else if (option == "--working-set-sigma") {
+            overrides.working_set_sigma_milli = parseU32(requireValue(i, option), option);
+        } else if (option == "--hot-access-ppm") {
+            overrides.hot_access_probability_ppm = parseU32(requireValue(i, option), option);
+        } else if (option == "--memory-pattern-weights") {
+            const auto values = parseU32List(requireValue(i, option), option);
+            if (values.size() != MEMORY_ACCESS_PATTERN_COUNT) {
+                throw std::invalid_argument(
+                    "--memory-pattern-weights requires four comma-separated values");
+            }
+            std::array<uint32_t, MEMORY_ACCESS_PATTERN_COUNT> weights{};
+            std::copy(values.begin(), values.end(), weights.begin());
+            overrides.memory_pattern_weights = weights;
         } else if (option == "--payload-weights") {
             const auto values = parseU32List(requireValue(i, option), option);
             if (values.size() != PAYLOAD_BYTES.size()) {
