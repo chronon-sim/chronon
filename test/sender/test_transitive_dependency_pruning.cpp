@@ -7,6 +7,7 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../TestAssertions.hpp"
@@ -216,10 +217,38 @@ void test_dependency_only_headroom_adds_reverse_edge_only_when_tighter() {
     CHECK(global_floor_suffices.size() == 1);
     CHECK(global_floor_suffices[0].delay == 1);
 
-    const auto floor_disabled =
-        buildDependencyOnlyHeadroomGraph(/*headroom=*/512, /*max_lookahead=*/0);
-    CHECK(floor_disabled.size() == 2);
-    CHECK(floor_disabled[0].delay == 511 || floor_disabled[1].delay == 511);
+    std::cout << "PASSED\n";
+}
+
+void test_zero_lookahead_window_selects_sequential() {
+    std::cout << "Testing zero lookahead window selects Sequential... ";
+
+    auto run = [](uint32_t max_lookahead) {
+        TickSimulationConfig config;
+        config.num_threads = 2;
+        config.enable_weighted_partitioning = false;
+        config.enable_dynamic_rebalance = false;
+        config.max_lookahead_cycles = max_lookahead;
+
+        TickSimulation sim(config);
+        std::vector<PassUnit*> units;
+        for (size_t i = 0; i < 6; ++i) {
+            units.push_back(sim.createUnit<PassUnit>("unit" + std::to_string(i)));
+        }
+        sim.initialize();
+        const bool parallel = sim.useParallelExecution();
+        sim.run(8);
+        for (const auto* unit : units) CHECK(unit->localCycle() == 8);
+        return std::pair{parallel, sim.epochFreeRunCount()};
+    };
+
+    const auto enabled = run(8);
+    CHECK(enabled.first);
+    CHECK(enabled.second == 1);
+
+    const auto disabled = run(0);
+    CHECK(!disabled.first);
+    CHECK(disabled.second == 0);
 
     std::cout << "PASSED\n";
 }
@@ -230,6 +259,7 @@ int main() {
     test_runtime_prunes_only_transitively_implied_constraints();
     test_pruning_does_not_hide_headroom_zero_delay_cycle();
     test_dependency_only_headroom_adds_reverse_edge_only_when_tighter();
+    test_zero_lookahead_window_selects_sequential();
     std::cout << "All transitive dependency pruning tests passed!\n";
     return 0;
 }

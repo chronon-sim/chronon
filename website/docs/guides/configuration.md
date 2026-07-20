@@ -108,7 +108,7 @@ int main(int argc, char* argv[]) {
 | `-o, --output-dir <path>` | Override output directory |
 | `-n, --run-cycles <N>` | Override run cycles |
 | `-t, --threads <N>` | Override thread count |
-| `--epoch-size <N>` | Override simulation epoch size in cycles |
+| `--epoch-size <N>` | Set host/Sequential polling interval (compatibility name) |
 | `--no-observe` | Disable observation |
 | `-v, --verbose` | Verbose output |
 
@@ -132,9 +132,9 @@ simulation:
   name: my_simulation
   num_workers: 4
   enable_parallel: true    # Enable parallel execution (requires num_workers > 1)
-  enable_lookahead: true   # Enable lookahead scheduling
-  enable_epoch_free_lookahead: true   # Drop the per-epoch barrier when safe
-  epoch_size: 64           # Deprecated: only used by the fallback scheduler
+  enable_lookahead: true   # Compatibility switch; false forces Sequential
+  enable_epoch_free_lookahead: true   # Compatibility switch; false forces Sequential
+  epoch_size: 64           # Host predicate / Sequential polling interval
   run_cycles: 1000000
 
   unit:
@@ -227,9 +227,9 @@ simulation:
         - pattern: "flush"
 ```
 
-`periodic_dump_cycles` never splits or pauses a run. Every execution mode uses
-the same owner-based push path: sequential and barrier schedulers publish at
-their exact cycle boundary, while lookahead workers publish counters owned by
+`periodic_dump_cycles` never splits or pauses a run. Both execution paths use
+the same owner-based push path: Sequential publishes at exact cycle boundaries,
+while epoch-free workers publish counters owned by
 their scheduler clusters when local progress crosses the boundary. Records go
 to the producer's lock-free SPSC observation queue. The CSV cycle is the
 nominal boundary; lookahead workers may be sampled within one configured

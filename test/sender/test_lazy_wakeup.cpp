@@ -483,7 +483,6 @@ void test_interval_port_wake_is_consumed_before_sleep(const ModeConfig& mode) {
 int main() {
     const ModeConfig modes[] = {
         {"sequential", false, false},
-        {"barrier", true, false},
         {"epoch-free", true, true},
     };
 

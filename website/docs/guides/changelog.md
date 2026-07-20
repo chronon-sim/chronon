@@ -4,6 +4,21 @@ sidebar_label: "Changelog"
 
 # Changelog
 
+## 2026-07-20 - Scheduler Path Simplification
+
+Chronon now has two execution paths: Sequential and epoch-free lookahead. The
+per-cycle `sync_wait` Barrier scheduler and the per-epoch `std::barrier`
+lookahead fallback have been removed. When parallel execution is disabled, is
+not worthwhile, or fails the epoch-free safety gate, initialization selects
+Sequential instead of retaining a second parallel protocol.
+
+The compatibility switches `enable_lookahead`,
+`enable_epoch_free_lookahead`, and `max_lookahead_cycles` remain accepted.
+Disabling either lookahead switch or setting the maximum window to zero now
+selects Sequential. `epoch_size` remains as the host-predicate and Sequential
+termination-polling interval and no longer defines a parallel synchronization
+epoch.
+
 ## 2026-07-17 - Direct-Lane Port Transport
 
 Chronon's MPSC transport now publishes each `Connection` directly into a

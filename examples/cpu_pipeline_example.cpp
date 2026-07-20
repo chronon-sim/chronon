@@ -30,7 +30,7 @@
  *   make cpu_pipeline_example
  *
  * Run:
- *   ./examples/cpu_pipeline_example [--threads=N] [--no-lookahead]
+ *   ./examples/cpu_pipeline_example [--threads=N] [--sequential]
  */
 
 #include <chrono>
@@ -55,7 +55,7 @@ int main(int argc, char* argv[]) {
     std::cout << "==============================================\n\n";
 
     unsigned int num_threads = 0;  // 0 = auto (hardware_concurrency)
-    bool enable_lookahead = true;
+    bool force_sequential = false;
     bool enable_observe = true;
 
     for (int i = 1; i < argc; ++i) {
@@ -63,15 +63,17 @@ int main(int argc, char* argv[]) {
             num_threads = static_cast<unsigned int>(std::atoi(argv[i] + 10));
         } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             num_threads = static_cast<unsigned int>(std::atoi(argv[++i]));
-        } else if (std::strcmp(argv[i], "--no-lookahead") == 0) {
-            enable_lookahead = false;
+        } else if (std::strcmp(argv[i], "--sequential") == 0 ||
+                   std::strcmp(argv[i], "--no-lookahead") == 0) {
+            force_sequential = true;
         } else if (std::strcmp(argv[i], "--no-observe") == 0) {
             enable_observe = false;
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             std::cout << "Usage: " << argv[0] << " [options]\n\n";
             std::cout << "Options:\n";
             std::cout << "  --threads=N       Number of threads (default: auto)\n";
-            std::cout << "  --no-lookahead    Disable lookahead (use barrier sync per cycle)\n";
+            std::cout << "  --sequential      Force sequential execution\n";
+            std::cout << "  --no-lookahead    Compatibility alias for --sequential\n";
             std::cout << "  --no-observe      Disable all tracing and logging\n";
             std::cout << "  --help, -h        Show this help message\n";
             return 0;
@@ -80,15 +82,13 @@ int main(int argc, char* argv[]) {
 
     TickSimulationConfig config;
     config.num_threads = (num_threads > 0) ? num_threads : std::thread::hardware_concurrency();
-    config.enable_parallel = (config.num_threads > 1);
-    config.enable_lookahead = enable_lookahead;
+    config.enable_parallel = config.num_threads > 1 && !force_sequential;
     config.epoch_size = 1024;
 
     std::cout << "Configuration:\n";
     std::cout << "  Threads:    " << config.num_threads << "\n";
-    std::cout << "  Parallel:   " << (config.enable_parallel ? "yes" : "no") << "\n";
-    std::cout << "  Lookahead:  " << (config.enable_lookahead ? "yes" : "no") << "\n";
-    std::cout << "  Epoch size: " << config.epoch_size << " cycles\n\n";
+    std::cout << "  Scheduler:  " << (config.enable_parallel ? "epoch-free" : "sequential")
+              << "\n\n";
 
     TickSimulation sim(config);
 

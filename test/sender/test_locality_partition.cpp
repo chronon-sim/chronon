@@ -217,12 +217,13 @@ void test_locality_colocation() {
 }
 
 // Worker-count invariance: the locality-aware default must not change results.
-// Same topology + feedback loop, run across worker counts and scheduler modes;
+// Same topology + feedback loop, run across worker counts with epoch-free;
 // every checksum must match the single-thread sequential reference.
-uint64_t runSweep(size_t num_threads, bool lookahead, uint64_t cycles) {
+uint64_t runSweep(size_t num_threads, uint64_t cycles) {
     TickSimulationConfig cfg = baseConfig(num_threads, /*sync_cost=*/8.0);
     cfg.enable_parallel = (num_threads > 1);
-    cfg.enable_lookahead = lookahead;
+    cfg.enable_lookahead = true;
+    cfg.enable_epoch_free_lookahead = true;
 
     TickSimulation sim(cfg);
     // Enough per-tick work that parallel placement is actually exercised.
@@ -245,15 +246,11 @@ void test_locality_determinism_sweep() {
     std::cout << "Testing worker-count invariance under locality default...\n";
 
     constexpr uint64_t kCycles = 1200;
-    const uint64_t ref = runSweep(/*num_threads=*/1, /*lookahead=*/false, kCycles);
+    const uint64_t ref = runSweep(/*num_threads=*/1, kCycles);
 
-    for (size_t nw : {1u, 2u, 3u, 4u, 6u, 8u}) {
-        for (bool lookahead : {false, true}) {
-            if (nw == 1 && !lookahead) continue;  // that is the reference
-            uint64_t got = runSweep(nw, lookahead, kCycles);
-            check(got == ref, "nw=" + std::to_string(nw) + (lookahead ? " lookahead" : " barrier") +
-                                  " matches sequential reference");
-        }
+    for (size_t nw : {2u, 3u, 4u, 6u, 8u}) {
+        uint64_t got = runSweep(nw, kCycles);
+        check(got == ref, "nw=" + std::to_string(nw) + " epoch-free matches sequential reference");
     }
 }
 

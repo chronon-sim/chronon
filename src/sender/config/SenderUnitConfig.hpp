@@ -67,14 +67,14 @@ struct PortConnectionSpec {
 struct SimulationYAMLConfig {
     uint32_t num_workers = 4;
     bool enable_parallel = true;
+    /// Compatibility switch. False forces Sequential; Barrier was removed.
     bool enable_lookahead = true;
     bool trace_execution = false;  ///< Print execution policy details.
     uint32_t max_lookahead_cycles = 100;
-    /// Deprecated compatibility knob for the per-epoch lookahead fallback.
-    /// Epoch-free lookahead ignores this value.
+    /// Host predicate and Sequential termination polling interval.
     uint64_t epoch_size = 64;
-    /// Drop the per-epoch barrier when safe. Setting this false selects the
-    /// deprecated per-epoch fallback, which will be removed in a future release.
+    /// Compatibility switch for epoch-free execution. False forces Sequential;
+    /// no epoch-boundary fallback remains.
     bool enable_epoch_free_lookahead = true;
     uint64_t run_cycles = 0;  ///< 0 = run until completion.
     std::string name = "simulation";

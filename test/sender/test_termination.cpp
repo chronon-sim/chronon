@@ -412,8 +412,8 @@ void test_simulation_parallel_termination() {
     std::cout << "PASSED\n";
 }
 
-void test_parallel_barrier_termination_respects_epoch_chunks() {
-    std::cout << "Testing parallel barrier termination chunking... ";
+void test_lookahead_disabled_uses_sequential_termination_polling() {
+    std::cout << "Testing disabled lookahead uses sequential termination polling... ";
 
     TickSimulationConfig config;
     config.enable_parallel = true;
@@ -424,6 +424,9 @@ void test_parallel_barrier_termination_respects_epoch_chunks() {
     TickSimulation sim(config);
     [[maybe_unused]] auto* counter = sim.createUnit<CountingUnit>("counter", 3);
     sim.createUnit<InfiniteUnit>("infinite");
+    sim.initialize();
+
+    assert(!sim.useParallelExecution());
 
     [[maybe_unused]] uint64_t executed = sim.runUntilTermination(100000);
 
@@ -432,6 +435,24 @@ void test_parallel_barrier_termination_respects_epoch_chunks() {
     assert(counter->count() >= 3);
     assert(counter->count() <= config.epoch_size);
     assert(executed <= config.epoch_size);
+    assert(sim.epochFreeRunCount() == 0);
+
+    std::cout << "PASSED\n";
+}
+
+void test_zero_polling_interval_is_clamped() {
+    std::cout << "Testing zero polling interval is clamped... ";
+
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    config.epoch_size = 0;
+
+    TickSimulation sim(config);
+    auto* counter = sim.createUnit<CountingUnit>("counter", 3);
+    const uint64_t executed = sim.runUntilComplete(10);
+
+    assert(executed == 3);
+    assert(counter->count() == 3);
 
     std::cout << "PASSED\n";
 }
@@ -559,7 +580,8 @@ int main() {
     test_simulation_reset_termination();
     test_simulation_multiple_units_first_wins();
     test_simulation_parallel_termination();
-    test_parallel_barrier_termination_respects_epoch_chunks();
+    test_lookahead_disabled_uses_sequential_termination_polling();
+    test_zero_polling_interval_is_clamped();
 
     std::cout << "\n";
 

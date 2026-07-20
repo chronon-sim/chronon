@@ -50,11 +50,10 @@ namespace chronon::sender {
 /**
  * High-performance simulation using stdexec.
  *
- * Execution model: Chronon selects sequential, barrier, or lookahead at
- * runtime. In lookahead mode, tight clusters advance on dependency progress
- * atomics; epoch-free lookahead is the default when the safety gate can prove
- * that no per-epoch flush is required. The older per-epoch lookahead fallback
- * is deprecated and kept only as a compatibility/safety fallback.
+ * Execution model: Chronon selects sequential or epoch-free lookahead at
+ * initialization. Tight clusters advance on dependency-progress atomics when
+ * the epoch-free safety gate proves that no barrier or per-epoch flush is
+ * required; otherwise the simulation uses the sequential reference path.
  *
  * @code
  * TickSimulation sim;
@@ -162,7 +161,8 @@ public:
 
         uint64_t executed = 0;
         while (executed < max_cycles && !should_stop()) {
-            uint64_t batch = std::min(config_.epoch_size, max_cycles - executed);
+            const uint64_t polling_interval = std::max<uint64_t>(1, config_.epoch_size);
+            uint64_t batch = std::min(polling_interval, max_cycles - executed);
             executed += run(batch);
         }
         return executed;
@@ -248,14 +248,13 @@ public:
         }
     }
 
-    /// Number of runParallel() invocations that took the epoch-free path.
-    /// Test/bench introspection for the enable_epoch_free_lookahead A/B knob.
+    /// Number of epoch-free scheduler invocations. Sequential fallback leaves
+    /// this unchanged, making the counter useful for safety-gate coverage.
     uint64_t epochFreeRunCount() const noexcept { return epoch_free_run_count_; }
 
     /// Total direct-lane pushes rejected by a full physical ring.
     /// Nonzero means the lookahead window outran transport capacity — a
-    /// correctness failure. The epoch-free A/B watchdog (see
-    /// enable_epoch_free_lookahead). Always 0 for the barrier/sequential paths.
+    /// correctness failure. Always 0 for sequential execution.
     uint64_t totalTransportOverflowEvents() const noexcept {
         uint64_t total = 0;
         for (const IMultiProducerPort* p : multi_producer_ports_) {
@@ -270,9 +269,7 @@ public:
     exec::static_thread_pool& pool() noexcept { return pool_; }
     bool hasTightConnectionsInGraph() const noexcept { return has_tight_connections_; }
     bool isParallelBeneficial() const noexcept { return parallel_beneficial_; }
-    bool useParallelExecution() const noexcept {
-        return config_.enable_parallel && units_.size() > 1 && parallel_beneficial_;
-    }
+    bool useParallelExecution() const noexcept { return shouldUseParallelExecution_(); }
 
     TickableUnit* getUnit(const std::string& name) {
         for (auto& unit : units_) {
@@ -308,11 +305,11 @@ public:
 private:
     enum class ExecutionMode {
         Sequential,
-        Parallel,
+        EpochFree,
     };
 
     bool shouldUseParallelExecution_() const noexcept {
-        return execution_mode_ == ExecutionMode::Parallel;
+        return execution_mode_ == ExecutionMode::EpochFree;
     }
 
     bool parallelBeneficialFromThreadAssignment_() const noexcept;
@@ -321,7 +318,6 @@ private:
 
     void resolveSolver_();
     PartitionResult runPartitionSolver_(const PartitionInput& input);
-    PartitionResult runRebalanceSolver_(const PartitionInput& input);
 
     void selectExecutionMode_();
     void traceExecutionMode_();
@@ -330,14 +326,10 @@ private:
     uint64_t runSequential(uint64_t num_cycles);
     template <bool PushPeriodicCounters>
     uint64_t runSequentialImpl_(uint64_t num_cycles);
-    uint64_t runSequentialEpoch(uint64_t epoch_cycles);
-    uint64_t runParallelEpoch(uint64_t epoch_cycles, uint64_t executed_offset);
-    uint64_t runParallel(uint64_t num_cycles);
-    bool persistentLookaheadEligible_() const;
+    uint64_t runEpochFree(uint64_t num_cycles);
     bool epochFreeLookaheadEligible_() const;
     std::string epochFreeVetoReason_() const;
     void warnParallelFallbackIfNeeded_();
-    void warnDeprecatedEpochLookaheadFallback_(std::string_view reason);
 
     bool executeUnitCycle_(TickableUnit* unit, uint64_t cycle) {
         if (!any_activity_scheduling_.enabled.load(std::memory_order_acquire)) {
@@ -354,105 +346,6 @@ private:
         } else {
             unit->advanceIdleTick(1);
             return false;
-        }
-    }
-
-    /**
-     * Barrier scheduler: per-cycle parallel advancement across clusters.
-     *
-     * Every cluster advances exactly one cycle, then all threads rejoin at
-     * sync_wait. Units inside a cluster always run sequentially on the same
-     * thread, preserving order for intra-cluster tight (delay=0) edges.
-     */
-    template <typename Scheduler>
-    void executeEpochBarrier(Scheduler& sched, uint64_t epoch_cycles) {
-        if (observe::ObservationManager::instance().periodicCounterSnapshotsEnabled()) {
-            executeEpochBarrierImpl_<true>(sched, epoch_cycles);
-        } else {
-            executeEpochBarrierImpl_<false>(sched, epoch_cycles);
-        }
-    }
-
-    template <bool PushPeriodicCounters, typename Scheduler>
-    void executeEpochBarrierImpl_(Scheduler& sched, uint64_t epoch_cycles) {
-        const size_t num_threads = thread_units_.size();
-        observe::ThreadContext* counter_producer = nullptr;
-        uint64_t next_counter_cycle = UINT64_MAX;
-        uint64_t counter_period = 0;
-        const uint64_t run_target = current_cycle_ + epoch_cycles;
-        if constexpr (PushPeriodicCounters) {
-            auto& obs_mgr = observe::ObservationManager::instance();
-            counter_producer = obs_mgr.periodicCounterProducer();
-            counter_period = obs_mgr.periodicDumpCycles();
-            next_counter_cycle = detail::nextPeriodicCycle(current_cycle_, counter_period);
-        }
-        auto push_counter_boundary = [&](uint64_t completed_cycle) {
-            if constexpr (PushPeriodicCounters) {
-                if (counter_producer && next_counter_cycle <= run_target &&
-                    completed_cycle >= next_counter_cycle) {
-                    (void)observe::ObservationManager::instance().pushPeriodicCounterSnapshots(
-                        next_counter_cycle, counter_owner_ids_, *counter_producer);
-                    next_counter_cycle = detail::nextPeriodicCycle(completed_cycle, counter_period);
-                }
-            }
-        };
-        if (num_threads == 0) {
-            for (uint64_t c = 0; c < epoch_cycles; ++c) {
-                const uint64_t cycle = current_cycle_ + c;
-                auto work = stdexec::bulk(stdexec::just(), stdexec::par, units_.size(),
-                                          [this](std::size_t idx) {
-                                              auto* unit = unit_ptrs_[idx];
-                                              executeUnitCycle_(unit, unit->localCycle());
-                                          });
-                auto scheduled = stdexec::starts_on(sched, std::move(work));
-                stdexec::sync_wait(std::move(scheduled));
-                push_counter_boundary(cycle + 1);
-            }
-            return;
-        }
-
-        for (uint64_t c = 0; c < epoch_cycles; ++c) {
-            const uint64_t cycle = current_cycle_ + c;
-            auto work = stdexec::bulk(
-                stdexec::just(), stdexec::par, num_threads, [this, cycle](std::size_t thread_idx) {
-                    if (timeline_trace_.traceUnits()) {
-                        auto& points = thread_trace_points_[thread_idx];
-                        const bool trace_thread_cpu = timeline_trace_.traceThreadCpuTime();
-                        auto* cpu_points =
-                            trace_thread_cpu ? &thread_trace_cpu_points_[thread_idx] : nullptr;
-                        std::vector<char> active(thread_units_[thread_idx].size(), 0);
-                        points[0] = SchedulerTimelineTrace::Clock::now();
-                        if (cpu_points) {
-                            (*cpu_points)[0] = threadTraceCpuPoint_();
-                        }
-                        for (size_t pos = 0; pos < thread_units_[thread_idx].size(); ++pos) {
-                            size_t unit_idx = thread_units_[thread_idx][pos];
-                            active[pos] = executeUnitCycle_(unit_ptrs_[unit_idx],
-                                                            unit_ptrs_[unit_idx]->localCycle());
-                            points[pos + 1] = SchedulerTimelineTrace::Clock::now();
-                            if (cpu_points) {
-                                (*cpu_points)[pos + 1] = threadTraceCpuPoint_();
-                            }
-                        }
-                        for (size_t pos = 0; pos < thread_units_[thread_idx].size(); ++pos) {
-                            size_t unit_idx = thread_units_[thread_idx][pos];
-                            recordUnitDuration_(
-                                thread_idx, active[pos] ? "unit" : "unit idle",
-                                unit_ptrs_[unit_idx]->name(), cycle, points[pos], points[pos + 1],
-                                active[pos] ? "" : "cycles=1", trace_thread_cpu,
-                                cpu_points ? (*cpu_points)[pos] : ThreadTraceCpuPoint{},
-                                cpu_points ? (*cpu_points)[pos + 1] : ThreadTraceCpuPoint{});
-                        }
-                    } else {
-                        for (size_t unit_idx : thread_units_[thread_idx]) {
-                            executeUnitCycle_(unit_ptrs_[unit_idx],
-                                              unit_ptrs_[unit_idx]->localCycle());
-                        }
-                    }
-                });
-            auto scheduled = stdexec::starts_on(sched, std::move(work));
-            stdexec::sync_wait(std::move(scheduled));
-            push_counter_boundary(cycle + 1);
         }
     }
 
@@ -488,10 +381,6 @@ private:
     /// sync margin) is less than total sequential cost.
     bool parallelBeneficialWeighted_() const;
 
-    bool shouldRebalance_() const;
-    bool performRebalance_();
-    void maybeRebalanceAfterEpoch_(uint64_t epoch_executed);
-    void recordTickSample_(size_t thread_idx, size_t unit_local_idx, uint64_t ticks, bool active);
     void recordClusterTickSample_(size_t cluster, uint64_t ticks, bool active);
 
     /**
@@ -522,37 +411,12 @@ private:
     void initTimelineTraceScratch_();
 
     /**
-     * Lookahead scheduler (progress-atomic backend).
-     *
-     * Each thread runs its assigned clusters cycle-by-cycle and publishes
-     * its progress to a cache-line-aligned atomic; peers spin on those
-     * atomics. No per-iteration sync_wait. The unified stop_source_
-     * prevents spin-wait deadlock and propagates unit-initiated
-     * termination into mid-epoch waits.
-     */
-    void executeEpochProgressBased(uint64_t epoch_cycles);
-
-    /**
-     * Persistent-worker variant of executeEpochProgressBased: one bulk launch for
-     * the whole run, epoch boundaries crossed via a reusable std::barrier, so the
-     * stdexec thread pool no longer heap-allocates a bulk op-state per epoch. Used
-     * by runParallel() as the fixed-layout fallback when the epoch-free gate is
-     * unavailable.
-     *
-     * Deprecated: this per-epoch lookahead fallback is retained only for
-     * compatibility and for topologies that the epoch-free safety gate cannot
-     * prove yet. It will be removed in a future release.
-     */
-    uint64_t executeRunProgressBased(uint64_t total_cycles);
-
-    /**
-     * Epoch-free variant of executeRunProgressBased: one bulk launch, one
-     * run-spanning window, NO per-epoch barrier. Each worker drives its
+     * Epoch-free scheduler: one bulk launch and one run-spanning window. Each worker drives its
      * clusters straight to run_target; run-ahead is bounded by the
      * lookahead_floor_ + max_lookahead_cycles synthetic dependency (refreshed
      * lazily on the slow path). Direct MPSC lanes need no epoch-end flush.
-     * Selected by runParallel() only when allMultiProducerPortsHaveProgress_() and
-     * max_lookahead_cycles > 0. Returns cycles actually executed.
+     * Selected only when allMultiProducerPortsHaveProgress_() and
+     * max_lookahead_cycles > 0; otherwise initialization selects Sequential.
      */
     uint64_t executeRunEpochFree_(uint64_t total_cycles);
     uint64_t executeRunEpochFreeDynamic_(uint64_t total_cycles);
@@ -579,32 +443,32 @@ private:
 
     /// True when every finite cross-thread queue has a provable capacity
     /// dependency after headroom preparation, and those dependencies do not
-    /// introduce a zero-delay cluster cycle. Zero-slack cycles fall back to the
-    /// per-cycle barrier path because progress-based lookahead has no cluster
-    /// that can legally make the first tick.
+    /// introduce a zero-delay cluster cycle. Zero-slack cycles fall back to
+    /// sequential execution because epoch-free lookahead has no cluster that
+    /// can legally make the first tick.
     bool crossThreadHeadroomAllowsEpochFree_() const noexcept;
 
     /// Compatibility helper used by logs/tests.
     bool crossThreadHeadroomFits_(uint64_t max_lookahead) const noexcept;
 
-    /// Per-thread epoch body. Spin-waits on cross-thread progress atomics
+    /// Per-thread run body. Spin-waits on cross-thread progress atomics
     /// and exits via stop_token on termination or exception.
-    void executeThreadEpoch_(size_t thread_idx, uint64_t end_cycle,
-                             stdexec::inplace_stop_token token);
-    void executeThreadEpochWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
-                                                 uint64_t run_start, uint64_t period,
-                                                 stdexec::inplace_stop_token token);
+    void executeThreadRun_(size_t thread_idx, uint64_t end_cycle,
+                           stdexec::inplace_stop_token token);
+    void executeThreadRunWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
+                                               uint64_t run_start, uint64_t period,
+                                               stdexec::inplace_stop_token token);
     template <bool PushPeriodicCounters>
-    void executeThreadEpochImpl_(size_t thread_idx, uint64_t end_cycle, uint64_t run_start,
-                                 uint64_t period, stdexec::inplace_stop_token token);
-    void executeThreadEpochDynamic_(size_t thread_idx, uint64_t end_cycle,
-                                    stdexec::inplace_stop_token token);
-    void executeThreadEpochDynamicWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
-                                                        uint64_t run_start, uint64_t period,
-                                                        stdexec::inplace_stop_token token);
+    void executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle, uint64_t run_start,
+                               uint64_t period, stdexec::inplace_stop_token token);
+    void executeThreadRunDynamic_(size_t thread_idx, uint64_t end_cycle,
+                                  stdexec::inplace_stop_token token);
+    void executeThreadRunDynamicWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
+                                                      uint64_t run_start, uint64_t period,
+                                                      stdexec::inplace_stop_token token);
     template <bool PushPeriodicCounters>
-    void executeThreadEpochDynamicImpl_(size_t thread_idx, uint64_t end_cycle, uint64_t run_start,
-                                        uint64_t period, stdexec::inplace_stop_token token);
+    void executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t end_cycle, uint64_t run_start,
+                                      uint64_t period, stdexec::inplace_stop_token token);
 
     /// Monotonically raise lookahead_floor_ to the global-min completed cycle.
     /// Slow-path only (a stalled worker); see lookahead_floor_ for the contract.
@@ -720,11 +584,11 @@ private:
     bool has_zero_delay_cross_thread_cycle_ = false;
     bool parallel_beneficial_ = false;
     bool parallel_fallback_warned_ = false;
+    std::string parallel_fallback_reason_;
 
-    /// Count of runParallel() invocations dispatched to executeRunEpochFree_.
+    /// Count of runEpochFree() invocations.
     /// Introspection only (see epochFreeRunCount()).
     uint64_t epoch_free_run_count_ = 0;
-    bool epoch_free_veto_logged_ = false;
 
     TerminationController termination_ctrl_;
 
@@ -763,7 +627,7 @@ private:
     /// only disables the bulk-idle optimization and is behavior-safe.
     std::unique_ptr<detail::ActivitySchedulingState[]> cluster_activity_scheduling_;
 
-    /// Per-epoch floor for max_lookahead_cycles enforcement: clusters gate at
+    /// Global floor for max_lookahead_cycles enforcement: clusters gate at
     /// floor + max_lookahead_cycles.  Memory-order contract: relaxed monotone
     /// CAS write (refreshLookaheadFloor_), acquire read (clusterCanAdvance_).
     /// A gating HINT only — never carries data, and a stale value is always
@@ -772,7 +636,6 @@ private:
     std::vector<std::vector<TickableUnit*>> thread_unit_ptrs_;
     std::vector<std::vector<size_t>> thread_clusters_;
     std::vector<std::vector<TickableUnit*>> cluster_unit_ptrs_;
-    std::vector<std::vector<size_t>> cluster_thread_unit_positions_;
     std::vector<std::vector<SchedulerTimelineTrace::TimePoint>> thread_trace_points_;
     std::vector<std::vector<ThreadTraceCpuPoint>> thread_trace_cpu_points_;
 
@@ -839,7 +702,6 @@ private:
     std::string last_rebalance_detail_;
 
     PartitionSolver partition_solver_ = &WeightedPartitioner::partition;
-    PartitionSolver rebalance_solver_ = &WeightedPartitioner::partition;
     PlatformMetrics platform_metrics_{};
     std::vector<double> unit_costs_;
 
@@ -849,16 +711,6 @@ private:
     bool force_stable_connection_queues_ = false;
     size_t transparent_broadcast_connection_count_ = 0;
 
-    struct alignas(64) ThreadSamplingState {
-        std::vector<uint64_t> tick_times;
-        std::vector<uint8_t> active_samples;
-        std::vector<size_t> unit_write_idx;
-        std::vector<size_t> unit_sample_count;
-        size_t sample_count = 0;
-        static constexpr size_t RING_SIZE = 128;
-    };
-    std::vector<ThreadSamplingState> thread_sampling_;
-    uint64_t cycles_since_last_rebalance_ = 0;
     uint64_t cycles_since_last_actual_rebalance_ = 0;
     uint64_t rebalance_count_ = 0;
 };
