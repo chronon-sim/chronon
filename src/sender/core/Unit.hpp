@@ -95,7 +95,7 @@ public:
     /// constructor. sleepUntil(), sleepForever(), and setTickInterval(N > 1)
     /// enable it automatically once they are used.
     void enableActivityScheduling() noexcept {
-        port_wake_enabled_.store(true, std::memory_order_release);
+        enableActivityScheduling_();
         wake_tracking_enabled_.store(true, std::memory_order_release);
         setNextActiveCycleMin_(local_cycle_);
     }
@@ -293,6 +293,13 @@ protected:
     }
 
 private:
+    void bindActivitySchedulingFlag_(std::atomic<bool>* any_activity_scheduling) noexcept {
+        any_activity_scheduling_ = any_activity_scheduling;
+        if (port_wake_enabled_.load(std::memory_order_relaxed)) {
+            any_activity_scheduling_->store(true, std::memory_order_release);
+        }
+    }
+
     [[gnu::noinline]] void prepareCyclePortsSlow_() {
         for (PortBase* port : *cycle_prepared_ports_) {
             port->prepareConsumerCycle(local_cycle_);
@@ -301,6 +308,9 @@ private:
 
     void enableActivityScheduling_() noexcept {
         port_wake_enabled_.store(true, std::memory_order_release);
+        if (any_activity_scheduling_ != nullptr) {
+            any_activity_scheduling_->store(true, std::memory_order_release);
+        }
     }
 
     void setSleepTarget_(uint64_t cycle) noexcept {
@@ -375,6 +385,10 @@ private:
     /// Owner-side relaxed reads require only a non-RMW load; cross-thread port
     /// producers use acceptsPortWakeups()'s acquire load.
     std::atomic<bool> port_wake_enabled_{false};
+    /// Bound by TickSimulation immediately after construction. This monotone
+    /// simulation-wide flag lets the scheduler bypass idle-discovery only when
+    /// no Unit has ever opted into activity scheduling.
+    std::atomic<bool>* any_activity_scheduling_ = nullptr;
     std::atomic<bool> wake_tracking_enabled_{false};
     uint32_t id_;
     std::vector<PortBase*> ports_;

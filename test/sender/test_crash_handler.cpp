@@ -71,6 +71,13 @@ private:
     uint64_t tick_count_ = 0;
 };
 
+class FatalSignalUnit : public TickableUnit {
+public:
+    FatalSignalUnit() : TickableUnit("fatal_tick_unit") {}
+
+    void tick() override { raise(SIGABRT); }
+};
+
 /**
  * An observable unit that emits a log every tick, then throws.
  * Used to test that observer data emitted before the crash is flushed.
@@ -388,12 +395,8 @@ void test_fatal_signal_handler_subprocess() {
         close(pipefd[1]);
 
         CrashHandler::install();
-        detail::current_tick_context_.unit = reinterpret_cast<TickableUnit*>(0x1234);
-        detail::current_tick_context_.cycle = 777;
-        std::memcpy(detail::current_tick_context_.unit_name, "test_unit", 10);
-        detail::current_tick_context_.phase = "tick";
-
-        raise(SIGABRT);
+        FatalSignalUnit unit;
+        unit.executeTick();
         _exit(0);  // Should never reach here
     }
 
@@ -429,8 +432,10 @@ void test_fatal_signal_handler_subprocess() {
     assert(WEXITSTATUS(status) == 128 + SIGABRT);
     assert(stderr_output.find("=== CHRONON CRASH ===") != std::string::npos);
     assert(stderr_output.find("SIGABRT") != std::string::npos);
-    assert(stderr_output.find("Unit:    test_unit") != std::string::npos);
+    assert(stderr_output.find("TickCtx: active") != std::string::npos);
+    assert(stderr_output.find("Unit:    fatal_tick_unit") != std::string::npos);
     assert(stderr_output.find("Phase:   tick") != std::string::npos);
+    assert(stderr_output.find("Cycle:   0") != std::string::npos);
 #if !defined(CHRONON_SANITIZER_BUILD)
     assert(stderr_output.find("Backtrace:") != std::string::npos);
 #endif

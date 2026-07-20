@@ -26,6 +26,7 @@
 
 #include "MessageQueue.hpp"
 #include "SharedBroadcastTransport.hpp"
+#include "detail/ConnectionAdmissionState.hpp"
 
 namespace chronon::sender {
 
@@ -364,12 +365,12 @@ public:
      * @return true if transfer succeeded, false if destination full (back pressure)
      */
     bool transfer(T data, uint64_t send_cycle) {
-        maybeResetPushesCycle_(send_cycle);
+        admission_.beginCycle(send_cycle);
         if (dependency_only_transport_) {
-            if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
+            if (admission_.pushes() >= edgeCycleRateLimit_()) {
                 return false;
             }
-            ++pushes_this_cycle_;
+            admission_.chargePush();
             return true;
         }
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
@@ -383,7 +384,7 @@ public:
             // lane. Unbounded InPorts consume the selected slot in place;
             // bounded InPorts move ready entries into a receiver-owned shared
             // FIFO with deterministic aggregate admission.
-            if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
+            if (admission_.pushes() >= edgeCycleRateLimit_()) {
                 return false;
             }
             if (!hasMPSCLaneAdmissionSlot_(send_cycle)) {
@@ -398,7 +399,7 @@ public:
                                                   send_cycle, conn_id_)) {
                 return false;
             }
-            ++pushes_this_cycle_;
+            admission_.chargePush();
             wakeUnitAt(destination(), arrive_cycle);
             return true;
         }
@@ -406,7 +407,7 @@ public:
         // model-visible destination capacity. The backing SPSC ring can be much
         // larger than the architectural FIFO depth, so admission uses a
         // producer-cycle snapshot instead of live target queue fullness.
-        if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
+        if (admission_.pushes() >= edgeCycleRateLimit_()) {
             return false;
         }
         if (!hasDestinationAdmissionSlot_(send_cycle)) {
@@ -420,7 +421,7 @@ public:
 #endif
                                                send_cycle, conn_id_);
         if (ok) {
-            ++pushes_this_cycle_;
+            admission_.chargePush();
             wakeUnitAt(destination(), arrive_cycle);
         }
         return ok;
@@ -451,14 +452,14 @@ public:
     bool canTransfer() const {
         if (dependency_only_transport_) {
             const uint64_t send_cycle = from_->getCurrentCycle();
-            maybeResetPushesCycle_(send_cycle);
-            return pushes_this_cycle_ < edgeCycleRateLimit_();
+            admission_.beginCycle(send_cycle);
+            return admission_.pushes() < edgeCycleRateLimit_();
         }
         // MPSC path: producer sees backpressure on its own direct SPSC lane.
         if (thread_queue_id_ != SIZE_MAX) {
             const uint64_t send_cycle = from_->getCurrentCycle();
-            maybeResetPushesCycle_(send_cycle);
-            if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
+            admission_.beginCycle(send_cycle);
+            if (admission_.pushes() >= edgeCycleRateLimit_()) {
                 return false;
             }
             if (!hasMPSCLaneAdmissionSlot_(send_cycle)) {
@@ -467,8 +468,8 @@ public:
             return to_->canPushToThreadQueue(thread_queue_id_);
         }
         const uint64_t send_cycle = from_->getCurrentCycle();
-        maybeResetPushesCycle_(send_cycle);
-        return pushes_this_cycle_ < edgeCycleRateLimit_() &&
+        admission_.beginCycle(send_cycle);
+        return admission_.pushes() < edgeCycleRateLimit_() &&
                hasDestinationAdmissionSlot_(send_cycle);
     }
 
@@ -543,6 +544,7 @@ public:
         }
         if (capacity.has_value()) registered_capacity_ = *capacity;
         if (rate.has_value()) registered_rate_ = *rate;
+        admission_.invalidateOccupancy();
         if (to_) to_->invalidatePortTransactions_();
     }
 
@@ -656,8 +658,8 @@ public:
     uint32_t connId() const noexcept override { return conn_id_; }
 
     size_t transactionPushesAt(uint64_t cycle) const noexcept override {
-        maybeResetPushesCycle_(cycle);
-        return pushes_this_cycle_;
+        admission_.beginCycle(cycle);
+        return admission_.pushes();
     }
 
     OutPort<T>* from() const noexcept { return from_; }
@@ -679,13 +681,13 @@ private:
     bool tryReserveTransfer_(uint64_t send_cycle) {
         if (shared_broadcast_ != nullptr) return false;
 
-        maybeResetPushesCycle_(send_cycle);
-        if (pushes_this_cycle_ >= edgeCycleRateLimit_()) {
+        admission_.beginCycle(send_cycle);
+        if (admission_.pushes() >= edgeCycleRateLimit_()) {
             return false;
         }
 
         if (dependency_only_transport_) {
-            ++pushes_this_cycle_;
+            admission_.chargePush();
             transaction_destination_epoch_ = to_->portTransactionEpoch_();
             return true;
         }
@@ -708,17 +710,17 @@ private:
             return false;
         }
 
-        ++pushes_this_cycle_;
+        admission_.reservePush(bounded_destination);
         transaction_destination_epoch_ = to_->portTransactionEpoch_();
         return true;
     }
 
     /** Validate a previously claimed slot without consuming another credit. */
     bool transactionReservationValid_(uint64_t send_cycle) const {
-        if (from_->getCurrentCycle() != send_cycle || last_pushes_cycle_ != send_cycle ||
-            pushes_this_cycle_ == 0 || shared_broadcast_ != nullptr ||
+        if (from_->getCurrentCycle() != send_cycle || admission_.pushCycle() != send_cycle ||
+            admission_.pushes() == 0 || shared_broadcast_ != nullptr ||
             transaction_destination_epoch_ != to_->portTransactionEpoch_() ||
-            pushes_this_cycle_ > edgeCycleRateLimit_()) {
+            admission_.pushes() > edgeCycleRateLimit_()) {
             return false;
         }
 
@@ -729,7 +731,7 @@ private:
             return false;
         }
 
-        const size_t pending_pushes = boundedTransactionDestination_() ? 1 : pushes_this_cycle_;
+        const size_t pending_pushes = boundedTransactionDestination_() ? 1 : admission_.pushes();
         if (thread_queue_id_ != SIZE_MAX) {
             return hasMPSCLaneAdmissionForPending_(send_cycle, pending_pushes) &&
                    to_->canPushToThreadQueue(thread_queue_id_);
@@ -739,9 +741,7 @@ private:
 
     /** Release one uncommitted producer-cycle claim. */
     void releaseReservedTransfer_(uint64_t send_cycle) noexcept {
-        if (last_pushes_cycle_ == send_cycle && pushes_this_cycle_ != 0) {
-            --pushes_this_cycle_;
-        }
+        admission_.releaseReservation(send_cycle);
         if (transaction_group_) transaction_group_->release(this);
     }
 
@@ -750,7 +750,7 @@ private:
      * multi-port transaction.
      *
      * There is deliberately no logical admission recheck here: the claim is
-     * already included in pushes_this_cycle_.  Once every participating port
+     * already included in the admission push count. Once every participating port
      * validates, producer ownership proves that the physical push cannot become
      * full before this call (consumers only free space).  A false return is thus
      * a framework invariant violation, not model backpressure after partial
@@ -784,6 +784,7 @@ private:
         if (!ok) {
             std::terminate();
         }
+        admission_.commitReservation();
         if (transaction_group_) transaction_group_->release(this);
         wakeUnitAt(destination(), arrive_cycle);
     }
@@ -860,8 +861,11 @@ private:
         if (admission_cap == 0) {
             return false;
         }
+        if (admission_.upperBoundHasSlot(admission_cap)) {
+            return true;
+        }
         const size_t occupancy = destinationAdmissionOccupancy_(send_cycle);
-        return occupancy < admission_cap && pushes_this_cycle_ < admission_cap - occupancy;
+        return occupancy < admission_cap && admission_.pushes() < admission_cap - occupancy;
     }
 
     bool hasMPSCLaneAdmissionForPending_(uint64_t send_cycle,
@@ -889,27 +893,26 @@ private:
         }
         if (admission_cap == 0) return false;
 
+        if (admission_.upperBoundHasSlot(admission_cap)) {
+            return true;
+        }
         const size_t occupancy = mpscAdmissionOccupancy_(send_cycle);
-        return occupancy < admission_cap && pushes_this_cycle_ < admission_cap - occupancy;
+        return occupancy < admission_cap && admission_.pushes() < admission_cap - occupancy;
     }
 
     size_t destinationAdmissionOccupancy_(uint64_t send_cycle) const noexcept {
-        if (!admission_snapshot_valid_ || send_cycle != last_admission_cycle_) {
-            admission_occupancy_at_cycle_start_ = to_->admissionOccupancy(send_cycle);
-            last_admission_cycle_ = send_cycle;
-            admission_snapshot_valid_ = true;
+        if (!admission_.hasSnapshot(send_cycle)) {
+            admission_.cacheOccupancy(send_cycle, to_->admissionOccupancy(send_cycle));
         }
-        return admission_occupancy_at_cycle_start_;
+        return admission_.occupancy();
     }
 
     size_t mpscAdmissionOccupancy_(uint64_t send_cycle) const noexcept {
-        if (!admission_snapshot_valid_ || send_cycle != last_admission_cycle_) {
-            admission_occupancy_at_cycle_start_ =
-                to_->threadQueueAdmissionOccupancy(thread_queue_id_, send_cycle);
-            last_admission_cycle_ = send_cycle;
-            admission_snapshot_valid_ = true;
+        if (!admission_.hasSnapshot(send_cycle)) {
+            admission_.cacheOccupancy(
+                send_cycle, to_->threadQueueAdmissionOccupancy(thread_queue_id_, send_cycle));
         }
-        return admission_occupancy_at_cycle_start_;
+        return admission_.occupancy();
     }
 
     bool isDFFStyleEdge_() const noexcept {
@@ -964,29 +967,8 @@ private:
     size_t thread_queue_id_ = SIZE_MAX;  ///< SIZE_MAX means not in MPSC mode
     uint32_t conn_id_ = 0;               ///< Stable topology-based tiebreaker
 
-    /// Producer-side cycle-local push counter (Track H v2 / RTL-strict
-    /// backpressure). Touched only by the producer thread for this
-    /// connection. No atomicity needed.
-    ///
-    /// Reset to 0 whenever transfer() observes a new producer cycle. Read by
-    /// canTransfer() to compute "snapshot + my pending pushes this cycle"
-    /// — the RTL-correct view of "would my next push exceed the destination
-    /// FIFO bound?" without ever consulting the destination's mid-cycle pop
-    /// activity (which a parallel-thread implementation can otherwise expose
-    /// and break cycle-count reproducibility across num_workers).
-    mutable size_t pushes_this_cycle_ = 0;
-    mutable uint64_t last_pushes_cycle_ = 0;
-    mutable bool admission_snapshot_valid_ = false;
-    mutable uint64_t last_admission_cycle_ = 0;
-    mutable size_t admission_occupancy_at_cycle_start_ = 0;
-
-    void maybeResetPushesCycle_(uint64_t send_cycle) const noexcept {
-        if (send_cycle != last_pushes_cycle_) {
-            pushes_this_cycle_ = 0;
-            last_pushes_cycle_ = send_cycle;
-            admission_snapshot_valid_ = false;
-        }
-    }
+    /// Producer-owned RTL-strict push accounting and conservative occupancy.
+    mutable detail::ConnectionAdmissionState admission_;
     /// Finite producer run-ahead supported by a model-owned external
     /// transport. SIZE_MAX retains the legacy unbounded dependency-only edge.
     size_t dependency_only_headroom_ = std::numeric_limits<size_t>::max();

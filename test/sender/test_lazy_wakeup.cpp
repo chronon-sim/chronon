@@ -50,6 +50,27 @@ public:
     uint64_t ticks = 0;
 };
 
+class PassiveUnit : public TickableUnit {
+public:
+    explicit PassiveUnit(std::string name) : TickableUnit(std::move(name)) {}
+
+    void tick() override { ++ticks; }
+
+    uint64_t ticks = 0;
+};
+
+class RuntimeOptInUnit : public TickableUnit {
+public:
+    RuntimeOptInUnit() : TickableUnit("runtime_opt_in") {}
+
+    void tick() override {
+        tick_cycles.push_back(localCycle());
+        if (localCycle() == 2) sleepForever();
+    }
+
+    std::vector<uint64_t> tick_cycles;
+};
+
 class InitiallyDeferredUnit : public TickableUnit {
 public:
     InitiallyDeferredUnit() : TickableUnit("initially_deferred") { sleepUntil(5); }
@@ -252,6 +273,24 @@ void test_tick_interval(const ModeConfig& mode) {
     assert(unit->localCycle() == 10);
 }
 
+void test_runtime_opt_in_leaves_always_active_fast_path(const ModeConfig& mode) {
+    TickSimulation sim(makeConfig(mode));
+    auto* unit = sim.createUnit<RuntimeOptInUnit>();
+    std::vector<PassiveUnit*> passive;
+    for (int i = 0; i < 8; ++i) {
+        passive.push_back(sim.createUnit<PassiveUnit>("passive_" + std::to_string(i)));
+    }
+
+    sim.run(10);
+
+    assert((unit->tick_cycles == std::vector<uint64_t>{0, 1, 2}));
+    assert(unit->localCycle() == 10);
+    for (const auto* filler : passive) {
+        assert(filler->ticks == 10);
+        assert(filler->localCycle() == 10);
+    }
+}
+
 void test_initial_sleep_until_defers_first_tick(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<InitiallyDeferredUnit>();
@@ -444,6 +483,10 @@ int main() {
 
         std::cout << "Testing lazy wakeup tick_interval (" << mode.name << ")... ";
         test_tick_interval(mode);
+        std::cout << "PASSED\n";
+
+        std::cout << "Testing runtime activity opt-in (" << mode.name << ")... ";
+        test_runtime_opt_in_leaves_always_active_fast_path(mode);
         std::cout << "PASSED\n";
 
         std::cout << "Testing lazy wakeup initial sleepUntil (" << mode.name << ")... ";

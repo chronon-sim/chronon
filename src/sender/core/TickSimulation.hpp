@@ -118,6 +118,7 @@ public:
         auto* ptr = unit.get();
 
         ptr->setId(static_cast<uint32_t>(units_.size()));
+        ptr->bindActivitySchedulingFlag_(&any_activity_scheduling_);
 
         units_.push_back(std::move(unit));
         unit_ptrs_.push_back(ptr);
@@ -338,6 +339,10 @@ private:
     void warnDeprecatedEpochLookaheadFallback_(std::string_view reason);
 
     bool executeUnitCycle_(TickableUnit* unit, uint64_t cycle) {
+        if (!any_activity_scheduling_.load(std::memory_order_acquire)) {
+            unit->executeTickAlwaysActive();
+            return true;
+        }
         if (!unit->usesActivityScheduling()) {
             unit->executeTickAlwaysActive();
             return true;
@@ -746,6 +751,12 @@ private:
     ThreadProgress* thread_progress_array_ = nullptr;
     size_t thread_progress_count_ = 0;
     std::vector<std::vector<ResolvedDep>> thread_resolved_deps_;
+
+    /// Monotone opt-in summary for Unit activity scheduling. A false acquire
+    /// load proves every Unit is always active, so lookahead workers can skip
+    /// the otherwise O(units-in-cluster) idle-target scan. Once true, the
+    /// original scheduling path is used for the remainder of the simulation.
+    alignas(64) std::atomic<bool> any_activity_scheduling_{false};
 
     /// Per-epoch floor for max_lookahead_cycles enforcement: clusters gate at
     /// floor + max_lookahead_cycles.  Memory-order contract: relaxed monotone

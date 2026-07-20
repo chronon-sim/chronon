@@ -33,34 +33,38 @@ namespace detail {
 struct TickContext {
     TickableUnit* unit = nullptr;
     uint64_t cycle = 0;
-    char unit_name[64] = {};      ///< copied into TLS via memcpy (heap-independent)
-    const char* phase = nullptr;  ///< points to a string literal in .rodata
+    const char* unit_name = nullptr;  ///< points to Unit's fixed, lifetime-stable crash buffer
+    const char* phase = nullptr;      ///< points to a string literal in .rodata
 };
 
-extern thread_local TickContext current_tick_context_;
+extern thread_local constinit TickContext current_tick_context_;
 
 /// RAII setter that always clears the thread-local tick context, even on
 /// exception unwind.
 class TickContextGuard {
 public:
     TickContextGuard(TickableUnit* unit, uint64_t cycle, const char* unit_name, uint8_t name_len,
-                     const char* phase) noexcept {
-        current_tick_context_.unit = unit;
-        current_tick_context_.cycle = cycle;
-        current_tick_context_.phase = phase;
-        // Precomputed length keeps this to ~1 instruction for short names.
-        std::memcpy(current_tick_context_.unit_name, unit_name, name_len + 1);
+                     const char* phase) noexcept
+        : context_(&current_tick_context_) {
+        (void)name_len;
+        context_->unit = unit;
+        context_->cycle = cycle;
+        context_->unit_name = unit_name;
+        context_->phase = phase;
     }
 
     ~TickContextGuard() noexcept {
-        current_tick_context_.unit = nullptr;
-        current_tick_context_.cycle = 0;
-        current_tick_context_.unit_name[0] = '\0';
-        current_tick_context_.phase = nullptr;
+        context_->unit = nullptr;
+        context_->cycle = 0;
+        context_->unit_name = nullptr;
+        context_->phase = nullptr;
     }
 
     TickContextGuard(const TickContextGuard&) = delete;
     TickContextGuard& operator=(const TickContextGuard&) = delete;
+
+private:
+    TickContext* context_;
 };
 
 }  // namespace detail
