@@ -15,8 +15,9 @@ add_library(chronon STATIC
     # Crash handler for simulation tick exceptions and fatal signals
     sender/core/CrashHandler.cpp
 
-    # Tick-based simulation driver (split across three files by concern)
+    # Tick-based simulation driver (split by concern)
     sender/core/TickSimulation.cpp
+    sender/core/TickSimulationActivity.cpp
     sender/core/TickSimulationPorts.cpp
     sender/core/TickSimulationDependencies.cpp
     sender/core/TickSimulationPartition.cpp

@@ -118,6 +118,7 @@ public:
         auto* ptr = unit.get();
 
         ptr->setId(static_cast<uint32_t>(units_.size()));
+        ptr->bindActivitySchedulingState_(&any_activity_scheduling_);
 
         units_.push_back(std::move(unit));
         unit_ptrs_.push_back(ptr);
@@ -324,6 +325,7 @@ private:
 
     void selectExecutionMode_();
     void traceExecutionMode_();
+    void initClusterActivityScheduling_();
 
     uint64_t runSequential(uint64_t num_cycles);
     template <bool PushPeriodicCounters>
@@ -338,6 +340,10 @@ private:
     void warnDeprecatedEpochLookaheadFallback_(std::string_view reason);
 
     bool executeUnitCycle_(TickableUnit* unit, uint64_t cycle) {
+        if (!any_activity_scheduling_.enabled.load(std::memory_order_acquire)) {
+            unit->executeTickAlwaysActive();
+            return true;
+        }
         if (!unit->usesActivityScheduling()) {
             unit->executeTickAlwaysActive();
             return true;
@@ -661,6 +667,8 @@ private:
                                                         uint64_t* predecessor_cache) const;
     uint64_t computeIdleClusterTarget_(size_t cluster, uint64_t cycle, uint64_t end_cycle,
                                        uint64_t* predecessor_cache) const;
+    [[gnu::noinline]] uint64_t computeIdleClusterTargetIfEnabled_(
+        size_t cluster, uint64_t cycle, uint64_t end_cycle, uint64_t* predecessor_cache) const;
     void advanceClusterIdle_(size_t cluster, uint64_t delta);
     void recordClusterIdle_(size_t thread_idx, size_t cluster, uint64_t cycle, uint64_t delta,
                             SchedulerTimelineTrace::TimePoint begin,
@@ -746,6 +754,14 @@ private:
     ThreadProgress* thread_progress_array_ = nullptr;
     size_t thread_progress_count_ = 0;
     std::vector<std::vector<ResolvedDep>> thread_resolved_deps_;
+
+    /// Root of the activity-summary hierarchy. A false acquire load proves
+    /// that every Unit is still always active; runtime opt-in publishes true.
+    detail::ActivitySchedulingState any_activity_scheduling_;
+
+    /// Cache-line-isolated, monotone per-cluster idle-scan hints. A stale false
+    /// only disables the bulk-idle optimization and is behavior-safe.
+    std::unique_ptr<detail::ActivitySchedulingState[]> cluster_activity_scheduling_;
 
     /// Per-epoch floor for max_lookahead_cycles enforcement: clusters gate at
     /// floor + max_lookahead_cycles.  Memory-order contract: relaxed monotone

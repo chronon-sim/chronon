@@ -23,7 +23,7 @@
 namespace chronon::sender {
 
 namespace detail {
-thread_local TickContext current_tick_context_;
+thread_local constinit TickContext current_tick_context_{};
 }  // namespace detail
 
 std::atomic<bool> CrashHandler::installed_{false};

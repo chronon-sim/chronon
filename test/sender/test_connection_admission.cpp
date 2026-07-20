@@ -93,6 +93,109 @@ void testMPSCCapacityIgnoresSameCycleConsumerPopInterleaving() {
     require(out.send(3), "MPSC send failed after prior-cycle consumer credit");
 }
 
+void testSPSCConservativeUpperBoundFallsBackAtCapacity() {
+    constexpr size_t kDepth = 8;
+
+    ManualUnit producer("spsc_producer");
+    ManualUnit consumer("spsc_consumer");
+    OutPort<int> out{&producer, "out", kDepth};
+    InPort<int> in{&consumer, "in", kDepth};
+    auto* connection = out.connect(&in, 1);
+    connection->optimizeForSPSC();
+
+    // After the first exact query, the remaining sends are admitted from the
+    // producer-only conservative upper bound until it reaches capacity.
+    producer.setCycle(0);
+    for (size_t value = 0; value < kDepth; ++value) {
+        require(out.send(static_cast<int>(value)), "SPSC failed to fill declared capacity");
+    }
+    require(!out.canSend(), "SPSC exceeded its per-cycle/depth bound");
+
+    // Host execution lets the consumer pop first, but architectural credit is
+    // cycle-strict: the producer must fall back to exact history and reject a
+    // same-cycle refill when the conservative bound reaches the limit.
+    consumer.setCycle(1);
+    const auto first_batch = in.receiveAll(1);
+    require(first_batch.size() == kDepth, "SPSC consumer did not drain the first burst");
+    producer.setCycle(1);
+    require(!out.canSend(), "SPSC upper bound exposed same-cycle consumer credit");
+    require(!out.send(99), "SPSC refilled from a same-cycle consumer pop");
+
+    // On the next producer cycle the original admission history retires those
+    // pops, refreshes the bound exactly, and permits the full burst again.
+    producer.setCycle(2);
+    for (size_t value = 0; value < kDepth; ++value) {
+        require(out.send(static_cast<int>(100 + value)),
+                "SPSC did not release prior-cycle consumer credit");
+    }
+}
+
+void testSPSCUpperBoundRefreshRecoversCycleStartOccupancy() {
+    constexpr size_t kDepth = 8;
+    constexpr size_t kInitialOccupancy = 5;
+
+    ManualUnit producer("spsc_refresh_producer");
+    ManualUnit consumer("spsc_refresh_consumer");
+    OutPort<int> out{&producer, "out", kDepth};
+    InPort<int> in{&consumer, "in", kDepth};
+    auto* connection = out.connect(&in, 1);
+    connection->optimizeForSPSC();
+
+    producer.setCycle(0);
+    for (size_t value = 0; value < kInitialOccupancy; ++value) {
+        require(out.send(static_cast<int>(value)), "SPSC failed to seed refresh test");
+    }
+
+    consumer.setCycle(1);
+    const auto drained = in.receiveAll(1);
+    require(drained.size() == kInitialOccupancy, "SPSC refresh test did not drain seed data");
+
+    // The carried bound admits the first three publications without touching
+    // receiver state. The fourth request refreshes occupancy after those
+    // publications are already visible. It must subtract them exactly once
+    // and recover the empty cycle-start snapshot, allowing all eight sends.
+    producer.setCycle(2);
+    for (size_t value = 0; value < kDepth; ++value) {
+        require(out.send(static_cast<int>(100 + value)),
+                "SPSC mid-cycle refresh double-counted current publications");
+    }
+    require(!out.canSend(), "SPSC refresh test exceeded declared capacity");
+}
+
+void testMPSCUpperBoundRefreshRecoversCycleStartOccupancy() {
+    constexpr size_t kDepth = 8;
+    constexpr size_t kInitialOccupancy = 5;
+
+    ManualUnit producer("mpsc_refresh_producer");
+    ManualUnit consumer("mpsc_refresh_consumer");
+    OutPort<int> out{&producer, "out", kDepth};
+    InPort<int> in{&consumer, "in", kDepth};
+    auto* connection = out.connect(&in, 1);
+    connection->optimizeForMPSC();
+    const size_t queue_id = connection->registerProducerThread(/*thread_id=*/0);
+    require(queue_id != SIZE_MAX, "MPSC refresh producer registration failed");
+    connection->setThreadQueueId(queue_id);
+    require(connection->registerOnDestMPSC() != nullptr,
+            "MPSC refresh destination registration failed");
+
+    producer.setCycle(0);
+    for (size_t value = 0; value < kInitialOccupancy; ++value) {
+        require(out.send(static_cast<int>(value)), "MPSC failed to seed refresh test");
+    }
+
+    consumer.setCycle(1);
+    in.prepareConsumerCycle(1);
+    const auto drained = in.receiveAll(1);
+    require(drained.size() == kInitialOccupancy, "MPSC refresh test did not drain seed data");
+
+    producer.setCycle(2);
+    for (size_t value = 0; value < kDepth; ++value) {
+        require(out.send(static_cast<int>(100 + value)),
+                "MPSC mid-cycle refresh double-counted current publications");
+    }
+    require(!out.canSend(), "MPSC refresh test exceeded declared capacity");
+}
+
 void testMPSCAggregateSharedDepthAcrossProducers() {
     constexpr size_t kRate = 2;
     constexpr size_t kDepth = 2;
@@ -217,6 +320,9 @@ void testMPSCRegisteredCapacityCreatesAggregateSharedFifo() {
 int main() {
     try {
         testRegisteredEdgeRejectsZeroCapacityAndRate();
+        testSPSCConservativeUpperBoundFallsBackAtCapacity();
+        testSPSCUpperBoundRefreshRecoversCycleStartOccupancy();
+        testMPSCUpperBoundRefreshRecoversCycleStartOccupancy();
         testMPSCCapacityIgnoresSameCycleConsumerPopInterleaving();
         testMPSCAggregateSharedDepthAcrossProducers();
         testMPSCRegisteredCapacityCreatesAggregateSharedFifo();

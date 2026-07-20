@@ -505,8 +505,11 @@ void TickSimulation::executeThreadEpochImpl_(size_t thread_idx, uint64_t end_cyc
                 continue;
             }
 
-            uint64_t idle_target =
-                computeIdleClusterTarget_(cluster, cycle, end_cycle, predecessor_cycles);
+            uint64_t idle_target = cycle;
+            if (any_activity_scheduling_.enabled.load(std::memory_order_acquire)) [[unlikely]] {
+                idle_target = computeIdleClusterTargetIfEnabled_(cluster, cycle, end_cycle,
+                                                                 predecessor_cycles);
+            }
             if (idle_target > cycle) {
                 SchedulerTimelineTrace::TimePoint idle_begin{};
                 if (trace_units) {

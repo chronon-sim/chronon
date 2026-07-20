@@ -33,6 +33,25 @@ class TickSimulation;
 
 enum class UnitState { Created, Initialized };
 
+namespace detail {
+
+struct alignas(64) ActivitySchedulingState {
+    void publish() noexcept {
+        // A cluster leaf owns root; the global root leaves it null. Publishing
+        // leaf first makes an acquire of root=true sufficient for leaf lookup.
+        enabled.store(true, std::memory_order_release);
+        if (root != nullptr) {
+            root->store(true, std::memory_order_release);
+        }
+    }
+
+    std::atomic<bool> enabled{false};
+    std::atomic<bool>* root = nullptr;
+};
+static_assert(sizeof(ActivitySchedulingState) % 64 == 0);
+
+}  // namespace detail
+
 /**
  * Base class for simulation components.
  *
@@ -95,7 +114,7 @@ public:
     /// constructor. sleepUntil(), sleepForever(), and setTickInterval(N > 1)
     /// enable it automatically once they are used.
     void enableActivityScheduling() noexcept {
-        port_wake_enabled_.store(true, std::memory_order_release);
+        enableActivityScheduling_();
         wake_tracking_enabled_.store(true, std::memory_order_release);
         setNextActiveCycleMin_(local_cycle_);
     }
@@ -293,6 +312,13 @@ protected:
     }
 
 private:
+    void bindActivitySchedulingState_(detail::ActivitySchedulingState* state) noexcept {
+        activity_scheduling_ = state;
+        if (port_wake_enabled_.load(std::memory_order_relaxed)) {
+            publishActivityScheduling_();
+        }
+    }
+
     [[gnu::noinline]] void prepareCyclePortsSlow_() {
         for (PortBase* port : *cycle_prepared_ports_) {
             port->prepareConsumerCycle(local_cycle_);
@@ -301,6 +327,13 @@ private:
 
     void enableActivityScheduling_() noexcept {
         port_wake_enabled_.store(true, std::memory_order_release);
+        publishActivityScheduling_();
+    }
+
+    void publishActivityScheduling_() noexcept {
+        if (activity_scheduling_ != nullptr) {
+            activity_scheduling_->publish();
+        }
     }
 
     void setSleepTarget_(uint64_t cycle) noexcept {
@@ -375,6 +408,9 @@ private:
     /// Owner-side relaxed reads require only a non-RMW load; cross-thread port
     /// producers use acceptsPortWakeups()'s acquire load.
     std::atomic<bool> port_wake_enabled_{false};
+    /// Hierarchical monotone summary bound by TickSimulation. One indirection
+    /// publishes the cache-line-isolated cluster leaf before the global root.
+    detail::ActivitySchedulingState* activity_scheduling_ = nullptr;
     std::atomic<bool> wake_tracking_enabled_{false};
     uint32_t id_;
     std::vector<PortBase*> ports_;
