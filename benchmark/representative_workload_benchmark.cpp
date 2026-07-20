@@ -831,11 +831,11 @@ void validateEquivalent(const RunResult& reference, const RunResult& candidate) 
 void printResults(const std::vector<size_t>& workers,
                   const std::vector<std::vector<RunResult>>& results, uint32_t num_units,
                   uint64_t cycles) {
-    std::cout << "\nworkers | median(s) | p10..p90(s)     | CV     | Munit-tick/s | Gmemop/s | "
-                 "Mmsg/s | GiB/s | blocked | speedup | mode\n";
+    std::cout << "\nworkers | median(s) | p10..p90(s)     | CV     | Mcycles/s | Munit-tick/s | "
+                 "Gmemop/s | Mmsg/s | GiB/s | blocked | speedup | mode\n";
     std::cout
-        << "--------+-----------+-----------------+--------+--------------+----------+--------"
-           "+-------+---------+---------+------\n";
+        << "--------+-----------+-----------------+--------+-----------+--------------+----------"
+           "+--------+-------+---------+---------+------\n";
     double baseline = 0.0;
     for (size_t index = 0; index < workers.size(); ++index) {
         std::vector<double> walls;
@@ -845,6 +845,7 @@ void printResults(const std::vector<size_t>& workers,
         const double p90 = percentile(walls, 0.9);
         if (workers[index] == 1 || baseline == 0.0) baseline = median;
         const auto& counters = results[index].front().measured;
+        const double mcycles = static_cast<double>(cycles) / median / 1e6;
         const double mticks = static_cast<double>(num_units) * cycles / median / 1e6;
         const double memory_ops =
             static_cast<double>(counters.memory_reads + counters.memory_writes) / median / 1e9;
@@ -857,10 +858,10 @@ void printResults(const std::vector<size_t>& workers,
         const auto& first = results[index].front();
         const char* mode = !first.parallel ? "seq" : (first.epoch_free ? "epoch" : "barrier");
         std::printf(
-            "%7zu | %9.4f | %7.4f..%-7.4f | %6.2f%% | %12.2f | %8.2f | %6.2f | %5.2f | "
-            "%6.2f%% | %7.2fx | %s\n",
-            workers[index], median, p10, p90, 100.0 * coefficientOfVariation(walls), mticks,
-            memory_ops, messages, gib, blocked, baseline / median, mode);
+            "%7zu | %9.4f | %7.4f..%-7.4f | %6.2f%% | %9.4f | %12.2f | %8.2f | %6.2f | "
+            "%5.2f | %6.2f%% | %7.2fx | %s\n",
+            workers[index], median, p10, p90, 100.0 * coefficientOfVariation(walls), mcycles,
+            mticks, memory_ops, messages, gib, blocked, baseline / median, mode);
     }
     const auto& representative = results.front().front();
     std::cout << "  digest=0x" << std::hex << representative.final.state_digest << std::dec

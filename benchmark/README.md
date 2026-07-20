@@ -182,8 +182,12 @@ boundary-condition bugs.
 Scenario creation, graph connection, simulation initialization, deterministic
 cost placement, and warmup are excluded from wall time. Repetition order is
 seeded and interleaved across worker counts. The report includes median,
-10th/90th percentiles, coefficient of variation, unit-ticks/s, messages/s,
-payload GiB/s, blocked-send percentage, and speedup.
+10th/90th percentiles, coefficient of variation, simulated cycles/s,
+unit-ticks/s, memory operations/s, messages/s, payload GiB/s, blocked-send
+percentage, and speedup. `Mcycles/s` is the primary global simulation
+throughput and does not scale with the number of units; `Munit-tick/s` retains
+the aggregate unit-work rate for comparing scenarios with different unit
+counts.
 
 Primary design references:
 
