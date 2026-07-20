@@ -37,12 +37,14 @@ unit baselines and final per-cycle samples are additionally capped at 4096 work
 iterations, so compounded variance cannot bypass the execution bound. Footprint
 variance uses the same bounded integer-only generator and is independently
 configurable. Each footprint is a real 64-byte-aligned allocation. Its contents
-are initialized on that unit's first tick so default warmup gives the operating
-system a worker-local first-touch opportunity. The timed work is never an empty
-spin loop: every iteration performs a modeled load, and all patterns except
-pointer chasing also perform a store. Hot/cold units direct the configured
-fraction of accesses (90% by default) to a seeded region that is 1/4, 1/8, or
-1/16 of that unit's full footprint.
+are initialized on that unit's first untimed tick, giving the operating system
+a worker-local first-touch opportunity. A requested `--warmup 0` still executes
+this single initialization tick before measured timing, so page faults and the
+pointer permutation never contaminate throughput. The timed work is never an
+empty spin loop: every iteration performs a modeled load, and all patterns
+except pointer chasing also perform a store. Hot/cold units direct the
+configured fraction of accesses (90% by default) to a seeded region that is
+1/4, 1/8, or 1/16 of that unit's full footprint.
 
 Each generated channel has a typed `OutPort`, one or more destinations, a delay,
 a send-rate schedule, and optional bursts. Receivers have independently varied

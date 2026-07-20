@@ -128,5 +128,5 @@ if(CHRONON_BUILD_TESTS)
         COMMAND chronon_representative_workload_benchmark
             --profile memory --seed 42 --units 16 --working-set 65536
             --memory-pattern-weights 1,1,1,1 --threads 1,2
-            --warmup 2 --cycles 32 --repetitions 1)
+            --warmup 0 --cycles 32 --repetitions 1)
 endif()

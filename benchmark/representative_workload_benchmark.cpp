@@ -203,6 +203,8 @@ struct TxChannel {
 
 class alignas(CACHE_LINE_BYTES) WorkloadUnit final : public TickableUnit {
 public:
+    static constexpr uint64_t MIN_UNTIMED_INITIALIZATION_CYCLES = 1;
+
     WorkloadUnit(uint32_t id, const Scenario* scenario)
         : TickableUnit("bench_unit_" + std::to_string(id)),
           id_(id),
@@ -582,6 +584,8 @@ private:
  */
 class alignas(CACHE_LINE_BYTES) SchedulerFloorUnit final : public TickableUnit {
 public:
+    static constexpr uint64_t MIN_UNTIMED_INITIALIZATION_CYCLES = 0;
+
     SchedulerFloorUnit(uint32_t id, const Scenario* scenario)
         : TickableUnit("floor_unit_" + std::to_string(id)),
           id_(id),
@@ -653,6 +657,7 @@ template <typename UnitType>
 
 struct RunResult {
     size_t workers = 1;
+    uint64_t untimed_cycles = 0;
     double setup_seconds = 0.0;
     double warmup_seconds = 0.0;
     double wall_seconds = 0.0;
@@ -693,7 +698,13 @@ template <typename UnitType>
     const auto setup_end = std::chrono::steady_clock::now();
 
     const auto warmup_begin = std::chrono::steady_clock::now();
-    simulation.run(options.warmup_cycles);
+    // Representative units allocate without touching their backing pages, then
+    // initialize on their execution worker's first tick. Preserve that
+    // first-touch placement even when the user requests zero warmup, while
+    // keeping initialization and page faults outside measured wall time.
+    const uint64_t untimed_cycles =
+        std::max(options.warmup_cycles, UnitType::MIN_UNTIMED_INITIALIZATION_CYCLES);
+    simulation.run(untimed_cycles);
     const auto warmup_end = std::chrono::steady_clock::now();
     const Totals before = collectTotals(units);
 
@@ -704,6 +715,7 @@ template <typename UnitType>
 
     RunResult result;
     result.workers = workers;
+    result.untimed_cycles = untimed_cycles;
     result.setup_seconds = std::chrono::duration<double>(setup_end - setup_begin).count();
     result.warmup_seconds = std::chrono::duration<double>(warmup_end - warmup_begin).count();
     result.wall_seconds = std::chrono::duration<double>(measured_end - measured_begin).count();
@@ -929,9 +941,10 @@ int main(int argc, char** argv) {
                     RunResult result = runOnce(scenario, workers, parsed.cli.run);
                     if (parsed.cli.verbose) {
                         std::cout << " setup=" << result.setup_seconds
-                                  << "s warmup=" << result.warmup_seconds
-                                  << "s wall=" << result.wall_seconds << "s digest=0x" << std::hex
-                                  << result.final.state_digest << std::dec << '\n';
+                                  << "s warmup=" << result.warmup_seconds << "s/"
+                                  << result.untimed_cycles << "cy wall=" << result.wall_seconds
+                                  << "s digest=0x" << std::hex << result.final.state_digest
+                                  << std::dec << '\n';
                     }
                     if (reference)
                         validateEquivalent(*reference, result);

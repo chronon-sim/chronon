@@ -345,6 +345,7 @@ inline void printHelp(const char* program) {
               << "); CPU affinity is external\n"
               << "  --cycles N --warmup N       measured and warmup cycles (max "
               << MAX_BENCHMARK_CYCLES << " each)\n"
+              << "                              zero warmup retains one untimed init cycle\n"
               << "  --repetitions N             interleaved repetitions (default 5, max "
               << MAX_BENCHMARK_REPETITIONS << ")\n"
               << "  --rebalance                 enable runtime dynamic rebalance\n"
