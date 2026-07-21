@@ -9,6 +9,7 @@
 /// @file
 /// Epoch-free dynamic migration runtime ownership and request bookkeeping.
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -21,8 +22,14 @@
 namespace chronon::sender {
 
 namespace {
+constexpr uint64_t kDynamicClusterMinSamples = 4;
 constexpr uint64_t kNoMigrationCycle = std::numeric_limits<uint64_t>::max();
+
+uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
+    const uint64_t max = std::numeric_limits<uint64_t>::max();
+    return delta > max - base ? max : base + delta;
 }
+}  // namespace
 
 void TickSimulation::clearDynamicMigrationRequest_() {
     migration_request_.cluster.store(SIZE_MAX, std::memory_order_relaxed);
@@ -86,6 +93,110 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         cluster_assignment_generation_.store(1, std::memory_order_release);
         clearDynamicMigrationRequest_();
     }
+}
+
+void TickSimulation::serviceEpochFreeMigration_(size_t worker_thread) {
+    if (!cluster_runtime_owner_ || dynamic_runtime_cluster_count_ == 0) return;
+
+    const uint8_t quiescing = static_cast<uint8_t>(MigrationRequestState::Quiescing);
+    if (migration_request_.state.load(std::memory_order_acquire) != quiescing) return;
+
+    const size_t cluster = migration_request_.cluster.load(std::memory_order_relaxed);
+    const size_t source = migration_request_.source_thread.load(std::memory_order_relaxed);
+    const size_t target = migration_request_.target_thread.load(std::memory_order_relaxed);
+    const uint64_t fence = migration_request_.fence_cycle.load(std::memory_order_acquire);
+    if (cluster >= dynamic_runtime_cluster_count_ || source >= config_.num_threads ||
+        target >= config_.num_threads) {
+        if (cluster < dynamic_runtime_cluster_count_) {
+            cluster_migration_pending_[cluster].store(0, std::memory_order_release);
+        }
+        clearDynamicMigrationRequest_();
+        return;
+    }
+
+    // Only the losing owner commits after finishing a complete sweep. A
+    // request published during a stable no-CAS sweep therefore permits at
+    // most that sweep to finish; the target cannot observe ownership until no
+    // source execution remains in flight.
+    if (worker_thread != source) return;
+
+    const uint64_t progress =
+        thread_progress_array_[cluster].completed_cycle.load(std::memory_order_acquire);
+    if (progress < fence) return;
+
+    uint8_t expected = quiescing;
+    if (!migration_request_.state.compare_exchange_strong(
+            expected, static_cast<uint8_t>(MigrationRequestState::ReadyToCommit),
+            std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        return;
+    }
+
+    cluster_runtime_owner_[cluster].store(target, std::memory_order_release);
+    cluster_migration_pending_[cluster].store(0, std::memory_order_release);
+    if (cluster < dynamic_cluster_last_migration_cycle_.size()) {
+        dynamic_cluster_last_migration_cycle_[cluster] = fence;
+        dynamic_cluster_last_source_thread_[cluster] = source;
+        dynamic_cluster_last_target_thread_[cluster] = target;
+    }
+    cluster_assignment_generation_.fetch_add(1, std::memory_order_acq_rel);
+
+    const uint64_t delay =
+        std::max(config_.rebalance_check_interval_cycles, config_.rebalance_cooldown_cycles);
+    const uint64_t next_check = saturatingCycleAdd(fence, delay);
+    uint64_t old_next = next_dynamic_rebalance_check_cycle_.load(std::memory_order_relaxed);
+    while (next_check > old_next &&
+           !next_dynamic_rebalance_check_cycle_.compare_exchange_weak(
+               old_next, next_check, std::memory_order_release, std::memory_order_relaxed)) {
+    }
+
+    for (size_t c = 0; c < dynamic_runtime_cluster_count_; ++c) {
+        const uint64_t samples = cluster_sample_count_[c].load(std::memory_order_relaxed);
+        const uint64_t total = cluster_sample_time_ns_[c].load(std::memory_order_relaxed);
+        bool low_frequency = false;
+        if (c < clusters_.clusters.size()) {
+            for (size_t unit_idx : clusters_.clusters[c]) {
+                if (unit_idx < unit_ptrs_.size() &&
+                    (unit_ptrs_[unit_idx]->tickInterval() > 1 ||
+                     unit_ptrs_[unit_idx]->usesActivityScheduling())) {
+                    low_frequency = true;
+                    break;
+                }
+            }
+        }
+        if (samples > 0 && (!low_frequency || samples >= kDynamicClusterMinSamples) &&
+            c < clusters_.clusters.size() && !clusters_.clusters[c].empty()) {
+            const double avg = static_cast<double>(total) / static_cast<double>(samples);
+            const double per_unit =
+                std::max(0.001, avg / static_cast<double>(clusters_.clusters[c].size()));
+            if (unit_costs_.size() < unit_ptrs_.size()) unit_costs_.resize(unit_ptrs_.size(), 1.0);
+            for (size_t unit_idx : clusters_.clusters[c]) {
+                if (unit_idx < unit_costs_.size()) unit_costs_[unit_idx] = per_unit;
+            }
+        }
+        cluster_sample_time_ns_[c].store(0, std::memory_order_relaxed);
+        cluster_sample_count_[c].store(0, std::memory_order_relaxed);
+        cluster_active_sample_count_[c].store(0, std::memory_order_relaxed);
+        dynamic_cluster_blocked_wait_ns_[c].store(0, std::memory_order_relaxed);
+        dynamic_cluster_blocker_wait_ns_[c].store(0, std::memory_order_relaxed);
+    }
+    for (size_t t = 0; t < dynamic_runtime_thread_count_; ++t) {
+        dynamic_thread_floor_wait_ns_[t].store(0, std::memory_order_relaxed);
+        dynamic_thread_dep_wait_ns_[t].store(0, std::memory_order_relaxed);
+        dynamic_thread_no_ready_wait_ns_[t].store(0, std::memory_order_relaxed);
+    }
+
+    ++rebalance_count_;
+    cycles_since_last_actual_rebalance_ = 0;
+    migration_request_.state.store(static_cast<uint8_t>(MigrationRequestState::Committed),
+                                   std::memory_order_release);
+
+    if (observe_ctx_) {
+        observe::log_info<"Dynamic rebalance committed: {}">(observe_ctx_,
+                                                             last_rebalance_detail_.c_str());
+    }
+    recordDynamicSchedulerMarker_("Chronon epoch-free rebalance committed", fence,
+                                  last_rebalance_detail_);
+    clearDynamicMigrationRequest_();
 }
 
 void TickSimulation::rebuildThreadUnitsFromClusterOwners_() {

@@ -20,6 +20,57 @@
 
 using namespace chronon::sender;
 
+namespace chronon::sender {
+
+struct DynamicMigrationTestAccess {
+    static bool sourceOnlyCommit(TickSimulation& sim) {
+        sim.initDynamicMigrationRuntime_();
+        if (!sim.cluster_runtime_owner_ || sim.dynamic_runtime_cluster_count_ == 0 ||
+            sim.dynamic_runtime_thread_count_ < 2) {
+            return false;
+        }
+
+        constexpr uint64_t fence = 11;
+        const size_t cluster = 0;
+        const size_t source = sim.cluster_runtime_owner_[cluster].load(std::memory_order_relaxed);
+        const size_t target = (source + 1) % sim.dynamic_runtime_thread_count_;
+        const uint64_t generation =
+            sim.cluster_assignment_generation_.load(std::memory_order_relaxed);
+
+        sim.thread_progress_array_[cluster].completed_cycle.store(fence - 1,
+                                                                  std::memory_order_relaxed);
+        sim.migration_request_.cluster.store(cluster, std::memory_order_relaxed);
+        sim.migration_request_.source_thread.store(source, std::memory_order_relaxed);
+        sim.migration_request_.target_thread.store(target, std::memory_order_relaxed);
+        sim.migration_request_.fence_cycle.store(fence, std::memory_order_relaxed);
+        sim.cluster_migration_pending_[cluster].store(1, std::memory_order_relaxed);
+        sim.migration_request_.state.store(
+            static_cast<uint8_t>(TickSimulation::MigrationRequestState::Quiescing),
+            std::memory_order_release);
+
+        sim.serviceEpochFreeMigration_(target);
+        const bool target_rejected =
+            sim.cluster_runtime_owner_[cluster].load(std::memory_order_relaxed) == source &&
+            sim.cluster_assignment_generation_.load(std::memory_order_relaxed) == generation;
+
+        sim.serviceEpochFreeMigration_(source);
+        const bool fence_enforced =
+            sim.cluster_runtime_owner_[cluster].load(std::memory_order_relaxed) == source;
+
+        sim.thread_progress_array_[cluster].completed_cycle.store(fence, std::memory_order_release);
+        sim.serviceEpochFreeMigration_(source);
+        const bool source_committed =
+            sim.cluster_runtime_owner_[cluster].load(std::memory_order_acquire) == target &&
+            sim.cluster_assignment_generation_.load(std::memory_order_acquire) == generation + 1 &&
+            sim.cluster_migration_pending_[cluster].load(std::memory_order_acquire) == 0 &&
+            sim.migration_request_.state.load(std::memory_order_acquire) ==
+                static_cast<uint8_t>(TickSimulation::MigrationRequestState::None);
+        return target_rejected && fence_enforced && source_committed;
+    }
+};
+
+}  // namespace chronon::sender
+
 namespace {
 
 class HeavyUnit : public TickableUnit {
@@ -267,8 +318,40 @@ int run_tight_cluster_migration_guard() {
     return 0;
 }
 
+int run_source_only_commit_guard() {
+    std::cout << "Testing source-only sweep-boundary commit... ";
+
+    TickSimulationConfig cfg;
+    cfg.num_threads = 2;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.enable_dynamic_rebalance = true;
+    cfg.initial_partition_sync_cost_ns = 0.0;
+
+    TickSimulation sim(cfg);
+    auto* p0 = sim.createUnit<TightProducer>();
+    auto* p1 = sim.createUnit<TightProducer>();
+    auto* c0 = sim.createUnit<TightConsumer>();
+    auto* c1 = sim.createUnit<TightConsumer>();
+    sim.connect(p0->out, c0->in, 1);
+    sim.connect(p1->out, c1->in, 1);
+    sim.initialize();
+
+    if (!DynamicMigrationTestAccess::sourceOnlyCommit(sim)) {
+        std::cerr << "FAIL: target committed, fence was bypassed, or source commit failed\n";
+        return 1;
+    }
+    std::cout << "PASSED\n";
+    return 0;
+}
+
 int main() {
     std::cout << "=== Rebalance Calibration Test ===\n";
+
+    if (run_source_only_commit_guard() != 0) {
+        return 1;
+    }
 
     if (run_rebalance_calibration(true, 0, 64, kRunUntilCycles) != 0) {
         return 1;

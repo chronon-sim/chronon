@@ -483,6 +483,8 @@ private:
     /// Test-only safe-point migration used by the epoch-free differential
     /// harness. The seam is intentionally outside the worker hot path.
     friend struct EpochFreeDifferentialTestAccess;
+    /// Test-only source-owner migration commit validation.
+    friend struct DynamicMigrationTestAccess;
 
     /// Move the cluster containing @p unit while all persistent workers are
     /// stopped between run() spans. Returns false when the request is invalid
@@ -555,7 +557,7 @@ private:
     void initDynamicMigrationRuntime_();
     void rebuildThreadUnitsFromClusterOwners_();
     bool maybeRequestEpochFreeMigration_(uint64_t cycle);
-    void serviceEpochFreeMigration_();
+    void serviceEpochFreeMigration_(size_t worker_thread);
     void clearDynamicMigrationRequest_();
     void recordDynamicWaitSample_(size_t thread_idx, const BlockedClusterInfo& blocker,
                                   uint64_t wait_ns);
