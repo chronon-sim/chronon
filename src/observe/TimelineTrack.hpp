@@ -8,9 +8,8 @@
 
 // TimelineTrack.hpp
 //
-// Declarative timeline members for ObservableUnit: occupancy lanes (multi-cycle
-// spans + instants) and push-model counter tracks. Same registration pattern as
-// Counter — declare as a member, no macros, no manual registration.
+// Declarative timeline members for ObservableUnit occupancy lanes (multi-cycle
+// spans + instants). Declare as a member; no macros or manual registration.
 
 #pragma once
 
@@ -27,22 +26,13 @@ namespace chronon::observe {
 
 class ObservableUnit;
 
-namespace timeline_detail {
-
-struct InternalTimelineCounterTag {
-    explicit InternalTimelineCounterTag() = default;
-};
-
-}  // namespace timeline_detail
-
 /**
  * @brief Base for declarative timeline tracks; handles owner registration and
  * context attach (track-id assignment).
  */
 class TimelineTrackBase {
 public:
-    TimelineTrackBase(ObservableUnit* owner, std::string_view name, std::string_view unit,
-                      uint16_t lanes, TimelineTrackInfo::Kind kind);
+    TimelineTrackBase(ObservableUnit* owner, std::string_view name, uint16_t lanes);
 
     TimelineTrackBase(const TimelineTrackBase&) = delete;
     TimelineTrackBase& operator=(const TimelineTrackBase&) = delete;
@@ -60,16 +50,14 @@ private:
     void onContextAttached(ObservationContext* ctx);
 
 protected:
-    /// Stamps the owner's cycle into the context (same as ObservableUnit::trace).
+    /// Stamps the owner's cycle into the context.
     void stampCycle_() noexcept;
 
     ObservableUnit* owner_ = nullptr;
     ObservationContext* ctx_ = nullptr;
     std::string name_;
-    std::string unit_;
     uint32_t track_id_ = 0;
     uint16_t lanes_ = 1;
-    TimelineTrackInfo::Kind kind_;
     bool registered_ = false;
 };
 
@@ -110,7 +98,7 @@ public:
     /// @param lanes Number of sub-lanes (slots); 1 renders as a single track,
     ///              N > 1 as a group with one child track per slot.
     TimelineLane(ObservableUnit* owner, std::string_view name, uint16_t lanes = 1)
-        : TimelineTrackBase(owner, name, /*unit=*/{}, lanes, TimelineTrackInfo::Kind::Lane) {}
+        : TimelineTrackBase(owner, name, lanes) {}
 
     /// Open the (this lane, @p slot) span. Items: at most one flow() plus up
     /// to MAX_TIMELINE_ARGS typed args, in any order.
@@ -161,44 +149,6 @@ private:
 
         return timeline_detail::emitEventWithItems(ctx_, cat_mask, kind, track_id_, slot, name,
                                                    items...);
-    }
-};
-
-/**
- * @brief Deprecated push-model counter track: explicit samples on the Perfetto timeline.
- *
- * Independent of the pull-model Counter/counters.csv machinery — sample() is
- * an event through the trace channel, so temporal filters apply and lookahead
- * rollback discards speculative samples.
- *
- * New code should use EventCounter::add() for aggregate metrics and
- * EventCounter::mark() when a timeline-visible sample is needed.
- */
-class TimelineCounter : public TimelineTrackBase {
-public:
-    [[deprecated(
-        "TimelineCounter is deprecated for user code; use EventCounter::add() for aggregate "
-        "metrics or EventCounter::mark() for timeline-visible events")]]
-    TimelineCounter(ObservableUnit* owner, std::string_view name, std::string_view unit = {})
-        : TimelineCounter(timeline_detail::InternalTimelineCounterTag{}, owner, name, unit) {}
-
-    TimelineCounter(timeline_detail::InternalTimelineCounterTag, ObservableUnit* owner,
-                    std::string_view name, std::string_view unit = {})
-        : TimelineTrackBase(owner, name, unit, /*lanes=*/1, TimelineTrackInfo::Kind::Counter) {}
-
-    bool sample(int64_t value) noexcept { return sample(category::NONE, value); }
-
-    template <typename Cat>
-    bool sample(Cat category, int64_t value) noexcept {
-        if (!ctx_ || !ctx_->timelineProducerEnabled() || !registered_) {
-            return false;
-        }
-        stampCycle_();  // Before the filter check: temporal filters read the current cycle.
-        const CategoryMask cat_mask = static_cast<CategoryMask>(category);
-        if (!ctx_->shouldTrace(cat_mask)) {
-            return false;
-        }
-        return timeline_detail::emitCounterSample(ctx_, cat_mask, track_id_, value);
     }
 };
 

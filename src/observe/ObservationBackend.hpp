@@ -55,7 +55,7 @@ namespace chronon::observe {
  *
  * Output files:
  * - events.log       — text output (debug/info/warn/error, optional trace mirror).
- * - timeline.pftrace — Perfetto timeline (trace events, counter tracks, and the
+ * - timeline.pftrace — Perfetto timeline (unit events, counter tracks, and the
  *                      scheduler execution timeline submitted at shutdown).
  * - counters.csv     — performance counter snapshots.
  */
@@ -70,10 +70,6 @@ public:
         bool enable_counter_csv = true;
         CounterCsvFormat counter_csv_format = CounterCsvFormat::Pivoted;
 
-        /// Mirror structured trace events to the text log (timeline is the primary sink).
-        bool trace_text = false;
-
-        std::string trace_file;
         std::string debug_file;
         std::string info_file;
         std::string warn_file;
@@ -81,7 +77,6 @@ public:
 
         bool timeline_enabled = true;
         std::string timeline_file = "timeline.pftrace";
-        bool timeline_trace_events = true;
         bool timeline_counters = true;
         bool timeline_compress = true;
 
@@ -135,7 +130,6 @@ public:
      */
     void submitTimeline(TimelineStreamData&& data);
 
-    void setTraceHandler(EventHandler handler) { trace_handler_ = std::move(handler); }
     void setLogHandler(EventHandler handler) { log_handler_ = std::move(handler); }
 
     /// Called by ObservationManager before start(). Definitions are resolved to
@@ -177,7 +171,7 @@ public:
 private:
     friend struct ObservationBackendTestAccess;
 
-    enum class Channel : uint8_t { Trace = 0, Debug = 1, Info = 2, Warn = 3, Error = 4, Count = 5 };
+    enum class Channel : uint8_t { Debug = 0, Info = 1, Warn = 2, Error = 3, Count = 4 };
 
     /// @brief Per-channel file sink: owns an ofstream and a write buffer.
     struct LogFileSink {
@@ -212,7 +206,6 @@ private:
                                std::string_view counter_name, uint64_t value, bool want_timeline,
                                size_t column_index = SIZE_MAX);
     void prepareCounterSnapshotPlans_();
-    void processStructuredTrace_(const std::byte* data, size_t data_size);
     void processStructuredLog_(const std::byte* data, size_t data_size);
     std::string reconstructMessage_(const FormatInfo& fmt_info, const StructuredRecord* rec,
                                     const std::byte* args_data, size_t args_size);
@@ -240,10 +233,6 @@ private:
     void writeEventAsText_(const StructuredRecord* rec, const std::byte* args_data,
                            size_t args_size, const char* level_str, LogFileSink& sink);
 
-    /// Emit a structured trace event as a Perfetto instant on its unit's track.
-    void writeTraceToTimeline_(const StructuredRecord* rec, const std::byte* args_data,
-                               size_t args_size);
-
     /// Emit a counter snapshot sample on its (lazily created) counter track.
     void writeCounterToTimeline_(uint64_t cycle, std::string_view unit_name,
                                  std::string_view counter_name, uint64_t value);
@@ -263,13 +252,13 @@ private:
     /// or lexicographic UI sorting.
     void predeclareTimelineSourceTracks_();
 
-    /// Route a TimelineRecord (span begin/end, lane instant, counter sample)
+    /// Route a TimelineRecord (span begin/end or lane instant)
     /// to the Perfetto timeline, maintaining the open-span table.
     void processTimelineEvent_(const std::byte* data, size_t data_size);
 
     /// Perfetto track for (timeline track id, slot), lazily created under the
     /// owning unit's track: single track, lane group + per-slot child, or
-    /// counter track depending on the declaration.
+    /// lane track selected by the declaration.
     uint64_t timelineSlotTrack_(uint32_t track_id, uint16_t slot);
 
     /// Lazily cached registry lookups (string_views point at stable deque storage).
@@ -326,7 +315,6 @@ private:
     static constexpr std::chrono::milliseconds OS_FLUSH_INTERVAL{50};
     std::chrono::steady_clock::time_point last_os_flush_time_{};
 
-    EventHandler trace_handler_;
     EventHandler log_handler_;
 
     std::atomic<uint64_t> events_processed_{0};

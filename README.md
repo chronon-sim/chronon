@@ -56,12 +56,12 @@ public:
         if (out.canSend()) {
             out.send(value_++);
             ++produced_;
-            trace<"Produced: {}">(DATA_FLOW, value_);
+            event<"produced">(DATA_FLOW, arg<"value">(value_));
         }
     }
 
 private:
-    Counter produced_{this, "produced", "Items produced"};
+    EventCounter produced_{this, "produced", "Items produced"};
     int value_ = 0;
 };
 
@@ -79,7 +79,7 @@ public:
     }
 
 private:
-    Counter consumed_{this, "consumed", "Items consumed"};
+    EventCounter consumed_{this, "consumed", "Items consumed"};
 };
 
 int main() {

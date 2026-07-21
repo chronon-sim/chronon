@@ -169,7 +169,7 @@ seeds cycle 0 activity when the unit has not already deferred itself.
 
 ### Observation Configuration
 
-Chronon uses a unified logging model where each event type (debug, info, warn, error, trace) is an independent "channel" with its own enable settings. Categories and temporal filters are shared across all channels. Log channels are text-only (`events.log`); trace events go to the unified Perfetto timeline (`timeline.pftrace`).
+Chronon uses a unified observation model where debug, info, warn, error, and timeline events have independent channel enable settings. Categories and temporal filters are shared across all channels. Log channels are text-only (`events.log`); timeline events go to `timeline.pftrace`.
 
 ```yaml
 simulation:
@@ -187,7 +187,6 @@ simulation:
     timeline:                  # Unified Perfetto timeline (timeline.pftrace)
       enabled: true            # Default true
       file: timeline.pftrace
-      trace_events: true       # Simulation trace channel -> instant events
       counters: true           # Counter snapshots -> counter tracks
       compress: true           # Deflate packet batches (compressed_packets)
       scheduler:               # Scheduler execution timeline (see below)
@@ -207,8 +206,7 @@ simulation:
       error:
         enabled: true
       trace:
-        enabled: true
-        text: false            # true mirrors trace events into events.log
+        enabled: true           # Gates unit timeline events
 
       # Shared temporal filters (apply to all channels)
       temporal:
@@ -240,29 +238,18 @@ worker template instances compile the checks out of the execution loop.
 
 | File | Contents |
 |------|----------|
-| `events.log` | Text logs (debug/info/warn/error); trace events mirrored when `trace.text: true` |
-| `timeline.pftrace` | Perfetto protobuf timeline: trace instant events, counter tracks, scheduler slices |
+| `events.log` | Text logs (debug/info/warn/error) |
+| `timeline.pftrace` | Perfetto protobuf timeline: unit events and counter tracks |
+| `scheduler_timeline.pftrace` | Scheduler execution slices when scheduler timeline collection is enabled |
 | `counters.csv` | Counter snapshots |
-
-Per-channel `format:` keys (and the removed binary trace output they used to
-select) are deprecated; they are parsed but ignored with a warning. Logs are
-always text, and trace events always go to the Perfetto timeline.
-
-### Category Format Overrides (Removed)
-
-Category patterns no longer accept per-category format overrides (`format`,
-`trace_format`, `debug_format`, ...). These keys are deprecated and ignored
-with a warning. Categories still control enable/disable and temporal filters.
 
 ### Scheduler Timeline Trace
 
 The scheduler timeline records Chronon scheduler streams, unit tick slices,
-lazy idle fast-path slices, cross-thread spin waits, and epoch spans. It is part
-of the unified Perfetto timeline: when the observation backend runs with a
-timeline sink, the scheduler slices merge into `timeline.pftrace` under a
-"Chronon Scheduler" process group, with one lane per worker stream (`stream 0`,
-`stream 1`, ...) plus a `scheduler` lane for epoch and rebalance spans. Slices
-carry `cycle` and `detail` debug annotations.
+lazy idle fast-path slices, cross-thread spin waits, and epoch spans. It is
+written as `scheduler_timeline.pftrace`, with one lane per worker stream
+(`stream 0`, `stream 1`, ...) plus a `scheduler` lane for epoch and rebalance
+spans. Slices carry `cycle` and `detail` debug annotations.
 
 ```yaml
 simulation:
@@ -287,13 +274,12 @@ simulation:
 | `trace_units` | Record each unit tick as a duration slice. |
 | `trace_waits` | Record spin waits on predecessor cluster progress atomics. |
 | `trace_epochs` | Record progress-epoch spans on the scheduler lane. |
-| `trace_arbitration` | Deprecated compatibility field; direct MPSC lanes perform no scheduler arbitration. |
+| `trace_thread_cpu_time` | Append per-thread CPU-time diagnostics to unit slice details. |
 | `min_duration_ns` | Drop events below this duration. |
 
-The old top-level `simulation.timeline_trace:` key is deprecated; it is still
-parsed but prints a warning. When observation is disabled (e.g. `--no-observe`),
-the scheduler timeline falls back to a standalone Perfetto protobuf file at the
-configured path (default `chronon_timeline.pftrace`).
+When observation is enabled, the file is placed in the timestamped observation
+output directory. With `--no-observe`, it is written relative to the current
+working directory. The default filename is `scheduler_timeline.pftrace`.
 
 See [Scheduler Timeline Trace](scheduler-timeline.md) for event semantics and
 Perfetto usage.

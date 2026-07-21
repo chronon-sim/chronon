@@ -1,4 +1,4 @@
--- Counter-track statistics: TimelineCounter samples and counter snapshots.
+-- Counter-track statistics for periodic and final counter snapshots.
 --
 -- Counter tracks nest under their owning unit, so the hierarchical path
 -- identifies them unambiguously (e.g. sim.cpu0.lsu.lsq_occupancy).

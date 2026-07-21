@@ -23,7 +23,6 @@ namespace chronon::observe {
 bool ReorderBuffer::extractCycle(ObservationQueue::EventType type, const std::byte* data,
                                  size_t data_size, uint64_t& cycle) {
     switch (type) {
-        case ObservationQueue::EventType::TRACE_EVENT:
         case ObservationQueue::EventType::LOG_EVENT:
         case ObservationQueue::EventType::TIMELINE_EVENT:
         case ObservationQueue::EventType::COUNTER_SNAPSHOT: {

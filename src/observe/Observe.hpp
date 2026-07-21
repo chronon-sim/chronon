@@ -44,7 +44,7 @@
 // Derived (computed) counters
 #include "DerivedCounter.hpp"
 
-// Timeline lanes and push-model counter tracks
+// Timeline lanes
 #include "TimelineApi.hpp"
 #include "TimelineTrack.hpp"
 

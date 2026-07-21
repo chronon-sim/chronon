@@ -94,6 +94,7 @@ target_compile_features(chronon_representative_workload_benchmark PRIVATE cxx_st
 if(CHRONON_BUILD_TESTS)
     add_test(NAME benchmark_direct_spsc_smoke
         COMMAND chronon_direct_spsc_benchmark 10000 1)
+    set_tests_properties(benchmark_direct_spsc_smoke PROPERTIES RUN_SERIAL TRUE)
 
     add_executable(chronon_representative_workload_test
         representative_workload_test.cpp

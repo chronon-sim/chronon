@@ -81,8 +81,8 @@ const FeatureList: FeatureItem[] = [
     title: 'Built-in Observability',
     description: (
       <>
-        Macro-free API for counters, traces, and logs.
-        Binary trace output with Perfetto/Chrome Trace visualization.
+        Macro-free API for counters, timeline events, and logs.
+        Perfetto protobuf output for interactive timeline visualization.
       </>
     ),
   },

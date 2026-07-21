@@ -34,24 +34,12 @@ struct InternalConstructionTag {
 }  // namespace counter_detail
 
 /**
- * Counter - Per-instance counter declared as a unit member.
+ * Counter - Internal per-instance counter storage used by EventCounter and
+ * DerivedCounter.
  *
  * Each unit instance has its own counter with separate values:
  * - Counter names include the unit's hierarchical path (e.g., "cpu0.alu0.ops")
  * - Fast increment path (~2-3ns) via direct context access
- *
- * Usage:
- * @code
- *   class ALU : public TickableUnit, public ObservableUnit {
- *       Counter ops_{this, "ops", "Operations executed"};
- *       Counter stalls_{this, "stalls", "Stall cycles"};
- *
- *       void tick() override {
- *           ++ops_;          // Fast: ~2-3ns
- *           stalls_ += 5;    // Add 5
- *       }
- *   };
- * @endcode
  *
  * Output (CSV):
  * @code
@@ -63,20 +51,6 @@ struct InternalConstructionTag {
  */
 class Counter {
 public:
-    /**
-     * Construct a counter.
-     *
-     * @param owner The ObservableUnit that owns this counter
-     * @param name Counter name (will be prefixed with unit path)
-     * @param description Counter description
-     * @param unit Unit of measurement (e.g., "ops", "cycles", "bytes")
-     */
-    [[deprecated(
-        "Counter is deprecated for user code; use EventCounter and call add() for counter-only "
-        "updates or mark() for timeline-visible events")]]
-    Counter(ObservableUnit* owner, std::string_view name, std::string_view description = "",
-            std::string_view unit = "");
-
     Counter(counter_detail::InternalConstructionTag, ObservableUnit* owner, std::string_view name,
             std::string_view description = "", std::string_view unit = "");
 

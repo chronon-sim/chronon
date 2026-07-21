@@ -113,23 +113,6 @@ public:
         return filter_.shouldObserve(category | category::TRACE, currentCycle());
     }
 
-    [[gnu::always_inline]] void trace(CategoryMask category, FormatId fmt_id) noexcept {
-        if (OBSERVE_UNLIKELY(shouldTrace(category))) {
-            emitEvent<ObservationChannel::Trace>(ObservationQueue::EventType::TRACE_EVENT, category,
-                                                 fmt_id);
-        }
-    }
-
-    /// Arguments are packed raw; backend reconstructs the message from the format ID.
-    template <typename... Args>
-    [[gnu::always_inline]] void trace(CategoryMask category, FormatId fmt_id,
-                                      Args&&... args) noexcept {
-        if (OBSERVE_UNLIKELY(shouldTrace(category))) {
-            emitEvent<ObservationChannel::Trace>(ObservationQueue::EventType::TRACE_EVENT, category,
-                                                 fmt_id, std::forward<Args>(args)...);
-        }
-    }
-
     template <LogLevel Level>
     [[gnu::always_inline]] bool shouldLog() const noexcept {
         return filter_.shouldObserve(logLevelToCategory(Level), currentCycle());
@@ -323,7 +306,7 @@ public:
     }
 
     /**
-     * @brief Emit a timeline event (span begin/end, lane instant, counter sample).
+     * @brief Emit a timeline event (span begin/end or lane instant).
      *
      * Producer-side cost matches the instant trace path: one filter check, a
      * fixed-size record fill, and a bounded arg memcpy into the SPSC queue.

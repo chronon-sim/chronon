@@ -67,9 +67,6 @@ void ObservationManager::initialize(const ObservationYAMLConfig& config) {
     backend_config.enable_counter_csv = config.counters.csv_output;
     backend_config.counter_csv_format = config.counters.csv_format;
 
-    backend_config.trace_text = ul.trace_channel.text;
-
-    backend_config.trace_file = ul.trace_channel.file;
     backend_config.debug_file = ul.debug_channel.file;
     backend_config.info_file = ul.info_channel.file;
     backend_config.warn_file = ul.warn_channel.file;
@@ -77,7 +74,6 @@ void ObservationManager::initialize(const ObservationYAMLConfig& config) {
 
     backend_config.timeline_enabled = config.timeline.enabled;
     backend_config.timeline_file = config.timeline.file;
-    backend_config.timeline_trace_events = config.timeline.trace_events;
     backend_config.timeline_counters = config.timeline.counters;
     backend_config.timeline_compress = config.timeline.compress;
 
@@ -361,14 +357,12 @@ void ObservationManager::printReport(std::ostream& out) const {
     out << "    info:   " << (ul.info_channel.enabled ? "on" : "off") << "\n";
     out << "    warn:   " << (ul.warn_channel.enabled ? "on" : "off") << "\n";
     out << "    error:  " << (ul.error_channel.enabled ? "on" : "off") << "\n";
-    out << "    trace:  " << (ul.trace_channel.enabled ? "on" : "off")
-        << (ul.trace_channel.enabled && ul.trace_channel.text ? " (+text)" : "") << "\n";
+    out << "    timeline events: " << (ul.trace_channel.enabled ? "on" : "off") << "\n";
 
     out << "\nTimeline (Perfetto):\n";
     out << "  Enabled: " << (config_.timeline.enabled ? "yes" : "no") << "\n";
     if (config_.timeline.enabled) {
         out << "  File: " << config_.timeline.file << "\n";
-        out << "  Trace events: " << (config_.timeline.trace_events ? "yes" : "no") << "\n";
         out << "  Counter tracks: " << (config_.timeline.counters ? "yes" : "no") << "\n";
     }
 

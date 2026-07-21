@@ -128,14 +128,11 @@ struct ChannelConfig {
 /**
  * @brief Trace channel config.
  *
- * Trace events go to timeline.pftrace (when the timeline sink is enabled) and,
- * when @c text is set, additionally to the text log.
+ * The trace channel gates first-class timeline events and controls their
+ * backpressure policy.
  */
 struct TraceChannelConfig {
     bool enabled = false;
-    bool text = false;  ///< Also mirror trace events to the text log.
-    std::string file;   ///< Text mirror destination; empty = default events.log.
-
     std::optional<BackpressurePolicy> backpressure;
     std::optional<uint32_t> backpressure_max_spins;
 };
@@ -143,14 +140,13 @@ struct TraceChannelConfig {
 /**
  * @brief Unified Perfetto timeline output (timeline.pftrace).
  *
- * One file carries simulation trace events (timestamp = cycle, 1 cycle
+ * One file carries simulation timeline events (timestamp = cycle, 1 cycle
  * rendered as 1 ns), counter tracks, and — when the scheduler timeline is
  * enabled — wall-clock scheduler execution slices. Opens in ui.perfetto.dev.
  */
 struct TimelineYAMLConfig {
     bool enabled = true;
     std::string file = "timeline.pftrace";  ///< Relative to the run output directory.
-    bool trace_events = true;               ///< Simulation trace channel → instant events.
     bool counters = true;                   ///< Counter snapshots → counter tracks.
     bool compress = true;                   ///< Deflate packet batches (compressed_packets).
 };

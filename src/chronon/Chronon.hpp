@@ -92,7 +92,6 @@ using params::ParameterSet;
 using observe::Category;
 using observe::CategoryRegistry;
 using observe::ComputeFn;
-using observe::Counter;
 using observe::CounterId;
 using observe::DerivedCounter;
 using observe::DerivedCounterDef;
@@ -106,26 +105,15 @@ using observe::ObservationStats;
 using observe::toIndex;
 namespace DerivedFormula = observe::DerivedFormula;
 
-// Timeline lanes: spans/instants with flows and typed args, counter samples.
+// Timeline lanes: spans/instants with flows and typed args.
 using observe::arg;
-using observe::capacity;
-using observe::event;
 using observe::EventNameRef;
 using observe::Flow;
 using observe::flow;
-using observe::gauge;
-using observe::instant;
 using observe::pipe;
 using observe::PipelinePipe;
 using observe::pipeStage;
 using observe::pipeStageHex;
-using observe::portAvailable;
-using observe::portRemaining;
-using observe::spanBegin;
-using observe::spanEnd;
-using observe::TimelineCapacity;
-using observe::TimelineCounter;
-using observe::TimelineGauge;
 using observe::TimelineLane;
 using observe::TimelineSpan;
 using observe::operator""_ev;

@@ -8,7 +8,7 @@
 
 #include "DerivedCounter.hpp"
 
-#include "LocalCounter.hpp"
+#include "EventCounter.hpp"
 #include "ObservableUnit.hpp"
 #include "ObservationContext.hpp"
 
@@ -18,15 +18,14 @@ void ObservableUnit::initializePendingDerivedCounters() {
     attachPending_(pending_derived_counters_);
 }
 
-DerivedCounter::DerivedCounter(ObservableUnit* owner, std::string_view name,
-                               std::string_view description,
-                               std::initializer_list<std::reference_wrapper<const Counter>> sources,
-                               ComputeFn compute)
-    : owner_(owner),
-      name_(name),
-      description_(description),
-      sources_(sources),
-      compute_(std::move(compute)) {
+DerivedCounter::DerivedCounter(
+    ObservableUnit* owner, std::string_view name, std::string_view description,
+    std::initializer_list<std::reference_wrapper<const EventCounter>> sources, ComputeFn compute)
+    : owner_(owner), name_(name), description_(description), compute_(std::move(compute)) {
+    source_names_.reserve(sources.size());
+    for (const auto& source : sources) {
+        source_names_.push_back(source.get().name());
+    }
     if (owner_) {
         owner_->registerDerivedCounter(this);
     }
@@ -41,10 +40,7 @@ void DerivedCounter::onContextAttached(ObservationContext* ctx) {
     def.unit_name = ctx->unitName();
     def.derived_name = name_;
     def.description = description_;
-    def.source_names.reserve(sources_.size());
-    for (const auto& src : sources_) {
-        def.source_names.push_back(src.get().name());
-    }
+    def.source_names = source_names_;
     def.compute = compute_;
 
     ctx->addDerivedCounterDef(std::move(def));

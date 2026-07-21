@@ -31,11 +31,10 @@ class ObservationQueue {
 public:
     enum class EventType : uint8_t {
         COUNTER_SNAPSHOT = 0,
-        TRACE_EVENT = 1,
-        LOG_EVENT = 2,
-        EPOCH_COMMIT = 3,
-        EPOCH_ROLLBACK = 4,
-        TIMELINE_EVENT = 5,  ///< TimelineRecord: span begin/end, lane instant, counter sample.
+        LOG_EVENT = 1,
+        EPOCH_COMMIT = 2,
+        EPOCH_ROLLBACK = 3,
+        TIMELINE_EVENT = 4,  ///< TimelineRecord: span begin/end or lane instant.
         SHUTDOWN = 255
     };
 

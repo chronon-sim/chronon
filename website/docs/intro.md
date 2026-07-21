@@ -67,7 +67,7 @@ inline const auto DATA_FLOW = Category<"data_flow", "Data flow events">{};
 
 class Producer : public TickableUnit, public ObservableUnit {
     OutPort<int> out{this, "out"};
-    Counter produced_{this, "produced", "Items produced"};
+    EventCounter produced_{this, "produced", "Items produced"};
     int value_ = 0;
 public:
     Producer() : TickableUnit("producer") {}
@@ -77,14 +77,14 @@ public:
         if (out.canSend()) {
             out.send(value_++);
             ++produced_;
-            trace<"Produced: {}">(DATA_FLOW, value_);
+            event<"produced">(DATA_FLOW, arg<"value">(value_));
         }
     }
 };
 
 class Consumer : public TickableUnit, public ObservableUnit {
     InPort<int> in{this, "in"};
-    Counter consumed_{this, "consumed", "Items consumed"};
+    EventCounter consumed_{this, "consumed", "Items consumed"};
 public:
     Consumer() : TickableUnit("consumer") {}
 

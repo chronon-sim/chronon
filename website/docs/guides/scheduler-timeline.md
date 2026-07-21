@@ -15,18 +15,16 @@ per-cycle timestamps for the timeline path.
 ## What Changed
 
 The scheduler timeline recording is implemented entirely in the Chronon
-scheduler layer; output goes through the observation backend's unified
-Perfetto timeline:
+scheduler layer and written as a dedicated Perfetto file:
 
 - `SchedulerTimelineTraceConfig` stores YAML/C++ configuration.
 - `SchedulerTimelineTrace` buffers per-stream events.
 - `TickSimulation` records events in the Sequential and epoch-free scheduler
   paths.
-- When the observation backend is running with a timeline sink, the recorded
-  scheduler slices merge into the unified `timeline.pftrace` (written during
-  backend shutdown), alongside simulation trace events and counter tracks.
-  When observation is disabled (e.g. `--no-observe`), `SimulationApp` writes a
-  standalone Perfetto `.pftrace` file after `runUntilTermination()` completes.
+- `SimulationApp` writes the scheduler slices to a standalone Perfetto
+  `scheduler_timeline.pftrace` file after `runUntilTermination()` completes.
+  With observation enabled, the file is placed in the timestamped output
+  directory; otherwise it is written relative to the current directory.
 
 No simulation unit code needs to be modified. The feature observes Chronon
 execution streams (`thread_units_[N]`), not model-specific pipeline state.
@@ -50,10 +48,6 @@ simulation:
         min_duration_ns: 0
 ```
 
-The old top-level `simulation.timeline_trace:` key is deprecated; it is still
-parsed but prints a warning. Use `simulation.observation.timeline.scheduler:`
-instead.
-
 Equivalent CLI overrides with `SimulationApp`:
 
 ```bash
@@ -67,21 +61,20 @@ Equivalent CLI overrides with `SimulationApp`:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Enables scheduler timeline collection. |
-| `file` | `chronon_timeline.pftrace` | Standalone output path, used only when observation is disabled. Parent directories are created if possible. With the observation backend running, slices merge into `timeline.pftrace` instead. |
+| `file` | `scheduler_timeline.pftrace` | Output path. Relative paths use the observation output directory when enabled and the current directory otherwise. Parent directories are created if possible. |
 | `max_events` | `1000000` | Global event cap. Further events are counted as dropped. |
 | `start_cycle` | `0` | First simulation cycle to record. |
 | `end_cycle` | `UINT64_MAX` | Stop recording at this cycle, exclusive. |
 | `trace_units` | `true` | Record each `TickableUnit::executeTick()` slice. |
 | `trace_waits` | `true` | Record predecessor cluster dependency spin waits. |
 | `trace_epochs` | `true` | Record scheduler epoch duration on the scheduler lane. |
-| `trace_arbitration` | `true` | Deprecated compatibility field; no events are emitted by direct MPSC lanes. |
+| `trace_thread_cpu_time` | `false` | Append per-thread CPU-time diagnostics to unit slice details. |
 | `min_duration_ns` | `0` | Drop events shorter than this wall-time duration. |
 
 ## Output Lanes
 
 The scheduler timeline appears as a process group named `Chronon Scheduler` in
-the Perfetto UI (separate from the `Simulation` process group that holds trace
-events and counter tracks).
+the Perfetto UI.
 
 | Lane | Meaning |
 |------|---------|

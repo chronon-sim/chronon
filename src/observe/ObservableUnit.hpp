@@ -133,27 +133,6 @@ public:
     // =========================================================================
 
     /**
-     * Emit a deprecated text trace event with compile-time format string.
-     *
-     * Usage:
-     *   trace<"I-Cache HIT: pc=0x{:x}">(ICACHE_HIT, pc);
-     *
-     * @tparam Fmt Format string (compile-time)
-     * @param category Trace category
-     * @param args Format arguments
-     */
-    template <FixedString Fmt, typename Cat, typename... Args>
-    [[deprecated(
-        "trace<> text events are deprecated and will be removed after 0.4; use timeline events for "
-        "structured Perfetto data or debug/info/warn/error for text logs")]]
-    void trace(Cat category, Args&&... args) {
-        if (observe_ctx_ && observe_ctx_->shouldTrace(category)) {
-            observe_ctx_->setCurrentCycleValue(getObserveCycle());
-            observe_detail::emitTrace<Fmt>(observe_ctx_, category, std::forward<Args>(args)...);
-        }
-    }
-
-    /**
      * Emit a first-class pipeline slice whose pipe/stage are compile-time constants.
      * The item id is both the visible Perfetto slice name and the flow id.
      */
@@ -243,26 +222,6 @@ public:
     template <FixedString Track>
     void spanEnd(uint16_t slot) {
         timeline_observe_detail::emitUnitSpanEnd<Track>(*this, slot);
-    }
-
-    /**
-     * Emit push-model counter samples under this unit.
-     */
-    template <FixedString Name, typename T>
-    [[deprecated(
-        "ObservableUnit::gauge() is deprecated; use EventCounter::add() for aggregate metrics or "
-        "EventCounter::mark() when a timeline instant is needed")]]
-    void gauge(T value, std::string_view unit_name = {}) {
-        timeline_observe_detail::emitUnitGauge<Name>(*this, category::NONE, value, unit_name);
-    }
-
-    template <FixedString Name, typename Used, typename Capacity>
-    [[deprecated(
-        "ObservableUnit::capacity() is deprecated; use EventCounter-based metrics instead of "
-        "push-model timeline counters")]]
-    void capacity(Used used, Capacity total, std::string_view unit_name = {}) {
-        timeline_observe_detail::emitUnitCapacity<Name>(*this, category::NONE, used, total,
-                                                        unit_name);
     }
 
     /**

@@ -87,8 +87,7 @@ uint32_t resolveRuntimePipelineTrackSlow(uint16_t source_id, uint16_t pipe,
     name.append(std::string_view(Stage));
 
     const uint32_t track_id = TimelineTrackRegistry::instance().registerTrack(
-        {name, /*unit=*/{}, source_id, /*lanes=*/1, TimelineTrackInfo::Kind::Lane,
-         TimelineTrackInfo::Layout::Pipeline});
+        {name, source_id, /*lanes=*/1, TimelineTrackInfo::Layout::Pipeline});
     entries.push_back({source_id, pipe, track_id});
     if (cached_entry) {
         cached_entry->store((static_cast<uint64_t>(source_id) << 32) | track_id,
@@ -124,9 +123,8 @@ uint32_t resolvePipelineTrack(ObservationContext* ctx) {
     if (!ctx) {
         return 0;
     }
-    return timeline_detail::resolveTrackForSource<Site>(
-        ctx->sourceId(), TimelineTrackInfo::Kind::Lane, /*lanes=*/1, /*unit=*/{},
-        TimelineTrackInfo::Layout::Pipeline);
+    return timeline_detail::resolveTrackForSource<Site>(ctx->sourceId(), /*lanes=*/1,
+                                                        TimelineTrackInfo::Layout::Pipeline);
 }
 
 template <typename... Items>

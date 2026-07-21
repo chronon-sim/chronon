@@ -164,7 +164,7 @@ if (out.canSend()) {
 
 ```cpp
 // Per-unit counter (~2-3ns increment)
-Counter ops_{this, "ops", "Operations"};
+EventCounter ops_{this, "ops", "Operations"};
 ```
 
 ### Disable Observability for Benchmarks
@@ -201,10 +201,10 @@ CLI override example:
   -p simulation.observation.timeline.scheduler.end_cycle=2000
 ```
 
-With the observation backend running, the scheduler slices appear in the run's
-`timeline.pftrace` under a "Chronon Scheduler" process group; with
-`--no-observe`, a standalone Perfetto file (default `chronon_timeline.pftrace`)
-is written instead. Open the `.pftrace` file in `ui.perfetto.dev`. Lanes named
+The scheduler slices are written to `scheduler_timeline.pftrace`. With the
+observation backend running, the file is placed in the run output directory;
+with `--no-observe`, it is written relative to the current directory. Open the
+file in `ui.perfetto.dev`. Lanes named
 `stream N (logical worker)` are Chronon logical execution streams. Unit events
 on a lane show which unit executed there at that time; after dynamic rebalance,
 the same unit may appear on a different stream. The separate `scheduler` lane
