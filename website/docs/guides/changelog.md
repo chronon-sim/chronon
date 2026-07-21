@@ -4,6 +4,24 @@ sidebar_label: "Changelog"
 
 # Changelog
 
+## 2026-07-21 - Deprecated API Removal
+
+Chronon removes the deprecated observation, port, register, and configuration
+compatibility surface. Timeline production now uses `TimelineLane` and member
+`event()`/`instant()`/span helpers; aggregate metrics use `EventCounter`.
+The fixed-depth `VersionedRegister<T, N>` form, obsolete port arbitration
+interfaces, `PortPolicy::General`, and the old scheduler-timeline configuration
+alias are no longer accepted. Removed observation format and text-trace keys are
+also no longer parsed.
+
+This is a source and configuration breaking change. Update configurations to
+`simulation.observation.timeline.scheduler` and use the APIs documented in the
+current observability and counter guides.
+
+`DerivedCounter` now binds directly to `EventCounter` sources and captures
+their names during construction. Derived formulas remain backend-only and add
+no work to the counter increment path.
+
 ## 2026-07-20 - Scheduler Path Simplification
 
 Chronon now has two execution paths: Sequential and epoch-free lookahead. The
@@ -26,8 +44,7 @@ dedicated SPSC lane. The receiver performs a deterministic
 `(arrive_cycle, connection_id, lane_id)` merge; sparse fan-in uses sharded
 notifications and a consumer-owned frontier. This removes Connection staging,
 the second envelope copy, scheduler arbitration passes, and arbitration trace
-events. The `trace_arbitration` field remains as a deprecated compatibility
-setting.
+events. The unused arbitration trace setting was removed on 2026-07-21.
 
 SPSC rings use monotonic tickets, every physical slot, cache-line-separated
 producer/consumer publications, and compact bounded storage. Finite-capacity
@@ -53,13 +70,12 @@ It now defaults on when the safety gate can prove that cross-thread connection
 headroom can absorb the configured run-ahead; otherwise Chronon falls back to the
 per-epoch path.
 
-### Deprecation
+### Removal status
 
-The per-epoch lookahead fallback is deprecated and will be removed in a future
-release. Keep `enable_epoch_free_lookahead` enabled and treat fallback warnings
-as configuration or topology issues to resolve before that removal. `epoch_size`
-now only controls the compatibility fallback and is ignored by epoch-free
-lookahead.
+The per-epoch lookahead fallback was removed on 2026-07-20. Current releases
+select Sequential when the epoch-free safety gate cannot prove the parallel
+path safe. `epoch_size` now controls host-predicate and Sequential termination
+polling intervals.
 
 ### Safety
 
@@ -77,17 +93,11 @@ Same-thread connections impose no bound. See the
 
 ### New Feature
 
-Chronon can emit a Chrome Trace / Perfetto JSON timeline for scheduler-level
-parallelism diagnostics. The timeline shows logical Chronon streams, unit tick
-duration slices, cluster dependency spin waits, scheduler epoch spans, and MPSC
-arbitration spans.
-
-The Perfetto thread ids in the JSON are 1-based so worker stream 0 does not use
-`tid=0`, which some Chrome Trace viewers display with main-thread-like
-semantics. The lane names remain zero-based (`stream 0`, `stream 1`, ...), and
-each duration slice includes `args.stream` with the original Chronon logical
-stream id. The separate `scheduler` lane records scheduler-side spans and is
-not an additional simulation worker.
+Chronon introduced a scheduler-level execution timeline for parallelism
+diagnostics. The timeline shows logical Chronon streams, unit tick duration
+slices, cluster dependency spin waits, and scheduler epoch spans. It now writes
+Perfetto protobuf output; arbitration spans were removed with the direct-lane
+transport.
 
 ### Motivation
 
@@ -102,10 +112,12 @@ instrumentation.
 
 ```yaml
 simulation:
-  timeline_trace:
-    enabled: true
-    file: out/chronon_timeline.json
-    end_cycle: 2000
+  observation:
+    timeline:
+      scheduler:
+        enabled: true
+        file: scheduler_timeline.pftrace
+        end_cycle: 2000
 ```
 
 See [Scheduler Timeline Trace](scheduler-timeline.md) for all fields and event
@@ -115,15 +127,15 @@ semantics.
 
 | File | Description |
 |------|-------------|
-| `src/sender/schedule/SchedulerTimelineTrace.hpp` | Timeline configuration, per-stream event buffers, and Chrome Trace JSON writer |
+| `src/sender/schedule/SchedulerTimelineTrace.hpp` | Timeline configuration, per-stream event buffers, and Perfetto writer |
 | `docs/scheduler-timeline.md` | User guide for capture, event interpretation, and overhead |
 
 ### Modified Files
 
 | File | Change |
 |------|--------|
-| `src/sender/core/TickSimulation.hpp` | Records unit, wait, epoch, and arbitration slices in scheduler paths |
-| `src/sender/config/SenderConfigLoader.hpp` | Parses `simulation.timeline_trace` |
+| `src/sender/core/TickSimulation.hpp` | Records unit, wait, and epoch slices in scheduler paths |
+| `src/sender/config/SenderConfigLoader.hpp` | Parses scheduler timeline configuration |
 | `src/sender/config/SenderSimulationBuilder.hpp` | Passes timeline config into `TickSimulationConfig` |
 | `src/sender/config/SenderUnitConfig.hpp` | Adds `SchedulerTimelineTraceConfig` to YAML config |
 | `src/sender/app/SimulationApp.cpp` | Writes the timeline after simulation run completion |
@@ -344,7 +356,7 @@ public:
 };
 ```
 
-### 3) Observation Macros -> Template API
+### 3) Observation Macros -> Current API
 
 Before:
 
@@ -357,8 +369,9 @@ OLOG_INFO(ctx, "done");
 After:
 
 ```cpp
-count(MY_COUNTER);
-trace<"pc={}">(MY_CATEGORY, pc);
+EventCounter instructions_{this, "instructions", "Instructions"};
+++instructions_;
+event<"retire">(MY_CATEGORY, arg<"pc">(pc));
 info<"done">();
 ```
 
@@ -384,5 +397,6 @@ struct MyParams : public ParameterSet {
 
 - Replace all pipeline register usage with `StageReg<T, N>` or `SingleStageReg<T>`.
 - Remove `REGISTER_SENDER_UNIT(...)` from translation units.
-- Replace observation macros with `count()/trace<>/debug<>/info<>/warn<>/error<>`.
+- Replace observation macros with `EventCounter`, timeline member helpers, and
+  `debug<>`/`info<>`/`warn<>`/`error<>`.
 - Rewrite any macro-based `ParameterSet` declarations to `Param<T>` fields.

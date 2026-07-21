@@ -20,7 +20,7 @@ that uses the timeline API.
 | `latency_histogram.sql` | Distribution of span durations per event name (e.g. `miss`, `mul`) |
 | `occupancy.sql` | How busy is each lane track — busy fraction, slice counts, mean duration |
 | `stall_attribution.sql` | Which lanes/events accumulate cycles beyond their per-name minimum (stall attribution) |
-| `counter_stats.sql` | Min/avg/max of every counter track (`TimelineCounter` samples and counter snapshots) |
+| `counter_stats.sql` | Min/avg/max of every counter track populated by periodic and final counter snapshots |
 
 Tip: `trace_processor --httpd timeline.pftrace` serves the trace to
 ui.perfetto.dev for interactive exploration alongside these queries.

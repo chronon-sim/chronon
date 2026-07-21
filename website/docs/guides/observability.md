@@ -11,7 +11,7 @@ Chronon provides a unified observability system with three integrated capabiliti
 | Feature | Purpose | API | Hot Path |
 |---------|---------|-----|----------|
 | Counters | Statistics collection | `++counter_` / `counter_ += n` | ~1-2ns |
-| Traces | Structured event capture | `trace<"fmt">(CAT, ...)` | ~2ns disabled |
+| Timeline events | Structured event capture | `event<"name">(CAT, ...)` | fixed record + typed args |
 | Pipeline traces | Typed one-cycle pipeline slices | model-level `observe::pipeline<"STAGE">(...)` | fixed record + typed args |
 | Logs | Debug output | `debug<"fmt">(...)` | ~2ns disabled |
 
@@ -41,15 +41,15 @@ inline const auto CACHE_MISS = Category<"cache_miss", "Cache miss events">{};
 
 ```cpp
 class FetchUnit : public TickableUnit, public ObservableUnit {
-    Counter cache_hits_{this, "cache_hits", "Cache hit count"};
+    EventCounter cache_hits_{this, "cache_hits", "Cache hit count"};
 
 public:
     void tick() override {
         // Increment counter
         ++cache_hits_;
 
-        // Emit trace with compile-time format string
-        trace<"Cache HIT: pc=0x{:x}">(CACHE_HIT, pc);
+        // Update the aggregate and emit a structured timeline event
+        cache_hits_.mark<"cache_hit">(CACHE_HIT, arg<"pc">(pc));
 
         // Logging
         debug<"Fetch cycle {} pc=0x{:x}">(localCycle(), pc);
@@ -131,7 +131,7 @@ ctx.setLookaheadMode(true);
 
 // Speculative work
 counter_ += 10;
-trace<"Speculative event">(CAT, value);
+event<"speculative_event">(CAT, arg<"value">(value));
 
 if (mispredicted) {
     ctx.rollbackEpoch();  // Counters restored, events discarded
@@ -148,39 +148,36 @@ ctx.setLookaheadMode(false);
 out/
 └── 20260124_143052/
     ├── counters.csv         # Counter snapshots
-    ├── timeline.pftrace     # Perfetto protobuf timeline (traces, counters, scheduler)
-    └── events.log           # Text logs (debug/info/warn/error, optional trace mirror)
+    ├── timeline.pftrace     # Perfetto protobuf timeline (unit events and counters)
+    ├── scheduler_timeline.pftrace # Optional scheduler execution timeline
+    └── events.log           # Text logs (debug/info/warn/error)
 ```
 
-- **events.log** holds text output for the debug/info/warn/error log channels. Trace events are mirrored into it only when the trace channel sets `text: true`.
-- **timeline.pftrace** is the unified Perfetto timeline (see below); created when `observation.timeline.enabled` is true (the default).
+- **events.log** holds text output for the debug/info/warn/error log channels.
+- **timeline.pftrace** contains unit events and counter tracks (see below); created when `observation.timeline.enabled` is true (the default).
+- **scheduler_timeline.pftrace** contains scheduler execution slices when scheduler timeline collection is enabled.
 - **counters.csv** is created when counters are enabled with `csv_output: true`.
 
 ## Perfetto Timeline
 
-Trace events, counter snapshots, and (optionally) the scheduler execution
-timeline are written to a single `timeline.pftrace` file in Perfetto protobuf
-format. Open it directly in [ui.perfetto.dev](https://ui.perfetto.dev) (drag
-and drop the file), or query it offline with Perfetto's `trace_processor`.
+Timeline events and counter snapshots are written to `timeline.pftrace` in
+Perfetto protobuf format. Scheduler execution data uses the separate
+`scheduler_timeline.pftrace` file. Open either file directly in
+[ui.perfetto.dev](https://ui.perfetto.dev), or query it offline with Perfetto's
+`trace_processor`.
 
 The timeline contains:
 
-- **Simulation trace events** — instant events on one track per unit, grouped
-  under a "Simulation" process. The timestamp is the simulation cycle (1 cycle
-  rendered as 1 ns) and the event name is the formatted trace message.
-  Hierarchical unit paths ("cpu0.lsu.mshr") become nested track groups, so the
-  UI sidebar mirrors the design hierarchy; counter tracks nest under their
-  owning unit instead of forming one flat list.
-- **Timeline lanes** — occupancy spans, lane instants, and push-model counter
-  samples emitted through the declarative `TimelineLane` / `TimelineCounter`
-  members (see below), nested under their owning unit's track.
+- **Timeline events and lanes** — typed instants and occupancy spans emitted
+  through `ObservableUnit::event/instant/spanBegin/spanEnd`, `TimelineLane`, or
+  `TimelineSpan`. Hierarchical unit paths become nested track groups.
 - **Counter tracks** — one Perfetto counter track per counter, sampled
   at counter dump cycles and nested under each unit's collapsible `counters`
   subgroup (`unit.counters.counter_name`).
-- **Scheduler execution timeline** — when enabled, wall-clock
-  unit/wait/epoch slices under a "Chronon Scheduler" process
-  group, with one lane per worker stream plus a `scheduler` lane. Slices
-  carry `cycle` and `detail` debug annotations. See
+- **Scheduler execution timeline** — the separate scheduler file contains
+  wall-clock unit/wait/epoch slices under a "Chronon Scheduler" process group,
+  with one lane per worker stream plus a `scheduler` lane. Slices carry `cycle`
+  and `detail` debug annotations. See
   [Scheduler Timeline Trace](scheduler-timeline.md).
 
 The file is produced by `src/observe/PerfettoTraceWriter`, a thin wrapper over
@@ -189,20 +186,8 @@ registration — packets are written straight to the file).
 
 ## Pipeline Trace Events
 
-For cycle-by-cycle pipeline visualization, prefer typed pipeline events over
-encoding pipeline state into formatted trace strings. Traditional trace calls
-such as:
-
-```cpp
-trace<"{}DEC#{};pc=0x{:x} op=0x{:x}">(PIPE, lane, inst.uid, inst.pc, inst.opcode);
-```
-
-work as text, but they force the Perfetto backend to reconstruct structure by
-parsing the formatted message: stage name, pipe/lane, item id, and annotations
-are all hidden inside one string. That is fragile and pushes formatting work
-onto the hot path.
-
-A model should instead expose a small category-binding wrapper, conventionally
+For cycle-by-cycle pipeline visualization, use typed pipeline events. A model
+should expose a small category-binding wrapper, conventionally
 named `observe::pipeline`, on top of Chronon's typed pipeline event primitive.
 The wrapper keeps the call site semantic while the queued record stays
 structured and numeric:
@@ -254,8 +239,8 @@ void pipeline(Unit& unit, Id id, Args&&... args);  // defaults to pipe 0
 }
 ```
 
-This API is intended to replace pipeline-specific `trace<>()` formatting, not
-general debug traces. It has these properties:
+This API is intended for pipeline state; use structured member events for rare
+point events and debug/info/warn/error for text logs. It has these properties:
 
 - **Structured hot path** — stage and pipe are compile-time/template state or a
   small runtime integer; the record carries a numeric item id plus typed
@@ -272,14 +257,10 @@ general debug traces. It has these properties:
   numeric id should be displayed as hexadecimal. The stored id is still a
   number; only the Perfetto event name formatting changes.
 
-Pull-model `Counter` snapshots are kept under each unit's `counters` subgroup,
+`EventCounter` snapshots are kept under each unit's `counters` subgroup,
 so dense pipeline stage tracks and low-frequency counters remain separately
-collapsible in the Perfetto sidebar. Push-model timeline counters
-(`TimelineCounter`, `TimelineGauge`, `TimelineCapacity`, `observe::gauge`, and
-`observe::capacity`) are direct children of the unit track, but Chronon assigns
-Perfetto `sibling_order_rank` values by track type: first-class pipeline lanes
-come first, normal timeline lanes follow, and timeline counters come after the
-pipeline lanes regardless of which event or sample arrives first.
+collapsible in the Perfetto sidebar. Pipeline lanes sort before normal timeline
+lanes through explicit Perfetto sibling ordering.
 
 ### Wire format
 
@@ -304,12 +285,11 @@ is transparent to ui.perfetto.dev and `trace_processor`:
   the timeline shrinks from ~115 MB to ~17 MB (~7×) with no measurable change
   in simulation wall time (encoding runs on the backend thread).
 
-## Timeline Lanes and Counters
+## Timeline Lanes and Events
 
-`trace<>()` emits point events. For microarchitecture state that *occupies*
-something over many cycles — MSHR entries, ROB/LSQ slots, DRAM requests in
-flight, busy functional units — declare timeline lanes as unit members (same
-pattern as `Counter`, no macros or registration calls):
+For microarchitecture state that *occupies* something over many cycles — MSHR
+entries, ROB/LSQ slots, DRAM requests in flight, busy functional units —
+declare timeline lanes as unit members (no macros or registration calls):
 
 ```cpp
 class LSU : public Unit, public ObservableUnit {
@@ -317,9 +297,6 @@ class LSU : public Unit, public ObservableUnit {
     // children mshr[0..7] under this unit's track.
     TimelineLane mshr_{this, "mshr", /*lanes=*/8};
     TimelineLane ld_port_{this, "ld_port", 2};
-    // Push-model counter samples (independent of counters.csv).
-    TimelineCounter occ_{this, "lsq_occupancy", "entries"};
-
     inline static const auto MISS = Category<"dcache_miss", "D$ miss lifetime">{};
 
     void tick() override {
@@ -329,8 +306,6 @@ class LSU : public Unit, public ObservableUnit {
                     arg<"addr">(paddr), arg<"set">(set));
         ...
         mshr_.end(slot);              // possibly many cycles later
-
-        occ_.sample(lsq_.size());
     }
 };
 ```
@@ -338,37 +313,22 @@ class LSU : public Unit, public ObservableUnit {
 For common model instrumentation, Chronon also provides a convenience layer
 that uses the same typed vocabulary as pipeline events (`"name"_ev`,
 `arg<"key">(value)`, `flow(uid)`) without requiring every call site to declare
-raw lanes and counters:
+raw lanes:
 
 ```cpp
 class Decode : public Unit, public ObservableUnit {
     TimelineSpan stall_{this, "stall"};
-    TimelineGauge fetch_occ_{this, "fetch_queue_occupancy", "entries"};
-    TimelineCapacity fetch_cap_{this, "fetch_queue", "entries"};
+    EventCounter flushes_{this, "flushes", "Pipeline flushes", "events"};
 
     void tick() override {
         // Shared "events" track under this unit.
-        event<"flush">(FLUSH, arg<"removed">(removed_count));
-
-        // Function-style entry mirrors model-level observe::pipeline wrappers.
-        observe::event<"credit_mismatch">(*this, FLOW, arg<"expected">(exp),
-                                          arg<"actual">(got));
+        flushes_.mark<"flush">(FLUSH, arg<"removed">(removed_count));
 
         // Boolean state helper: opens once, closes when the condition clears.
         stall_.update(!fetch_queue_.empty() && !out_uop_queue.canSend(),
                       STALL, "out_uop_blocked"_ev,
                       arg<"fq_size">(fetch_queue_.size()),
                       arg<"out_rem">(out_uop_queue.remainingThisCycle()));
-
-        // Push-model counter samples. sampleOnChange() is available when dense
-        // per-cycle samples would add noise without adding information.
-        fetch_occ_.sampleOnChange(fetch_queue_.size());
-        fetch_cap_.sampleOnChange(fetch_queue_.size(), fetch_queue_size_);
-
-        // Header-only function forms are useful for model-level wrappers.
-        observe::gauge<"rename_credits">(*this, rename_credits_, "credits");
-        observe::capacity<"fetch_queue">(*this, fetch_queue_.size(),
-                                          fetch_queue_size_, "entries");
     }
 };
 ```
@@ -378,10 +338,8 @@ Use this layer for:
 - **single-point events** such as flushes, credit mismatches, replay markers, or
   rare protocol transitions (`event<"flush">`, `instant<"track">`);
 - **state spans** such as stalls, blocked ports, busy functional units, or
-  waiting conditions (`TimelineSpan::update`, `spanBegin` / `spanEnd`);
-- **time-varying state** such as queue occupancy, free slots, credits, and port
-  capacity (`TimelineGauge`, `TimelineCapacity`, `gauge`, `capacity`);
-- **aggregate totals** should still use `Counter`; do not turn every counter
+  waiting conditions (`TimelineSpan::update`, member `spanBegin` / `spanEnd`);
+- **aggregate totals** should use `EventCounter`; do not turn every counter
   increment into a timeline event unless the timestamp itself matters.
 
 The vocabulary is deliberately SQL-shaped:
@@ -403,10 +361,10 @@ The vocabulary is deliberately SQL-shaped:
 
 Semantics under the existing machinery:
 
-- Producers write fixed-size records to their SPSC queue (no allocation, cost
-  at or below the `trace<>()` instant path); all Perfetto encoding happens on
-  the backend thread. With observation disabled, calls are a null-check.
-- Category and temporal filters apply to `begin`/`instant`/`sample`.
+- Producers write fixed-size records to their SPSC queue without allocation;
+  all Perfetto encoding happens on the backend thread. With observation
+  disabled, calls are a null-check.
+- Category and temporal filters apply to `begin` and `instant`.
   `end()` skips temporal filters so a span begun inside an observation window
   still closes outside it; an `end` whose `begin` was suppressed is dropped by
   the backend's open-span table.
@@ -423,18 +381,12 @@ best case), and counter statistics — all keyed by the hierarchical track paths
 so they work unchanged on any model using the timeline API. See
 `scripts/trace_sql/README.md` for usage.
 
-## Pre-Registered Format Strings
+## Structured Event Arguments
 
-Traditional approach (~30ns):
-```cpp
-trace("Request id={}", id);  // Runtime formatting
-```
+Use a low-cardinality compile-time event name and typed arguments:
 
-Chronon approach (~4ns):
 ```cpp
-trace<"Request id={}">(CAT, id);
-// Format registered at program start
-// Runtime only: FormatId + args
+event<"request">(CAT, arg<"id">(id));
 ```
 
 ## ObservationManager
@@ -555,14 +507,9 @@ struct Config {
     bool enable_counter_csv = true;
     CounterCsvFormat counter_csv_format = CounterCsvFormat::Pivoted;
 
-    // Mirror structured trace events to the text log
-    // (the Perfetto timeline is the primary trace sink)
-    bool trace_text = false;
-
     // Unified Perfetto timeline (timeline.pftrace)
     bool timeline_enabled = true;
     std::string timeline_file = "timeline.pftrace";
-    bool timeline_trace_events = true;
     bool timeline_counters = true;
 
     // Reorder buffer
@@ -578,10 +525,7 @@ struct Config {
 ### Output Routing
 
 Log channels (debug/info/warn/error) are text-only and write to `events.log`.
-Trace events go to the Perfetto timeline; set `trace_text = true` (YAML:
-`trace: { text: true }`) to additionally mirror them into `events.log`. The
-old per-channel output-format selection and per-category format overrides
-have been removed.
+Structured timeline events and lanes go to `timeline.pftrace`.
 
 ## Debug Build Backpressure (No-Drop Guarantee)
 

@@ -164,7 +164,6 @@ int run(const Options& options) {
         config.counter_csv_format = CounterCsvFormat::Pivoted;
         config.timeline_enabled = BenchmarkMode == Mode::Perfetto || BenchmarkMode == Mode::Full;
         config.timeline_counters = config.timeline_enabled;
-        config.timeline_trace_events = false;
         config.enable_reordering = true;
         backend = std::make_unique<ObservationBackend>(shared, config);
         backend->setCounterSnapshotPlans(registry.snapshotPlans());

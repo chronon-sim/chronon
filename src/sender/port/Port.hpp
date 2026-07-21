@@ -71,7 +71,6 @@ inline bool stageTracePortMatches_(const std::string& name) noexcept {
  */
 enum class PortPolicy : uint8_t {
     LegacyFastPath = 0,
-    General [[deprecated("Use LegacyFastPath")]] = LegacyFastPath,  ///< Backward-compatible alias.
     StageSelective = 1,
 };
 
@@ -354,8 +353,6 @@ public:
     /// Backward-compatible name retained for diagnostics clients.
     uint64_t stagingOverflowEvents() const noexcept { return transportOverflowEvents(); }
 };
-
-using IArbitratablePort [[deprecated("use IMultiProducerPort")]] = IMultiProducerPort;
 
 /**
  * PortBase - Type-erased base class for all ports.

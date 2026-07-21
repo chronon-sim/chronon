@@ -9,7 +9,7 @@
 // TimelineApi.hpp
 //
 // Wire records and producer-side vocabulary for first-class timeline events
-// (occupancy spans, lane instants, push-model counter samples): low-cardinality
+// (occupancy spans and lane instants): low-cardinality
 // event names ("miss"_ev), typed annotation args (arg<"addr">(v)), and flow
 // ids (flow(uid)). See TimelineTrack.hpp for the declarative unit members.
 
@@ -42,8 +42,7 @@ enum class TimelineEventKind : uint8_t {
     Instant = 0,
     SpanBegin = 1,
     SpanEnd = 2,
-    CounterSample = 3,
-    PipelineSlice = 4,  ///< One-cycle pipeline occupancy slice; payload is item id.
+    PipelineSlice = 3,  ///< One-cycle pipeline occupancy slice; payload is item id.
 };
 
 /**
@@ -60,8 +59,7 @@ constexpr uint8_t TIMELINE_FLAG_NAME_HEX = 1u << 0;
 
 struct TimelineRecord {
     uint64_t cycle;
-    /// Flow id for Instant/SpanBegin (0 = none); bit-cast int64_t counter
-    /// value for CounterSample.
+    /// Flow id for Instant/SpanBegin or item id for PipelineSlice.
     uint64_t payload;
     uint32_t track_id;  ///< TimelineTrackRegistry id.
     uint16_t name_id;   ///< EventNameRegistry id (0 = none, e.g. SpanEnd).
@@ -221,19 +219,16 @@ private:
     std::unordered_map<std::string_view, uint64_t> ids_;
 };
 
-/** @brief Metadata for one declared timeline track (lane group or counter). */
+/** @brief Metadata for one declared timeline lane group. */
 struct TimelineTrackInfo {
-    enum class Kind : uint8_t { Lane = 0, Counter = 1 };
     enum class Layout : uint8_t {
         Normal = 0,
         Pipeline = 1,
     };
 
     std::string name;
-    std::string unit;    ///< Counter unit string (Counter kind only).
     uint16_t source_id;  ///< Owning unit in the source-name registry.
-    uint16_t lanes;      ///< Declared sub-lane count (Lane kind; 1 = single track).
-    Kind kind;
+    uint16_t lanes;      ///< Declared sub-lane count (1 = single track).
     Layout layout = Layout::Normal;
 };
 
@@ -285,8 +280,7 @@ struct CachedTrackEntry {
 
 template <typename Site>
 uint32_t resolveTrackForSourceSlow(uint16_t source_id, std::atomic<uint64_t>& cached_entry,
-                                   TimelineTrackInfo::Kind kind, uint16_t lanes,
-                                   std::string_view unit, TimelineTrackInfo::Layout layout) {
+                                   uint16_t lanes, TimelineTrackInfo::Layout layout) {
     static std::mutex mutex;
     static std::vector<CachedTrackEntry> entries;
     static const std::string track_name = Site::trackName();
@@ -300,8 +294,8 @@ uint32_t resolveTrackForSourceSlow(uint16_t source_id, std::atomic<uint64_t>& ca
         }
     }
 
-    const uint32_t track_id = TimelineTrackRegistry::instance().registerTrack(
-        {track_name, std::string(unit), source_id, lanes, kind, layout});
+    const uint32_t track_id =
+        TimelineTrackRegistry::instance().registerTrack({track_name, source_id, lanes, layout});
     entries.push_back({source_id, track_id});
     cached_entry.store((static_cast<uint64_t>(source_id) << 32) | track_id,
                        std::memory_order_relaxed);
@@ -310,7 +304,7 @@ uint32_t resolveTrackForSourceSlow(uint16_t source_id, std::atomic<uint64_t>& ca
 
 template <typename Site>
 uint32_t resolveTrackForSource(
-    uint16_t source_id, TimelineTrackInfo::Kind kind, uint16_t lanes, std::string_view unit = {},
+    uint16_t source_id, uint16_t lanes,
     TimelineTrackInfo::Layout layout = TimelineTrackInfo::Layout::Normal) {
     static std::atomic<uint64_t> cached_entry{0};
 
@@ -320,7 +314,7 @@ uint32_t resolveTrackForSource(
         return track_id;
     }
 
-    return resolveTrackForSourceSlow<Site>(source_id, cached_entry, kind, lanes, unit, layout);
+    return resolveTrackForSourceSlow<Site>(source_id, cached_entry, lanes, layout);
 }
 
 }  // namespace timeline_detail

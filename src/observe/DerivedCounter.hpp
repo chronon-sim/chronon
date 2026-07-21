@@ -18,7 +18,7 @@
 
 namespace chronon::observe {
 
-class Counter;
+class EventCounter;
 class ObservableUnit;
 class ObservationContext;
 
@@ -65,19 +65,13 @@ inline constexpr auto PerKilo = [](std::span<const uint64_t> v) -> double {
 }  // namespace DerivedFormula
 
 /**
- * @brief Computed counter declared as a unit member alongside raw Counters.
+ * @brief Computed counter declared as a unit member alongside aggregate counters.
  *
  * Computation runs on the backend thread at CSV dump time, so there is no
  * simulation hot-path overhead.
  *
- * @code
- *   class Fetch : public TickableUnit, public ObservableUnit {
- *       Counter hits_{this, "hits", "Cache hits"};
- *       Counter misses_{this, "misses", "Cache misses"};
- *       DerivedCounter hit_rate_{this, "hit_rate", "Cache hit rate",
- *           {hits_, misses_}, DerivedFormula::Ratio};
- *   };
- * @endcode
+ * Source counters are supplied as EventCounter references. Their names are
+ * captured during construction; aggregate counter updates remain unchanged.
  */
 class DerivedCounter {
 public:
@@ -89,7 +83,7 @@ public:
      * @param compute     Function computing the derived value from source deltas.
      */
     DerivedCounter(ObservableUnit* owner, std::string_view name, std::string_view description,
-                   std::initializer_list<std::reference_wrapper<const Counter>> sources,
+                   std::initializer_list<std::reference_wrapper<const EventCounter>> sources,
                    ComputeFn compute);
 
     DerivedCounter(const DerivedCounter&) = delete;
@@ -106,7 +100,7 @@ private:
     ObservableUnit* owner_;
     std::string name_;
     std::string description_;
-    std::vector<std::reference_wrapper<const Counter>> sources_;
+    std::vector<std::string> source_names_;
     ComputeFn compute_;
 };
 

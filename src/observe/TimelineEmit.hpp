@@ -8,7 +8,6 @@
 
 #pragma once
 
-#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -65,15 +64,6 @@ bool emitEventWithItems(ObservationContext* ctx, CategoryMask category, Timeline
         }
         return emitted;
     }
-}
-
-inline bool emitCounterSample(ObservationContext* ctx, CategoryMask category, uint32_t track_id,
-                              int64_t value) noexcept {
-    if (!ctx || track_id == 0) {
-        return false;
-    }
-    return ctx->timelineEvent(category, TimelineEventKind::CounterSample, track_id, /*slot=*/0,
-                              /*name_id=*/0, std::bit_cast<uint64_t>(value), nullptr, 0);
 }
 
 }  // namespace chronon::observe::timeline_detail

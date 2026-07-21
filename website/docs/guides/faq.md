@@ -110,10 +110,10 @@ auto* unit = sim.createUnit<MyUnit>(arg1, arg2);
 
 ### How do I use counters?
 
-Declare `Counter` members in your unit class:
+Declare `EventCounter` members in your unit class:
 
 ```cpp
-Counter ops_{this, "ops", "Operations executed", "ops"};
+EventCounter ops_{this, "ops", "Operations executed", "ops"};
 ```
 
 Each unit instance gets its own counter with hierarchical naming (e.g., `alu0.ops`, `alu1.ops`).
@@ -252,7 +252,7 @@ OCOUNT(ctx, COUNTER_ID);
 
 New:
 ```cpp
-Counter my_counter_{this, "my_counter", "desc"};  // Per-unit member
+EventCounter my_counter_{this, "my_counter", "desc"};  // Per-unit member
 ++my_counter_;                                      // Increment
 my_counter_ += 5;                                   // Add
 ```
@@ -266,7 +266,7 @@ OBSERVE_COUNTER_ID(MY_COUNTER, 5);
 
 New:
 ```cpp
-Counter my_counter_{this, "my_counter", "desc"};  // Per-unit member
+EventCounter my_counter_{this, "my_counter", "desc"};  // Per-unit member
 ```
 
 ### From AutoPipelineReg / PipelineReg

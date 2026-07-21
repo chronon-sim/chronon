@@ -25,21 +25,15 @@ namespace chronon::sender {
  * the newest version with write_cycle <= reader_cycle. Single-writer/multi-reader safe via
  * acquire/release on write_head_; multiple writers require external serialization.
  *
- * Preferred usage (runtime depth derived from the dependency graph):
+ * Usage (runtime depth derived from the dependency graph):
  *
  *     auto depth = sim.dependencyGraph()
  *                      .requiredVersionedRegisterDepth(writer, readers, max_lookahead);
  *     VersionedRegister<uint64_t> reg(initial_value, depth);
  *
- * Legacy usage (compile-time depth, deprecated):
- *
- *     VersionedRegister<uint64_t, 16> reg(initial_value);   // deprecated
- *
- * @tparam T            Value type.
- * @tparam HistoryDepth Compile-time depth.  0 (default) selects the new runtime-depth API;
- *                       any positive value selects the deprecated fixed-depth API.
+ * @tparam T Value type.
  */
-template <typename T, size_t HistoryDepth = 0>
+template <typename T>
 class VersionedRegister {
     struct Version {
         T value{};
@@ -62,7 +56,7 @@ public:
     static constexpr uint32_t kDefaultDepth = 16;
 
     // ------------------------------------------------------------------
-    // Runtime-depth constructors (HistoryDepth == 0, preferred)
+    // Runtime-depth constructors
     //
     // Two forms:
     //   VersionedRegister<T> reg;              // default value, default depth
@@ -72,39 +66,10 @@ public:
     // with the initial-value form when T is an integer type.
     // ------------------------------------------------------------------
 
-    VersionedRegister()
-        requires(HistoryDepth == 0)
-        : versions_(kDefaultDepth), depth_(kDefaultDepth) {}
+    VersionedRegister() : versions_(kDefaultDepth), depth_(kDefaultDepth) {}
 
     VersionedRegister(T initial_value, uint32_t depth = kDefaultDepth)
-        requires(HistoryDepth == 0)
         : versions_(checkedDepth(depth)), depth_(depth) {
-        versions_[0] = {initial_value, 0};
-    }
-
-    // ------------------------------------------------------------------
-    // Fixed-depth constructors (HistoryDepth > 0, deprecated)
-    //
-    // Migrate to VersionedRegister<T>(initial_value, depth) with depth
-    // from DependencyGraph::requiredVersionedRegisterDepth().
-    // ------------------------------------------------------------------
-
-    [[deprecated(
-        "Use VersionedRegister<T>(initial_value, depth) with runtime depth from "
-        "DependencyGraph::requiredVersionedRegisterDepth()")]]
-    VersionedRegister()
-        requires(HistoryDepth > 0)
-        : versions_(HistoryDepth), depth_(static_cast<uint32_t>(HistoryDepth)) {
-        static_assert(HistoryDepth >= 2 && HistoryDepth <= 100000);
-    }
-
-    [[deprecated(
-        "Use VersionedRegister<T>(initial_value, depth) with runtime depth from "
-        "DependencyGraph::requiredVersionedRegisterDepth()")]]
-    explicit VersionedRegister(T initial_value)
-        requires(HistoryDepth > 0)
-        : versions_(HistoryDepth), depth_(static_cast<uint32_t>(HistoryDepth)) {
-        static_assert(HistoryDepth >= 2 && HistoryDepth <= 100000);
         versions_[0] = {initial_value, 0};
     }
 

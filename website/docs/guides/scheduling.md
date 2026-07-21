@@ -367,25 +367,23 @@ clusters or migrate individual units.
 
 Typical investigation workflow:
 
-1. Capture a short window with `simulation.timeline_trace.enabled=true`.
-2. Open the JSON in `ui.perfetto.dev` or `chrome://tracing`.
+1. Capture a short window with `simulation.observation.timeline.scheduler.enabled=true`.
+2. Open the resulting `.pftrace` file in `ui.perfetto.dev`.
 3. Inspect whether `stream N` lanes overlap tightly.
 4. Identify streams with long `cluster dependency` slices.
 5. Correlate the waiting streams with unit placement and connection delays.
 
 Timeline `stream N` lane names are zero-based Chronon logical stream ids. The
-Chrome Trace `tid` values are intentionally 1-based for Perfetto compatibility;
-use each slice's `args.stream` field when correlating viewer output back to
-Chronon stream ids. The `scheduler` lane is separate from worker streams and
-only records scheduler-side spans.
+`scheduler` lane is separate from worker streams and only records
+scheduler-side spans.
 
 Example:
 
 ```bash
 ./my_sim config.yaml --no-observe \
-  -p simulation.timeline_trace.enabled=true \
-  -p simulation.timeline_trace.file=out/chronon_timeline.json \
-  -p simulation.timeline_trace.end_cycle=2000
+  -p simulation.observation.timeline.scheduler.enabled=true \
+  -p simulation.observation.timeline.scheduler.file=out/scheduler_timeline.pftrace \
+  -p simulation.observation.timeline.scheduler.end_cycle=2000
 ```
 
 Long wait slices usually indicate that one predecessor cluster is on the

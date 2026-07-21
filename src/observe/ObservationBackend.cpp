@@ -656,19 +656,7 @@ void ObservationBackend::processEvent_(const ObservationQueue::RecordHeader* hea
             break;
         }
 
-        case ObservationQueue::EventType::TRACE_EVENT: {
-            if (trace_handler_) {
-                trace_handler_(header->type, data, data_size);
-            } else if (is_structured) {
-                processStructuredTrace_(data, data_size);
-            }
-            break;
-        }
-
         case ObservationQueue::EventType::TIMELINE_EVENT: {
-            // Gated only on the sink: timeline_trace_events controls the
-            // legacy trace<>() instant mirror, not first-class lane/counter
-            // records (which have their own producer-side category filters).
             if (perfetto_writer_ && perfetto_writer_->isOpen()) {
                 processTimelineEvent_(data, data_size);
             }
@@ -810,27 +798,6 @@ void ObservationBackend::processCounterSample_(uint64_t cycle, std::string_view 
     }
 
     if (counter_buffer_.size() >= COUNTER_BUFFER_FLUSH_SIZE) flushCounterBuffer_();
-}
-
-void ObservationBackend::processStructuredTrace_(const std::byte* data, size_t data_size) {
-    if (data_size < sizeof(StructuredRecord)) {
-        return;
-    }
-
-    const auto* rec = reinterpret_cast<const StructuredRecord*>(data);
-    const std::byte* args_data = data + sizeof(StructuredRecord);
-    size_t args_size = data_size - sizeof(StructuredRecord);
-
-    if (config_.timeline_trace_events && perfetto_writer_ && perfetto_writer_->isOpen()) {
-        writeTraceToTimeline_(rec, args_data, args_size);
-    }
-
-    if (config_.trace_text) {
-        auto* sink = channel_sink_[static_cast<size_t>(Channel::Trace)];
-        if (sink && sink->file.is_open()) {
-            writeEventAsText_(rec, args_data, args_size, "TRACE", *sink);
-        }
-    }
 }
 
 void ObservationBackend::processStructuredLog_(const std::byte* data, size_t data_size) {

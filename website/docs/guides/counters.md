@@ -6,17 +6,17 @@ sidebar_label: "Counter System"
 
 ## Overview
 
-Chronon provides per-unit counters via the `Counter` class. Each unit instance declares its own counters as members, and they are automatically registered with the observation system when the unit's context is attached.
+Chronon provides per-unit counters via the `EventCounter` class. Each unit instance declares its own counters as members, and they are automatically registered with the observation system when the unit's context is attached.
 
-## Counter (Per-Unit)
+## EventCounter (Per-Unit)
 
 Declare counters as unit members for automatic per-instance tracking:
 
 ```cpp
 class ALUUnit : public TickableUnit, public ObservableUnit {
     // Per-instance counters - each ALU has its own
-    Counter ops_{this, "ops", "Operations executed", "ops"};
-    Counter stalls_{this, "stalls", "Stall cycles", "cycles"};
+    EventCounter ops_{this, "ops", "Operations executed", "ops"};
+    EventCounter stalls_{this, "stalls", "Stall cycles", "cycles"};
 
 public:
     void tick() override {
@@ -111,15 +111,19 @@ This makes interval-local rate metrics (hit rate, IPC, stall rate) directly comp
 ### Counter API
 
 ```cpp
-class Counter {
+class EventCounter {
 public:
-    Counter(ObservableUnit* owner,
-            std::string_view name,
-            std::string_view description = "",
-            std::string_view unit = "");
+    EventCounter(ObservableUnit* owner,
+                 std::string_view name,
+                 std::string_view description = "",
+                 std::string_view unit = "");
 
-    Counter& operator++() noexcept;
-    Counter& operator+=(uint64_t delta) noexcept;
+    EventCounter& operator++() noexcept;
+    EventCounter& operator+=(uint64_t delta) noexcept;
+    void add(uint64_t delta = 1) noexcept;
+
+    template <FixedString Name, typename Cat, typename... Items>
+    void mark(Cat category, Items&&... items);
 
     uint64_t get() const noexcept;
     void reset() noexcept;
@@ -245,27 +249,17 @@ Derived counters compute values from raw counters at CSV dump time. They add zer
 
 ```cpp
 class Fetch : public TickableUnit, public ObservableUnit {
-    Counter hits_{this, "hits", "Cache hits"};
-    Counter misses_{this, "misses", "Cache misses"};
-    Counter retired_{this, "retired", "Instructions retired"};
-    Counter cycles_{this, "cycles", "Active cycles"};
+    EventCounter hits_{this, "hits", "Cache hits"};
+    EventCounter misses_{this, "misses", "Cache misses"};
 
-    // Convenience formula: a / (a + b)
     DerivedCounter hit_rate_{this, "hit_rate", "Cache hit rate",
         {hits_, misses_}, DerivedFormula::Ratio};
-
-    // Custom lambda — any computation
-    DerivedCounter ipc_{this, "ipc", "Instructions per cycle",
-        {retired_, cycles_},
-        [](std::span<const uint64_t> v) {
-            return v[1] > 0 ? double(v[0]) / v[1] : 0.0;
-        }};
-
-    // Multi-source with arbitrary formula
-    DerivedCounter branch_mpki_{this, "branch_mpki", "Branch MPKI",
-        {mispred_, retired_}, DerivedFormula::PerKilo};
 };
 ```
+
+The source names are captured when `DerivedCounter` is constructed. Incrementing
+an `EventCounter` does not perform any derived-counter work; formulas still run
+only on the observation backend thread when a CSV row is emitted.
 
 ### Available Convenience Formulas
 
@@ -313,7 +307,7 @@ Derived values are computed from **per-interval deltas** (same as raw counters).
 using namespace chronon;
 
 class ALUUnit : public TickableUnit, public ObservableUnit {
-    Counter ops_{this, "ops", "Operations", "ops"};
+    EventCounter ops_{this, "ops", "Operations", "ops"};
     uint32_t id_;
 
 public:

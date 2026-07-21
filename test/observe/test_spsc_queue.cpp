@@ -42,7 +42,7 @@ void test_basic_write_read() {
 
     TestRecord record;
     record.header.total_size = sizeof(TestRecord);
-    record.header.type = ObservationQueue::EventType::TRACE_EVENT;
+    record.header.type = ObservationQueue::EventType::LOG_EVENT;
     record.header.flags = 1;
     record.header.padding = 0;
     record.data = 0xDEADBEEF;
@@ -61,7 +61,7 @@ void test_basic_write_read() {
 
     auto* header = reinterpret_cast<const ObservationQueue::RecordHeader*>(read_ptr);
     assert(header->total_size == sizeof(TestRecord));
-    assert(header->type == ObservationQueue::EventType::TRACE_EVENT);
+    assert(header->type == ObservationQueue::EventType::LOG_EVENT);
 
     auto* read_record = reinterpret_cast<const TestRecord*>(read_ptr);
     assert(read_record->data == 0xDEADBEEF);
@@ -90,7 +90,7 @@ void test_multiple_records() {
 
         Record record;
         record.header.total_size = sizeof(Record);
-        record.header.type = ObservationQueue::EventType::TRACE_EVENT;
+        record.header.type = ObservationQueue::EventType::LOG_EVENT;
         record.header.flags = 1;
         record.header.padding = 0;
         record.value = i;
@@ -210,7 +210,7 @@ void test_producer_consumer() {
     for (int i = 0; i < NUM_RECORDS; ++i) {
         Record record;
         record.header.total_size = sizeof(Record);
-        record.header.type = ObservationQueue::EventType::TRACE_EVENT;
+        record.header.type = ObservationQueue::EventType::LOG_EVENT;
         record.header.flags = 1;
         record.header.padding = 0;
         record.value = i;

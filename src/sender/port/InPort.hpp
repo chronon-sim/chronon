@@ -144,10 +144,6 @@ public:
     /// so the epoch-free gate must bound producer run-ahead against capacity().
     bool usesLockFreeQueue() const noexcept { return lock_free_queue_; }
     bool usesDirectSPSC() const noexcept { return direct_spsc_queue_raw_ != nullptr; }
-    [[deprecated("use usesDirectSPSC()")]]
-    bool usesExperimentalDirectSPSC() const noexcept {
-        return usesDirectSPSC();
-    }
 
     /**
      * Switch to lock-free SPSC queue.

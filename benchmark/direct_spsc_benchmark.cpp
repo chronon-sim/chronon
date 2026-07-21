@@ -3,13 +3,14 @@
 
 #include <algorithm>
 #include <array>
-#include <barrier>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <latch>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -135,40 +136,61 @@ template <size_t Bytes>
     uint64_t checksum = 0;
     bool order_ok = true;
 
-    std::barrier start_gate(3, [&]() noexcept { begin = Clock::now(); });
-    std::thread producer([&] {
-        start_gate.arrive_and_wait();
-        for (uint64_t sequence = 0; sequence < items; ++sequence) {
-            Message message{};
-            message.data.words.front() = sequence;
-            message.enqueue_cycle = sequence;
-            message.sender_id = 1;
-            while (true) {
-                // Registered edges query architectural admission before their
-                // direct publication. This also retires the consumer's pop
-                // ledger and keeps this a production-path measurement.
-                (void)queue.admissionOccupancy(sequence);
-                if (queue.pushDirect(std::move(message), sequence, 1)) break;
-                chronon::cpuPause();
-            }
-        }
-    });
-    std::thread consumer([&] {
-        start_gate.arrive_and_wait();
-        uint64_t expected = 0;
-        while (expected < items) {
-            const bool consumed = queue.consumeReady(expected, [&](Message& message) {
-                const uint64_t sequence = message.data.words.front();
-                order_ok = order_ok && sequence == expected;
-                checksum += sequence;
-                ++expected;
-            });
-            if (!consumed) chronon::cpuPause();
-        }
-        end = Clock::now();
-    });
+    std::latch ready_gate(2);
+    std::atomic<bool> start{false};
+    std::atomic<bool> cancel{false};
 
-    start_gate.arrive_and_wait();
+    auto waitForStart = [&]() noexcept {
+        ready_gate.count_down();
+        while (!start.load(std::memory_order_acquire)) chronon::cpuPause();
+        return !cancel.load(std::memory_order_acquire);
+    };
+
+    std::thread producer;
+    std::thread consumer;
+    try {
+        producer = std::thread([&] {
+            if (!waitForStart()) return;
+            for (uint64_t sequence = 0; sequence < items; ++sequence) {
+                Message message{};
+                message.data.words.front() = sequence;
+                message.enqueue_cycle = sequence;
+                message.sender_id = 1;
+                while (true) {
+                    // Registered edges query architectural admission before their
+                    // direct publication. This also retires the consumer's pop
+                    // ledger and keeps this a production-path measurement.
+                    (void)queue.admissionOccupancy(sequence);
+                    if (queue.pushDirect(std::move(message), sequence, 1)) break;
+                    chronon::cpuPause();
+                }
+            }
+        });
+        consumer = std::thread([&] {
+            if (!waitForStart()) return;
+            uint64_t expected = 0;
+            while (expected < items) {
+                const bool consumed = queue.consumeReady(expected, [&](Message& message) {
+                    const uint64_t sequence = message.data.words.front();
+                    order_ok = order_ok && sequence == expected;
+                    checksum += sequence;
+                    ++expected;
+                });
+                if (!consumed) chronon::cpuPause();
+            }
+            end = Clock::now();
+        });
+    } catch (...) {
+        cancel.store(true, std::memory_order_release);
+        start.store(true, std::memory_order_release);
+        if (producer.joinable()) producer.join();
+        if (consumer.joinable()) consumer.join();
+        throw;
+    }
+
+    ready_gate.wait();
+    begin = Clock::now();
+    start.store(true, std::memory_order_release);
     producer.join();
     consumer.join();
     if (!order_ok || checksum != items * (items - 1) / 2) {

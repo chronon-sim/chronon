@@ -93,11 +93,11 @@ InPort<Data> in{this, "in"};          // unlimited capacity by default
 inline const auto MY_CATEGORY = Category<"my_category", "Description">{};
 
 // Declare counters as unit members
-Counter ops_{this, "ops", "Operations executed"};
+EventCounter ops_{this, "ops", "Operations executed"};
 
 // Use in ObservableUnit (no macros needed)
 ++ops_;                                      // Increment counter
-trace<"Event: {}">(MY_CATEGORY, value);     // Emit trace
+event<"event">(MY_CATEGORY, arg<"value">(value)); // Emit structured timeline event
 debug<"Debug info: {}">(value);              // Debug log
 info<"Info message">();                      // Info log
 ```
@@ -111,7 +111,7 @@ using namespace chronon;
 // All types available directly in chronon:: namespace:
 // - TickableUnit, TickSimulation, TickSimulationConfig
 // - OutPort<T>, InPort<T>, Connection<T>
-// - Counter<>, Category<>, ObservableUnit
+// - EventCounter, Category<>, ObservableUnit
 // - Param<T>, ParameterSet, AutoRegisteredUnit
 // - StageReg<T, N>, SingleStageReg<T>
 // - TerminationReason, TerminationRequest, TerminationController
@@ -269,6 +269,6 @@ int main(int argc, char* argv[]) {
 - Headers use `.hpp` extension
 - C++20 features required (GCC 12+ required)
 - Tests use simple assertion-based pattern with `std::cout` for pass/fail output
-- **Observability**: Use member `Counter` objects (`++counter_`, `counter_ += n`) and `trace<>()`/`debug<>()`; legacy macros (`OCOUNT`, `OTRACE`) no longer exist
+- **Observability**: Use member `EventCounter` objects (`++counter_`, `counter_.mark<>()`), structured `event<>()`/timeline lanes, and `debug<>()`; legacy counter/trace macros no longer exist
 - **Port registration**: Automatic via constructor - never call registration methods manually
 - **Tick-based execution**: Use `TickableUnit` + `TickSimulation` for all simulations

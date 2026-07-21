@@ -31,7 +31,7 @@ System dependencies: `yaml-cpp`, `fmt`, and optionally `zstd`. Other dependencie
 - Headers use `.hpp` extension.
 - Use the single include `#include "chronon/Chronon.hpp"` for public API.
 - Prefer `TickableUnit` for new simulation units.
-- Use the macro-free observability API (`Counter`, `trace<>()`, `debug<>()`) instead of raw print statements.
+- Use the macro-free observability API (`EventCounter`, `event<>()`, `TimelineLane`, `debug<>()`) instead of raw print statements.
 
 ## Making Changes
 

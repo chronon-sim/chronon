@@ -38,6 +38,8 @@
 
 #include "PftraceTestDecoder.hpp"
 #include "observe/CounterRegistry.hpp"
+#include "observe/DerivedCounter.hpp"
+#include "observe/EventCounter.hpp"
 #include "observe/FormatRegistry.hpp"
 #include "observe/LookaheadBuffer.hpp"
 #include "observe/ObservationBackend.hpp"
@@ -72,6 +74,26 @@ using namespace pftrace_test;
 namespace {
 
 void fakeWakeupCallback(void*) {}
+
+void discardQueuedRecords(ThreadContext& context) {
+    auto& queue = context.queue();
+    queue.forceCommitWrite();
+    while (std::byte* ptr = queue.prepareRead()) {
+        const auto* header = reinterpret_cast<const ObservationQueue::RecordHeader*>(ptr);
+        assert(header->total_size >= sizeof(ObservationQueue::RecordHeader));
+        assert(header->total_size <= queue.capacity());
+        queue.finishRead(header->total_size);
+    }
+    queue.forceCommitRead();
+}
+
+class DerivedCounterTestUnit : public ObservableUnit {
+public:
+    EventCounter hits{this, "hits", "Cache hits"};
+    EventCounter misses{this, "misses", "Cache misses"};
+    DerivedCounter hit_rate{
+        this, "hit_rate", "Cache hit rate", {hits, misses}, DerivedFormula::Ratio};
+};
 
 ObservationYAMLConfig makeEnabledConfig(const std::string& output_dir) {
     ObservationYAMLConfig cfg;
@@ -224,7 +246,7 @@ void test_reorder_buffer_force_flush() {
         [[maybe_unused]] ObservationQueue::RecordHeader header{};
         header.total_size =
             static_cast<uint16_t>(sizeof(ObservationQueue::RecordHeader) + sizeof(uint64_t));
-        header.type = ObservationQueue::EventType::TRACE_EVENT;
+        header.type = ObservationQueue::EventType::TIMELINE_EVENT;
         header.flags = 1;
         header.padding = 0;
 
@@ -265,7 +287,7 @@ void test_reorder_buffer_force_flush() {
         [[maybe_unused]] ObservationQueue::RecordHeader header{};
         header.total_size =
             static_cast<uint16_t>(sizeof(ObservationQueue::RecordHeader) + sizeof(uint64_t));
-        header.type = ObservationQueue::EventType::TRACE_EVENT;
+        header.type = ObservationQueue::EventType::TIMELINE_EVENT;
         header.flags = 1;
         header.padding = 0;
 
@@ -346,7 +368,6 @@ void test_no_drops_under_pressure_debug() {
     backend_cfg.output_dir = "/tmp/chronon_obs_pressure";
     backend_cfg.enable_counter_csv = false;
     backend_cfg.enable_reordering = false;
-    backend_cfg.trace_text = true;
     backend_cfg.timeline_enabled = false;
 
     ObservationBackend backend(queue, backend_cfg);
@@ -421,6 +442,8 @@ void test_pressure_without_backend_drops_instead_of_hanging() {
     uint64_t cycle = 0;
     ObservationContext ctx(&queue, [&cycle]() { return cycle; }, 0, "pressure_no_backend", 1);
     ctx.enableCategory(category::LOG_INFO);
+    ThreadContext* producer_context = ThreadContextManager::instance().getContext();
+    assert(producer_context != nullptr);
 
     constexpr size_t NUM_EVENTS = 10000;
     for (size_t i = 0; i < NUM_EVENTS; ++i) {
@@ -431,6 +454,11 @@ void test_pressure_without_backend_drops_instead_of_hanging() {
     [[maybe_unused]] const uint64_t dropped_after =
         ThreadContextManager::instance().totalDroppedCount();
     assert(dropped_after > dropped_before && "Expected drops when backend is not running");
+
+    // This test intentionally fills the persistent thread-local queue without
+    // a consumer. Discard those records so later backend tests do not inherit
+    // backpressure from this test.
+    discardQueuedRecords(*producer_context);
 
     std::cout << "PASSED\n";
 }
@@ -451,6 +479,7 @@ void test_spin_wait_exits_when_wakeup_is_removed() {
 
     std::atomic<bool> ready_to_spin{false};
     std::atomic<bool> producer_done{false};
+    ThreadContext* producer_context = nullptr;
 
     std::thread producer([&]() {
         ObservationQueue queue(64 * 1024);
@@ -460,6 +489,7 @@ void test_spin_wait_exits_when_wakeup_is_removed() {
 
         ThreadContext* tc = ThreadContextManager::instance().getContext();
         assert(tc != nullptr);
+        producer_context = tc;
         const uint64_t dropped_before = tc->droppedCount();
 
         // Fill queue with Drop policy until full.
@@ -508,6 +538,8 @@ void test_spin_wait_exits_when_wakeup_is_removed() {
         std::abort();
     }
     producer.join();
+    assert(producer_context != nullptr);
+    discardQueuedRecords(*producer_context);
 
     // Restore defaults for following tests.
     ThreadContextManager::instance().setBackpressurePolicy(ObservationChannel::Info,
@@ -611,8 +643,8 @@ void test_timeline_restart_redeclares_tracks() {
 
     ObservationBackend backend(queue, cfg);
 
-    const FormatId fmt_id = FormatRegistry::instance().registerFormat(
-        "restart round {}", __FILE__, __LINE__, {ArgType::UInt64}, false, LogLevel::Info);
+    const uint32_t event_track = TimelineTrackRegistry::instance().registerTrack(
+        {"restart_events", /*source_id=*/1, /*lanes=*/1, TimelineTrackInfo::Layout::Normal});
 
     uint64_t cycle = 1;
     std::filesystem::path last_timeline;
@@ -621,7 +653,10 @@ void test_timeline_restart_redeclares_tracks() {
 
         ObservationContext ctx(&queue, [&cycle]() { return cycle; }, 0, "restart_unit", 1);
         ctx.enableCategory(category::TRACE);
-        ctx.trace(category::TRACE, fmt_id, round);
+        ctx.setCurrentCycleValue(cycle);
+        CHECK(ctx.timelineEvent(category::TRACE, TimelineEventKind::Instant, event_track,
+                                /*slot=*/0, EventName<"restart_round">::ref().id,
+                                /*payload=*/round, nullptr, 0));
         ThreadContextManager::instance().flushAll();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
@@ -670,9 +705,12 @@ void test_counter_group_does_not_collide_with_child_unit() {
 
     ObservationContext child_ctx(&queue, []() { return 1ULL; }, 0, "core.counters", 2);
     child_ctx.enableCategory(category::TRACE);
-    const FormatId fmt =
-        FormatRegistry::instance().registerFormat("child", __FILE__, __LINE__, {}, true);
-    child_ctx.trace(category::TRACE, fmt);
+    const uint32_t child_event_track = TimelineTrackRegistry::instance().registerTrack(
+        {"events", /*source_id=*/2, /*lanes=*/1, TimelineTrackInfo::Layout::Normal});
+    child_ctx.setCurrentCycleValue(1);
+    CHECK(child_ctx.timelineEvent(category::TRACE, TimelineEventKind::Instant, child_event_track,
+                                  /*slot=*/0, EventName<"child">::ref().id,
+                                  /*payload=*/0, nullptr, 0));
 
     SimpleCounter counter;
     counter.increment(7);
@@ -837,6 +875,57 @@ void test_pivoted_csv_preserves_unowned_final_counter_columns() {
     std::cout << "PASSED\n";
 }
 
+void test_derived_counter_uses_event_counter_sources() {
+    std::cout << "Testing derived counter with EventCounter sources... ";
+
+    const std::string out_dir = "/tmp/chronon_derived_counter";
+    std::filesystem::remove_all(out_dir);
+
+    ObservationQueue shared(64 * 1024);
+    std::vector<std::unique_ptr<ObservationContext>> contexts;
+    auto ctx = std::make_unique<ObservationContext>(&shared, []() { return 10ULL; }, 0, "cache");
+    ctx->setCounterOwnerId(0);
+
+    DerivedCounterTestUnit unit;
+    unit.setObservationContext(ctx.get());
+    unit.hits += 8;
+    unit.misses += 2;
+    contexts.push_back(std::move(ctx));
+
+    CounterRegistry registry;
+    registry.reregisterAll(contexts);
+    CHECK(registry.derivedDefs().size() == 1);
+    CHECK(registry.derivedDefs()[0].source_names == std::vector<std::string>({"hits", "misses"}));
+
+    ObservationBackend::Config config;
+    config.output_dir = out_dir;
+    config.enable_counter_csv = true;
+    config.counter_csv_format = CounterCsvFormat::Pivoted;
+    config.enable_reordering = false;
+    config.timeline_enabled = false;
+
+    ObservationBackend backend(shared, config);
+    backend.setDerivedCounterDefs(registry.derivedDefs());
+    backend.setCounterColumns(registry.counterColumns());
+    backend.setCounterSnapshotPlans(registry.snapshotPlans());
+    backend.start();
+    const auto csv_path = backend.outputDir() / "counters.csv";
+
+    registry.dumpFinalSnapshot(10, &shared, contexts);
+    backend.stop();
+
+    std::ifstream csv(csv_path);
+    std::string header;
+    std::string row;
+    CHECK(static_cast<bool>(std::getline(csv, header)));
+    CHECK(static_cast<bool>(std::getline(csv, row)));
+    CHECK(header == "cycle,cache.hits,cache.misses,cache.hit_rate");
+    CHECK(row == "10,8,2,0.800000");
+
+    std::filesystem::remove_all(out_dir);
+    std::cout << "PASSED\n";
+}
+
 void test_pipeline_slice_name_cache_is_bounded() {
     std::cout << "Testing pipeline slice name cache bound... ";
 
@@ -881,6 +970,7 @@ int main() {
     test_counter_group_does_not_collide_with_child_unit();
     test_periodic_counter_snapshot_is_metadata_indexed_batch();
     test_pivoted_csv_preserves_unowned_final_counter_columns();
+    test_derived_counter_uses_event_counter_sources();
     test_pipeline_slice_name_cache_is_bounded();
 
     std::cout << "\n=== Observation hardening tests PASSED ===\n";

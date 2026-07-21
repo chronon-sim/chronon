@@ -76,34 +76,9 @@ public:
         markWithDelta_<Name>(delta, category, std::forward<Items>(items)...);
     }
 
-    template <FixedString Name, typename Cat, typename... Items>
-    [[deprecated(
-        "EventCounter::add<Name>(...) is deprecated; use add(delta) for counter-only updates or "
-        "mark<Name>(delta, category, ...) for timeline events")]] [[gnu::always_inline]] void
-    add(uint64_t delta, Cat category, Items&&... items) {
-        mark<Name>(delta, category, std::forward<Items>(items)...);
-    }
-
     [[gnu::always_inline]] uint64_t get() const noexcept { return counter_.get(); }
 
     void reset() noexcept { counter_.reset(); }
-
-    [[deprecated("Direct Counter access is deprecated; use EventCounter methods instead")]]
-    Counter& counter() noexcept {
-        return counter_;
-    }
-    [[deprecated("Direct Counter access is deprecated; use EventCounter methods instead")]]
-    const Counter& counter() const noexcept {
-        return counter_;
-    }
-    [[deprecated("Implicit EventCounter-to-Counter conversion is deprecated")]]
-    operator Counter&() noexcept {
-        return counter_;
-    }
-    [[deprecated("Implicit EventCounter-to-Counter conversion is deprecated")]]
-    operator const Counter&() const noexcept {
-        return counter_;
-    }
 
     const std::string& name() const noexcept { return counter_.name(); }
     const std::string& description() const noexcept { return counter_.description(); }

@@ -49,11 +49,6 @@ void appendInvisibleSortPrefix(std::string& out, uint32_t rank) {
 int32_t timelineTrackRank(uint32_t track_id, const TimelineTrackInfo& info) {
     constexpr int32_t kPipelineRankBase = 10'000;
     constexpr int32_t kLaneRankBase = 50'000'000;
-    constexpr int32_t kCounterRankBase = 90'000'000;
-
-    if (info.kind == TimelineTrackInfo::Kind::Counter) {
-        return kCounterRankBase + static_cast<int32_t>(track_id);
-    }
     if (info.layout == TimelineTrackInfo::Layout::Pipeline) {
         return kPipelineRankBase + static_cast<int32_t>(track_id);
     }
@@ -149,27 +144,6 @@ uint64_t ObservationBackend::timelineTrackForPath_(std::string_view path,
     return uuid;
 }
 
-void ObservationBackend::writeTraceToTimeline_(const StructuredRecord* rec,
-                                               const std::byte* args_data, size_t args_size) {
-    const FormatInfo& fmt_info = FormatRegistry::instance().getFormat(rec->format_id);
-    if (fmt_info.format_string.empty()) {
-        return;  // Invalid format ID
-    }
-
-    timeline_msg_buffer_.clear();
-    reconstructMessageTo_(timeline_msg_buffer_, fmt_info, rec, args_data, args_size);
-    const std::string_view message(timeline_msg_buffer_.data(), timeline_msg_buffer_.size());
-
-    // 1 cycle is rendered as 1 ns on the timeline axis.
-    perfetto_writer_->instant(timelineTrackForSource_(rec->source_id), "trace", message,
-                              rec->cycle);
-    if (rec->cycle > timeline_max_cycle_) {
-        timeline_max_cycle_ = rec->cycle;
-    }
-
-    local_bytes_written_ += timeline_msg_buffer_.size() + 24;
-}
-
 void ObservationBackend::writeCounterToTimeline_(uint64_t cycle, std::string_view unit_name,
                                                  std::string_view counter_name, uint64_t value) {
     std::string key;
@@ -200,7 +174,7 @@ void ObservationBackend::writeCounterToTimeline_(uint64_t cycle, std::string_vie
 }
 
 // ---------------------------------------------------------------------------
-// Timeline lane / counter events (TimelineRecord)
+// Timeline lane events (TimelineRecord)
 // ---------------------------------------------------------------------------
 
 std::string_view ObservationBackend::timelineEventName_(uint16_t name_id) {
@@ -272,14 +246,6 @@ uint64_t ObservationBackend::timelineSlotTrack_(uint32_t track_id, uint16_t slot
 
     const TimelineTrackInfo& info = TimelineTrackRegistry::instance().get(track_id);
     const uint64_t parent = timelineTrackForSource_(info.source_id);
-
-    if (info.kind == TimelineTrackInfo::Kind::Counter) {
-        if (uuids.single == 0) {
-            uuids.single = perfetto_writer_->addCounterTrack(info.name, info.unit, parent,
-                                                             timelineTrackRank(track_id, info));
-        }
-        return uuids.single;
-    }
 
     if (info.lanes <= 1) {
         if (uuids.single == 0) {
@@ -408,11 +374,6 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
             open_spans_.erase(it);
             break;
         }
-
-        case TimelineEventKind::CounterSample:
-            perfetto_writer_->counterValue(track_uuid, rec.cycle,
-                                           static_cast<int64_t>(rec.payload));
-            break;
 
         default:
             break;
@@ -972,8 +933,9 @@ void ObservationBackend::initializeOutputDir_() {
             const std::string& file;
         };
         const ChannelFileEntry channel_files[] = {
-            {Channel::Trace, config_.trace_file}, {Channel::Debug, config_.debug_file},
-            {Channel::Info, config_.info_file},   {Channel::Warn, config_.warn_file},
+            {Channel::Debug, config_.debug_file},
+            {Channel::Info, config_.info_file},
+            {Channel::Warn, config_.warn_file},
             {Channel::Error, config_.error_file},
         };
         for (const auto& entry : channel_files) {

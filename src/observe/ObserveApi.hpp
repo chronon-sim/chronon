@@ -125,37 +125,6 @@ struct Format {
     }
 };
 
-namespace observe_detail {
-
-template <FixedString Fmt, typename Cat, typename... Args>
-inline void emitTrace(ObservationContext* ctx, Cat category, Args&&... args) {
-    if (!ctx) return;
-
-    CategoryMask cat_mask = static_cast<CategoryMask>(category);
-
-    if (OBSERVE_UNLIKELY(ctx->shouldTrace(cat_mask))) {
-        static FormatId fmt_id = Format<Fmt>::template getIdWithTypes<Args...>("", 0, false);
-        ctx->trace(cat_mask, fmt_id, std::forward<Args>(args)...);
-    }
-}
-
-}  // namespace observe_detail
-
-/**
- * @brief Emit a deprecated text trace event with compile-time format string.
- *
- * @code
- *   trace<"Cache HIT: addr=0x{:x}">(ctx, CACHE_HIT, addr);
- * @endcode
- */
-template <FixedString Fmt, typename Cat, typename... Args>
-[[deprecated(
-    "trace<> text events are deprecated and will be removed after 0.4; use timeline events for "
-    "structured Perfetto data or log_* for text logs")]]
-inline void trace(ObservationContext* ctx, Cat category, Args&&... args) {
-    observe_detail::emitTrace<Fmt>(ctx, category, std::forward<Args>(args)...);
-}
-
 template <LogLevel Level, FixedString Fmt, typename... Args>
 inline void log(ObservationContext* ctx, Args&&... args) {
     if (!ctx) return;
