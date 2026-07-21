@@ -312,6 +312,126 @@ private:
     bool asserted_ = false;
 };
 
+class SaturationConsumer final : public TickableUnit {
+public:
+    SaturationConsumer() : TickableUnit("saturation_consumer") {}
+
+    InPort<uint64_t> in{this, "in", 8};
+    OutPort<uint64_t> feedback{this, "feedback", 1};
+
+    void tick() override {
+        if (auto value = in.tryReceive(localCycle())) {
+            checksum_ = burn(checksum_ ^ *value ^ localCycle(), 3);
+            ++received_;
+        }
+        (void)feedback.send(localCycle());
+    }
+
+    uint64_t received() const noexcept { return received_; }
+    uint64_t checksum() const noexcept { return checksum_; }
+
+private:
+    uint64_t received_ = 0;
+    uint64_t checksum_ = 0;
+};
+
+class SaturationProducer final : public TickableUnit {
+public:
+    SaturationProducer() : TickableUnit("saturation_producer") {}
+
+    OutPort<uint64_t> out{this, "out", 2};
+    InPort<uint64_t> feedback{this, "feedback"};
+
+    void tick() override {
+        (void)feedback.receiveAll(localCycle());
+        for (size_t attempt = 0; attempt < 2; ++attempt) {
+            if (!out.send(next_value_)) {
+                ++blocked_;
+                break;
+            }
+            ++sent_;
+            ++next_value_;
+        }
+    }
+
+    uint64_t sent() const noexcept { return sent_; }
+    uint64_t blocked() const noexcept { return blocked_; }
+
+private:
+    uint64_t next_value_ = 0;
+    uint64_t sent_ = 0;
+    uint64_t blocked_ = 0;
+};
+
+class SaturationFiller final : public TickableUnit {
+public:
+    explicit SaturationFiller(std::string name) : TickableUnit(std::move(name)) {}
+
+    void tick() override {}
+};
+
+struct SaturationRunResult {
+    uint64_t sent = 0;
+    uint64_t blocked = 0;
+    uint64_t received = 0;
+    uint64_t checksum = 0;
+    size_t queued = 0;
+    uint64_t epoch_free_runs = 0;
+    bool parallel = false;
+    bool lock_free_transport = false;
+};
+
+SaturationRunResult runBoundedSaturation(size_t num_threads) {
+    TickSimulationConfig config;
+    config.num_threads = num_threads;
+    config.enable_parallel = num_threads > 1;
+    config.enable_lookahead = num_threads > 1;
+    config.enable_weighted_partitioning = false;
+    config.enable_dynamic_rebalance = false;
+    config.enable_epoch_free_lookahead = num_threads > 1;
+    config.max_lookahead_cycles = 32;
+
+    TickSimulation simulation(config);
+    if (num_threads > 1) simulation.forceStableConnectionQueues();
+    // Registered feedback keeps both endpoints in one SCC. Creation order then
+    // makes the sequential consumer pop before the producer attempts to refill.
+    auto* consumer = simulation.createUnit<SaturationConsumer>();
+    auto* producer = simulation.createUnit<SaturationProducer>();
+    for (size_t i = 0; i < 4; ++i) {
+        simulation.createUnit<SaturationFiller>("saturation_filler_" + std::to_string(i));
+    }
+    simulation.connect(producer->out, consumer->in, 1);
+    simulation.connect(consumer->feedback, producer->feedback, 1);
+    simulation.initialize();
+
+    const bool lock_free_transport = consumer->in.usesLockFreeQueue();
+    simulation.run(128);
+    return {.sent = producer->sent(),
+            .blocked = producer->blocked(),
+            .received = consumer->received(),
+            .checksum = consumer->checksum(),
+            .queued = consumer->in.queuedMessageCount(),
+            .epoch_free_runs = simulation.epochFreeRunCount(),
+            .parallel = simulation.useParallelExecution(),
+            .lock_free_transport = lock_free_transport};
+}
+
+void verifyBoundedSaturationEquivalence() {
+    const SaturationRunResult reference = runBoundedSaturation(1);
+    const SaturationRunResult epoch_free = runBoundedSaturation(2);
+
+    require(reference.blocked > 0, "bounded saturation must exercise backpressure");
+    require(!reference.lock_free_transport && epoch_free.lock_free_transport,
+            "bounded saturation must exercise same-thread and SPSC transports");
+    require(epoch_free.parallel && epoch_free.epoch_free_runs > 0,
+            "bounded saturation must engage epoch-free execution");
+    require(epoch_free.sent == reference.sent, "bounded saturation sent count diverged");
+    require(epoch_free.blocked == reference.blocked, "bounded saturation blocking diverged");
+    require(epoch_free.received == reference.received, "bounded saturation receive count diverged");
+    require(epoch_free.queued == reference.queued, "bounded saturation queue depth diverged");
+    require(epoch_free.checksum == reference.checksum, "bounded saturation checksum diverged");
+}
+
 class EquivalenceScenario {
 public:
     EquivalenceScenario(TickSimulation& simulation, size_t cycles) {
@@ -486,6 +606,7 @@ int main() {
     try {
         std::cout << "=== Epoch-free scheduler equivalence ===\n";
         verifyFirstDivergenceDiagnostic();
+        verifyBoundedSaturationEquivalence();
         verifyEpochFreeMatrix();
         std::cout << "Epoch-free scheduler equivalence tests passed.\n";
         return 0;

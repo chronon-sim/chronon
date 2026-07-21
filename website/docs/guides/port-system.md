@@ -581,11 +581,10 @@ model-visible ports retain bounded physical storage. Physical storage,
 simulated-cycle admission credit, aggregate FIFO admission, and per-edge rate
 are separate checks; a same-cycle host pop never nondeterministically reopens
 model capacity.
-For bounded edges whose endpoints share one epoch-free worker, a non-atomic
-consumer-owned pop summary preserves that same cycle-start contract when the
-lookahead floor temporarily changes cluster execution order. Sequential and
-unbounded same-thread queues bypass this ledger, and no same-thread path takes a
-lock.
+For bounded edges whose endpoints share a worker, a non-atomic consumer-owned
+pop summary preserves that same cycle-start contract in both sequential and
+epoch-free execution. Unbounded same-thread queues bypass this ledger, and no
+same-thread path takes a lock.
 
 ## Per-Cycle Capacity (OutPort Bandwidth Limiting)
 
