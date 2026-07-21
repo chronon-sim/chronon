@@ -550,7 +550,9 @@ void TickSimulation::optimizeAllQueuesForSingleThread() {
         (void)dst_port_key;
         if (conns.empty()) continue;
         if (conns.size() == 1) {
-            conns[0]->optimizeForSameThread();
+            // Preserve the same cycle-start admission contract as SPSC/MPSC.
+            // The adapter bypasses this ledger for unbounded destinations.
+            conns[0]->optimizeForSameThread(/*cycle_strict_admission=*/true);
             continue;
         }
         // Multi-producer fan-in: one direct lane per Connection; the receiver
@@ -649,16 +651,10 @@ void TickSimulation::optimizeConnectionQueuesForThreads() {
 
         if (all_same_thread) {
             if (conns.size() == 1) {
-                // Epoch-free workers may skip a floor-blocked producer cluster
-                // and run its local consumer first in the same sweep. Preserve
-                // cycle-start admission without charging same-cluster or
-                // same-cluster edges for bookkeeping they cannot need.
-                const size_t src_cluster = getClusterForUnit(conns[0]->source());
-                const size_t dst_cluster = getClusterForUnit(dst);
-                const bool cycle_strict_admission =
-                    config_.enable_lookahead && src_cluster != SIZE_MAX &&
-                    dst_cluster != SIZE_MAX && src_cluster != dst_cluster;
-                conns[0]->optimizeForSameThread(cycle_strict_admission);
+                // Keep bounded admission independent of partition placement.
+                // SingleThreadQueueAdapter enables the ledger only for finite
+                // destinations, so unbounded local edges retain the fast path.
+                conns[0]->optimizeForSameThread(/*cycle_strict_admission=*/true);
                 same_thread_count += 1;
             } else {
                 // Multi-producer fan-in (even on one thread): route through

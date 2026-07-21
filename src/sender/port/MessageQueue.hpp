@@ -485,12 +485,13 @@ private:
  * SingleThreadQueueAdapter - cycle-strict registered-edge storage without
  * synchronization.
  *
- * Epoch-free workers may temporarily skip an earlier local cluster while it
- * waits on the shared lookahead floor, then execute a later cluster in the
- * same worker sweep.  A consumer pop at cycle C must therefore not become
- * producer admission credit until C + 1 even though both Units are owned by
- * one host thread.  Consulting the live priority-queue size would make model
- * backpressure depend on that wall-clock interleaving.
+ * A consumer pop at cycle C must not become producer admission credit until
+ * C + 1, regardless of whether topology selection chooses same-thread, SPSC,
+ * or MPSC transport. Consulting the live priority-queue size would otherwise
+ * make model backpressure depend on the scheduler and host execution order.
+ * Epoch-free workers can expose this directly when a floor-blocked local
+ * cluster changes the normal sweep order; sequential SCC order can expose the
+ * same boundary under sustained registered feedback.
  *
  * Bounded ports keep a ring of per-cycle pop summaries. Admission is the live
  * queue size plus pops whose simulated cycle has not become credit yet. There
