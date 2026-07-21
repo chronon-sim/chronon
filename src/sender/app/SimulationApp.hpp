@@ -79,7 +79,7 @@ public:
     /// Default search paths are {"."}.
     SimulationApp& setConfigSearchPaths(std::vector<std::string> paths);
 
-    /// Shown with --version. Default "0.3.2".
+    /// Shown with --version. Default "0.4.0".
     SimulationApp& setVersion(std::string version);
 
     /// 0 = inherit YAML or system default.
@@ -132,7 +132,7 @@ private:
 
     std::string name_;
     std::string description_;
-    std::string version_ = "0.3.2";
+    std::string version_ = "0.4.0";
     std::string default_config_;
     std::vector<std::string> search_paths_ = {"."};
     uint32_t default_threads_ = 0;  ///< 0 = inherit YAML.
