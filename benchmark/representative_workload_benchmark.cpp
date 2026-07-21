@@ -24,7 +24,9 @@
 #include <vector>
 
 #include "RepresentativeWorkload.hpp"
+#include "RepresentativeWorkloadCalibration.hpp"
 #include "RepresentativeWorkloadOptions.hpp"
+#include "RepresentativeWorkloadReporting.hpp"
 #include "sender/core/TickSimulation.hpp"
 #include "sender/core/TickableUnit.hpp"
 #include "sender/port/InPort.hpp"
@@ -841,7 +843,7 @@ void validateEquivalent(const RunResult& reference, const RunResult& candidate) 
 }
 
 void printResults(const std::vector<size_t>& workers,
-                  const std::vector<std::vector<RunResult>>& results, uint32_t num_units,
+                  const std::vector<std::vector<RunResult>>& results, const Scenario& scenario,
                   uint64_t cycles) {
     std::cout << "\nworkers | median(s) | p10..p90(s)     | CV     | Mcycles/s | Munit-tick/s | "
                  "Gmemop/s | Mmsg/s | GiB/s | blocked | speedup | mode\n";
@@ -858,7 +860,8 @@ void printResults(const std::vector<size_t>& workers,
         if (workers[index] == 1 || baseline == 0.0) baseline = median;
         const auto& counters = results[index].front().measured;
         const double mcycles = static_cast<double>(cycles) / median / 1e6;
-        const double mticks = static_cast<double>(num_units) * cycles / median / 1e6;
+        const double mticks =
+            static_cast<double>(scenario.config.num_units) * cycles / median / 1e6;
         const double memory_ops =
             static_cast<double>(counters.memory_reads + counters.memory_writes) / median / 1e9;
         const double messages = static_cast<double>(counters.received) / median / 1e6;
@@ -874,6 +877,14 @@ void printResults(const std::vector<size_t>& workers,
             "%5.2f | %6.2f%% | %7.2fx | %s\n",
             workers[index], median, p10, p90, 100.0 * coefficientOfVariation(walls), mcycles,
             mticks, memory_ops, messages, gib, blocked, baseline / median, mode);
+
+        const uint64_t estimated_port_storage_bytes =
+            scenario.summary.estimated_input_scratch_reserve_bytes +
+            scenario.summary.estimated_transport_reserve_bytes;
+        printMachineResult(workers[index], scenario.config.num_units, cycles, median, p10, p90,
+                           100.0 * coefficientOfVariation(walls), mcycles, mticks, memory_ops,
+                           messages, gib, blocked, baseline / median, mode,
+                           scenario.summary.unit_working_set_bytes, estimated_port_storage_bytes);
     }
     const auto& representative = results.front().front();
     std::cout << "  digest=0x" << std::hex << representative.final.state_digest << std::dec
@@ -907,9 +918,12 @@ int main(int argc, char** argv) {
         std::cout << "=== Chronon representative workload benchmark ===\n"
                   << "base-seed=" << parsed.cli.seed << " scenarios=" << parsed.cli.scenario_count
                   << " scenario-offset=" << parsed.cli.scenario_offset
-                  << " repetitions=" << parsed.cli.repetitions
-                  << " measured-cycles=" << parsed.cli.run.measured_cycles
-                  << " warmup-cycles=" << parsed.cli.run.warmup_cycles
+                  << " repetitions=" << parsed.cli.repetitions;
+        if (parsed.cli.run.target_seconds)
+            std::cout << " target-seconds=" << *parsed.cli.run.target_seconds;
+        else
+            std::cout << " measured-cycles=" << parsed.cli.run.measured_cycles;
+        std::cout << " warmup-cycles=" << parsed.cli.run.warmup_cycles
                   << " hw-concurrency=" << std::thread::hardware_concurrency() << '\n'
                   << "affinity is intentionally external; use taskset/hwloc to select homogeneous "
                      "physical cores\n";
@@ -926,6 +940,26 @@ int main(int argc, char** argv) {
             std::cout << '\n';
             if (parsed.cli.describe_only) continue;
 
+            RunOptions run_options = parsed.cli.run;
+            const CalibrationResult calibration = calibrateMeasuredCycles(
+                parsed.cli.workers, run_options, parsed.cli.verbose,
+                [&](size_t worker_count, const RunOptions& probe_options) {
+                    return runOnce(scenario, worker_count, probe_options).wall_seconds;
+                });
+            run_options.target_seconds.reset();
+            run_options.measured_cycles = calibration.measured_cycles;
+            if (parsed.cli.run.target_seconds) {
+                std::cout << "  calibrated target=" << *parsed.cli.run.target_seconds
+                          << "s resolved-cycles=" << run_options.measured_cycles
+                          << " fastest-estimate=" << calibration.fastest_cycles_per_second / 1e6
+                          << " Mcycles/s (10% headroom)\n";
+                ParsedOptions resolved = parsed;
+                resolved.cli.run = run_options;
+                std::cout << "  resolved-replay: ";
+                printReplayCommand(std::cout, argv[0], resolved, global_scenario_index);
+                std::cout << '\n';
+            }
+
             std::vector<std::vector<RunResult>> results(parsed.cli.workers.size());
             std::optional<RunResult> reference;
             for (uint32_t repetition = 0; repetition < parsed.cli.repetitions; ++repetition) {
@@ -938,7 +972,7 @@ int main(int argc, char** argv) {
                         std::cout << "  run repetition=" << repetition << " workers=" << workers
                                   << std::flush;
                     }
-                    RunResult result = runOnce(scenario, workers, parsed.cli.run);
+                    RunResult result = runOnce(scenario, workers, run_options);
                     if (parsed.cli.verbose) {
                         std::cout << " setup=" << result.setup_seconds
                                   << "s warmup=" << result.warmup_seconds << "s/"
@@ -953,8 +987,7 @@ int main(int argc, char** argv) {
                     results[worker_index].push_back(std::move(result));
                 }
             }
-            printResults(parsed.cli.workers, results, config.num_units,
-                         parsed.cli.run.measured_cycles);
+            printResults(parsed.cli.workers, results, scenario, run_options.measured_cycles);
         }
         return 0;
     } catch (const std::exception& error) {

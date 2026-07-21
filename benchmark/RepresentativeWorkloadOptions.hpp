@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -26,6 +27,7 @@ inline constexpr uint32_t MAX_BENCHMARK_SCENARIOS = 256;
 inline constexpr uint32_t MAX_BENCHMARK_REPETITIONS = 1'024;
 inline constexpr uint32_t MAX_BENCHMARK_WORKERS = 256;
 inline constexpr uint64_t MAX_BENCHMARK_CYCLES = 1'000'000'000;
+inline constexpr double MAX_BENCHMARK_TARGET_SECONDS = 3600.0;
 inline constexpr uint32_t MAX_BENCHMARK_LOOKAHEAD = DEFAULT_TRANSPORT_RING_SLOTS / 2;
 static_assert(static_cast<uint64_t>(MAX_BENCHMARK_LOOKAHEAD) + MAX_FORCED_DELAY - 1 <=
               DEFAULT_TRANSPORT_RING_SLOTS);
@@ -33,6 +35,7 @@ static_assert(static_cast<uint64_t>(MAX_BENCHMARK_LOOKAHEAD) + MAX_FORCED_DELAY 
 struct RunOptions {
     uint64_t warmup_cycles = 8192;
     uint64_t measured_cycles = 50'000;
+    std::optional<double> target_seconds = 1.0;
     bool dynamic_rebalance = false;
     bool precomputed_costs = true;
     uint32_t max_lookahead = 32;
@@ -56,8 +59,12 @@ struct CliOptions {
             if (i != 0) output << ',';
             output << workers[i];
         }
-        output << " --warmup " << run.warmup_cycles << " --cycles " << run.measured_cycles
-               << " --repetitions " << repetitions << " --max-lookahead " << run.max_lookahead;
+        output << " --warmup " << run.warmup_cycles;
+        if (run.target_seconds)
+            output << " --target-seconds " << *run.target_seconds;
+        else
+            output << " --cycles " << run.measured_cycles;
+        output << " --repetitions " << repetitions << " --max-lookahead " << run.max_lookahead;
         if (run.dynamic_rebalance) output << " --rebalance";
         if (!run.precomputed_costs) output << " --no-precomputed-costs";
         if (describe_only) output << " --describe-only";
@@ -184,6 +191,15 @@ inline void printReplayCommand(std::ostream& output, std::string_view program,
         throw std::invalid_argument("value for " + std::string(option) + " exceeds uint32_t range");
     }
     return static_cast<uint32_t>(result);
+}
+
+[[nodiscard]] inline double parseDouble(std::string_view value, std::string_view option) {
+    size_t consumed = 0;
+    const double result = std::stod(std::string(value), &consumed);
+    if (consumed != value.size() || !std::isfinite(result) || result <= 0.0) {
+        throw std::invalid_argument("invalid value for " + std::string(option));
+    }
+    return result;
 }
 
 [[nodiscard]] inline std::vector<uint32_t> parseU32List(std::string_view text,
@@ -343,8 +359,14 @@ inline void printHelp(const char* program) {
               << MAX_BENCHMARK_SCENARIOS << ")\n"
               << "  --threads 1,2,4,8           worker sweep (max " << MAX_BENCHMARK_WORKERS
               << "); CPU affinity is external\n"
-              << "  --cycles N --warmup N       measured and warmup cycles (max "
-              << MAX_BENCHMARK_CYCLES << " each)\n"
+              << "  --target-seconds S          auto-calibrate to at least S seconds per run"
+                 " (default 1.0, max "
+              << MAX_BENCHMARK_TARGET_SECONDS << ")\n"
+              << "  --cycles N                  fixed measured cycles; disables time targeting"
+                 " (max "
+              << MAX_BENCHMARK_CYCLES << ")\n"
+              << "  --warmup N                  untimed warmup cycles (max " << MAX_BENCHMARK_CYCLES
+              << ")\n"
               << "                              zero warmup retains one untimed init cycle\n"
               << "  --repetitions N             interleaved repetitions (default 5, max "
               << MAX_BENCHMARK_REPETITIONS << ")\n"
@@ -413,6 +435,9 @@ inline void printHelp(const char* program) {
             cli.workers = parseWorkers(requireValue(i, option));
         } else if (option == "--cycles") {
             cli.run.measured_cycles = parseInteger(requireValue(i, option), option);
+            cli.run.target_seconds.reset();
+        } else if (option == "--target-seconds") {
+            cli.run.target_seconds = parseDouble(requireValue(i, option), option);
         } else if (option == "--warmup") {
             cli.run.warmup_cycles = parseInteger(requireValue(i, option), option);
         } else if (option == "--repetitions") {
@@ -430,6 +455,7 @@ inline void printHelp(const char* program) {
         } else if (option == "--quick") {
             cli.run.warmup_cycles = 256;
             cli.run.measured_cycles = 2'000;
+            cli.run.target_seconds.reset();
             cli.repetitions = 1;
         } else if (option == "--units") {
             overrides.num_units = parseU32(requireValue(i, option), option);
@@ -518,6 +544,9 @@ inline void printHelp(const char* program) {
     if (cli.run.measured_cycles > MAX_BENCHMARK_CYCLES ||
         cli.run.warmup_cycles > MAX_BENCHMARK_CYCLES) {
         throw std::invalid_argument("cycle count exceeds benchmark limit");
+    }
+    if (cli.run.target_seconds && *cli.run.target_seconds > MAX_BENCHMARK_TARGET_SECONDS) {
+        throw std::invalid_argument("target duration exceeds benchmark limit");
     }
     if (cli.run.max_lookahead > MAX_BENCHMARK_LOOKAHEAD) {
         throw std::invalid_argument("max lookahead exceeds benchmark transport limit");

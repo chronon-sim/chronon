@@ -12,16 +12,19 @@
 #include <vector>
 
 #include "RepresentativeWorkload.hpp"
+#include "RepresentativeWorkloadCalibration.hpp"
 #include "RepresentativeWorkloadOptions.hpp"
 
 namespace {
 
+using chronon::benchmark::calibrateMeasuredCycles;
 using chronon::benchmark::generateScenario;
 using chronon::benchmark::inputScratchBytesPerSlot;
 using chronon::benchmark::MAX_BENCHMARK_CYCLES;
 using chronon::benchmark::MAX_BENCHMARK_LOOKAHEAD;
 using chronon::benchmark::MAX_BENCHMARK_REPETITIONS;
 using chronon::benchmark::MAX_BENCHMARK_SCENARIOS;
+using chronon::benchmark::MAX_BENCHMARK_TARGET_SECONDS;
 using chronon::benchmark::MAX_BENCHMARK_WORKERS;
 using chronon::benchmark::MAX_DRAIN_LIMIT;
 using chronon::benchmark::MAX_FINITE_QUEUE_CAPACITY;
@@ -39,6 +42,7 @@ using chronon::benchmark::PAYLOAD_BYTES;
 using chronon::benchmark::PayloadClass;
 using chronon::benchmark::payloadMask;
 using chronon::benchmark::printReplayCommand;
+using chronon::benchmark::RunOptions;
 using chronon::benchmark::ScenarioConfig;
 using chronon::benchmark::scenarioConfigFor;
 using chronon::benchmark::transportFifoStorageBytes;
@@ -435,6 +439,10 @@ void testWorkerBounds() {
 }
 
 void testExecutionBounds() {
+    const auto defaults = parseArgs({"benchmark"});
+    require(defaults.cli.run.target_seconds == std::optional<double>{1.0},
+            "default benchmark duration is not one second");
+
     const auto maximum_scenarios =
         parseArgs({"benchmark", "--scenario-count", std::to_string(MAX_BENCHMARK_SCENARIOS)});
     require(maximum_scenarios.cli.scenario_count == MAX_BENCHMARK_SCENARIOS,
@@ -455,12 +463,30 @@ void testExecutionBounds() {
         parseArgs({"benchmark", "--cycles", std::to_string(MAX_BENCHMARK_CYCLES), "--warmup",
                    std::to_string(MAX_BENCHMARK_CYCLES)});
     require(maximum_cycles.cli.run.measured_cycles == MAX_BENCHMARK_CYCLES &&
-                maximum_cycles.cli.run.warmup_cycles == MAX_BENCHMARK_CYCLES,
+                maximum_cycles.cli.run.warmup_cycles == MAX_BENCHMARK_CYCLES &&
+                !maximum_cycles.cli.run.target_seconds,
             "maximum cycle count was rejected");
     require(rejects({"benchmark", "--cycles", std::to_string(MAX_BENCHMARK_CYCLES + 1)}),
             "oversized measured cycle count was accepted");
     require(rejects({"benchmark", "--warmup", std::to_string(MAX_BENCHMARK_CYCLES + 1)}),
             "oversized warmup cycle count was accepted");
+
+    const auto maximum_target =
+        parseArgs({"benchmark", "--target-seconds", std::to_string(MAX_BENCHMARK_TARGET_SECONDS)});
+    require(maximum_target.cli.run.target_seconds ==
+                std::optional<double>{MAX_BENCHMARK_TARGET_SECONDS},
+            "maximum target duration was rejected");
+    require(rejects({"benchmark", "--target-seconds",
+                     std::to_string(MAX_BENCHMARK_TARGET_SECONDS + 1.0)}),
+            "oversized target duration was accepted");
+    for (const char* invalid : {"0", "-1", "nan", "inf"}) {
+        require(rejects({"benchmark", "--target-seconds", invalid}),
+                "invalid target duration was accepted");
+    }
+    const auto quick = parseArgs({"benchmark", "--quick"});
+    require(!quick.cli.run.target_seconds && quick.cli.run.measured_cycles == 2'000 &&
+                quick.cli.repetitions == 1,
+            "quick mode did not select its fixed-cycle smoke configuration");
 
     const auto maximum_lookahead =
         parseArgs({"benchmark", "--max-lookahead", std::to_string(MAX_BENCHMARK_LOOKAHEAD)});
@@ -482,6 +508,26 @@ void testExecutionBounds() {
             "maximum single scenario offset was rejected");
     require(rejects({"benchmark", "--scenario-offset", max_u64, "--scenario-count", "2"}),
             "overflowing scenario index range was accepted");
+}
+
+void testCalibrationUsesMeasuredProbe() {
+    RunOptions options;
+    options.target_seconds = 0.1;
+    uint64_t last_measured_cycles = 0;
+    uint32_t probe_count = 0;
+    constexpr double PROBE_SECONDS = 0.009;
+    const auto calibration = calibrateMeasuredCycles(
+        std::vector<size_t>{1}, options, false,
+        [&](size_t workers, const RunOptions& probe_options) {
+            require(workers == 1, "calibration changed the requested worker count");
+            last_measured_cycles = probe_options.measured_cycles;
+            ++probe_count;
+            return PROBE_SECONDS;
+        });
+    const double expected_rate = static_cast<double>(last_measured_cycles) / PROBE_SECONDS;
+    require(probe_count == 3, "calibration did not exhaust the short-probe attempts");
+    require(std::abs(calibration.fastest_cycles_per_second - expected_rate) < 1e-9,
+            "calibration used an unmeasured cycle count for its rate");
 }
 
 void testWorkAndDrainBounds() {
@@ -692,6 +738,7 @@ int main() {
         testPortStorageBudget();
         testWorkerBounds();
         testExecutionBounds();
+        testCalibrationUsesMeasuredProbe();
         testWorkAndDrainBounds();
         testWorkingSetBudget();
         testFixedDelayOverridesAllChannels();

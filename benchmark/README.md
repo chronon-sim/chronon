@@ -64,8 +64,57 @@ cmake --build build-release \
 taskset -c 16-31 \
   ./build-release/benchmark/chronon_representative_workload_benchmark \
   --profile nucleus --seed 20260719 --threads 1,2,4,8,16 \
-  --warmup 8192 --cycles 50000 --repetitions 5
+  --warmup 8192 --target-seconds 1 --repetitions 5
 ```
+
+The benchmark defaults to `--target-seconds 1`: it runs a short untimed
+calibration, then chooses one measured cycle count from the fastest requested
+worker configuration. Every worker therefore runs for roughly one second or
+longer, while all workers still execute the same cycle count for deterministic
+cross-worker validation. Calibration is excluded from reported timings. Use
+`--cycles N` to request a fixed cycle count, or `--quick` for the fixed 2,000
+cycle CI/smoke configuration.
+
+For a standard worker/footprint sweep, use the matrix driver. Its defaults run
+the mixed `nucleus`, port-free `scheduler-floor`, memory-locality `memory`, and
+transport-heavy `port` profiles with 64 units, workers 1/2/4/8, five
+repetitions, and exact per-unit memory footprints of 64 KiB, 1 MiB, and 4 MiB:
+
+```bash
+./scripts/run_performance_matrix.py --cpus 16-31
+```
+
+Use `--quick` for a smoke run, or select explicit dimensions:
+
+```bash
+./scripts/run_performance_matrix.py \
+  --profiles nucleus,scheduler-floor,memory,port \
+  --workers 1,2,4,8,16 --units 32,64 \
+  --memory-working-sets 64K,1M,4M \
+  --target-seconds 1 --warmup 8192 --repetitions 5 \
+  --cpus 16-31 --output-dir out/performance-baseline
+```
+
+The driver launches every worker/repetition pair in a fresh process, interleaves
+worker order deterministically, and records per-process peak RSS through
+`getrusage`. At completion it prints the summary table directly to the terminal
+and also writes the files below. Because each process contains one worker count,
+every matrix row calibrates independently to the requested target duration.
+
+- `raw.csv`: one row per process, including measured throughput, peak RSS, page
+  faults, CPU time, context switches, mode, and the full replay command;
+- `summary.csv`: median/p10/p90/CV, speedup, `Mcycles/s`,
+  `Mcycles*units/s`, median/max peak RSS, modeled working set, and estimated port
+  storage for each configuration;
+- `metadata.json`: Git revision and dirtiness, executable hash, host/CPU details,
+  affinity, complete matrix configuration, and measurement method; and
+- `logs/`: the human-readable benchmark output for every individual run.
+
+By default results go below ignored `out/performance-<UTC>-<git-sha>/`. The
+script refuses to overwrite a non-empty result directory. Run `--dry-run` to
+inspect the exact matrix without executing it. `Mcycles*units/s` is the same
+aggregate rate that the benchmark table labels `Munit-tick/s`; it equals global
+`Mcycles/s` multiplied by the scenario's unit count.
 
 CPU affinity is deliberately external. On hybrid or SMT machines, select a
 homogeneous set of physical cores and record that set with the result. Do not
@@ -182,14 +231,18 @@ performance result. `saturation` is specifically intended to find these
 boundary-condition bugs.
 
 Scenario creation, graph connection, simulation initialization, deterministic
-cost placement, and warmup are excluded from wall time. Repetition order is
-seeded and interleaved across worker counts. The report includes median,
+cost placement, target-duration calibration, and warmup are excluded from wall
+time. Repetition order is seeded and interleaved across worker counts. The report includes median,
 10th/90th percentiles, coefficient of variation, simulated cycles/s,
 unit-ticks/s, memory operations/s, messages/s, payload GiB/s, blocked-send
 percentage, and speedup. `Mcycles/s` is the primary global simulation
 throughput and does not scale with the number of units; `Munit-tick/s` retains
 the aggregate unit-work rate for comparing scenarios with different unit
 counts.
+
+The human-readable table is followed by one stable `RESULT key=value...` line
+per worker configuration. Automation should consume that line rather than
+depending on table spacing.
 
 Primary design references:
 
