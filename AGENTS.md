@@ -240,7 +240,7 @@ int main(int argc, char* argv[]) {
     return chronon::SimulationApp("My Simulator")
         .setDefaultConfig("config.yaml")
         .setConfigSearchPaths({".", "../configs"})
-        .setVersion("0.3.2")
+        .setVersion("0.4.0")
         .onPostBuild([](auto& result) {
             // Custom setup after units are created
         })
