@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "TickSimulation.hpp"
+#include "sender/schedule/EpochFreeTopologyCost.hpp"
 #include "sender/schedule/WeightedDependencyReduction.hpp"
 
 namespace chronon::sender {
@@ -61,6 +62,7 @@ void TickSimulation::buildCrossThreadDependencies() {
     const size_t num_clusters = clusters_.numClusters();
     thread_cross_deps_temp_.clear();
     thread_cross_deps_temp_.resize(num_clusters);
+    dynamic_rebalance_adjacency_.clear();
     has_zero_delay_cross_thread_cycle_ = false;
     if (num_clusters == 0) return;
 
@@ -70,8 +72,15 @@ void TickSimulation::buildCrossThreadDependencies() {
     }
 
     std::vector<std::unordered_map<size_t, uint32_t>> min_delay(num_clusters);
+    std::vector<std::unordered_map<size_t, uint32_t>> rebalance_min_delay(num_clusters);
     auto add_dep = [&](size_t cluster, size_t pred_cluster, uint32_t delay) {
         auto [it, inserted] = min_delay[cluster].try_emplace(pred_cluster, delay);
+        if (!inserted && delay < it->second) {
+            it->second = delay;
+        }
+    };
+    auto add_rebalance_dep = [&](size_t cluster, size_t pred_cluster, uint32_t delay) {
+        auto [it, inserted] = rebalance_min_delay[cluster].try_emplace(pred_cluster, delay);
         if (!inserted && delay < it->second) {
             it->second = delay;
         }
@@ -92,17 +101,22 @@ void TickSimulation::buildCrossThreadDependencies() {
         if (src_cluster == dst_cluster) continue;
 
         add_dep(dst_cluster, src_cluster, conn->delay());
+        add_rebalance_dep(dst_cluster, src_cluster, conn->delay());
 
         const size_t headroom = conn->crossThreadHeadroom();
-        // The global lookahead floor already bounds producer run-ahead when
-        // it is enabled and the transport can retain more cycles than
-        // max_lookahead. Install a reverse edge when the floor is disabled or
-        // the per-connection constraint is tighter.
-        if (headroom != std::numeric_limits<size_t>::max() && headroom > 0 &&
-            (config_.max_lookahead_cycles == 0 || headroom <= config_.max_lookahead_cycles)) {
+        if (headroom != std::numeric_limits<size_t>::max() && headroom > 0) {
             const uint64_t safe_cap = static_cast<uint64_t>(headroom - 1);
             const auto delay = static_cast<uint32_t>(std::min<uint64_t>(safe_cap, UINT32_MAX));
-            add_dep(src_cluster, dst_cluster, delay);
+            // A finite queue still couples producer and consumer placement
+            // when the global floor makes this reverse edge unnecessary as an
+            // execution gate. Preserve that relationship for migration cost.
+            add_rebalance_dep(src_cluster, dst_cluster, delay);
+            // The global lookahead floor already bounds producer run-ahead
+            // when it can retain fewer cycles than this connection. Install
+            // an execution reverse edge only when the connection is tighter.
+            if (config_.max_lookahead_cycles == 0 || headroom <= config_.max_lookahead_cycles) {
+                add_dep(src_cluster, dst_cluster, delay);
+            }
         }
     }
 
@@ -138,6 +152,36 @@ void TickSimulation::buildCrossThreadDependencies() {
             }
         }
     }
+
+    if (!config_.enable_dynamic_rebalance) return;
+
+    // Rebalance scores both synchronization and finite-headroom coupling.
+    // Reduce the pair-min graph once instead of reconstructing raw physical
+    // connections on every planning interval.
+    std::vector<weighted_dependency_reduction::Edge> rebalance_edges;
+    for (size_t dependent = 0; dependent < rebalance_min_delay.size(); ++dependent) {
+        for (const auto& [predecessor, delay] : rebalance_min_delay[dependent]) {
+            rebalance_edges.push_back({dependent, predecessor, delay});
+        }
+    }
+    if (transitiveDependencyPruneEnabled()) {
+        rebalance_edges =
+            weighted_dependency_reduction::reduce(num_clusters, rebalance_edges).retained;
+    } else {
+        std::sort(rebalance_edges.begin(), rebalance_edges.end(), [](const auto& a, const auto& b) {
+            if (a.dependent != b.dependent) return a.dependent < b.dependent;
+            if (a.predecessor != b.predecessor) return a.predecessor < b.predecessor;
+            return a.delay < b.delay;
+        });
+    }
+    std::vector<epoch_free_cost::RuntimeDependency> runtime_dependencies;
+    runtime_dependencies.reserve(rebalance_edges.size());
+    for (const auto& edge : rebalance_edges) {
+        runtime_dependencies.push_back(
+            {edge.dependent, edge.predecessor, static_cast<uint32_t>(edge.delay)});
+    }
+    dynamic_rebalance_adjacency_ =
+        epoch_free_cost::buildRuntimeAdjacency(num_clusters, runtime_dependencies);
 }
 
 void TickSimulation::collectMultiProducerPorts_() {

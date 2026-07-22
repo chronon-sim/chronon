@@ -8,13 +8,65 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <numeric>
+#include <span>
 #include <vector>
 
 #include "sender/schedule/PartitionUtils.hpp"
 
 namespace chronon::sender::epoch_free_cost {
+
+struct RuntimeDependency {
+    size_t dependent = 0;
+    size_t predecessor = 0;
+    uint32_t min_delay = 0;
+};
+
+/// Runtime rebalance is calibrated from measured platform synchronization,
+/// independently of the heuristic locality weight used for initial placement.
+inline double runtimeSyncCostNs(double atomic_roundtrip_ns) noexcept {
+    return std::max(1.0, atomic_roundtrip_ns);
+}
+
+/// Dependency stalls ahead of the global frontier overlap useful work on
+/// other workers; only a dependent at the exact floor is unhidden loss.
+inline bool isUnhiddenDependencyWait(uint64_t dependent_cycle, uint64_t global_floor) noexcept {
+    return dependent_cycle == global_floor;
+}
+
+/// Build the directed predecessor -> dependent graph used by the rebalance
+/// cost model from runtime scheduling and finite-headroom relationships.
+inline std::vector<std::vector<PartitionInput::EdgeInfo>> buildRuntimeAdjacency(
+    size_t num_clusters, std::span<const RuntimeDependency> dependencies) {
+    std::vector<std::vector<PartitionInput::EdgeInfo>> adjacency(num_clusters);
+    for (const auto& dep : dependencies) {
+        if (dep.predecessor >= num_clusters || dep.dependent >= num_clusters ||
+            dep.predecessor == dep.dependent) {
+            continue;
+        }
+        adjacency[dep.predecessor].push_back({dep.dependent, 1, dep.min_delay});
+    }
+
+    for (auto& edges : adjacency) {
+        std::sort(edges.begin(), edges.end(), [](const auto& a, const auto& b) {
+            if (a.neighbor != b.neighbor) return a.neighbor < b.neighbor;
+            return a.min_delay < b.min_delay;
+        });
+        auto output = edges.begin();
+        for (auto it = edges.begin(); it != edges.end(); ++it) {
+            if (output != edges.begin() && std::prev(output)->neighbor == it->neighbor) {
+                std::prev(output)->min_delay =
+                    std::min(std::prev(output)->min_delay, it->min_delay);
+                continue;
+            }
+            *output++ = *it;
+        }
+        edges.erase(output, edges.end());
+    }
+    return adjacency;
+}
 
 struct ObjectiveSummary {
     double objective = 0.0;

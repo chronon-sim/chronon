@@ -617,6 +617,9 @@ private:
     std::vector<std::vector<size_t>> thread_units_;
 
     std::vector<std::vector<ThreadCrossDep>> thread_cross_deps_temp_;
+    /// Directed predecessor -> dependent graph used by runtime rebalance.
+    /// Includes retained progress and finite-headroom scheduling relationships.
+    std::vector<std::vector<PartitionInput::EdgeInfo>> dynamic_rebalance_adjacency_;
     ThreadProgress* thread_progress_array_ = nullptr;
     size_t thread_progress_count_ = 0;
     std::vector<std::vector<ResolvedDep>> thread_resolved_deps_;
@@ -679,6 +682,7 @@ private:
     size_t dynamic_runtime_thread_count_ = 0;
     alignas(64) std::atomic<uint64_t> next_dynamic_rebalance_check_cycle_{0};
     alignas(64) std::atomic<bool> epoch_free_dynamic_runtime_active_{false};
+    alignas(64) std::atomic_flag dynamic_planner_busy_ = ATOMIC_FLAG_INIT;
 
     struct DynamicSchedulerMarker {
         SchedulerTimelineTrace::TimePoint time{};

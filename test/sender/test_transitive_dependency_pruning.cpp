@@ -26,6 +26,11 @@ struct TransitiveDependencyPruneTestAccess {
     static bool hasZeroDelayCycle(const TickSimulation& sim) {
         return sim.has_zero_delay_cross_thread_cycle_;
     }
+
+    static const std::vector<std::vector<PartitionInput::EdgeInfo>>& rebalanceAdjacency(
+        const TickSimulation& sim) {
+        return sim.dynamic_rebalance_adjacency_;
+    }
 };
 
 }  // namespace chronon::sender
@@ -77,6 +82,22 @@ std::vector<reduction::Edge> snapshotDependencies(const TickSimulation& sim) {
     for (size_t dependent = 0; dependent < dependencies.size(); ++dependent) {
         for (const ThreadCrossDep& dependency : dependencies[dependent]) {
             edges.push_back({dependent, dependency.pred_thread, dependency.min_delay});
+        }
+    }
+    std::sort(edges.begin(), edges.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.dependent != rhs.dependent) return lhs.dependent < rhs.dependent;
+        if (lhs.predecessor != rhs.predecessor) return lhs.predecessor < rhs.predecessor;
+        return lhs.delay < rhs.delay;
+    });
+    return edges;
+}
+
+std::vector<reduction::Edge> snapshotRebalanceAdjacency(const TickSimulation& sim) {
+    std::vector<reduction::Edge> edges;
+    const auto& adjacency = TransitiveDependencyPruneTestAccess::rebalanceAdjacency(sim);
+    for (size_t predecessor = 0; predecessor < adjacency.size(); ++predecessor) {
+        for (const auto& edge : adjacency[predecessor]) {
+            edges.push_back({edge.neighbor, predecessor, edge.min_delay});
         }
     }
     std::sort(edges.begin(), edges.end(), [](const auto& lhs, const auto& rhs) {
@@ -149,14 +170,14 @@ ZeroCycleSnapshot buildHeadroomZeroCycleGraph(const char* prune_value) {
     return {snapshotDependencies(sim), TransitiveDependencyPruneTestAccess::hasZeroDelayCycle(sim)};
 }
 
-std::vector<reduction::Edge> buildDependencyOnlyHeadroomGraph(size_t headroom,
-                                                              uint32_t max_lookahead) {
+std::pair<std::vector<reduction::Edge>, std::vector<reduction::Edge>>
+buildDependencyOnlyHeadroomGraph(size_t headroom, uint32_t max_lookahead) {
     ScopedEnvironmentVariable prune("CHRONON_EXPERIMENTAL_TRANSITIVE_DEP_PRUNE", "0");
 
     TickSimulationConfig config;
     config.num_threads = 2;
     config.enable_weighted_partitioning = false;
-    config.enable_dynamic_rebalance = false;
+    config.enable_dynamic_rebalance = true;
     config.max_lookahead_cycles = max_lookahead;
     TickSimulation sim(config);
     auto* producer = sim.createUnit<PassUnit>("producer");
@@ -164,7 +185,7 @@ std::vector<reduction::Edge> buildDependencyOnlyHeadroomGraph(size_t headroom,
     sim.connect(producer->out, consumer->in, 1);
     producer->out.setDependencyOnlyTransport(true, headroom);
     sim.initialize();
-    return snapshotDependencies(sim);
+    return {snapshotDependencies(sim), snapshotRebalanceAdjacency(sim)};
 }
 
 void test_runtime_prunes_only_transitively_implied_constraints() {
@@ -209,13 +230,18 @@ void test_dependency_only_headroom_adds_reverse_edge_only_when_tighter() {
     std::cout << "Testing dependency-only headroom constraint selection... ";
 
     const auto tighter = buildDependencyOnlyHeadroomGraph(/*headroom=*/8, /*max_lookahead=*/100);
-    CHECK(tighter.size() == 2);
-    CHECK(tighter[0].delay == 7 || tighter[1].delay == 7);
+    CHECK(tighter.first.size() == 2);
+    CHECK(tighter.first[0].delay == 7 || tighter.first[1].delay == 7);
+    CHECK(tighter.second.size() == 2);
 
     const auto global_floor_suffices =
         buildDependencyOnlyHeadroomGraph(/*headroom=*/512, /*max_lookahead=*/100);
-    CHECK(global_floor_suffices.size() == 1);
-    CHECK(global_floor_suffices[0].delay == 1);
+    CHECK(global_floor_suffices.first.size() == 1);
+    CHECK(global_floor_suffices.first[0].delay == 1);
+    CHECK(global_floor_suffices.second.size() == 2);
+    CHECK(global_floor_suffices.second[0].delay == 1 || global_floor_suffices.second[1].delay == 1);
+    CHECK(global_floor_suffices.second[0].delay == 511 ||
+          global_floor_suffices.second[1].delay == 511);
 
     std::cout << "PASSED\n";
 }
