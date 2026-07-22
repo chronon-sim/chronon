@@ -71,6 +71,18 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         dynamic_runtime_thread_count_ = num_threads;
     }
 
+    dynamic_cluster_tick_sample_schedule_.assign(num_clusters, {});
+    for (size_t c = 0; c < num_clusters && c < cluster_unit_ptrs_.size(); ++c) {
+        for (const auto* unit : cluster_unit_ptrs_[c]) {
+            const auto candidate = detail::dynamicTickSamplingSchedule(unit->tickInterval());
+            auto& schedule = dynamic_cluster_tick_sample_schedule_[c];
+            if (candidate.phase == 0 &&
+                (schedule.phase != 0 || candidate.period < schedule.period)) {
+                schedule = candidate;
+            }
+        }
+    }
+
     for (size_t c = 0; c < num_clusters; ++c) {
         cluster_execution_owner_[c].store(SIZE_MAX, std::memory_order_relaxed);
         if (!reset_runtime) continue;

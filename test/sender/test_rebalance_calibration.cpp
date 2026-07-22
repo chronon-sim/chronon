@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "sender/core/TickSimulation.hpp"
 #include "sender/core/TickableUnit.hpp"
@@ -25,6 +26,23 @@ using namespace chronon::sender;
 namespace chronon::sender {
 
 struct DynamicMigrationTestAccess {
+    struct SamplingStats {
+        detail::DynamicTickSamplingSchedule schedule;
+        uint64_t samples = 0;
+        uint64_t total_ns = 0;
+    };
+
+    static std::vector<SamplingStats> samplingStats(const TickSimulation& sim) {
+        std::vector<SamplingStats> out;
+        out.reserve(sim.dynamic_cluster_tick_sample_schedule_.size());
+        for (size_t c = 0; c < sim.dynamic_cluster_tick_sample_schedule_.size(); ++c) {
+            out.push_back({sim.dynamic_cluster_tick_sample_schedule_[c],
+                           sim.cluster_sample_count_[c].load(std::memory_order_relaxed),
+                           sim.cluster_sample_time_ns_[c].load(std::memory_order_relaxed)});
+        }
+        return out;
+    }
+
     static bool sourceOnlyCommit(TickSimulation& sim) {
         sim.initDynamicMigrationRuntime_();
         if (!sim.cluster_runtime_owner_ || sim.dynamic_runtime_cluster_count_ == 0 ||
@@ -78,21 +96,46 @@ namespace {
 int run_runtime_planner_input_test() {
     using chronon::sender::epoch_free_cost::RuntimeDependency;
 
-    if (chronon::sender::detail::shouldSampleDynamicTick(0) ||
-        !chronon::sender::detail::shouldSampleDynamicTick(255) ||
-        chronon::sender::detail::shouldSampleDynamicTick(256)) {
-        std::cerr << "FAIL: dynamic tick sampling must skip cold cycle zero and end each window\n";
+    const auto ordinary = chronon::sender::detail::dynamicTickSamplingSchedule(1);
+    const auto periodic_256 = chronon::sender::detail::dynamicTickSamplingSchedule(256);
+    if (chronon::sender::detail::shouldSampleDynamicTick(0, periodic_256) ||
+        !chronon::sender::detail::shouldSampleDynamicTick(255, ordinary) ||
+        chronon::sender::detail::shouldSampleDynamicTick(256, ordinary) ||
+        chronon::sender::detail::shouldSampleDynamicTick(255, periodic_256) ||
+        !chronon::sender::detail::shouldSampleDynamicTick(256, periodic_256)) {
+        std::cerr << "FAIL: dynamic tick sampling must use warm window ends for ordinary "
+                     "clusters and non-cold boundaries for periodic clusters\n";
         return 1;
     }
     const uint64_t first_window =
         chronon::sender::TickSimulationConfig{}.rebalance_check_interval_cycles;
     size_t warm_samples = 0;
     for (uint64_t cycle = 0; cycle < first_window; ++cycle) {
-        warm_samples += chronon::sender::detail::shouldSampleDynamicTick(cycle) ? 1 : 0;
+        warm_samples += chronon::sender::detail::shouldSampleDynamicTick(cycle, ordinary) ? 1 : 0;
     }
     if (warm_samples != first_window / chronon::sender::detail::kDynamicTickSampleInterval) {
         std::cerr << "FAIL: default rebalance window must contain only complete warm samples\n";
         return 1;
+    }
+
+    for (const uint32_t tick_interval : {2U, 3U, 255U, 256U, 257U, 1000U}) {
+        const auto schedule = chronon::sender::detail::dynamicTickSamplingSchedule(tick_interval);
+        if (schedule.phase != 0 || schedule.period < tick_interval ||
+            schedule.period % tick_interval != 0 ||
+            !chronon::sender::detail::shouldSampleDynamicTick(schedule.period, schedule)) {
+            std::cerr << "FAIL: periodic dynamic sample is not an active tick for interval "
+                      << tick_interval << '\n';
+            return 1;
+        }
+        for (uint64_t sample = schedule.period, count = 0; count < 4;
+             sample += schedule.period, ++count) {
+            if (sample % tick_interval != 0 ||
+                !chronon::sender::detail::shouldSampleDynamicTick(sample, schedule)) {
+                std::cerr << "FAIL: first four dynamic samples alias inactive interval "
+                          << tick_interval << '\n';
+                return 1;
+            }
+        }
     }
 
     if (chronon::sender::epoch_free_cost::runtimeSyncCostNs(0.0) != 1.0 ||
@@ -191,6 +234,46 @@ public:
 private:
     uint64_t checksum_ = 0;
 };
+
+int run_periodic_sampling_detection_test() {
+    TickSimulationConfig cfg;
+    cfg.num_threads = 3;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.enable_dynamic_rebalance = true;
+    cfg.rebalance_check_interval_cycles = 4096;
+    cfg.initial_partition_sync_cost_ns = 0.0;
+
+    TickSimulation sim(cfg);
+    auto* periodic = sim.createUnit<HeavyUnit>("periodic", 5000);
+    auto* ordinary0 = sim.createUnit<HeavyUnit>("ordinary0", 1);
+    auto* ordinary1 = sim.createUnit<HeavyUnit>("ordinary1", 1);
+    auto* ordinary2 = sim.createUnit<HeavyUnit>("ordinary2", 1);
+    auto* sink = sim.createUnit<Sink>();
+    periodic->setTickInterval(256);
+    sim.connect(periodic->out, sink->in, 1);
+    sim.connect(ordinary0->out, sink->in, 1);
+    sim.connect(ordinary1->out, sink->in, 1);
+    sim.connect(ordinary2->out, sink->in, 1);
+    sim.initialize();
+    sim.run(1025);
+
+    const auto stats = DynamicMigrationTestAccess::samplingStats(sim);
+    const size_t periodic_clusters = static_cast<size_t>(std::count_if(
+        stats.begin(), stats.end(), [](const auto& entry) { return entry.schedule.phase == 0; }));
+    const bool sampled_four_active_ticks =
+        std::any_of(stats.begin(), stats.end(), [](const auto& entry) {
+            return entry.schedule.phase == 0 && entry.schedule.period == 256 &&
+                   entry.samples == 4 && entry.total_ns > 0;
+        });
+    if (periodic_clusters != 1 || !sampled_four_active_ticks) {
+        std::cerr << "FAIL: periodic tick interval did not select boundary-aligned sampling "
+                  << "(clusters=" << periodic_clusters << ")\n";
+        return 1;
+    }
+    return 0;
+}
 
 #ifdef CHRONON_SANITIZER_BUILD
 constexpr int kPrimaryHeavy0Iterations = 6000;
@@ -399,6 +482,10 @@ int main() {
     std::cout << "=== Rebalance Calibration Test ===\n";
 
     if (run_runtime_planner_input_test() != 0) {
+        return 1;
+    }
+
+    if (run_periodic_sampling_detection_test() != 0) {
         return 1;
     }
 

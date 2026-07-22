@@ -747,7 +747,10 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
             } else {
                 const uint64_t burst_end = cycle + 1;
                 do {
-                    const bool sample_tick = detail::shouldSampleDynamicTick(cycle);
+                    const auto schedule = cluster < dynamic_cluster_tick_sample_schedule_.size()
+                                              ? dynamic_cluster_tick_sample_schedule_[cluster]
+                                              : detail::DynamicTickSamplingSchedule{};
+                    const bool sample_tick = detail::shouldSampleDynamicTick(cycle, schedule);
                     SchedulerTimelineTrace::TimePoint begin{};
                     if (sample_tick) begin = SchedulerTimelineTrace::Clock::now();
                     executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units);
