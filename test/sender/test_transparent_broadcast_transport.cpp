@@ -22,6 +22,16 @@
 
 using namespace chronon::sender;
 
+namespace chronon::sender {
+
+struct TransparentBroadcastFusionTestAccess {
+    static size_t connectionCount(const TickSimulation& simulation) noexcept {
+        return simulation.transparent_broadcast_fusion_connection_count_;
+    }
+};
+
+}  // namespace chronon::sender
+
 namespace {
 
 int failures = 0;
@@ -251,6 +261,118 @@ void testAutomaticSelectionAndPortSemantics() {
     check(!bus.consumers[3]->in.hasData(1), "flush did not drop future shared payloads");
     check(bus.consumers[3]->in.queuedMessageCount() == 0,
           "flush did not clear the shared queue facade");
+}
+
+void testGenericCompleteBusUsesFusedReplay() {
+    constexpr size_t kProducerCount = 3;
+    constexpr size_t kConsumerCount = 5;
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+
+    std::array<PassiveProducer*, kProducerCount> producers{};
+    std::array<PassiveConsumer*, kConsumerCount> consumers{};
+    for (size_t producer = 0; producer < producers.size(); ++producer) {
+        producers[producer] = simulation.createUnit<PassiveProducer>(
+            "generic_fused_producer" + std::to_string(producer), 2);
+    }
+    for (size_t consumer = 0; consumer < consumers.size(); ++consumer) {
+        consumers[consumer] = simulation.createUnit<PassiveConsumer>("generic_fused_consumer" +
+                                                                     std::to_string(consumer));
+    }
+    for (auto* producer : producers) {
+        for (auto* consumer : consumers) simulation.connect(producer->out, consumer->in, 1);
+    }
+    simulation.initialize();
+
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+    constexpr size_t expected_fused_connections = kProducerCount * kConsumerCount;
+#else
+    constexpr size_t expected_fused_connections = 0;
+#endif
+    check(TransparentBroadcastFusionTestAccess::connectionCount(simulation) ==
+              expected_fused_connections,
+          "generic complete bus selected the wrong replay path");
+
+    for (size_t producer = 0; producer < producers.size(); ++producer) {
+        producers[producer]->setCycle(0);
+        check(producers[producer]->out.send(100 + producer * 10),
+              "generic fused first send failed");
+        check(producers[producer]->out.send(101 + producer * 10),
+              "generic fused second send failed");
+    }
+    const std::vector<uint64_t> expected{100, 101, 110, 111, 120, 121};
+    for (auto* consumer : consumers) {
+        check(consumer->in.receiveAll(1) == expected,
+              "generic fused replay changed stable producer/send order");
+    }
+
+    producers[0]->setCycle(2);
+    check(producers[0]->out.send(200), "generic fused backlog send failed");
+    producers[1]->setCycle(4);
+    check(producers[1]->out.send(400), "generic fused future send failed");
+    check(consumers[0]->in.tryReceive(3) == std::optional<uint64_t>{200},
+          "generic fused replay lost a sparse backlog cycle");
+    check(!consumers[0]->in.tryReceive(3), "generic fused replay exposed a future cycle too early");
+    check(consumers[0]->in.tryReceive(5) == std::optional<uint64_t>{400},
+          "generic fused replay lost a cached future cycle");
+}
+
+void testIncompleteBusKeepsExistingSharedReplayFallback() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    std::array<PassiveProducer*, 2> producers{
+        simulation.createUnit<PassiveProducer>("fallback_producer0"),
+        simulation.createUnit<PassiveProducer>("fallback_producer1")};
+    std::array<PassiveConsumer*, 5> consumers{};
+    for (size_t consumer = 0; consumer < consumers.size(); ++consumer) {
+        consumers[consumer] =
+            simulation.createUnit<PassiveConsumer>("fallback_consumer" + std::to_string(consumer));
+        simulation.connect(producers[0]->out, consumers[consumer]->in, 1);
+        if (consumer != consumers.size() - 1) {
+            simulation.connect(producers[1]->out, consumers[consumer]->in, 1);
+        }
+    }
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == 9,
+          "incomplete bus did not retain existing shared replay selection");
+    check(TransparentBroadcastFusionTestAccess::connectionCount(simulation) == 0,
+          "incomplete bus was incorrectly treated as a complete fused group");
+
+    producers[0]->setCycle(0);
+    producers[1]->setCycle(0);
+    check(producers[0]->out.send(10), "fallback producer 0 send failed");
+    check(producers[1]->out.send(11), "fallback producer 1 send failed");
+    for (size_t consumer = 0; consumer + 1 < consumers.size(); ++consumer) {
+        check(consumers[consumer]->in.receiveAll(1) == std::vector<uint64_t>({10, 11}),
+              "incomplete shared replay changed fan-in delivery");
+    }
+    check(consumers.back()->in.receiveAll(1) == std::vector<uint64_t>({10}),
+          "incomplete shared replay delivered across a missing edge");
+}
+
+void testFusionOptOutKeepsCanonicalSharedReplay() {
+    setenv("CHRONON_EXPERIMENTAL_TRANSPARENT_BROADCAST_FUSION", "0", 1);
+
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    auto bus = makePassiveBus(simulation);
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == 8,
+          "fusion opt-out disabled canonical transparent broadcast");
+    check(TransparentBroadcastFusionTestAccess::connectionCount(simulation) == 0,
+          "fusion opt-out still finalized a direct replay plan");
+    check(bus.producers[0]->out.send(42), "fusion opt-out shared send failed");
+    for (auto* consumer : bus.consumers) {
+        check(consumer->in.tryReceive(1) == std::optional<uint64_t>{42},
+              "fusion opt-out changed canonical shared replay");
+    }
+
+    unsetenv("CHRONON_EXPERIMENTAL_TRANSPARENT_BROADCAST_FUSION");
 }
 
 void testReceiverFilterIsCursorLocal() {
@@ -844,6 +966,9 @@ void testEnvironmentOptOut() {
 
 int main() {
     testAutomaticSelectionAndPortSemantics();
+    testGenericCompleteBusUsesFusedReplay();
+    testIncompleteBusKeepsExistingSharedReplayFallback();
+    testFusionOptOutKeepsCanonicalSharedReplay();
     testReceiverFilterIsCursorLocal();
     testLateActivityOptInInvalidatesWakeCache();
     testNucleusScaleDelayOneBusReplay();

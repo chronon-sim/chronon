@@ -69,6 +69,10 @@ public:
         return false;
     }
 
+    /// Compile an eligible destination's complete delay-one fan-in into a
+    /// direct replay plan after every source transport has been attached.
+    virtual bool finalizeTransparentBroadcastForDestination(size_t producer_count) = 0;
+
     /// Keep this edge in the scheduler dependency graph without transporting
     /// payloads. Intended for model-owned shared fabrics that carry data once
     /// while declared connections continue to describe ordering and delay.
@@ -307,6 +311,8 @@ public:
         return from_ && from_->enableTransparentBroadcast(headroom_cycles);
     }
 
+    bool finalizeTransparentBroadcastForDestination(size_t producer_count) override;
+
     void attachTransparentBroadcast(SharedBroadcast* transport) {
         if (!transport || shared_broadcast_) {
             throw std::logic_error("invalid transparent broadcast attachment");
@@ -322,6 +328,16 @@ public:
     [[nodiscard]] bool transparentBroadcastEnabled() const noexcept {
         return shared_broadcast_ != nullptr;
     }
+
+    [[nodiscard]] SharedBroadcast* sharedBroadcastTransport() noexcept { return shared_broadcast_; }
+    [[nodiscard]] SharedBroadcastCursor* sharedBroadcastCursor() noexcept {
+        return &shared_cursor_;
+    }
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+    [[nodiscard]] const std::atomic<uint64_t>* sharedBroadcastCancelBefore() const noexcept {
+        return &shared_cancel_before_;
+    }
+#endif
 
     [[nodiscard]] std::optional<SharedBroadcastView> peekSharedBroadcast() const noexcept {
         if (!shared_broadcast_) return std::nullopt;
