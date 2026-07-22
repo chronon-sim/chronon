@@ -472,6 +472,12 @@ public:
         }
     }
 
+    /** Finalize the initialization-time direct replay plan for a complete bus. */
+    bool finalizeTransparentBroadcastReplay(size_t producer_count) {
+        return shared_broadcast_queue_raw_ &&
+               shared_broadcast_queue_raw_->finalizeCompleteGroup(producer_count);
+    }
+
     [[nodiscard]] bool usesTransparentBroadcast() const noexcept {
         return shared_broadcast_queue_raw_ != nullptr;
     }
@@ -518,6 +524,19 @@ public:
      * @return The message if available, std::nullopt otherwise
      */
     std::optional<T> tryReceive(uint64_t current_cycle) {
+        if constexpr (std::is_copy_constructible_v<T>) {
+            if (shared_broadcast_queue_raw_) {
+                if (selective_flush_state_.empty()) {
+                    return shared_broadcast_queue_raw_->tryPopData(current_cycle);
+                }
+                while (auto message = shared_broadcast_queue_raw_->tryPop(current_cycle)) {
+                    const bool rejected = isReceiverCanceled_(*message);
+                    retireSelectiveFlushesAtFront_(*shared_broadcast_queue_raw_, current_cycle);
+                    if (!rejected) return std::move(message->data);
+                }
+                return std::nullopt;
+            }
+        }
         return tryReceiveFiltered(current_cycle, [](const T&) noexcept { return true; });
     }
 
@@ -925,6 +944,11 @@ IMultiProducerPort* Connection<T>::registerOnDestMPSC() {
     }
     to_->registerMPSCConnection(this);
     return static_cast<IMultiProducerPort*>(to_);
+}
+
+template <typename T>
+bool Connection<T>::finalizeTransparentBroadcastForDestination(size_t producer_count) {
+    return to_ && to_->finalizeTransparentBroadcastReplay(producer_count);
 }
 
 template <typename T>

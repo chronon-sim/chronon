@@ -75,6 +75,21 @@ target_link_libraries(chronon_mpsc_lane_frontier_benchmark PRIVATE
 
 target_compile_features(chronon_mpsc_lane_frontier_benchmark PRIVATE cxx_std_20)
 
+add_executable(chronon_transparent_broadcast_fusion_benchmark
+    transparent_broadcast_fusion_benchmark.cpp
+)
+
+target_include_directories(chronon_transparent_broadcast_fusion_benchmark PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_link_libraries(chronon_transparent_broadcast_fusion_benchmark PRIVATE
+    chronon::core
+    chronon_compile_options
+)
+
+target_compile_features(chronon_transparent_broadcast_fusion_benchmark PRIVATE cxx_std_20)
+
 add_executable(chronon_representative_workload_benchmark
     representative_workload_benchmark.cpp
 )

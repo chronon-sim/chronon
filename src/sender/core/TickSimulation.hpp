@@ -485,6 +485,8 @@ private:
     friend struct EpochFreeDifferentialTestAccess;
     /// Test-only source-owner migration commit validation.
     friend struct DynamicMigrationTestAccess;
+    /// Test-only transparent-broadcast fusion selection inspection.
+    friend struct TransparentBroadcastFusionTestAccess;
 
     /// Move the cluster containing @p unit while all persistent workers are
     /// stopped between run() spans. Returns false when the request is invalid
@@ -603,6 +605,7 @@ private:
 
     /// Pointers only — Connections are owned by their OutPort.
     std::vector<ConnectionBase*> connections_;
+    size_t transparent_broadcast_fusion_connection_count_ = 0;
 
     /// Flat, deduplicated list of InPorts with at least one MPSC ingress lane.
     /// Used for initialization-time progress coverage and overflow diagnostics;
