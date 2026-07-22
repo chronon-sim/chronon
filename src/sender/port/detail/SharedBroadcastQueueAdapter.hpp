@@ -197,7 +197,11 @@ private:
                 }
                 ++ready_connection_index_;
             }
+            const uint64_t exhausted_cycle = ready_arrival_cycle_;
             invalidateReadyGroup_();
+            // Per-lane arrival cycles are monotonic. Once the current cycle is exhausted,
+            // no later group can be ready; the next API call still rescans for late publishes.
+            if (exhausted_cycle == current_cycle) return std::nullopt;
         }
     }
 
