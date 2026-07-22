@@ -78,6 +78,23 @@ namespace {
 int run_runtime_planner_input_test() {
     using chronon::sender::epoch_free_cost::RuntimeDependency;
 
+    if (chronon::sender::detail::shouldSampleDynamicTick(0) ||
+        !chronon::sender::detail::shouldSampleDynamicTick(255) ||
+        chronon::sender::detail::shouldSampleDynamicTick(256)) {
+        std::cerr << "FAIL: dynamic tick sampling must skip cold cycle zero and end each window\n";
+        return 1;
+    }
+    const uint64_t first_window =
+        chronon::sender::TickSimulationConfig{}.rebalance_check_interval_cycles;
+    size_t warm_samples = 0;
+    for (uint64_t cycle = 0; cycle < first_window; ++cycle) {
+        warm_samples += chronon::sender::detail::shouldSampleDynamicTick(cycle) ? 1 : 0;
+    }
+    if (warm_samples != first_window / chronon::sender::detail::kDynamicTickSampleInterval) {
+        std::cerr << "FAIL: default rebalance window must contain only complete warm samples\n";
+        return 1;
+    }
+
     if (chronon::sender::epoch_free_cost::runtimeSyncCostNs(0.0) != 1.0 ||
         chronon::sender::epoch_free_cost::runtimeSyncCostNs(3.5) != 3.5) {
         std::cerr << "FAIL: runtime sync cost must use measured platform cost only\n";
