@@ -102,6 +102,28 @@ int run_runtime_planner_input_test() {
         return 1;
     }
 
+    PartitionInput move_input;
+    move_input.num_units = 3;
+    move_input.num_threads = 2;
+    move_input.unit_cost_ns = {1000.0, 400.0, 1.0};
+    move_input.sync_cost_ns = 1.0;
+    move_input.adjacency.resize(3);
+    move_input.adjacency[0].push_back({1, 1, 0});
+    const std::vector<size_t> assignment{0, 0, 1};
+    if (!chronon::sender::epoch_free_cost::moveWouldSplitZeroDelay(move_input, assignment, 1, 1)) {
+        std::cerr << "FAIL: fixture must expose a zero-delay runtime coupling\n";
+        return 1;
+    }
+    const chronon::sender::epoch_free_cost::RuntimeWaits no_waits;
+    const auto scored = chronon::sender::epoch_free_cost::scoreMove(
+        move_input, assignment, 1, 1, no_waits, /*min_gain_fraction=*/0.0,
+        /*churn_penalty=*/0.0);
+    if (!scored.valid || scored.active_gain <= 0.0) {
+        std::cerr << "FAIL: runtime scoring rejected a beneficial move across a zero-delay "
+                     "headroom constraint\n";
+        return 1;
+    }
+
     return 0;
 }
 

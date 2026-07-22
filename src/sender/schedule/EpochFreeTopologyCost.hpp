@@ -335,8 +335,13 @@ inline MoveBreakdown scoreMove(const PartitionInput& input, const std::vector<si
     const size_t num_threads = input.num_threads;
     const size_t source_thread = assignment[cluster];
     if (target_thread >= num_threads || target_thread == source_thread) return out;
-    if (moveWouldSplitZeroDelay(input, assignment, cluster, target_thread)) return out;
 
+    // Runtime adjacency also contains finite-headroom reverse constraints:
+    // headroom=1 is represented with min_delay=0, but it is not a physical
+    // same-cycle connection. Physical delay-zero components were already
+    // coalesced into indivisible scheduler clusters. Let the measured cost
+    // model score moves across these remaining zero-delay edges; the epoch-free
+    // dependency graph continues to enforce their progress constraint.
     ObjectiveSummary old_summary = summarize(input, assignment, num_threads);
     std::vector<size_t> candidate = assignment;
     candidate[cluster] = target_thread;
