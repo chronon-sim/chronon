@@ -64,8 +64,14 @@ public:
     };
 
     struct alignas(64) ConsumerCursor {
-        std::atomic<uint64_t> sequence{0};
-        std::atomic<Chunk*> chunk{nullptr};
+        // Only the owning InPort advances these hot fields. Producers need to
+        // observe a cursor only when reclaiming a full chunk, so publishing
+        // the chunk pointer at that rare boundary avoids two atomic cursor
+        // operations per replayed message.
+        uint64_t sequence = 0;
+        uint64_t cached_tail = 0;
+        Chunk* chunk = nullptr;
+        std::atomic<Chunk*> published_chunk{nullptr};
     };
 
     SharedBroadcastTransport(size_t headroom_cycles, size_t messages_per_cycle)
@@ -105,8 +111,10 @@ public:
         if (!cursor) {
             throw std::invalid_argument("shared broadcast consumer cursor is null");
         }
-        cursor->chunk.store(tail_chunk_, std::memory_order_relaxed);
-        cursor->sequence.store(tail_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        cursor->chunk = tail_chunk_;
+        cursor->sequence = tail_.load(std::memory_order_relaxed);
+        cursor->cached_tail = cursor->sequence;
+        cursor->published_chunk.store(tail_chunk_, std::memory_order_relaxed);
         consumer_cursors_.push_back(cursor);
     }
 
@@ -134,17 +142,20 @@ public:
     }
 
     [[nodiscard]] std::optional<View> peek(ConsumerCursor& cursor) const noexcept {
-        const uint64_t sequence = cursor.sequence.load(std::memory_order_relaxed);
-        const uint64_t tail = tail_.load(std::memory_order_acquire);
-        if (sequence >= tail) return std::nullopt;
+        const uint64_t sequence = cursor.sequence;
+        if (sequence >= cursor.cached_tail) {
+            cursor.cached_tail = tail_.load(std::memory_order_acquire);
+            if (sequence >= cursor.cached_tail) return std::nullopt;
+        }
 
-        Chunk* chunk = cursor.chunk.load(std::memory_order_acquire);
+        Chunk* chunk = cursor.chunk;
         while (chunk) {
             if (sequence < chunk->base_sequence) return std::nullopt;
             if (sequence - chunk->base_sequence < chunk_capacity_) break;
             Chunk* next = chunk->next.load(std::memory_order_acquire);
             if (!next) return std::nullopt;
-            cursor.chunk.store(next, std::memory_order_release);
+            cursor.chunk = next;
+            cursor.published_chunk.store(next, std::memory_order_release);
             chunk = next;
         }
         if (!chunk) return std::nullopt;
@@ -158,19 +169,20 @@ public:
     }
 
     void advance(ConsumerCursor& cursor, uint64_t next_sequence) const noexcept {
-        Chunk* chunk = cursor.chunk.load(std::memory_order_relaxed);
+        Chunk* chunk = cursor.chunk;
         while (chunk && next_sequence >= chunk->base_sequence &&
                next_sequence - chunk->base_sequence >= chunk_capacity_) {
             Chunk* next = chunk->next.load(std::memory_order_acquire);
             if (!next) break;
-            cursor.chunk.store(next, std::memory_order_release);
+            cursor.chunk = next;
+            cursor.published_chunk.store(next, std::memory_order_release);
             chunk = next;
         }
-        cursor.sequence.store(next_sequence, std::memory_order_release);
+        cursor.sequence = next_sequence;
     }
 
     [[nodiscard]] uint64_t consumerSequence(const ConsumerCursor& cursor) const noexcept {
-        return cursor.sequence.load(std::memory_order_relaxed);
+        return cursor.sequence;
     }
 
     [[nodiscard]] uint64_t publishedExclusive() const noexcept {
@@ -217,7 +229,7 @@ private:
         while (head_chunk_ != tail_chunk_) {
             bool referenced = false;
             for (const auto* cursor : consumer_cursors_) {
-                if (cursor->chunk.load(std::memory_order_acquire) == head_chunk_) {
+                if (cursor->published_chunk.load(std::memory_order_acquire) == head_chunk_) {
                     referenced = true;
                     break;
                 }

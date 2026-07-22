@@ -41,12 +41,14 @@ struct alignas(64) ActivitySchedulingState {
         // leaf first makes an acquire of root=true sufficient for leaf lookup.
         enabled.store(true, std::memory_order_release);
         if (root != nullptr) {
-            root->store(true, std::memory_order_release);
+            root->enabled.store(true, std::memory_order_release);
+            root->generation.fetch_add(1, std::memory_order_acq_rel);
         }
     }
 
     std::atomic<bool> enabled{false};
-    std::atomic<bool>* root = nullptr;
+    ActivitySchedulingState* root = nullptr;
+    std::atomic<uint64_t> generation{0};
 };
 static_assert(sizeof(ActivitySchedulingState) % 64 == 0);
 
@@ -149,6 +151,13 @@ public:
 
     bool acceptsPortWakeups() const noexcept {
         return port_wake_enabled_.load(std::memory_order_acquire);
+    }
+
+    uint64_t activitySchedulingGeneration() const noexcept {
+        if (!activity_scheduling_) return 0;
+        const auto* root = activity_scheduling_->root;
+        const auto* state = root ? root : activity_scheduling_;
+        return state->generation.load(std::memory_order_acquire);
     }
 
     bool usesActivityScheduling() const noexcept {
@@ -326,8 +335,9 @@ private:
     }
 
     void enableActivityScheduling_() noexcept {
-        port_wake_enabled_.store(true, std::memory_order_release);
-        publishActivityScheduling_();
+        if (!port_wake_enabled_.exchange(true, std::memory_order_acq_rel)) {
+            publishActivityScheduling_();
+        }
     }
 
     void publishActivityScheduling_() noexcept {
@@ -480,6 +490,14 @@ inline void wakeUnitAt(Unit* unit, uint64_t cycle) {
     if (unit && unit->acceptsPortWakeups()) {
         unit->wakeAt(cycle);
     }
+}
+
+inline bool unitAcceptsPortWakeups(const Unit* unit) noexcept {
+    return unit && unit->acceptsPortWakeups();
+}
+
+inline uint64_t activitySchedulingGeneration(const Unit* unit) noexcept {
+    return unit ? unit->activitySchedulingGeneration() : 0;
 }
 
 }  // namespace chronon::sender

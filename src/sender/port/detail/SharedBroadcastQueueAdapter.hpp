@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -20,14 +22,16 @@ namespace chronon::sender::detail {
 /**
  * Consumer-side queue view over one or more shared-broadcast connections.
  *
- * SharedBroadcastTransport remains the producer-owned, one-write/many-reader
- * data plane. This adapter only presents a destination's independent cursors
- * through IMessageQueue, so InPort can use the same ready/filter/cancel/flush
- * control plane as every other transport.
+ * Delay-one scheduler dependencies guarantee that every producer has completed
+ * source cycle C before a consumer starts cycle C+1. The adapter therefore
+ * finds the oldest ready source cycle once and replays producer lanes directly
+ * in stable connection order. Multiple messages from one producer stay on the
+ * same lane, so the hot path neither rescans every producer after each message
+ * nor copies a whole cycle into an intermediate sortable batch.
  *
- * The connection registry is immutable after simulation initialization and is
- * touched only by the destination unit while running. No lock or extra shared
- * cache line is introduced on the receive path.
+ * Sender cancellation remains lazy in Connection::peekSharedBroadcast(). A
+ * receiver flush resets the replay cursor and discards transport-resident
+ * future entries.
  */
 template <typename T>
 class SharedBroadcastQueueAdapter final : public IMessageQueue<PortEnvelope<T>> {
@@ -45,6 +49,7 @@ public:
             if ((*it)->connId() > connection->connId()) break;
         }
         connections_.insert(it, connection);
+        invalidateReadyGroup_();
     }
 
     // Shared payloads are published by OutPort directly into the transport.
@@ -53,13 +58,23 @@ public:
     }
 
     template <typename Visitor>
-    bool consumeReady(uint64_t current_cycle, Visitor&& visitor) {
+    [[gnu::always_inline]] inline bool consumeReady(uint64_t current_cycle, Visitor&& visitor) {
         if constexpr (!std::is_copy_constructible_v<T>) {
             (void)current_cycle;
             (void)visitor;
             throw std::logic_error("shared broadcast requires copy-constructible payloads");
-        } else {
+        } else if (!cycle_scan_enabled_) {
             auto candidate = peekBest_(current_cycle);
+            if (!candidate) return false;
+
+            StoredMessage message{.data = *candidate->data};
+            message.enqueue_cycle = candidate->enqueue_cycle;
+            message.sender_id = candidate->connection->connId();
+            std::forward<Visitor>(visitor)(message);
+            candidate->connection->popSharedBroadcast(candidate->sequence);
+            return true;
+        } else {
+            auto candidate = nextReady_(current_cycle);
             if (!candidate) return false;
 
             StoredMessage message{.data = *candidate->data};
@@ -92,7 +107,8 @@ public:
     }
 
     [[nodiscard]] bool hasReady(uint64_t current_cycle) const override {
-        return peekBest_(current_cycle).has_value();
+        if (!cycle_scan_enabled_) return peekBest_(current_cycle).has_value();
+        return nextReady_(current_cycle).has_value();
     }
 
     [[nodiscard]] std::optional<uint64_t> minArrivalCycle() const override {
@@ -129,6 +145,7 @@ public:
     }
 
     void clear() override {
+        invalidateReadyGroup_();
         for (auto* connection : connections_) {
             connection->flushSharedBroadcast();
         }
@@ -142,6 +159,47 @@ private:
         uint64_t arrive_cycle = 0;
         uint64_t enqueue_cycle = 0;
     };
+
+    static constexpr uint64_t kInvalidReadyCycle = std::numeric_limits<uint64_t>::max();
+
+    [[nodiscard]] static bool cycleScanEnabled_() noexcept {
+        const char* value = std::getenv("CHRONON_EXPERIMENTAL_SHARED_BROADCAST_CYCLE_BATCH");
+        return value == nullptr || value[0] != '0' || value[1] != '\0';
+    }
+
+    void invalidateReadyGroup_() const noexcept {
+        ready_arrival_cycle_ = kInvalidReadyCycle;
+        ready_connection_index_ = 0;
+    }
+
+    [[nodiscard, gnu::always_inline]] inline std::optional<Candidate> nextReady_(
+        uint64_t current_cycle) const noexcept {
+        for (;;) {
+            if (ready_arrival_cycle_ == kInvalidReadyCycle) {
+                for (auto* connection : connections_) {
+                    auto view = connection->peekSharedBroadcast();
+                    if (!view || view->arrive_cycle > current_cycle) continue;
+                    ready_arrival_cycle_ = std::min(ready_arrival_cycle_, view->arrive_cycle);
+                }
+                if (ready_arrival_cycle_ == kInvalidReadyCycle) return std::nullopt;
+                ready_connection_index_ = 0;
+            }
+
+            while (ready_connection_index_ < connections_.size()) {
+                auto* connection = connections_[ready_connection_index_];
+                auto view = connection->peekSharedBroadcast();
+                if (view && view->arrive_cycle == ready_arrival_cycle_) {
+                    return Candidate{.connection = connection,
+                                     .data = view->data,
+                                     .sequence = view->sequence,
+                                     .arrive_cycle = view->arrive_cycle,
+                                     .enqueue_cycle = view->enqueue_cycle};
+                }
+                ++ready_connection_index_;
+            }
+            invalidateReadyGroup_();
+        }
+    }
 
     [[nodiscard]] std::optional<Candidate> peekBest_(uint64_t current_cycle) const noexcept {
         std::optional<Candidate> best;
@@ -166,6 +224,9 @@ private:
     }
 
     std::vector<Connection<T>*> connections_;
+    const bool cycle_scan_enabled_ = cycleScanEnabled_();
+    mutable size_t ready_connection_index_ = 0;
+    mutable uint64_t ready_arrival_cycle_ = kInvalidReadyCycle;
 };
 
 }  // namespace chronon::sender::detail

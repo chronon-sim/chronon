@@ -582,8 +582,22 @@ private:
         }
         if (last_broadcast_wakeup_cycle_ != current_cycle) {
             last_broadcast_wakeup_cycle_ = current_cycle;
-            for (const auto& connection : connections_) {
-                wakeUnitAt(connection->destination(), current_cycle + 1);
+            const uint64_t activity_generation =
+                activitySchedulingGeneration(connections_.front()->source());
+            if (!broadcast_wakeup_cache_valid_ ||
+                activity_generation != broadcast_wakeup_activity_generation_) {
+                broadcast_wakeup_destinations_.clear();
+                for (const auto& connection : connections_) {
+                    Unit* destination = connection->destination();
+                    if (unitAcceptsPortWakeups(destination)) {
+                        broadcast_wakeup_destinations_.push_back(destination);
+                    }
+                }
+                broadcast_wakeup_activity_generation_ = activity_generation;
+                broadcast_wakeup_cache_valid_ = true;
+            }
+            for (Unit* destination : broadcast_wakeup_destinations_) {
+                wakeUnitAt(destination, current_cycle + 1);
             }
         }
         return true;
@@ -603,6 +617,9 @@ private:
     mutable uint64_t last_counted_cycle_ = 0;
     std::unique_ptr<detail::SharedBroadcastTransport<T>> shared_broadcast_;
     uint64_t last_broadcast_wakeup_cycle_ = std::numeric_limits<uint64_t>::max();
+    std::vector<Unit*> broadcast_wakeup_destinations_;
+    uint64_t broadcast_wakeup_activity_generation_ = 0;
+    bool broadcast_wakeup_cache_valid_ = false;
     bool dependency_only_transport_ = false;
     // Producer-owned transaction state occupies the existing seven-byte
     // alignment gap before dependency_only_headroom_. Even values are idle;

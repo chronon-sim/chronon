@@ -37,6 +37,8 @@ class OutPort;
 class Unit;
 class IMultiProducerPort;
 void wakeUnitAt(Unit* unit, uint64_t cycle);
+bool unitAcceptsPortWakeups(const Unit* unit) noexcept;
+uint64_t activitySchedulingGeneration(const Unit* unit) noexcept;
 
 /**
  * ConnectionBase - Type-erased base class for connections.
