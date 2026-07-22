@@ -404,6 +404,83 @@ void testCachedHeadInvalidation() {
           "post-flush replay reused stale cached heads");
 }
 
+void testFrontierRefreshesSparseAndFutureLanes() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    std::array<PassiveProducer*, 3> producers{};
+    std::array<PassiveConsumer*, 4> consumers{};
+    for (size_t producer = 0; producer < producers.size(); ++producer) {
+        producers[producer] =
+            simulation.createUnit<PassiveProducer>("frontier_producer" + std::to_string(producer));
+    }
+    for (size_t consumer = 0; consumer < consumers.size(); ++consumer) {
+        consumers[consumer] =
+            simulation.createUnit<PassiveConsumer>("frontier_consumer" + std::to_string(consumer));
+    }
+    for (auto* producer : producers) {
+        for (auto* consumer : consumers) simulation.connect(producer->out, consumer->in, 1);
+    }
+    simulation.initialize();
+
+    check(simulation.transparentBroadcastConnectionCount() == producers.size() * consumers.size(),
+          "generic sparse frontier topology did not select transparent broadcast");
+
+    producers[0]->setCycle(4);
+    check(producers[0]->out.send(400), "future frontier publish failed");
+    check(!consumers[0]->in.hasData(2), "future frontier head became ready too early");
+
+    producers[1]->setCycle(2);
+    check(producers[1]->out.send(200), "earlier sparse-lane publish failed");
+    check(consumers[0]->in.tryReceive(3) == std::optional<uint64_t>{200},
+          "cached future head hid an earlier sparse-lane publish");
+    check(!consumers[0]->in.tryReceive(3), "sparse frontier retained a ready payload");
+
+    producers[2]->setCycle(2);
+    check(producers[2]->out.send(201), "same-cycle late sparse-lane publish failed");
+    check(consumers[0]->in.tryReceive(3) == std::optional<uint64_t>{201},
+          "empty frontier lookup hid a same-cycle late publish");
+    check(consumers[0]->in.tryReceive(5) == std::optional<uint64_t>{400},
+          "frontier lost its cached future head");
+}
+
+void testFrontierPreservesMultiCycleBacklogOrder() {
+    TickSimulationConfig config;
+    config.enable_parallel = false;
+    TickSimulation simulation(config);
+    std::array<PassiveProducer*, 3> producers{};
+    std::array<PassiveConsumer*, 4> consumers{};
+    for (size_t producer = 0; producer < producers.size(); ++producer) {
+        producers[producer] =
+            simulation.createUnit<PassiveProducer>("backlog_producer" + std::to_string(producer));
+    }
+    for (size_t consumer = 0; consumer < consumers.size(); ++consumer) {
+        consumers[consumer] =
+            simulation.createUnit<PassiveConsumer>("backlog_consumer" + std::to_string(consumer));
+    }
+    for (auto* producer : producers) {
+        for (auto* consumer : consumers) simulation.connect(producer->out, consumer->in, 1);
+    }
+    simulation.initialize();
+
+    producers[2]->setCycle(0);
+    check(producers[2]->out.send(20), "backlog producer 2 cycle 0 send failed");
+    producers[0]->setCycle(0);
+    check(producers[0]->out.send(0), "backlog producer 0 cycle 0 send failed");
+    producers[1]->setCycle(0);
+    check(producers[1]->out.send(10), "backlog producer 1 cycle 0 send failed");
+    producers[2]->setCycle(1);
+    check(producers[2]->out.send(21), "backlog producer 2 cycle 1 send failed");
+    producers[0]->setCycle(1);
+    check(producers[0]->out.send(1), "backlog producer 0 cycle 1 send failed");
+
+    const std::vector<uint64_t> expected{0, 10, 20, 1, 21};
+    check(drainTryReceive(consumers[0]->in, 2) == expected,
+          "frontier changed arrival-cycle or stable producer order");
+    check(consumers[1]->in.receiveAll(2) == expected,
+          "frontier ordering differed across independent consumers");
+}
+
 void testUnsafeComponentsFallBackAtomically() {
     TickSimulationConfig config;
     config.enable_parallel = false;
@@ -771,6 +848,8 @@ int main() {
     testLateActivityOptInInvalidatesWakeCache();
     testNucleusScaleDelayOneBusReplay();
     testCachedHeadInvalidation();
+    testFrontierRefreshesSparseAndFutureLanes();
+    testFrontierPreservesMultiCycleBacklogOrder();
     testUnsafeComponentsFallBackAtomically();
     testOversizedRateFallsBackAtomically();
     testInitializedQueueFallsBackAtomically();
