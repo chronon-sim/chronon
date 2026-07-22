@@ -16,7 +16,6 @@
 #include <limits>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 #include "../../chronon/CpuPause.hpp"
@@ -30,17 +29,6 @@ namespace {
 constexpr uint64_t kFloorRefreshSpinMask = 0xFF;
 constexpr uint64_t kDynamicClusterMinSamples = 4;
 constexpr uint64_t kNoMigrationCycle = std::numeric_limits<uint64_t>::max();
-
-struct PairKey {
-    size_t u, v;
-    bool operator==(const PairKey& o) const { return u == o.u && v == o.v; }
-};
-
-struct PairHash {
-    size_t operator()(const PairKey& k) const {
-        return k.u ^ (k.v * 0x9e3779b97f4a7c15ULL + (k.u << 6) + (k.u >> 2));
-    }
-};
 
 uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
     const uint64_t max = std::numeric_limits<uint64_t>::max();
@@ -147,12 +135,21 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
         return false;
     }
 
-    uint8_t expected = static_cast<uint8_t>(MigrationRequestState::None);
-    if (!migration_request_.state.compare_exchange_strong(
-            expected, static_cast<uint8_t>(MigrationRequestState::Requested),
-            std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    // Planning is comparatively expensive. Keep the request state at None so
+    // peer workers retain their stable-sweep fast path until a complete,
+    // generation-validated migration is ready to publish.
+    if (dynamic_planner_busy_.test_and_set(std::memory_order_acquire)) {
         return false;
     }
+    struct PlannerGuard {
+        std::atomic_flag& busy;
+        ~PlannerGuard() { busy.clear(std::memory_order_release); }
+    } planner_guard{dynamic_planner_busy_};
+
+    const uint8_t none = static_cast<uint8_t>(MigrationRequestState::None);
+    if (migration_request_.state.load(std::memory_order_acquire) != none) return false;
+    const uint64_t planning_generation =
+        cluster_assignment_generation_.load(std::memory_order_acquire);
 
     const size_t num_threads = thread_units_.size();
     const size_t num_clusters = dynamic_runtime_cluster_count_;
@@ -215,13 +212,11 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     double total_cost = 0.0;
     for (double cost : thread_cost) total_cost += cost;
     if (total_cost <= 0.0) {
-        clearDynamicMigrationRequest_();
         return false;
     }
 
     const double avg = total_cost / static_cast<double>(num_threads);
     if (avg <= 0.0) {
-        clearDynamicMigrationRequest_();
         return false;
     }
 
@@ -242,7 +237,6 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
         }
     }
     if (source_threads.empty()) {
-        clearDynamicMigrationRequest_();
         return false;
     }
 
@@ -250,40 +244,9 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     input.num_units = num_clusters;
     input.num_threads = num_threads;
     input.unit_cost_ns = cluster_cost;
-    input.sync_cost_ns =
-        std::max(platform_metrics_.atomic_roundtrip_ns, config_.initial_partition_sync_cost_ns);
+    input.sync_cost_ns = epoch_free_cost::runtimeSyncCostNs(platform_metrics_.atomic_roundtrip_ns);
     input.critical_path_weight = config_.sa_critical_path_weight;
-    input.adjacency.resize(num_clusters);
-
-    std::unordered_map<Unit*, size_t> unit_ptr_to_idx;
-    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-        unit_ptr_to_idx[static_cast<Unit*>(unit_ptrs_[i])] = i;
-    }
-    std::unordered_map<PairKey, std::pair<size_t, uint32_t>, PairHash> cluster_pair_info;
-    for (auto* conn : connections_) {
-        Unit* src = conn->source();
-        Unit* dst = conn->destination();
-        if (!src || !dst) continue;
-        auto si = unit_ptr_to_idx.find(src);
-        auto di = unit_ptr_to_idx.find(dst);
-        if (si == unit_ptr_to_idx.end() || di == unit_ptr_to_idx.end()) continue;
-        size_t sc = unit_to_cluster_[si->second];
-        size_t dc = unit_to_cluster_[di->second];
-        if (sc == dc) continue;
-        auto& fwd = cluster_pair_info[{sc, dc}];
-        fwd.first++;
-        fwd.second = (fwd.second == 0) ? conn->delay() : std::min(fwd.second, conn->delay());
-    }
-    std::vector<PairKey> keys;
-    keys.reserve(cluster_pair_info.size());
-    for (const auto& [key, info] : cluster_pair_info) keys.push_back(key);
-    std::sort(keys.begin(), keys.end(), [](const PairKey& a, const PairKey& b) {
-        return a.u != b.u ? a.u < b.u : a.v < b.v;
-    });
-    for (const PairKey& key : keys) {
-        const auto& info = cluster_pair_info[key];
-        input.adjacency[key.u].push_back({key.v, info.first, info.second});
-    }
+    input.adjacency = dynamic_rebalance_adjacency_;
 
     epoch_free_cost::RuntimeWaits waits{&thread_floor_wait, &thread_dep_wait, &thread_no_ready_wait,
                                         &cluster_blocked_wait, &cluster_blocker_wait};
@@ -409,7 +372,6 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     }
     if (source == SIZE_MAX || cluster == SIZE_MAX || target == SIZE_MAX || !best_breakdown.valid ||
         best_cluster_cost <= 0.0) {
-        clearDynamicMigrationRequest_();
         return false;
     }
 
@@ -421,7 +383,7 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     if (cluster < clusters_.clusters.size()) {
         names = buildUnitNameList_(clusters_.clusters[cluster]);
     }
-    last_rebalance_detail_ =
+    std::string rebalance_detail =
         "rebalance=" + std::to_string(rebalance_count_ + 1) + " C" + std::to_string(cluster) + "(" +
         names + ") T" + std::to_string(source) + "->T" + std::to_string(target) +
         " fence=" + std::to_string(fence) + " src_active=" + std::to_string(thread_cost[source]) +
@@ -446,6 +408,27 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
         " dst_no_ready_wait_ns=" + std::to_string(thread_no_ready_wait[target]) +
         " cluster_blocked_wait_ns=" + std::to_string(cluster_blocked_wait[cluster]) +
         " cluster_blocker_wait_ns=" + std::to_string(cluster_blocker_wait[cluster]);
+
+    // The planner ran without disturbing peer workers. Reject a stale plan,
+    // then reserve the request slot and publish only the complete handoff.
+    if (cluster_assignment_generation_.load(std::memory_order_acquire) != planning_generation ||
+        cluster_runtime_owner_[cluster].load(std::memory_order_acquire) != source ||
+        cluster_migration_pending_[cluster].load(std::memory_order_acquire) != 0) {
+        return false;
+    }
+    uint8_t expected = none;
+    if (!migration_request_.state.compare_exchange_strong(
+            expected, static_cast<uint8_t>(MigrationRequestState::Requested),
+            std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        return false;
+    }
+    if (cluster_assignment_generation_.load(std::memory_order_acquire) != planning_generation ||
+        cluster_runtime_owner_[cluster].load(std::memory_order_acquire) != source ||
+        cluster_migration_pending_[cluster].load(std::memory_order_acquire) != 0) {
+        clearDynamicMigrationRequest_();
+        return false;
+    }
+    last_rebalance_detail_ = std::move(rebalance_detail);
 
     if (observe_ctx_) {
         observe::log_info<"Dynamic rebalance requested: cluster {} [{}] T{} -> T{} fence={}">(
@@ -844,6 +827,24 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
 
         constexpr uint64_t kWaitSampleMask = 0x0F;
         const bool sample_wait = trace_waits || ((wait_sample_sequence++ & kWaitSampleMask) == 0);
+        bool sampled_wait_on_floor = false;
+        if (sample_wait && blocker.cluster < num_clusters) {
+            // A worker ahead of the exact frontier is consuming lookahead
+            // slack, so its dependency wait overlaps useful work elsewhere.
+            // Classify only sampled waits to keep this global scan off the
+            // common no-progress spin path.
+            uint64_t exact_floor = std::numeric_limits<uint64_t>::max();
+            for (size_t cluster = 0; cluster < num_clusters; ++cluster) {
+                exact_floor =
+                    std::min(exact_floor, thread_progress_array_[cluster].completed_cycle.load(
+                                              std::memory_order_acquire));
+            }
+            const uint64_t dependent_cycle =
+                thread_progress_array_[blocker.cluster].completed_cycle.load(
+                    std::memory_order_acquire);
+            sampled_wait_on_floor =
+                epoch_free_cost::isUnhiddenDependencyWait(dependent_cycle, exact_floor);
+        }
         SchedulerTimelineTrace::TimePoint wait_begin{};
         if (sample_wait) wait_begin = SchedulerTimelineTrace::Clock::now();
 
@@ -930,7 +931,10 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                         raw_wait_ns > std::numeric_limits<uint64_t>::max() / (kWaitSampleMask + 1)
                     ? raw_wait_ns
                     : raw_wait_ns * (kWaitSampleMask + 1);
-            recordDynamicWaitSample_(thread_idx, blocker, wait_ns);
+            if (blocker.cluster == SIZE_MAX || blocker.pred_cluster == SIZE_MAX ||
+                sampled_wait_on_floor) {
+                recordDynamicWaitSample_(thread_idx, blocker, wait_ns);
+            }
             if (!trace_waits) continue;
 
             const char* stall_name = blocker.cluster == SIZE_MAX        ? "stall: no-ready-cluster"

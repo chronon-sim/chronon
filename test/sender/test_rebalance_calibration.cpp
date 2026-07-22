@@ -9,6 +9,7 @@
 // rebalance_check_interval_cycles is low enough to migrate within the budget.
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdint>
 #include <iostream>
@@ -17,6 +18,7 @@
 #include "sender/core/TickSimulation.hpp"
 #include "sender/core/TickableUnit.hpp"
 #include "sender/port/Port.hpp"
+#include "sender/schedule/EpochFreeTopologyCost.hpp"
 
 using namespace chronon::sender;
 
@@ -72,6 +74,36 @@ struct DynamicMigrationTestAccess {
 }  // namespace chronon::sender
 
 namespace {
+
+int run_runtime_planner_input_test() {
+    using chronon::sender::epoch_free_cost::RuntimeDependency;
+
+    if (chronon::sender::epoch_free_cost::runtimeSyncCostNs(0.0) != 1.0 ||
+        chronon::sender::epoch_free_cost::runtimeSyncCostNs(3.5) != 3.5) {
+        std::cerr << "FAIL: runtime sync cost must use measured platform cost only\n";
+        return 1;
+    }
+    if (!chronon::sender::epoch_free_cost::isUnhiddenDependencyWait(42, 42) ||
+        chronon::sender::epoch_free_cost::isUnhiddenDependencyWait(43, 42)) {
+        std::cerr << "FAIL: only global-frontier dependency waits are unhidden\n";
+        return 1;
+    }
+
+    const std::array dependencies = {
+        RuntimeDependency{1, 0, 4}, RuntimeDependency{1, 0, 2}, RuntimeDependency{1, 0, 3, 3},
+        RuntimeDependency{2, 1, 1}, RuntimeDependency{2, 2, 0}, RuntimeDependency{9, 0, 1},
+    };
+    const auto adjacency = chronon::sender::epoch_free_cost::buildRuntimeAdjacency(3, dependencies);
+    if (adjacency.size() != 3 || adjacency[0].size() != 1 || adjacency[0][0].neighbor != 1 ||
+        adjacency[0][0].num_connections != 5 || adjacency[0][0].min_delay != 2 ||
+        adjacency[1].size() != 1 || adjacency[1][0].neighbor != 2 ||
+        adjacency[1][0].min_delay != 1 || !adjacency[2].empty()) {
+        std::cerr << "FAIL: runtime adjacency must deduplicate scheduling relationships\n";
+        return 1;
+    }
+
+    return 0;
+}
 
 class HeavyUnit : public TickableUnit {
 public:
@@ -348,6 +380,10 @@ int run_source_only_commit_guard() {
 
 int main() {
     std::cout << "=== Rebalance Calibration Test ===\n";
+
+    if (run_runtime_planner_input_test() != 0) {
+        return 1;
+    }
 
     if (run_source_only_commit_guard() != 0) {
         return 1;

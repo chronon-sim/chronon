@@ -26,6 +26,11 @@ struct TransitiveDependencyPruneTestAccess {
     static bool hasZeroDelayCycle(const TickSimulation& sim) {
         return sim.has_zero_delay_cross_thread_cycle_;
     }
+
+    static const std::vector<std::vector<PartitionInput::EdgeInfo>>& rebalanceAdjacency(
+        const TickSimulation& sim) {
+        return sim.dynamic_rebalance_adjacency_;
+    }
 };
 
 }  // namespace chronon::sender
@@ -83,6 +88,47 @@ std::vector<reduction::Edge> snapshotDependencies(const TickSimulation& sim) {
         if (lhs.dependent != rhs.dependent) return lhs.dependent < rhs.dependent;
         if (lhs.predecessor != rhs.predecessor) return lhs.predecessor < rhs.predecessor;
         return lhs.delay < rhs.delay;
+    });
+    return edges;
+}
+
+std::vector<reduction::Edge> snapshotRebalanceAdjacency(const TickSimulation& sim) {
+    std::vector<reduction::Edge> edges;
+    const auto& adjacency = TransitiveDependencyPruneTestAccess::rebalanceAdjacency(sim);
+    for (size_t predecessor = 0; predecessor < adjacency.size(); ++predecessor) {
+        for (const auto& edge : adjacency[predecessor]) {
+            edges.push_back({edge.neighbor, predecessor, edge.min_delay});
+        }
+    }
+    std::sort(edges.begin(), edges.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.dependent != rhs.dependent) return lhs.dependent < rhs.dependent;
+        if (lhs.predecessor != rhs.predecessor) return lhs.predecessor < rhs.predecessor;
+        return lhs.delay < rhs.delay;
+    });
+    return edges;
+}
+
+struct RebalanceEdgeSnapshot {
+    size_t dependent = 0;
+    size_t predecessor = 0;
+    size_t num_connections = 0;
+    uint32_t min_delay = 0;
+
+    bool operator==(const RebalanceEdgeSnapshot&) const = default;
+};
+
+std::vector<RebalanceEdgeSnapshot> snapshotRebalancePhysicalEdges(const TickSimulation& sim) {
+    std::vector<RebalanceEdgeSnapshot> edges;
+    const auto& adjacency = TransitiveDependencyPruneTestAccess::rebalanceAdjacency(sim);
+    for (size_t predecessor = 0; predecessor < adjacency.size(); ++predecessor) {
+        for (const auto& edge : adjacency[predecessor]) {
+            edges.push_back({edge.neighbor, predecessor, edge.num_connections, edge.min_delay});
+        }
+    }
+    std::sort(edges.begin(), edges.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.dependent != rhs.dependent) return lhs.dependent < rhs.dependent;
+        if (lhs.predecessor != rhs.predecessor) return lhs.predecessor < rhs.predecessor;
+        return lhs.min_delay < rhs.min_delay;
     });
     return edges;
 }
@@ -149,14 +195,14 @@ ZeroCycleSnapshot buildHeadroomZeroCycleGraph(const char* prune_value) {
     return {snapshotDependencies(sim), TransitiveDependencyPruneTestAccess::hasZeroDelayCycle(sim)};
 }
 
-std::vector<reduction::Edge> buildDependencyOnlyHeadroomGraph(size_t headroom,
-                                                              uint32_t max_lookahead) {
+std::pair<std::vector<reduction::Edge>, std::vector<reduction::Edge>>
+buildDependencyOnlyHeadroomGraph(size_t headroom, uint32_t max_lookahead) {
     ScopedEnvironmentVariable prune("CHRONON_EXPERIMENTAL_TRANSITIVE_DEP_PRUNE", "0");
 
     TickSimulationConfig config;
     config.num_threads = 2;
     config.enable_weighted_partitioning = false;
-    config.enable_dynamic_rebalance = false;
+    config.enable_dynamic_rebalance = true;
     config.max_lookahead_cycles = max_lookahead;
     TickSimulation sim(config);
     auto* producer = sim.createUnit<PassUnit>("producer");
@@ -164,7 +210,34 @@ std::vector<reduction::Edge> buildDependencyOnlyHeadroomGraph(size_t headroom,
     sim.connect(producer->out, consumer->in, 1);
     producer->out.setDependencyOnlyTransport(true, headroom);
     sim.initialize();
-    return snapshotDependencies(sim);
+    return {snapshotDependencies(sim), snapshotRebalanceAdjacency(sim)};
+}
+
+struct PhysicalRebalanceGraph {
+    std::vector<reduction::Edge> execution;
+    std::vector<RebalanceEdgeSnapshot> rebalance;
+};
+
+PhysicalRebalanceGraph buildPhysicalRebalanceGraph(const char* prune_value) {
+    ScopedEnvironmentVariable prune("CHRONON_EXPERIMENTAL_TRANSITIVE_DEP_PRUNE", prune_value);
+
+    TickSimulationConfig config;
+    config.num_threads = 2;
+    config.enable_weighted_partitioning = false;
+    config.enable_dynamic_rebalance = true;
+    config.max_lookahead_cycles = 32;
+    TickSimulation sim(config);
+    auto* a = sim.createUnit<PassUnit>("physical_a");
+    auto* b = sim.createUnit<PassUnit>("physical_b");
+    auto* c = sim.createUnit<PassUnit>("physical_c");
+
+    sim.connect(a->out, b->in, 1);
+    sim.connect(b->out, c->in, 1);
+    sim.connect(a->out, c->in, 2);
+    sim.connect(a->out, c->in, 2);
+    sim.initialize();
+
+    return {snapshotDependencies(sim), snapshotRebalancePhysicalEdges(sim)};
 }
 
 void test_runtime_prunes_only_transitively_implied_constraints() {
@@ -209,13 +282,38 @@ void test_dependency_only_headroom_adds_reverse_edge_only_when_tighter() {
     std::cout << "Testing dependency-only headroom constraint selection... ";
 
     const auto tighter = buildDependencyOnlyHeadroomGraph(/*headroom=*/8, /*max_lookahead=*/100);
-    CHECK(tighter.size() == 2);
-    CHECK(tighter[0].delay == 7 || tighter[1].delay == 7);
+    CHECK(tighter.first.size() == 2);
+    CHECK(tighter.first[0].delay == 7 || tighter.first[1].delay == 7);
+    CHECK(tighter.second.size() == 2);
 
     const auto global_floor_suffices =
         buildDependencyOnlyHeadroomGraph(/*headroom=*/512, /*max_lookahead=*/100);
-    CHECK(global_floor_suffices.size() == 1);
-    CHECK(global_floor_suffices[0].delay == 1);
+    CHECK(global_floor_suffices.first.size() == 1);
+    CHECK(global_floor_suffices.first[0].delay == 1);
+    CHECK(global_floor_suffices.second.size() == 2);
+    CHECK(global_floor_suffices.second[0].delay == 1 || global_floor_suffices.second[1].delay == 1);
+    CHECK(global_floor_suffices.second[0].delay == 511 ||
+          global_floor_suffices.second[1].delay == 511);
+
+    std::cout << "PASSED\n";
+}
+
+void test_rebalance_preserves_physical_edges_and_multiplicity() {
+    std::cout << "Testing rebalance preserves physical topology... ";
+
+    const auto unpruned = buildPhysicalRebalanceGraph("0");
+    const auto pruned = buildPhysicalRebalanceGraph("1");
+    CHECK(unpruned.execution.size() == 3);
+    CHECK(pruned.execution.size() == 2);
+    CHECK(unpruned.rebalance == pruned.rebalance);
+
+    const auto direct = std::find_if(pruned.rebalance.begin(), pruned.rebalance.end(),
+                                     [](const RebalanceEdgeSnapshot& edge) {
+                                         return edge.dependent == 2 && edge.predecessor == 0;
+                                     });
+    CHECK(direct != pruned.rebalance.end());
+    CHECK(direct->num_connections == 2);
+    CHECK(direct->min_delay == 2);
 
     std::cout << "PASSED\n";
 }
@@ -259,6 +357,7 @@ int main() {
     test_runtime_prunes_only_transitively_implied_constraints();
     test_pruning_does_not_hide_headroom_zero_delay_cycle();
     test_dependency_only_headroom_adds_reverse_edge_only_when_tighter();
+    test_rebalance_preserves_physical_edges_and_multiplicity();
     test_zero_lookahead_window_selects_sequential();
     std::cout << "All transitive dependency pruning tests passed!\n";
     return 0;
