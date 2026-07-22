@@ -677,7 +677,7 @@ private:
     std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_no_ready_wait_ns_;
     std::unique_ptr<std::atomic<uint64_t>[]> dynamic_cluster_blocked_wait_ns_;
     std::unique_ptr<std::atomic<uint64_t>[]> dynamic_cluster_blocker_wait_ns_;
-    std::vector<detail::DynamicTickSamplingSchedule> dynamic_cluster_tick_sample_schedule_;
+    std::vector<uint64_t> dynamic_cluster_last_tick_sample_cycle_;
     std::vector<uint64_t> dynamic_cluster_last_migration_cycle_;
     std::vector<size_t> dynamic_cluster_last_source_thread_;
     std::vector<size_t> dynamic_cluster_last_target_thread_;

@@ -747,10 +747,13 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
             } else {
                 const uint64_t burst_end = cycle + 1;
                 do {
-                    const auto schedule = cluster < dynamic_cluster_tick_sample_schedule_.size()
-                                              ? dynamic_cluster_tick_sample_schedule_[cluster]
-                                              : detail::DynamicTickSamplingSchedule{};
-                    const bool sample_tick = detail::shouldSampleDynamicTick(cycle, schedule);
+                    const uint64_t last_sample = dynamic_cluster_last_tick_sample_cycle_[cluster];
+                    const bool sample_due = detail::shouldSampleDynamicTick(cycle, last_sample);
+                    const bool sample_tick =
+                        sample_due &&
+                        std::all_of(
+                            cluster_unit_ptrs_[cluster].begin(), cluster_unit_ptrs_[cluster].end(),
+                            [cycle](const auto* unit) { return unit->shouldRunTickAt(cycle); });
                     SchedulerTimelineTrace::TimePoint begin{};
                     if (sample_tick) begin = SchedulerTimelineTrace::Clock::now();
                     executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units);
@@ -760,6 +763,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                             std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
                                 .count());
                         recordClusterTickSample_(cluster, elapsed_ns, true);
+                        dynamic_cluster_last_tick_sample_cycle_[cluster] = cycle;
                     }
                     ++cycle;
                     progress.store(cycle, std::memory_order_release);

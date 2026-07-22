@@ -27,16 +27,16 @@ namespace chronon::sender {
 
 struct DynamicMigrationTestAccess {
     struct SamplingStats {
-        detail::DynamicTickSamplingSchedule schedule;
+        uint64_t last_sample = detail::kNoDynamicTickSample;
         uint64_t samples = 0;
         uint64_t total_ns = 0;
     };
 
     static std::vector<SamplingStats> samplingStats(const TickSimulation& sim) {
         std::vector<SamplingStats> out;
-        out.reserve(sim.dynamic_cluster_tick_sample_schedule_.size());
-        for (size_t c = 0; c < sim.dynamic_cluster_tick_sample_schedule_.size(); ++c) {
-            out.push_back({sim.dynamic_cluster_tick_sample_schedule_[c],
+        out.reserve(sim.dynamic_runtime_cluster_count_);
+        for (size_t c = 0; c < sim.dynamic_runtime_cluster_count_; ++c) {
+            out.push_back({sim.dynamic_cluster_last_tick_sample_cycle_[c],
                            sim.cluster_sample_count_[c].load(std::memory_order_relaxed),
                            sim.cluster_sample_time_ns_[c].load(std::memory_order_relaxed)});
         }
@@ -96,46 +96,28 @@ namespace {
 int run_runtime_planner_input_test() {
     using chronon::sender::epoch_free_cost::RuntimeDependency;
 
-    const auto ordinary = chronon::sender::detail::dynamicTickSamplingSchedule(1);
-    const auto periodic_256 = chronon::sender::detail::dynamicTickSamplingSchedule(256);
-    if (chronon::sender::detail::shouldSampleDynamicTick(0, periodic_256) ||
-        !chronon::sender::detail::shouldSampleDynamicTick(255, ordinary) ||
-        chronon::sender::detail::shouldSampleDynamicTick(256, ordinary) ||
-        chronon::sender::detail::shouldSampleDynamicTick(255, periodic_256) ||
-        !chronon::sender::detail::shouldSampleDynamicTick(256, periodic_256)) {
-        std::cerr << "FAIL: dynamic tick sampling must use warm window ends for ordinary "
-                     "clusters and non-cold boundaries for periodic clusters\n";
+    if (chronon::sender::detail::shouldSampleDynamicTick(
+            254, chronon::sender::detail::kNoDynamicTickSample) ||
+        !chronon::sender::detail::shouldSampleDynamicTick(
+            255, chronon::sender::detail::kNoDynamicTickSample) ||
+        chronon::sender::detail::shouldSampleDynamicTick(510, 255) ||
+        !chronon::sender::detail::shouldSampleDynamicTick(511, 255)) {
+        std::cerr << "FAIL: dynamic tick sampling must warm up and separate accepted samples\n";
         return 1;
     }
     const uint64_t first_window =
         chronon::sender::TickSimulationConfig{}.rebalance_check_interval_cycles;
     size_t warm_samples = 0;
+    uint64_t last_sample = chronon::sender::detail::kNoDynamicTickSample;
     for (uint64_t cycle = 0; cycle < first_window; ++cycle) {
-        warm_samples += chronon::sender::detail::shouldSampleDynamicTick(cycle, ordinary) ? 1 : 0;
+        if (chronon::sender::detail::shouldSampleDynamicTick(cycle, last_sample)) {
+            ++warm_samples;
+            last_sample = cycle;
+        }
     }
     if (warm_samples != first_window / chronon::sender::detail::kDynamicTickSampleInterval) {
         std::cerr << "FAIL: default rebalance window must contain only complete warm samples\n";
         return 1;
-    }
-
-    for (const uint32_t tick_interval : {2U, 3U, 255U, 256U, 257U, 1000U}) {
-        const auto schedule = chronon::sender::detail::dynamicTickSamplingSchedule(tick_interval);
-        if (schedule.phase != 0 || schedule.period < tick_interval ||
-            schedule.period % tick_interval != 0 ||
-            !chronon::sender::detail::shouldSampleDynamicTick(schedule.period, schedule)) {
-            std::cerr << "FAIL: periodic dynamic sample is not an active tick for interval "
-                      << tick_interval << '\n';
-            return 1;
-        }
-        for (uint64_t sample = schedule.period, count = 0; count < 4;
-             sample += schedule.period, ++count) {
-            if (sample % tick_interval != 0 ||
-                !chronon::sender::detail::shouldSampleDynamicTick(sample, schedule)) {
-                std::cerr << "FAIL: first four dynamic samples alias inactive interval "
-                          << tick_interval << '\n';
-                return 1;
-            }
-        }
     }
 
     if (chronon::sender::epoch_free_cost::runtimeSyncCostNs(0.0) != 1.0 ||
@@ -235,17 +217,39 @@ private:
     uint64_t checksum_ = 0;
 };
 
-int run_periodic_sampling_detection_test() {
+class SleepingProducer : public TickableUnit {
+public:
+    SleepingProducer() : TickableUnit("sleeping_producer") {}
+    OutPort<uint64_t> out{this, "out", 1};
+
+    void tick() override {
+        uint64_t value = localCycle();
+        for (size_t i = 0; i < 5000; ++i) {
+            value = value * 6364136223846793005ULL + 1442695040888963407ULL;
+        }
+        checksum_ ^= value;
+        (void)out.send(value);
+        sleepUntil(localCycle() + 1024);
+    }
+
+private:
+    uint64_t checksum_ = 0;
+};
+
+TickSimulationConfig samplingTestConfig() {
     TickSimulationConfig cfg;
     cfg.num_threads = 3;
     cfg.enable_parallel = true;
     cfg.enable_lookahead = true;
     cfg.enable_epoch_free_lookahead = true;
     cfg.enable_dynamic_rebalance = true;
-    cfg.rebalance_check_interval_cycles = 4096;
+    cfg.rebalance_check_interval_cycles = 8192;
     cfg.initial_partition_sync_cost_ns = 0.0;
+    return cfg;
+}
 
-    TickSimulation sim(cfg);
+int run_periodic_sampling_detection_test() {
+    TickSimulation sim(samplingTestConfig());
     auto* periodic = sim.createUnit<HeavyUnit>("periodic", 5000);
     auto* ordinary0 = sim.createUnit<HeavyUnit>("ordinary0", 1);
     auto* ordinary1 = sim.createUnit<HeavyUnit>("ordinary1", 1);
@@ -260,16 +264,60 @@ int run_periodic_sampling_detection_test() {
     sim.run(1025);
 
     const auto stats = DynamicMigrationTestAccess::samplingStats(sim);
-    const size_t periodic_clusters = static_cast<size_t>(std::count_if(
-        stats.begin(), stats.end(), [](const auto& entry) { return entry.schedule.phase == 0; }));
     const bool sampled_four_active_ticks =
         std::any_of(stats.begin(), stats.end(), [](const auto& entry) {
-            return entry.schedule.phase == 0 && entry.schedule.period == 256 &&
-                   entry.samples == 4 && entry.total_ns > 0;
+            return entry.last_sample == 1024 && entry.samples == 4 && entry.total_ns > 0;
         });
-    if (periodic_clusters != 1 || !sampled_four_active_ticks) {
-        std::cerr << "FAIL: periodic tick interval did not select boundary-aligned sampling "
-                  << "(clusters=" << periodic_clusters << ")\n";
+    if (!sampled_four_active_ticks) {
+        std::cerr << "FAIL: periodic tick interval did not sample four active executions\n";
+        return 1;
+    }
+    return 0;
+}
+
+int run_multi_periodic_cluster_sampling_test() {
+    TickSimulation sim(samplingTestConfig());
+    auto* periodic2 = sim.createUnit<LightUnit>("periodic2");
+    auto* periodic3 = sim.createUnit<LightUnit>("periodic3");
+    sim.createUnit<HeavyUnit>("multi_ordinary0", 1);
+    sim.createUnit<HeavyUnit>("multi_ordinary1", 1);
+    sim.createUnit<HeavyUnit>("multi_ordinary2", 1);
+    periodic2->setTickInterval(2);
+    periodic3->setTickInterval(3);
+    sim.connect(periodic2->out, periodic3->in, 0);
+    sim.initialize();
+    sim.run(1033);
+
+    const auto stats = DynamicMigrationTestAccess::samplingStats(sim);
+    const bool sampled_common_active_cycles =
+        std::any_of(stats.begin(), stats.end(), [](const auto& entry) {
+            return entry.last_sample == 1032 && entry.samples == 4 && entry.total_ns > 0;
+        });
+    if (!sampled_common_active_cycles) {
+        std::cerr << "FAIL: mixed periodic cluster sampled an inactive member phase\n";
+        return 1;
+    }
+    return 0;
+}
+
+int run_activity_scheduled_cluster_sampling_test() {
+    TickSimulation sim(samplingTestConfig());
+    auto* sleeping = sim.createUnit<SleepingProducer>();
+    auto* ordinary = sim.createUnit<LightUnit>("sleeping_consumer");
+    sim.createUnit<HeavyUnit>("sleep_ordinary0", 1);
+    sim.createUnit<HeavyUnit>("sleep_ordinary1", 1);
+    sim.createUnit<HeavyUnit>("sleep_ordinary2", 1);
+    sim.connect(sleeping->out, ordinary->in, 0);
+    sim.initialize();
+    sim.run(4097);
+
+    const auto stats = DynamicMigrationTestAccess::samplingStats(sim);
+    const bool sampled_real_wake_cycles =
+        std::any_of(stats.begin(), stats.end(), [](const auto& entry) {
+            return entry.last_sample == 4096 && entry.samples == 4 && entry.total_ns > 0;
+        });
+    if (!sampled_real_wake_cycles) {
+        std::cerr << "FAIL: activity-scheduled cluster sampled outside actual wake cycles\n";
         return 1;
     }
     return 0;
@@ -486,6 +534,14 @@ int main() {
     }
 
     if (run_periodic_sampling_detection_test() != 0) {
+        return 1;
+    }
+
+    if (run_multi_periodic_cluster_sampling_test() != 0) {
+        return 1;
+    }
+
+    if (run_activity_scheduled_cluster_sampling_test() != 0) {
         return 1;
     }
 

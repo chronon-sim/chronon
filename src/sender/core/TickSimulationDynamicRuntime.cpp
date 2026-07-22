@@ -60,6 +60,7 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         dynamic_cluster_blocked_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_clusters);
         dynamic_cluster_blocker_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_clusters);
         dynamic_cluster_last_migration_cycle_.assign(num_clusters, kNoMigrationCycle);
+        dynamic_cluster_last_tick_sample_cycle_.assign(num_clusters, detail::kNoDynamicTickSample);
         dynamic_cluster_last_source_thread_.assign(num_clusters, SIZE_MAX);
         dynamic_cluster_last_target_thread_.assign(num_clusters, SIZE_MAX);
         dynamic_runtime_cluster_count_ = num_clusters;
@@ -69,18 +70,6 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         dynamic_thread_dep_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_threads);
         dynamic_thread_no_ready_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_threads);
         dynamic_runtime_thread_count_ = num_threads;
-    }
-
-    dynamic_cluster_tick_sample_schedule_.assign(num_clusters, {});
-    for (size_t c = 0; c < num_clusters && c < cluster_unit_ptrs_.size(); ++c) {
-        for (const auto* unit : cluster_unit_ptrs_[c]) {
-            const auto candidate = detail::dynamicTickSamplingSchedule(unit->tickInterval());
-            auto& schedule = dynamic_cluster_tick_sample_schedule_[c];
-            if (candidate.phase == 0 &&
-                (schedule.phase != 0 || candidate.period < schedule.period)) {
-                schedule = candidate;
-            }
-        }
     }
 
     for (size_t c = 0; c < num_clusters; ++c) {
