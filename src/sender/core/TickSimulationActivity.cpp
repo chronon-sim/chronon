@@ -17,7 +17,7 @@ void TickSimulation::initClusterActivityScheduling_() {
     cluster_activity_scheduling_ =
         std::make_unique<detail::ActivitySchedulingState[]>(cluster_count);
     for (size_t cluster = 0; cluster < cluster_count; ++cluster) {
-        cluster_activity_scheduling_[cluster].root = &any_activity_scheduling_.enabled;
+        cluster_activity_scheduling_[cluster].root = &any_activity_scheduling_;
     }
     for (size_t unit_idx = 0; unit_idx < unit_ptrs_.size(); ++unit_idx) {
         const size_t cluster = unit_idx < unit_to_cluster_.size() ? unit_to_cluster_[unit_idx] : 0;

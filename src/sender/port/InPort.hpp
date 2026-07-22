@@ -714,8 +714,8 @@ private:
     }
 
     template <typename Filter>
-    [[gnu::noinline]] std::optional<T> tryReceiveFromSharedQueue_(uint64_t current_cycle,
-                                                                  Filter& filter) {
+    [[gnu::always_inline]] inline std::optional<T> tryReceiveFromSharedQueue_(
+        uint64_t current_cycle, Filter& filter) {
         return tryReceiveFromConsumableQueue_(*shared_broadcast_queue_raw_, current_cycle, filter);
     }
 
