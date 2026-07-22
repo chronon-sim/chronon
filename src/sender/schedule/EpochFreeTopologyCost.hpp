@@ -22,6 +22,7 @@ struct RuntimeDependency {
     size_t dependent = 0;
     size_t predecessor = 0;
     uint32_t min_delay = 0;
+    size_t num_connections = 1;
 };
 
 /// Runtime rebalance is calibrated from measured platform synchronization,
@@ -43,10 +44,10 @@ inline std::vector<std::vector<PartitionInput::EdgeInfo>> buildRuntimeAdjacency(
     std::vector<std::vector<PartitionInput::EdgeInfo>> adjacency(num_clusters);
     for (const auto& dep : dependencies) {
         if (dep.predecessor >= num_clusters || dep.dependent >= num_clusters ||
-            dep.predecessor == dep.dependent) {
+            dep.predecessor == dep.dependent || dep.num_connections == 0) {
             continue;
         }
-        adjacency[dep.predecessor].push_back({dep.dependent, 1, dep.min_delay});
+        adjacency[dep.predecessor].push_back({dep.dependent, dep.num_connections, dep.min_delay});
     }
 
     for (auto& edges : adjacency) {
@@ -57,8 +58,11 @@ inline std::vector<std::vector<PartitionInput::EdgeInfo>> buildRuntimeAdjacency(
         auto output = edges.begin();
         for (auto it = edges.begin(); it != edges.end(); ++it) {
             if (output != edges.begin() && std::prev(output)->neighbor == it->neighbor) {
-                std::prev(output)->min_delay =
-                    std::min(std::prev(output)->min_delay, it->min_delay);
+                auto& aggregate = *std::prev(output);
+                aggregate.min_delay = std::min(aggregate.min_delay, it->min_delay);
+                const size_t remaining =
+                    std::numeric_limits<size_t>::max() - aggregate.num_connections;
+                aggregate.num_connections += std::min(remaining, it->num_connections);
                 continue;
             }
             *output++ = *it;

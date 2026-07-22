@@ -90,12 +90,12 @@ int run_runtime_planner_input_test() {
     }
 
     const std::array dependencies = {
-        RuntimeDependency{1, 0, 4}, RuntimeDependency{1, 0, 2}, RuntimeDependency{2, 1, 1},
-        RuntimeDependency{2, 2, 0}, RuntimeDependency{9, 0, 1},
+        RuntimeDependency{1, 0, 4}, RuntimeDependency{1, 0, 2}, RuntimeDependency{1, 0, 3, 3},
+        RuntimeDependency{2, 1, 1}, RuntimeDependency{2, 2, 0}, RuntimeDependency{9, 0, 1},
     };
     const auto adjacency = chronon::sender::epoch_free_cost::buildRuntimeAdjacency(3, dependencies);
     if (adjacency.size() != 3 || adjacency[0].size() != 1 || adjacency[0][0].neighbor != 1 ||
-        adjacency[0][0].num_connections != 1 || adjacency[0][0].min_delay != 2 ||
+        adjacency[0][0].num_connections != 5 || adjacency[0][0].min_delay != 2 ||
         adjacency[1].size() != 1 || adjacency[1][0].neighbor != 2 ||
         adjacency[1][0].min_delay != 1 || !adjacency[2].empty()) {
         std::cerr << "FAIL: runtime adjacency must deduplicate scheduling relationships\n";

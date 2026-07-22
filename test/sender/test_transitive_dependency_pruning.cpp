@@ -108,6 +108,31 @@ std::vector<reduction::Edge> snapshotRebalanceAdjacency(const TickSimulation& si
     return edges;
 }
 
+struct RebalanceEdgeSnapshot {
+    size_t dependent = 0;
+    size_t predecessor = 0;
+    size_t num_connections = 0;
+    uint32_t min_delay = 0;
+
+    bool operator==(const RebalanceEdgeSnapshot&) const = default;
+};
+
+std::vector<RebalanceEdgeSnapshot> snapshotRebalancePhysicalEdges(const TickSimulation& sim) {
+    std::vector<RebalanceEdgeSnapshot> edges;
+    const auto& adjacency = TransitiveDependencyPruneTestAccess::rebalanceAdjacency(sim);
+    for (size_t predecessor = 0; predecessor < adjacency.size(); ++predecessor) {
+        for (const auto& edge : adjacency[predecessor]) {
+            edges.push_back({edge.neighbor, predecessor, edge.num_connections, edge.min_delay});
+        }
+    }
+    std::sort(edges.begin(), edges.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.dependent != rhs.dependent) return lhs.dependent < rhs.dependent;
+        if (lhs.predecessor != rhs.predecessor) return lhs.predecessor < rhs.predecessor;
+        return lhs.min_delay < rhs.min_delay;
+    });
+    return edges;
+}
+
 std::vector<reduction::Edge> buildConstraintGraph(const char* prune_value,
                                                   bool verify_rebuild = false) {
     ScopedEnvironmentVariable prune("CHRONON_EXPERIMENTAL_TRANSITIVE_DEP_PRUNE", prune_value);
@@ -188,6 +213,33 @@ buildDependencyOnlyHeadroomGraph(size_t headroom, uint32_t max_lookahead) {
     return {snapshotDependencies(sim), snapshotRebalanceAdjacency(sim)};
 }
 
+struct PhysicalRebalanceGraph {
+    std::vector<reduction::Edge> execution;
+    std::vector<RebalanceEdgeSnapshot> rebalance;
+};
+
+PhysicalRebalanceGraph buildPhysicalRebalanceGraph(const char* prune_value) {
+    ScopedEnvironmentVariable prune("CHRONON_EXPERIMENTAL_TRANSITIVE_DEP_PRUNE", prune_value);
+
+    TickSimulationConfig config;
+    config.num_threads = 2;
+    config.enable_weighted_partitioning = false;
+    config.enable_dynamic_rebalance = true;
+    config.max_lookahead_cycles = 32;
+    TickSimulation sim(config);
+    auto* a = sim.createUnit<PassUnit>("physical_a");
+    auto* b = sim.createUnit<PassUnit>("physical_b");
+    auto* c = sim.createUnit<PassUnit>("physical_c");
+
+    sim.connect(a->out, b->in, 1);
+    sim.connect(b->out, c->in, 1);
+    sim.connect(a->out, c->in, 2);
+    sim.connect(a->out, c->in, 2);
+    sim.initialize();
+
+    return {snapshotDependencies(sim), snapshotRebalancePhysicalEdges(sim)};
+}
+
 void test_runtime_prunes_only_transitively_implied_constraints() {
     std::cout << "Testing runtime transitive dependency pruning... ";
 
@@ -246,6 +298,26 @@ void test_dependency_only_headroom_adds_reverse_edge_only_when_tighter() {
     std::cout << "PASSED\n";
 }
 
+void test_rebalance_preserves_physical_edges_and_multiplicity() {
+    std::cout << "Testing rebalance preserves physical topology... ";
+
+    const auto unpruned = buildPhysicalRebalanceGraph("0");
+    const auto pruned = buildPhysicalRebalanceGraph("1");
+    CHECK(unpruned.execution.size() == 3);
+    CHECK(pruned.execution.size() == 2);
+    CHECK(unpruned.rebalance == pruned.rebalance);
+
+    const auto direct = std::find_if(pruned.rebalance.begin(), pruned.rebalance.end(),
+                                     [](const RebalanceEdgeSnapshot& edge) {
+                                         return edge.dependent == 2 && edge.predecessor == 0;
+                                     });
+    CHECK(direct != pruned.rebalance.end());
+    CHECK(direct->num_connections == 2);
+    CHECK(direct->min_delay == 2);
+
+    std::cout << "PASSED\n";
+}
+
 void test_zero_lookahead_window_selects_sequential() {
     std::cout << "Testing zero lookahead window selects Sequential... ";
 
@@ -285,6 +357,7 @@ int main() {
     test_runtime_prunes_only_transitively_implied_constraints();
     test_pruning_does_not_hide_headroom_zero_delay_cycle();
     test_dependency_only_headroom_adds_reverse_edge_only_when_tighter();
+    test_rebalance_preserves_physical_edges_and_multiplicity();
     test_zero_lookahead_window_selects_sequential();
     std::cout << "All transitive dependency pruning tests passed!\n";
     return 0;

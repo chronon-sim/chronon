@@ -72,18 +72,19 @@ void TickSimulation::buildCrossThreadDependencies() {
     }
 
     std::vector<std::unordered_map<size_t, uint32_t>> min_delay(num_clusters);
-    std::vector<std::unordered_map<size_t, uint32_t>> rebalance_min_delay(num_clusters);
+    std::vector<epoch_free_cost::RuntimeDependency> runtime_dependencies;
+    if (config_.enable_dynamic_rebalance) {
+        runtime_dependencies.reserve(connections_.size());
+    }
     auto add_dep = [&](size_t cluster, size_t pred_cluster, uint32_t delay) {
         auto [it, inserted] = min_delay[cluster].try_emplace(pred_cluster, delay);
         if (!inserted && delay < it->second) {
             it->second = delay;
         }
     };
-    auto add_rebalance_dep = [&](size_t cluster, size_t pred_cluster, uint32_t delay) {
-        auto [it, inserted] = rebalance_min_delay[cluster].try_emplace(pred_cluster, delay);
-        if (!inserted && delay < it->second) {
-            it->second = delay;
-        }
+    auto add_rebalance_dep = [&](size_t dependent, size_t predecessor, uint32_t delay) {
+        if (!config_.enable_dynamic_rebalance) return;
+        runtime_dependencies.push_back({dependent, predecessor, delay, 1});
     };
 
     for (auto* conn : connections_) {
@@ -155,31 +156,9 @@ void TickSimulation::buildCrossThreadDependencies() {
 
     if (!config_.enable_dynamic_rebalance) return;
 
-    // Rebalance scores both synchronization and finite-headroom coupling.
-    // Reduce the pair-min graph once instead of reconstructing raw physical
-    // connections on every planning interval.
-    std::vector<weighted_dependency_reduction::Edge> rebalance_edges;
-    for (size_t dependent = 0; dependent < rebalance_min_delay.size(); ++dependent) {
-        for (const auto& [predecessor, delay] : rebalance_min_delay[dependent]) {
-            rebalance_edges.push_back({dependent, predecessor, delay});
-        }
-    }
-    if (transitiveDependencyPruneEnabled()) {
-        rebalance_edges =
-            weighted_dependency_reduction::reduce(num_clusters, rebalance_edges).retained;
-    } else {
-        std::sort(rebalance_edges.begin(), rebalance_edges.end(), [](const auto& a, const auto& b) {
-            if (a.dependent != b.dependent) return a.dependent < b.dependent;
-            if (a.predecessor != b.predecessor) return a.predecessor < b.predecessor;
-            return a.delay < b.delay;
-        });
-    }
-    std::vector<epoch_free_cost::RuntimeDependency> runtime_dependencies;
-    runtime_dependencies.reserve(rebalance_edges.size());
-    for (const auto& edge : rebalance_edges) {
-        runtime_dependencies.push_back(
-            {edge.dependent, edge.predecessor, static_cast<uint32_t>(edge.delay)});
-    }
+    // Rebalance scores physical synchronization and finite-headroom coupling.
+    // Preserve direct physical edges and their multiplicity: an execution edge
+    // can be transitively redundant while its queue and atomic cost remain real.
     dynamic_rebalance_adjacency_ =
         epoch_free_cost::buildRuntimeAdjacency(num_clusters, runtime_dependencies);
 }
