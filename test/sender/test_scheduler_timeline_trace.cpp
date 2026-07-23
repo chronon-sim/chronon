@@ -170,6 +170,33 @@ void testFilteringBudgetAndOwnedStrings() {
     REQUIRE(instant.instant);
 }
 
+void testReconfigureRebuildsRecorderState() {
+    SchedulerTimelineTrace trace;
+    SchedulerTimelineTraceConfig config;
+    config.enabled = true;
+    config.max_events = 2;
+    trace.configure(config);
+    trace.start({{0}}, {});
+
+    const auto now = SchedulerTimelineTrace::Clock::now();
+    trace.recordInstant(0, "old", "event", 0, now);
+
+    config.max_events = 1;
+    trace.configure(config);
+    trace.start({{0}, {1}}, {});
+    REQUIRE(trace.schedulerStream() == 2);
+    const auto restarted = SchedulerTimelineTrace::Clock::now();
+    trace.recordInstant(1, "new", "event", 0, restarted);
+    trace.recordInstant(trace.schedulerStream(), "scheduler", "over-budget", 0, restarted);
+
+    const auto data = trace.exportData();
+    REQUIRE(data.streams.size() == 3);
+    REQUIRE(data.streams[0].empty());
+    REQUIRE(data.streams[1].size() == 1);
+    REQUIRE(data.streams[trace.schedulerStream()].empty());
+    REQUIRE(data.dropped_events == 1);
+}
+
 void testChunkedBudgetAcrossStreams() {
     SchedulerTimelineTrace trace;
     SchedulerTimelineTraceConfig config;
@@ -338,6 +365,7 @@ void testSimulationTimelineIncludesThreadCpuDiagnostics() {
 int main() {
     testDisabledRecorderIsInert();
     testFilteringBudgetAndOwnedStrings();
+    testReconfigureRebuildsRecorderState();
     testChunkedBudgetAcrossStreams();
     testChunkedBudgetReclaimsSparseStreams();
     testConcurrentChunkReclamationPreservesExactCap();

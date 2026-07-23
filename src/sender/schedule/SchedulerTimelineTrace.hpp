@@ -69,7 +69,11 @@ public:
         trace_epochs_ = config_.enabled && config_.trace_epochs;
         trace_thread_cpu_time_ =
             config_.enabled && config_.trace_units && config_.trace_thread_cpu_time;
+        started_ = false;
         written_ = false;
+        base_time_ = TimePoint{};
+        scheduler_stream_ = 0;
+        data_ = observe::TimelineStreamData{};
         reserved_events_ = 0;
         stream_budgets_.reset();
         stream_budget_count_ = 0;
