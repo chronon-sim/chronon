@@ -41,6 +41,57 @@ void TickSimulation::recordDynamicUnitTickSample_(size_t unit, uint64_t ticks, b
     count[unit].fetch_add(1, std::memory_order_relaxed);
 }
 
+void TickSimulation::recordDynamicWaitSample_(size_t thread_idx, const BlockedClusterInfo& blocker,
+                                              uint64_t wait_ns) {
+    if (thread_idx >= dynamic_runtime_thread_count_ || !dynamic_thread_floor_wait_ns_) return;
+    if (blocker.cluster == SIZE_MAX) {
+        dynamic_thread_no_ready_wait_ns_[thread_idx].fetch_add(wait_ns, std::memory_order_relaxed);
+    } else if (blocker.pred_cluster == SIZE_MAX) {
+        dynamic_thread_floor_wait_ns_[thread_idx].fetch_add(wait_ns, std::memory_order_relaxed);
+    } else {
+        dynamic_thread_dep_wait_ns_[thread_idx].fetch_add(wait_ns, std::memory_order_relaxed);
+        if (dynamic_cluster_blocked_wait_ns_ && blocker.cluster < dynamic_runtime_cluster_count_) {
+            dynamic_cluster_blocked_wait_ns_[blocker.cluster].fetch_add(wait_ns,
+                                                                        std::memory_order_relaxed);
+        }
+        if (dynamic_cluster_blocker_wait_ns_ &&
+            blocker.pred_cluster < dynamic_runtime_cluster_count_) {
+            dynamic_cluster_blocker_wait_ns_[blocker.pred_cluster].fetch_add(
+                wait_ns, std::memory_order_relaxed);
+        }
+    }
+}
+
+void TickSimulation::refineDynamicWaitBlocker_(size_t thread_idx,
+                                               const std::vector<size_t>& owned_clusters,
+                                               bool stable_sweep, uint64_t end_cycle,
+                                               uint64_t* predecessor_cache,
+                                               BlockedClusterInfo& blocker) const {
+    // The common readiness sweep may stop at the first proof of blocking,
+    // whereas sampled attribution feeds migration scoring and must retain the
+    // previous maximum-deficit semantics.
+    BlockedClusterInfo sampled_blocker{};
+    for (size_t cluster : owned_clusters) {
+        const uint64_t cycle =
+            thread_progress_array_[cluster].completed_cycle.load(std::memory_order_relaxed);
+        if (cycle >= end_cycle) continue;
+        if (!stable_sweep &&
+            (!cluster_runtime_owner_ ||
+             cluster_runtime_owner_[cluster].load(std::memory_order_acquire) != thread_idx)) {
+            continue;
+        }
+        if (!stable_sweep && dynamicMigrationBlocksCluster_(cluster, cycle)) continue;
+
+        BlockedClusterInfo candidate{};
+        if (!clusterCanAdvance_(cluster, cycle, candidate, predecessor_cache,
+                                /*stop_on_first_blocker=*/false) &&
+            candidate.deficit > sampled_blocker.deficit) {
+            sampled_blocker = candidate;
+        }
+    }
+    if (sampled_blocker.cluster != SIZE_MAX) blocker = sampled_blocker;
+}
+
 TickSimulation::DynamicRuntimeCostEstimate TickSimulation::dynamicUnitRuntimeCost_(
     size_t unit, double fallback) const {
     DynamicRuntimeCostEstimate estimate;

@@ -572,8 +572,12 @@ private:
     bool maybeRequestEpochFreeMigration_(uint64_t cycle);
     void serviceEpochFreeMigration_(size_t worker_thread);
     void clearDynamicMigrationRequest_();
+    bool dynamicMigrationBlocksCluster_(size_t cluster, uint64_t cycle) const;
     void recordDynamicWaitSample_(size_t thread_idx, const BlockedClusterInfo& blocker,
                                   uint64_t wait_ns);
+    void refineDynamicWaitBlocker_(size_t thread_idx, const std::vector<size_t>& owned_clusters,
+                                   bool stable_sweep, uint64_t end_cycle,
+                                   uint64_t* predecessor_cache, BlockedClusterInfo& blocker) const;
     void resetDynamicSchedulerMarkers_();
     void recordDynamicSchedulerMarker_(std::string name, uint64_t cycle, std::string detail);
     void flushDynamicSchedulerMarkers_();
