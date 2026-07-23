@@ -8,12 +8,15 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -66,9 +69,14 @@ public:
         trace_epochs_ = config_.enabled && config_.trace_epochs;
         trace_thread_cpu_time_ =
             config_.enabled && config_.trace_units && config_.trace_thread_cpu_time;
+        started_ = false;
         written_ = false;
-        dropped_events_.store(0, std::memory_order_relaxed);
-        event_count_.store(0, std::memory_order_relaxed);
+        base_time_ = TimePoint{};
+        scheduler_stream_ = 0;
+        data_ = observe::TimelineStreamData{};
+        reserved_events_ = 0;
+        stream_budgets_.reset();
+        stream_budget_count_ = 0;
     }
 
     bool enabled() const noexcept { return configured_; }
@@ -87,6 +95,10 @@ public:
         data_ = observe::TimelineStreamData{};
         data_.streams.resize(stream_count + 1);  // Last stream is the scheduler lane.
         data_.arenas.resize(stream_count + 1);
+        stream_budget_count_ = stream_count + 1;
+        stream_budgets_ = std::make_unique<StreamBudget[]>(stream_budget_count_);
+        event_budget_chunk_ =
+            config_.max_events / data_.streams.size() < kEventBudgetChunk ? 1 : kEventBudgetChunk;
         const size_t reserve_per = config_.max_events / data_.streams.size();
         for (auto& s : data_.streams) {
             s.reserve(reserve_per);
@@ -126,11 +138,7 @@ public:
             std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
         if (duration_ns < config_.min_duration_ns) return;
 
-        const uint64_t slot = event_count_.fetch_add(1, std::memory_order_relaxed);
-        if (slot >= config_.max_events) {
-            dropped_events_.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
+        if (!claimEventSlot_(stream)) return;
 
         // Copy the strings into this stream's byte arena and store [offset,len)
         // slices. No per-event std::string is constructed (the arena's capacity is
@@ -156,11 +164,7 @@ public:
         if (!started_ || stream >= data_.streams.size()) return;
         if (cycle < config_.start_cycle || cycle >= config_.end_cycle) return;
 
-        const uint64_t slot = event_count_.fetch_add(1, std::memory_order_relaxed);
-        if (slot >= config_.max_events) {
-            dropped_events_.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
+        if (!claimEventSlot_(stream)) return;
 
         std::string& arena = data_.arenas[stream];
         const auto intern = [&arena](std::string_view s) -> std::pair<uint32_t, uint32_t> {
@@ -186,7 +190,7 @@ public:
      */
     observe::TimelineStreamData exportData() {
         written_ = true;
-        data_.dropped_events = dropped_events_.load(std::memory_order_relaxed);
+        data_.dropped_events = droppedEvents_();
         return std::move(data_);
     }
 
@@ -220,9 +224,54 @@ private:
             return;
         }
 
-        data_.dropped_events = dropped_events_.load(std::memory_order_relaxed);
+        data_.dropped_events = droppedEvents_();
         observe::writeTimeline(writer, data_);
         writer.close();
+    }
+
+    bool claimEventSlot_(size_t stream) noexcept {
+        // Each stream has one writer. Reserve global capacity in blocks so the
+        // common event path only advances stream-local, cache-line-isolated state.
+        auto& budget = stream_budgets_[stream];
+        uint64_t available = budget.available.load(std::memory_order_relaxed);
+        while (available != 0) {
+            if (budget.available.compare_exchange_weak(available, available - 1,
+                                                       std::memory_order_relaxed,
+                                                       std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+
+        std::lock_guard lock(event_budget_mutex_);
+        if (reserved_events_ == config_.max_events) {
+            // Credits are local atomics so reclaim races linearly with their
+            // single writer. A successful writer CAS consumes the credit first;
+            // otherwise exchange() reclaims it for another stream.
+            uint64_t reclaimed = 0;
+            for (size_t index = 0; index < stream_budget_count_; ++index) {
+                reclaimed +=
+                    stream_budgets_[index].available.exchange(0, std::memory_order_relaxed);
+            }
+            reserved_events_ -= reclaimed;
+        }
+
+        if (reserved_events_ == config_.max_events) {
+            ++budget.dropped;
+            return false;
+        }
+
+        const uint64_t grant = std::min(event_budget_chunk_, config_.max_events - reserved_events_);
+        reserved_events_ += grant;
+        budget.available.store(grant - 1, std::memory_order_relaxed);
+        return true;
+    }
+
+    uint64_t droppedEvents_() const noexcept {
+        uint64_t total = 0;
+        for (size_t index = 0; index < stream_budget_count_; ++index) {
+            total += stream_budgets_[index].dropped;
+        }
+        return total;
     }
 
     uint64_t relNs(TimePoint tp) const {
@@ -240,10 +289,18 @@ private:
     bool written_ = false;
     TimePoint base_time_{};
     size_t scheduler_stream_ = 0;
+    static constexpr uint64_t kEventBudgetChunk = 256;
+    struct alignas(64) StreamBudget {
+        std::atomic<uint64_t> available{0};
+        uint64_t dropped = 0;
+    };
     /// Recorded streams: slices, per-stream byte arenas, lane names.
     observe::TimelineStreamData data_;
-    std::atomic<uint64_t> event_count_{0};
-    std::atomic<uint64_t> dropped_events_{0};
+    std::unique_ptr<StreamBudget[]> stream_budgets_;
+    size_t stream_budget_count_ = 0;
+    uint64_t event_budget_chunk_ = 1;
+    uint64_t reserved_events_ = 0;
+    std::mutex event_budget_mutex_;
 };
 
 }  // namespace chronon::sender
