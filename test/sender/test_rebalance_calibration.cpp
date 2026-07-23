@@ -147,6 +147,20 @@ int run_dynamic_wait_policy_test() {
     return 0;
 }
 
+int run_dynamic_cluster_burst_test() {
+    using chronon::sender::detail::dynamicClusterBurstEnd;
+
+    if (dynamicClusterBurstEnd(100, 200, 150) != 104 ||
+        dynamicClusterBurstEnd(100, 200, 102) != 101 ||
+        dynamicClusterBurstEnd(100, 102, 150) != 101 ||
+        dynamicClusterBurstEnd(100, 200, 150, 103) != 101 ||
+        dynamicClusterBurstEnd(UINT64_MAX - 2, UINT64_MAX, UINT64_MAX) != UINT64_MAX) {
+        std::cerr << "FAIL: dynamic cluster burst crossed a scheduler frontier\n";
+        return 1;
+    }
+    return 0;
+}
+
 int run_runtime_planner_input_test() {
     using chronon::sender::epoch_free_cost::RuntimeDependency;
 
@@ -671,6 +685,9 @@ int main() {
     std::cout << "=== Rebalance Calibration Test ===\n";
 
     if (run_dynamic_wait_policy_test() != 0) {
+        return 1;
+    }
+    if (run_dynamic_cluster_burst_test() != 0) {
         return 1;
     }
 

@@ -21,6 +21,7 @@
 #include "../../chronon/CpuPause.hpp"
 #include "DynamicWaitPolicy.hpp"
 #include "TickSimulation.hpp"
+#include "TickSimulationCycleUtils.hpp"
 #include "sender/schedule/EpochFreeTopologyCost.hpp"
 #include "sender/schedule/SchedulerTimelineStyle.hpp"
 
@@ -756,7 +757,12 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                 }
                 progress.store(reached_cycle, std::memory_order_release);
             } else {
-                const uint64_t burst_end = cycle + 1;
+                uint64_t next_counter_cycle = UINT64_MAX;
+                if constexpr (PushPeriodicCounters) {
+                    next_counter_cycle = detail::nextPeriodicCycle(cycle, period);
+                }
+                const uint64_t burst_end = detail::dynamicClusterBurstEnd(
+                    cycle, end_cycle, ready_through_cycle[cluster], next_counter_cycle);
                 do {
                     const bool sample_units = cluster < dynamic_cluster_unit_sampling_.size() &&
                                               dynamic_cluster_unit_sampling_[cluster] != 0;
