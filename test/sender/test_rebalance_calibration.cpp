@@ -11,9 +11,11 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "sender/core/TickSimulation.hpp"
 #include "sender/core/TickableUnit.hpp"
@@ -25,6 +27,44 @@ using namespace chronon::sender;
 namespace chronon::sender {
 
 struct DynamicMigrationTestAccess {
+    struct UnitSamplingStats {
+        uint64_t active_samples = 0;
+        uint64_t active_total_ns = 0;
+        uint64_t inactive_samples = 0;
+        uint64_t inactive_total_ns = 0;
+        uint64_t active_ticks = 0;
+        uint64_t observed_cycles = 0;
+        double normalized_cost = 0.0;
+        bool ready = false;
+    };
+
+    static UnitSamplingStats unitSamplingStats(const TickSimulation& sim, const Unit* unit) {
+        const auto it = std::find(sim.unit_ptrs_.begin(), sim.unit_ptrs_.end(), unit);
+        assert(it != sim.unit_ptrs_.end());
+        const size_t index = static_cast<size_t>(it - sim.unit_ptrs_.begin());
+        const auto estimate = sim.dynamicUnitRuntimeCost_(index, 1.0);
+        return {
+            sim.dynamic_unit_active_sample_count_[index].load(std::memory_order_relaxed),
+            sim.dynamic_unit_active_sample_time_ns_[index].load(std::memory_order_relaxed),
+            sim.dynamic_unit_inactive_sample_count_[index].load(std::memory_order_relaxed),
+            sim.dynamic_unit_inactive_sample_time_ns_[index].load(std::memory_order_relaxed),
+            sim.dynamic_unit_observed_active_ticks_[index].load(std::memory_order_relaxed),
+            sim.dynamic_unit_observed_cycles_[index].load(std::memory_order_relaxed),
+            estimate.cost,
+            estimate.ready,
+        };
+    }
+
+    static bool sameCluster(const TickSimulation& sim, const Unit* lhs, const Unit* rhs) {
+        const auto lhs_it = std::find(sim.unit_ptrs_.begin(), sim.unit_ptrs_.end(), lhs);
+        const auto rhs_it = std::find(sim.unit_ptrs_.begin(), sim.unit_ptrs_.end(), rhs);
+        if (lhs_it == sim.unit_ptrs_.end() || rhs_it == sim.unit_ptrs_.end()) return false;
+        const size_t lhs_index = static_cast<size_t>(lhs_it - sim.unit_ptrs_.begin());
+        const size_t rhs_index = static_cast<size_t>(rhs_it - sim.unit_ptrs_.begin());
+        return lhs_index < sim.unit_to_cluster_.size() && rhs_index < sim.unit_to_cluster_.size() &&
+               sim.unit_to_cluster_[lhs_index] == sim.unit_to_cluster_[rhs_index];
+    }
+
     static bool sourceOnlyCommit(TickSimulation& sim) {
         sim.initDynamicMigrationRuntime_();
         if (!sim.cluster_runtime_owner_ || sim.dynamic_runtime_cluster_count_ == 0 ||
@@ -75,8 +115,36 @@ struct DynamicMigrationTestAccess {
 
 namespace {
 
+bool nearlyEqual(double lhs, double rhs) {
+    return std::abs(lhs - rhs) <= std::max(1e-9, std::abs(rhs) * 1e-12);
+}
+
 int run_runtime_planner_input_test() {
     using chronon::sender::epoch_free_cost::RuntimeDependency;
+
+    if (chronon::sender::detail::shouldSampleDynamicTick(
+            254, chronon::sender::detail::kNoDynamicTickSample) ||
+        !chronon::sender::detail::shouldSampleDynamicTick(
+            255, chronon::sender::detail::kNoDynamicTickSample) ||
+        chronon::sender::detail::shouldSampleDynamicTick(510, 255) ||
+        !chronon::sender::detail::shouldSampleDynamicTick(511, 255)) {
+        std::cerr << "FAIL: dynamic tick sampling must warm up and separate accepted samples\n";
+        return 1;
+    }
+    const uint64_t first_window =
+        chronon::sender::TickSimulationConfig{}.rebalance_check_interval_cycles;
+    size_t warm_samples = 0;
+    uint64_t last_sample = chronon::sender::detail::kNoDynamicTickSample;
+    for (uint64_t cycle = 0; cycle < first_window; ++cycle) {
+        if (chronon::sender::detail::shouldSampleDynamicTick(cycle, last_sample)) {
+            ++warm_samples;
+            last_sample = cycle;
+        }
+    }
+    if (warm_samples != first_window / chronon::sender::detail::kDynamicTickSampleInterval) {
+        std::cerr << "FAIL: default rebalance window must contain only complete warm samples\n";
+        return 1;
+    }
 
     if (chronon::sender::epoch_free_cost::runtimeSyncCostNs(0.0) != 1.0 ||
         chronon::sender::epoch_free_cost::runtimeSyncCostNs(3.5) != 3.5) {
@@ -196,6 +264,177 @@ public:
 private:
     uint64_t checksum_ = 0;
 };
+
+class SleepingProducer : public TickableUnit {
+public:
+    SleepingProducer() : TickableUnit("sleeping_producer") {}
+    OutPort<uint64_t> out{this, "out", 1};
+
+    void tick() override {
+        uint64_t value = localCycle();
+        for (size_t i = 0; i < 5000; ++i) {
+            value = value * 6364136223846793005ULL + 1442695040888963407ULL;
+        }
+        checksum_ ^= value;
+        (void)out.send(value);
+        sleepUntil(localCycle() + 1024);
+    }
+
+private:
+    uint64_t checksum_ = 0;
+};
+
+TickSimulationConfig samplingTestConfig() {
+    TickSimulationConfig cfg;
+    cfg.num_threads = 3;
+    cfg.enable_parallel = true;
+    cfg.enable_lookahead = true;
+    cfg.enable_epoch_free_lookahead = true;
+    cfg.enable_dynamic_rebalance = true;
+    cfg.rebalance_check_interval_cycles = 8192;
+    cfg.initial_partition_sync_cost_ns = 0.0;
+    return cfg;
+}
+
+int run_periodic_sampling_detection_test() {
+    TickSimulation sim(samplingTestConfig());
+    auto* periodic = sim.createUnit<HeavyUnit>("periodic", 5000);
+    auto* ordinary0 = sim.createUnit<HeavyUnit>("ordinary0", 1);
+    auto* ordinary1 = sim.createUnit<HeavyUnit>("ordinary1", 1);
+    auto* ordinary2 = sim.createUnit<HeavyUnit>("ordinary2", 1);
+    auto* sink = sim.createUnit<Sink>();
+    periodic->setTickInterval(256);
+    sim.connect(periodic->out, sink->in, 0);
+    sim.connect(ordinary0->out, sink->in, 1);
+    sim.connect(ordinary1->out, sink->in, 1);
+    sim.connect(ordinary2->out, sink->in, 1);
+    sim.initialize();
+    sim.run(1025);
+
+    const auto periodic_stats = DynamicMigrationTestAccess::unitSamplingStats(sim, periodic);
+    const auto sink_stats = DynamicMigrationTestAccess::unitSamplingStats(sim, sink);
+    const double periodic_active_mean =
+        periodic_stats.active_samples == 0 ? 0.0
+                                           : static_cast<double>(periodic_stats.active_total_ns) /
+                                                 static_cast<double>(periodic_stats.active_samples);
+    const double periodic_inactive_mean =
+        periodic_stats.inactive_samples == 0
+            ? 0.0
+            : static_cast<double>(periodic_stats.inactive_total_ns) /
+                  static_cast<double>(periodic_stats.inactive_samples);
+    const double periodic_expected_cost =
+        periodic_active_mean / 256.0 + periodic_inactive_mean * 255.0 / 256.0;
+    if (!DynamicMigrationTestAccess::sameCluster(sim, periodic, sink) ||
+        periodic_stats.active_samples != 4 || periodic_stats.inactive_samples < 4 ||
+        periodic_stats.active_ticks != 4 || periodic_stats.observed_cycles != 1024 ||
+        !periodic_stats.ready || periodic_active_mean <= 0.0 ||
+        !nearlyEqual(periodic_stats.normalized_cost, periodic_expected_cost) || !sink_stats.ready ||
+        sink_stats.active_ticks != sink_stats.observed_cycles) {
+        std::cerr << "FAIL: periodic sampling did not preserve its 1/256 activation rate "
+                     "inside a mixed cluster"
+                  << " (same_cluster="
+                  << DynamicMigrationTestAccess::sameCluster(sim, periodic, sink)
+                  << ", active_samples=" << periodic_stats.active_samples
+                  << ", inactive_samples=" << periodic_stats.inactive_samples
+                  << ", active_ticks=" << periodic_stats.active_ticks
+                  << ", cycles=" << periodic_stats.observed_cycles
+                  << ", normalized=" << periodic_stats.normalized_cost
+                  << ", active_mean=" << periodic_active_mean << ", sink_ready=" << sink_stats.ready
+                  << ", sink_active_ticks=" << sink_stats.active_ticks
+                  << ", sink_cycles=" << sink_stats.observed_cycles << ")\n";
+        return 1;
+    }
+    return 0;
+}
+
+int run_multi_periodic_cluster_sampling_test() {
+    TickSimulation sim(samplingTestConfig());
+    auto* periodic2 = sim.createUnit<LightUnit>("periodic2");
+    auto* periodic3 = sim.createUnit<LightUnit>("periodic3");
+    sim.createUnit<HeavyUnit>("multi_ordinary0", 1);
+    sim.createUnit<HeavyUnit>("multi_ordinary1", 1);
+    sim.createUnit<HeavyUnit>("multi_ordinary2", 1);
+    periodic2->setTickInterval(2);
+    periodic3->setTickInterval(3);
+    sim.connect(periodic2->out, periodic3->in, 0);
+    sim.initialize();
+    sim.run(1033);
+
+    const auto periodic2_stats = DynamicMigrationTestAccess::unitSamplingStats(sim, periodic2);
+    const auto periodic3_stats = DynamicMigrationTestAccess::unitSamplingStats(sim, periodic3);
+    const bool interval2_rate = periodic2_stats.observed_cycles != 0 &&
+                                periodic2_stats.active_ticks * 2 == periodic2_stats.observed_cycles;
+    const bool interval3_rate =
+        periodic3_stats.observed_cycles != 0 &&
+        periodic3_stats.active_ticks * 3 >= periodic3_stats.observed_cycles &&
+        periodic3_stats.active_ticks * 3 - periodic3_stats.observed_cycles <= 2;
+    if (!DynamicMigrationTestAccess::sameCluster(sim, periodic2, periodic3) ||
+        periodic2_stats.active_samples != 4 || periodic3_stats.active_samples != 4 ||
+        !periodic2_stats.ready || !periodic3_stats.ready || !interval2_rate || !interval3_rate) {
+        std::cerr << "FAIL: mixed periodic cluster did not retain each member's activation rate"
+                  << " (same_cluster="
+                  << DynamicMigrationTestAccess::sameCluster(sim, periodic2, periodic3)
+                  << ", p2_samples=" << periodic2_stats.active_samples
+                  << ", p2_active=" << periodic2_stats.active_ticks
+                  << ", p2_cycles=" << periodic2_stats.observed_cycles
+                  << ", p2_ready=" << periodic2_stats.ready
+                  << ", p3_samples=" << periodic3_stats.active_samples
+                  << ", p3_active=" << periodic3_stats.active_ticks
+                  << ", p3_cycles=" << periodic3_stats.observed_cycles
+                  << ", p3_ready=" << periodic3_stats.ready << ")\n";
+        return 1;
+    }
+    return 0;
+}
+
+int run_activity_scheduled_cluster_sampling_test() {
+    TickSimulation sim(samplingTestConfig());
+    auto* sleeping = sim.createUnit<SleepingProducer>();
+    auto* ordinary = sim.createUnit<LightUnit>("sleeping_consumer");
+    sim.createUnit<HeavyUnit>("sleep_ordinary0", 1);
+    sim.createUnit<HeavyUnit>("sleep_ordinary1", 1);
+    sim.createUnit<HeavyUnit>("sleep_ordinary2", 1);
+    sim.connect(sleeping->out, ordinary->in, 0);
+    sim.initialize();
+    sim.run(4097);
+
+    const auto sleeping_stats = DynamicMigrationTestAccess::unitSamplingStats(sim, sleeping);
+    const auto ordinary_stats = DynamicMigrationTestAccess::unitSamplingStats(sim, ordinary);
+    const double sleeping_active_mean =
+        sleeping_stats.active_samples == 0 ? 0.0
+                                           : static_cast<double>(sleeping_stats.active_total_ns) /
+                                                 static_cast<double>(sleeping_stats.active_samples);
+    const double sleeping_inactive_mean =
+        sleeping_stats.inactive_samples == 0
+            ? 0.0
+            : static_cast<double>(sleeping_stats.inactive_total_ns) /
+                  static_cast<double>(sleeping_stats.inactive_samples);
+    const double sleeping_expected_cost =
+        sleeping_active_mean / 1024.0 + sleeping_inactive_mean * 1023.0 / 1024.0;
+    if (!DynamicMigrationTestAccess::sameCluster(sim, sleeping, ordinary) ||
+        sleeping_stats.active_samples != 4 || sleeping_stats.active_ticks != 4 ||
+        sleeping_stats.observed_cycles != 4096 || !sleeping_stats.ready ||
+        sleeping_active_mean <= 0.0 ||
+        !nearlyEqual(sleeping_stats.normalized_cost, sleeping_expected_cost) ||
+        !ordinary_stats.ready || ordinary_stats.active_ticks != ordinary_stats.observed_cycles) {
+        std::cerr << "FAIL: activity-scheduled sampling did not preserve wakeup rate "
+                     "inside a mixed cluster"
+                  << " (same_cluster="
+                  << DynamicMigrationTestAccess::sameCluster(sim, sleeping, ordinary)
+                  << ", active_samples=" << sleeping_stats.active_samples
+                  << ", inactive_samples=" << sleeping_stats.inactive_samples
+                  << ", active_ticks=" << sleeping_stats.active_ticks
+                  << ", cycles=" << sleeping_stats.observed_cycles
+                  << ", ready=" << sleeping_stats.ready
+                  << ", normalized=" << sleeping_stats.normalized_cost
+                  << ", expected=" << sleeping_expected_cost
+                  << ", ordinary_ready=" << ordinary_stats.ready
+                  << ", ordinary_active=" << ordinary_stats.active_ticks
+                  << ", ordinary_cycles=" << ordinary_stats.observed_cycles << ")\n";
+        return 1;
+    }
+    return 0;
+}
 
 #ifdef CHRONON_SANITIZER_BUILD
 constexpr int kPrimaryHeavy0Iterations = 6000;
@@ -404,6 +643,18 @@ int main() {
     std::cout << "=== Rebalance Calibration Test ===\n";
 
     if (run_runtime_planner_input_test() != 0) {
+        return 1;
+    }
+
+    if (run_periodic_sampling_detection_test() != 0) {
+        return 1;
+    }
+
+    if (run_multi_periodic_cluster_sampling_test() != 0) {
+        return 1;
+    }
+
+    if (run_activity_scheduled_cluster_sampling_test() != 0) {
         return 1;
     }
 

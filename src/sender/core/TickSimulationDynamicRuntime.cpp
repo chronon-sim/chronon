@@ -43,12 +43,19 @@ void TickSimulation::initDynamicMigrationRuntime_() {
     const size_t num_clusters = clusters_.numClusters();
     if (num_clusters == 0 || thread_units_.empty()) return;
     const size_t num_threads = thread_units_.size();
+    const size_t num_units = unit_ptrs_.size();
+    // Dynamic workers access these costs through atomic_ref while migrations
+    // publish new estimates. Fix the backing storage before any worker starts;
+    // resizing it during a run would invalidate every atomic_ref.
+    if (unit_costs_.size() < num_units) unit_costs_.resize(num_units, 1.0);
 
     const bool rebuild_clusters =
         dynamic_runtime_cluster_count_ != num_clusters || !cluster_runtime_owner_;
     const bool rebuild_threads =
         dynamic_runtime_thread_count_ != num_threads || !dynamic_thread_floor_wait_ns_;
-    const bool reset_runtime = rebuild_clusters || rebuild_threads;
+    const bool rebuild_units =
+        dynamic_runtime_unit_count_ != num_units || !dynamic_unit_active_sample_time_ns_;
+    const bool reset_runtime = rebuild_clusters || rebuild_threads || rebuild_units;
 
     if (rebuild_clusters) {
         cluster_runtime_owner_ = std::make_unique<std::atomic<size_t>[]>(num_clusters);
@@ -60,6 +67,8 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         dynamic_cluster_blocked_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_clusters);
         dynamic_cluster_blocker_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_clusters);
         dynamic_cluster_last_migration_cycle_.assign(num_clusters, kNoMigrationCycle);
+        dynamic_cluster_last_tick_sample_cycle_.assign(num_clusters, detail::kNoDynamicTickSample);
+        dynamic_cluster_unit_sampling_.assign(num_clusters, 0);
         dynamic_cluster_last_source_thread_.assign(num_clusters, SIZE_MAX);
         dynamic_cluster_last_target_thread_.assign(num_clusters, SIZE_MAX);
         dynamic_runtime_cluster_count_ = num_clusters;
@@ -69,6 +78,31 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         dynamic_thread_dep_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_threads);
         dynamic_thread_no_ready_wait_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_threads);
         dynamic_runtime_thread_count_ = num_threads;
+    }
+    if (rebuild_units) {
+        dynamic_unit_active_sample_time_ns_ = std::make_unique<std::atomic<uint64_t>[]>(num_units);
+        dynamic_unit_active_sample_count_ = std::make_unique<std::atomic<uint64_t>[]>(num_units);
+        dynamic_unit_inactive_sample_time_ns_ =
+            std::make_unique<std::atomic<uint64_t>[]>(num_units);
+        dynamic_unit_inactive_sample_count_ = std::make_unique<std::atomic<uint64_t>[]>(num_units);
+        dynamic_unit_observed_active_ticks_ = std::make_unique<std::atomic<uint64_t>[]>(num_units);
+        dynamic_unit_observed_cycles_ = std::make_unique<std::atomic<uint64_t>[]>(num_units);
+        dynamic_unit_last_active_sample_cycle_.assign(num_units, detail::kNoDynamicTickSample);
+        dynamic_unit_last_inactive_sample_cycle_.assign(num_units, detail::kNoDynamicTickSample);
+        dynamic_unit_last_activity_checkpoint_cycle_.assign(num_units,
+                                                            detail::kNoDynamicTickSample);
+        dynamic_unit_active_ticks_since_checkpoint_.assign(num_units, 0);
+        dynamic_runtime_unit_count_ = num_units;
+    }
+
+    for (size_t c = 0; c < num_clusters && c < clusters_.clusters.size(); ++c) {
+        for (size_t unit_idx : clusters_.clusters[c]) {
+            if (unit_idx < unit_ptrs_.size() && (unit_ptrs_[unit_idx]->tickInterval() > 1 ||
+                                                 unit_ptrs_[unit_idx]->usesActivityScheduling())) {
+                dynamic_cluster_unit_sampling_[c] = 1;
+                break;
+            }
+        }
     }
 
     for (size_t c = 0; c < num_clusters; ++c) {
@@ -84,6 +118,22 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         dynamic_cluster_blocker_wait_ns_[c].store(0, std::memory_order_relaxed);
     }
     if (reset_runtime) {
+        std::fill(dynamic_unit_last_active_sample_cycle_.begin(),
+                  dynamic_unit_last_active_sample_cycle_.end(), detail::kNoDynamicTickSample);
+        std::fill(dynamic_unit_last_inactive_sample_cycle_.begin(),
+                  dynamic_unit_last_inactive_sample_cycle_.end(), detail::kNoDynamicTickSample);
+        std::fill(dynamic_unit_last_activity_checkpoint_cycle_.begin(),
+                  dynamic_unit_last_activity_checkpoint_cycle_.end(), detail::kNoDynamicTickSample);
+        std::fill(dynamic_unit_active_ticks_since_checkpoint_.begin(),
+                  dynamic_unit_active_ticks_since_checkpoint_.end(), 0);
+        for (size_t u = 0; u < num_units; ++u) {
+            dynamic_unit_active_sample_time_ns_[u].store(0, std::memory_order_relaxed);
+            dynamic_unit_active_sample_count_[u].store(0, std::memory_order_relaxed);
+            dynamic_unit_inactive_sample_time_ns_[u].store(0, std::memory_order_relaxed);
+            dynamic_unit_inactive_sample_count_[u].store(0, std::memory_order_relaxed);
+            dynamic_unit_observed_active_ticks_[u].store(0, std::memory_order_relaxed);
+            dynamic_unit_observed_cycles_[u].store(0, std::memory_order_relaxed);
+        }
         for (size_t t = 0; t < num_threads; ++t) {
             dynamic_thread_floor_wait_ns_[t].store(0, std::memory_order_relaxed);
             dynamic_thread_dep_wait_ns_[t].store(0, std::memory_order_relaxed);

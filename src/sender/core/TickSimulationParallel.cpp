@@ -654,9 +654,36 @@ std::string TickSimulation::formatBlockerDetail_(const BlockedClusterInfo& block
 }
 
 void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, uint64_t cycle,
-                                             bool trace_units) {
+                                             bool trace_units, bool sample_unit_activity) {
     auto* const* units = cluster_unit_ptrs_[cluster].data();
     const size_t num_units = cluster_unit_ptrs_[cluster].size();
+
+    auto unit_index = [&](size_t offset) {
+        return cluster < clusters_.clusters.size() && offset < clusters_.clusters[cluster].size()
+                   ? clusters_.clusters[cluster][offset]
+                   : SIZE_MAX;
+    };
+    auto record_activity = [&](size_t unit, bool active) {
+        if (unit >= dynamic_runtime_unit_count_) return;
+        if (active) ++dynamic_unit_active_ticks_since_checkpoint_[unit];
+        const uint64_t last = dynamic_unit_last_activity_checkpoint_cycle_[unit];
+        if (!detail::shouldSampleDynamicTick(cycle, last)) return;
+        const uint64_t window_cycles =
+            last == detail::kNoDynamicTickSample ? cycle + 1 : cycle - last;
+        dynamic_unit_observed_active_ticks_[unit].fetch_add(
+            dynamic_unit_active_ticks_since_checkpoint_[unit], std::memory_order_relaxed);
+        dynamic_unit_observed_cycles_[unit].fetch_add(window_cycles, std::memory_order_relaxed);
+        dynamic_unit_active_ticks_since_checkpoint_[unit] = 0;
+        dynamic_unit_last_activity_checkpoint_cycle_[unit] = cycle;
+    };
+    auto record_cost_sample = [&](size_t unit, bool active, uint64_t elapsed_ns) {
+        if (unit >= dynamic_runtime_unit_count_) return;
+        auto& last = active ? dynamic_unit_last_active_sample_cycle_[unit]
+                            : dynamic_unit_last_inactive_sample_cycle_[unit];
+        if (!detail::shouldSampleDynamicTick(cycle, last)) return;
+        recordDynamicUnitTickSample_(unit, elapsed_ns, active);
+        last = cycle;
+    };
 
     if (trace_units) {
         auto& points = thread_trace_points_[thread_idx];
@@ -686,10 +713,45 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
                                 trace_thread_cpu,
                                 cpu_points ? (*cpu_points)[u] : ThreadTraceCpuPoint{},
                                 cpu_points ? (*cpu_points)[u + 1] : ThreadTraceCpuPoint{});
+            if (sample_unit_activity) {
+                const size_t unit = unit_index(u);
+                const uint64_t elapsed_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(points[u + 1] - points[u])
+                        .count());
+                record_cost_sample(unit, active[u] != 0, elapsed_ns);
+                record_activity(unit, active[u] != 0);
+            }
         }
     } else {
         for (size_t u = 0; u < num_units; ++u) {
-            executeUnitCycle_(units[u], cycle);
+            if (!sample_unit_activity) {
+                executeUnitCycle_(units[u], cycle);
+                continue;
+            }
+
+            const size_t unit = unit_index(u);
+            bool expected_active = false;
+            bool time_sample = false;
+            if (unit < dynamic_runtime_unit_count_) {
+                const bool active_due = detail::shouldSampleDynamicTick(
+                    cycle, dynamic_unit_last_active_sample_cycle_[unit]);
+                const bool inactive_due = detail::shouldSampleDynamicTick(
+                    cycle, dynamic_unit_last_inactive_sample_cycle_[unit]);
+                if (active_due || inactive_due) {
+                    expected_active = units[u]->shouldRunTickAt(cycle);
+                    time_sample = expected_active ? active_due : inactive_due;
+                }
+            }
+            SchedulerTimelineTrace::TimePoint begin{};
+            if (time_sample) begin = SchedulerTimelineTrace::Clock::now();
+            const bool active = executeUnitCycle_(units[u], cycle);
+            if (time_sample && active == expected_active) {
+                const auto end = SchedulerTimelineTrace::Clock::now();
+                const uint64_t elapsed_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+                record_cost_sample(unit, active, elapsed_ns);
+            }
+            record_activity(unit, active);
         }
     }
 }
