@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "sender/core/DynamicWaitPolicy.hpp"
 #include "sender/core/TickSimulation.hpp"
 #include "sender/core/TickableUnit.hpp"
 #include "sender/port/Port.hpp"
@@ -117,6 +118,33 @@ namespace {
 
 bool nearlyEqual(double lhs, double rhs) {
     return std::abs(lhs - rhs) <= std::max(1e-9, std::abs(rhs) * 1e-12);
+}
+
+int run_dynamic_wait_policy_test() {
+    using chronon::sender::detail::dynamicWaitThreadYieldSpinMask;
+    using chronon::sender::detail::shouldYieldDynamicWaitThread;
+
+    const uint64_t floor_mask = dynamicWaitThreadYieldSpinMask(true);
+    const uint64_t dependency_mask = dynamicWaitThreadYieldSpinMask(false);
+    if (floor_mask != 255 || dependency_mask != 4095) {
+        std::cerr << "FAIL: dynamic wait policy selected the wrong yield cadence\n";
+        return 1;
+    }
+    if (shouldYieldDynamicWaitThread(254, floor_mask) ||
+        !shouldYieldDynamicWaitThread(255, floor_mask) ||
+        shouldYieldDynamicWaitThread(256, floor_mask) ||
+        !shouldYieldDynamicWaitThread(511, floor_mask)) {
+        std::cerr << "FAIL: lookahead-floor waits must yield every 256 spins\n";
+        return 1;
+    }
+    if (shouldYieldDynamicWaitThread(255, dependency_mask) ||
+        shouldYieldDynamicWaitThread(4094, dependency_mask) ||
+        !shouldYieldDynamicWaitThread(4095, dependency_mask) ||
+        !shouldYieldDynamicWaitThread(8191, dependency_mask)) {
+        std::cerr << "FAIL: dependency waits must yield every 4096 spins\n";
+        return 1;
+    }
+    return 0;
 }
 
 int run_runtime_planner_input_test() {
@@ -641,6 +669,10 @@ int run_source_only_commit_guard() {
 
 int main() {
     std::cout << "=== Rebalance Calibration Test ===\n";
+
+    if (run_dynamic_wait_policy_test() != 0) {
+        return 1;
+    }
 
     if (run_runtime_planner_input_test() != 0) {
         return 1;

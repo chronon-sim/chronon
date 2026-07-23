@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "../../chronon/CpuPause.hpp"
+#include "DynamicWaitPolicy.hpp"
 #include "TickSimulation.hpp"
 #include "sender/schedule/EpochFreeTopologyCost.hpp"
 #include "sender/schedule/SchedulerTimelineStyle.hpp"
@@ -26,12 +27,11 @@
 namespace chronon::sender {
 
 namespace {
-constexpr uint64_t kFloorRefreshSpinMask = 0xFF;
 // Entering the OS scheduler is far more expensive than a CPU pause/yield hint,
 // especially for the short dependency waits common in cycle-level simulation.
 // Keep lookahead-floor waits cooperative so lagging workers can advance, but
 // only yield after a sustained cluster-dependency wait.
-constexpr uint64_t kDependencyWaitThreadYieldSpinMask = 0xFFF;  // Every 4096 spins.
+constexpr uint64_t kFloorRefreshSpinMask = detail::kFloorWaitThreadYieldSpinMask;
 constexpr uint64_t kNoMigrationCycle = std::numeric_limits<uint64_t>::max();
 
 uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
@@ -874,11 +874,10 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
         if (sample_wait) wait_begin = SchedulerTimelineTrace::Clock::now();
 
         uint64_t spin = 0;
-        const uint64_t thread_yield_spin_mask = blocker.pred_cluster == SIZE_MAX
-                                                    ? kFloorRefreshSpinMask
-                                                    : kDependencyWaitThreadYieldSpinMask;
+        const uint64_t thread_yield_spin_mask =
+            detail::dynamicWaitThreadYieldSpinMask(blocker.pred_cluster == SIZE_MAX);
         auto pause_or_yield_hidden_wait = [&](uint64_t spin_iteration) {
-            if ((spin_iteration & thread_yield_spin_mask) == thread_yield_spin_mask &&
+            if (detail::shouldYieldDynamicWaitThread(spin_iteration, thread_yield_spin_mask) &&
                 blocker.cluster < num_clusters) {
                 const uint64_t dependent_cycle =
                     thread_progress_array_[blocker.cluster].completed_cycle.load(
