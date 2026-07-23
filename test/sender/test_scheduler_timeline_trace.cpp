@@ -169,6 +169,29 @@ void testFilteringBudgetAndOwnedStrings() {
     REQUIRE(instant.instant);
 }
 
+void testChunkedBudgetAcrossStreams() {
+    SchedulerTimelineTrace trace;
+    SchedulerTimelineTraceConfig config;
+    config.enabled = true;
+    config.max_events = 2'048;
+    trace.configure(config);
+    trace.start({{0}, {1}}, {});
+
+    const auto now = SchedulerTimelineTrace::Clock::now();
+    const size_t scheduler_stream = trace.schedulerStream();
+    for (uint64_t cycle = 0; cycle < 1'024; ++cycle) {
+        trace.recordDuration(0, "unit", "worker", cycle, now, now + std::chrono::nanoseconds(1));
+        trace.recordInstant(scheduler_stream, "scheduler", "marker", cycle, now);
+    }
+    trace.recordDuration(1, "unit", "over-budget", 0, now, now + std::chrono::nanoseconds(1));
+
+    const auto data = trace.exportData();
+    REQUIRE(data.streams[0].size() == 1'024);
+    REQUIRE(data.streams[1].empty());
+    REQUIRE(data.streams[scheduler_stream].size() == 1'024);
+    REQUIRE(data.dropped_events == 1);
+}
+
 void testStandaloneWriteAndStyleMapping() {
     const auto cluster = schedulerStallStyle("stall: cluster-dep");
     const auto floor = schedulerStallStyle("stall: lookahead-floor");
@@ -260,6 +283,7 @@ void testSimulationTimelineIncludesThreadCpuDiagnostics() {
 int main() {
     testDisabledRecorderIsInert();
     testFilteringBudgetAndOwnedStrings();
+    testChunkedBudgetAcrossStreams();
     testStandaloneWriteAndStyleMapping();
     testSimulationTimelineIncludesThreadCpuDiagnostics();
     return chronon::test::failureCount() == 0 ? 0 : 1;
