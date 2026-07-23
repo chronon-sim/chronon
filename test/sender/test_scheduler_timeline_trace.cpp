@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include "../TestAssertions.hpp"
@@ -192,6 +193,60 @@ void testChunkedBudgetAcrossStreams() {
     REQUIRE(data.dropped_events == 1);
 }
 
+void testChunkedBudgetReclaimsSparseStreams() {
+    SchedulerTimelineTrace trace;
+    SchedulerTimelineTraceConfig config;
+    config.enabled = true;
+    config.max_events = 1'024;
+    trace.configure(config);
+    trace.start({{0}}, {});
+
+    const auto now = SchedulerTimelineTrace::Clock::now();
+    const size_t scheduler_stream = trace.schedulerStream();
+    trace.recordDuration(0, "unit", "sparse-worker", 0, now, now + std::chrono::nanoseconds(1));
+    for (uint64_t cycle = 0; cycle < 1'023; ++cycle) {
+        trace.recordInstant(scheduler_stream, "scheduler", "marker", cycle, now);
+    }
+    trace.recordInstant(scheduler_stream, "scheduler", "over-budget", 1'023, now);
+
+    const auto data = trace.exportData();
+    REQUIRE(data.streams[0].size() == 1);
+    REQUIRE(data.streams[scheduler_stream].size() == 1'023);
+    REQUIRE(data.dropped_events == 1);
+}
+
+void testConcurrentChunkReclamationPreservesExactCap() {
+    SchedulerTimelineTrace trace;
+    SchedulerTimelineTraceConfig config;
+    config.enabled = true;
+    config.max_events = 4'097;
+    trace.configure(config);
+    trace.start({{0}, {1}, {2}, {3}}, {});
+
+    constexpr size_t kWorkers = 4;
+    constexpr uint64_t kEventsPerWorker = 2'000;
+    const auto now = SchedulerTimelineTrace::Clock::now();
+    std::array<std::thread, kWorkers> workers;
+    for (size_t stream = 0; stream < kWorkers; ++stream) {
+        workers[stream] = std::thread([&, stream] {
+            for (uint64_t cycle = 0; cycle < kEventsPerWorker; ++cycle) {
+                trace.recordInstant(stream, "unit", "worker", cycle, now);
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    const auto data = trace.exportData();
+    size_t recorded = 0;
+    for (const auto& stream : data.streams) {
+        recorded += stream.size();
+    }
+    REQUIRE(recorded == config.max_events);
+    REQUIRE(data.dropped_events == kWorkers * kEventsPerWorker - config.max_events);
+}
+
 void testStandaloneWriteAndStyleMapping() {
     const auto cluster = schedulerStallStyle("stall: cluster-dep");
     const auto floor = schedulerStallStyle("stall: lookahead-floor");
@@ -284,6 +339,8 @@ int main() {
     testDisabledRecorderIsInert();
     testFilteringBudgetAndOwnedStrings();
     testChunkedBudgetAcrossStreams();
+    testChunkedBudgetReclaimsSparseStreams();
+    testConcurrentChunkReclamationPreservesExactCap();
     testStandaloneWriteAndStyleMapping();
     testSimulationTimelineIncludesThreadCpuDiagnostics();
     return chronon::test::failureCount() == 0 ? 0 : 1;
