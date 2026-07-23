@@ -546,6 +546,68 @@ void test_receiver_filter_direct_spsc_path() {
     std::cout << "PASSED\n";
 }
 
+void test_unfiltered_direct_spsc_path() {
+    std::cout << "Testing unfiltered direct SPSC receive path... ";
+
+    TestUnit prod("prod");
+    TestUnit cons("cons");
+    OutPort<int> out{&prod, "out", 8};
+    InPort<int> in{&cons, "in", 16};
+    out.connect(&in, 1);
+    in.useLockFreeQueue();
+    require(in.usesDirectSPSC(), "unfiltered test did not select the direct SPSC backend");
+
+    prod.setCycle(0);
+    require(out.send(11), "failed to seed first unfiltered direct-SPSC message");
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+    out.cancelInFlight();
+#endif
+    require(out.send(22), "failed to seed second unfiltered direct-SPSC message");
+
+    auto first = in.tryReceive(1);
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+    require(first.has_value() && *first == 22,
+            "unfiltered direct SPSC path did not skip the canceled sender epoch");
+#else
+    require(first.has_value() && *first == 11,
+            "unfiltered direct SPSC path changed first-message delivery");
+    auto second = in.tryReceive(1);
+    require(second.has_value() && *second == 22,
+            "unfiltered direct SPSC path changed second-message delivery");
+#endif
+    require(!in.tryReceive(1).has_value(),
+            "unfiltered direct SPSC path left an unexpected ready message");
+
+    std::cout << "PASSED\n";
+}
+
+void test_unfiltered_mpsc_path() {
+    std::cout << "Testing unfiltered MPSC receive path... ";
+
+    TestUnit cons("cons");
+    InPort<int> in{&cons, "in", 16};
+    in.useMultiProducerQueue();
+    const size_t q0 = in.registerProducerThread(1);
+    const size_t q1 = in.registerProducerThread(2);
+
+    require(in.pushToThreadQueue(q1, 3, 5, 0, 20), "failed to seed MPSC lane 1");
+    require(in.pushToThreadQueue(q0, 1, 5, 0, 10), "failed to seed MPSC lane 0 head");
+    require(in.pushToThreadQueue(q0, 2, 6, 1, 10), "failed to seed MPSC lane 0 tail");
+
+    auto first = in.tryReceive(5);
+    auto second = in.tryReceive(5);
+    require(first.has_value() && *first == 1,
+            "unfiltered MPSC path changed same-cycle sender order");
+    require(second.has_value() && *second == 3,
+            "unfiltered MPSC path did not consume the second ready lane");
+    require(!in.tryReceive(5).has_value(), "unfiltered MPSC path exposed a future-cycle message");
+    auto third = in.tryReceive(6);
+    require(third.has_value() && *third == 2, "unfiltered MPSC path changed next-cycle lane order");
+    require(!in.tryReceive(6).has_value(), "unfiltered MPSC path left an unexpected ready message");
+
+    std::cout << "PASSED\n";
+}
+
 void test_receiver_filter_preserves_mpsc_order() {
     std::cout << "Testing receiver filter preserves MPSC order... ";
 
@@ -653,6 +715,8 @@ int main() {
     test_inport_selective_cancel_mpsc_thread_queues();
     test_receiver_filter_cancels_rejected_messages();
     test_receiver_filter_direct_spsc_path();
+    test_unfiltered_direct_spsc_path();
+    test_unfiltered_mpsc_path();
     test_receiver_filter_preserves_mpsc_order();
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
     test_outport_cancel_isolated_between_mpsc_lanes();

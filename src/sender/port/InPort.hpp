@@ -537,6 +537,25 @@ public:
                 return std::nullopt;
             }
         }
+        if (selective_flush_state_.empty()) [[likely]] {
+            if (direct_spsc_queue_raw_) {
+                while (true) {
+                    StoredMessage* message = direct_spsc_queue_raw_->peekReady(current_cycle);
+                    if (!message) return std::nullopt;
+                    if (detail::isCanceled(*message)) {
+                        direct_spsc_queue_raw_->consumePeeked(current_cycle);
+                        continue;
+                    }
+                    std::optional<T> result{std::in_place, std::move(message->data)};
+                    direct_spsc_queue_raw_->consumePeeked(current_cycle);
+                    return result;
+                }
+            }
+            if (multi_producer_queue_raw_) {
+                return tryReceiveUnfilteredFromConsumableQueue_(*multi_producer_queue_raw_,
+                                                                current_cycle);
+            }
+        }
         return tryReceiveFiltered(current_cycle, [](const T&) noexcept { return true; });
     }
 
@@ -753,6 +772,22 @@ private:
             const bool consumed = queue.consumeReady(current_cycle, visit);
             if (!consumed) return std::nullopt;
             retireSelectiveFlushesAtFront_(queue, current_cycle);
+            if (result) return result;
+        }
+    }
+
+    template <typename Queue>
+    [[gnu::always_inline]] inline std::optional<T> tryReceiveUnfilteredFromConsumableQueue_(
+        Queue& queue, uint64_t current_cycle) {
+        while (true) {
+            std::optional<T> result;
+            auto visit = [&](StoredMessage& msg) {
+                if (!isSenderCanceledByQueue_<Queue>(msg)) {
+                    result.emplace(std::move(msg.data));
+                }
+            };
+            const bool consumed = queue.consumeReady(current_cycle, visit);
+            if (!consumed) return std::nullopt;
             if (result) return result;
         }
     }
