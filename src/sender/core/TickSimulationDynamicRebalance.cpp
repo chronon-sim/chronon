@@ -527,6 +527,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                                                   stdexec::inplace_stop_token token) {
     const bool trace_units = timeline_trace_.traceUnits();
     const bool trace_waits = timeline_trace_.traceWaits();
+    const bool stop_on_first_blocker = !trace_waits;
     const uint64_t max_lookahead = config_.max_lookahead_cycles;
     const size_t num_clusters = dynamic_runtime_cluster_count_;
     std::vector<size_t> owned_clusters;
@@ -627,7 +628,10 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     auto cluster_can_advance_cached = [&](size_t cluster, uint64_t cycle,
                                           BlockedClusterInfo& blocker) {
         if (cycle < ready_through_cycle[cluster]) return true;
-        if (!clusterCanAdvance_(cluster, cycle, blocker, predecessor_cycles)) return false;
+        if (!clusterCanAdvance_(cluster, cycle, blocker, predecessor_cycles,
+                                stop_on_first_blocker)) {
+            return false;
+        }
 
         uint64_t ready_through = std::numeric_limits<uint64_t>::max();
         if (cluster < thread_resolved_deps_.size()) {

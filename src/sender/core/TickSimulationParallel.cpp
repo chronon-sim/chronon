@@ -323,6 +323,7 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     WorkerPredecessorCycleCache predecessor_cache(thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
     const bool trace_waits = timeline_trace_.traceWaits();
+    const bool stop_on_first_blocker = !trace_waits;
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;
     if constexpr (PushPeriodicCounters) {
@@ -342,7 +343,8 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
             all_done = false;
 
             BlockedClusterInfo candidate{};
-            if (!clusterCanAdvance_(cluster, cycle, candidate, predecessor_cycles)) {
+            if (!clusterCanAdvance_(cluster, cycle, candidate, predecessor_cycles,
+                                    stop_on_first_blocker)) {
                 if (candidate.deficit > blocker.deficit) {
                     blocker = candidate;
                 }
@@ -441,7 +443,8 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
                     thread_progress_array_[cluster].completed_cycle.load(std::memory_order_relaxed);
                 if (cycle >= end_cycle) continue;
                 BlockedClusterInfo ignored{};
-                if (clusterCanAdvance_(cluster, cycle, ignored, predecessor_cycles)) {
+                if (clusterCanAdvance_(cluster, cycle, ignored, predecessor_cycles,
+                                       stop_on_first_blocker)) {
                     any_ready = true;
                     break;
                 }
@@ -503,7 +506,8 @@ void TickSimulation::refreshLookaheadFloor_() {
 }
 
 bool TickSimulation::clusterCanAdvance_(size_t cluster, uint64_t cycle, BlockedClusterInfo& blocker,
-                                        uint64_t* predecessor_cache) const {
+                                        uint64_t* predecessor_cache,
+                                        bool stop_on_first_blocker) const {
     if (cluster >= thread_resolved_deps_.size()) return true;
 
     // Treat predecessor dependencies as SIMT lanes. The ballot pass is local
@@ -528,13 +532,14 @@ bool TickSimulation::clusterCanAdvance_(size_t cluster, uint64_t cycle, BlockedC
 
     if (refresh_mask == 0) [[likely]]
         return true;
-    return refreshPredecessorMisses_(cluster, cycle, blocker, predecessor_cache, refresh_mask);
+    return refreshPredecessorMisses_(cluster, cycle, blocker, predecessor_cache, refresh_mask,
+                                     stop_on_first_blocker);
 }
 
 bool TickSimulation::refreshPredecessorMisses_(size_t cluster, uint64_t cycle,
                                                BlockedClusterInfo& blocker,
-                                               uint64_t* predecessor_cache,
-                                               uint64_t refresh_mask) const {
+                                               uint64_t* predecessor_cache, uint64_t refresh_mask,
+                                               bool stop_on_first_blocker) const {
     const auto& deps = thread_resolved_deps_[cluster];
     bool ready = true;
     while (refresh_mask != 0) {
@@ -557,6 +562,7 @@ bool TickSimulation::refreshPredecessorMisses_(size_t cluster, uint64_t cycle,
             blocker.delay = dep.min_delay;
             blocker.deficit = deficit;
         }
+        if (stop_on_first_blocker) return false;
     }
     return ready;
 }

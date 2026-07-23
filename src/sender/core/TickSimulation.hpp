@@ -535,11 +535,12 @@ private:
     }
 
     bool clusterCanAdvance_(size_t cluster, uint64_t cycle, BlockedClusterInfo& blocker,
-                            uint64_t* predecessor_cache) const;
+                            uint64_t* predecessor_cache, bool stop_on_first_blocker = false) const;
     [[gnu::noinline]] bool refreshPredecessorMisses_(size_t cluster, uint64_t cycle,
                                                      BlockedClusterInfo& blocker,
                                                      uint64_t* predecessor_cache,
-                                                     uint64_t refresh_mask) const;
+                                                     uint64_t refresh_mask,
+                                                     bool stop_on_first_blocker) const;
     [[gnu::noinline]] bool clusterCanAdvanceScalarSlow_(size_t cluster, uint64_t cycle,
                                                         BlockedClusterInfo& blocker,
                                                         uint64_t* predecessor_cache) const;
