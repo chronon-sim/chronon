@@ -27,7 +27,6 @@ namespace chronon::sender {
 
 namespace {
 constexpr uint64_t kFloorRefreshSpinMask = 0xFF;
-constexpr uint64_t kDynamicClusterMinSamples = 4;
 constexpr uint64_t kNoMigrationCycle = std::numeric_limits<uint64_t>::max();
 
 uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
@@ -36,15 +35,6 @@ uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
 }
 
 }  // namespace
-
-void TickSimulation::recordClusterTickSample_(size_t cluster, uint64_t ticks, bool active) {
-    if (!cluster_sample_time_ns_ || cluster >= dynamic_runtime_cluster_count_) return;
-    cluster_sample_time_ns_[cluster].fetch_add(ticks, std::memory_order_relaxed);
-    cluster_sample_count_[cluster].fetch_add(1, std::memory_order_relaxed);
-    if (active) {
-        cluster_active_sample_count_[cluster].fetch_add(1, std::memory_order_relaxed);
-    }
-}
 
 void TickSimulation::recordDynamicWaitSample_(size_t thread_idx, const BlockedClusterInfo& blocker,
                                               uint64_t wait_ns) {
@@ -154,7 +144,6 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     const size_t num_threads = thread_units_.size();
     const size_t num_clusters = dynamic_runtime_cluster_count_;
     std::vector<double> cluster_cost(num_clusters, 0.0);
-    std::vector<uint64_t> cluster_samples(num_clusters, 0);
     std::vector<double> thread_cost(num_threads, 0.0);
     std::vector<size_t> thread_active_clusters(num_threads, 0);
     std::vector<uint64_t> thread_floor_wait(num_threads, 0);
@@ -163,28 +152,12 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     std::vector<uint64_t> cluster_blocked_wait(num_clusters, 0);
     std::vector<uint64_t> cluster_blocker_wait(num_clusters, 0);
     std::vector<size_t> assignment(num_clusters, 0);
-    std::vector<uint8_t> cluster_low_frequency(num_clusters, 0);
+    std::vector<uint8_t> cluster_cost_ready(num_clusters, 0);
 
     for (size_t c = 0; c < num_clusters; ++c) {
-        double fallback = 0.0;
-        if (c < clusters_.clusters.size()) {
-            for (size_t u : clusters_.clusters[c]) {
-                fallback += u < unit_costs_.size() ? unit_costs_[u] : 1.0;
-                if (u < unit_ptrs_.size() && (unit_ptrs_[u]->tickInterval() > 1 ||
-                                              unit_ptrs_[u]->usesActivityScheduling())) {
-                    cluster_low_frequency[c] = 1;
-                }
-            }
-        }
-        if (fallback <= 0.0) fallback = 1.0;
-
-        const uint64_t samples = cluster_sample_count_[c].load(std::memory_order_relaxed);
-        const uint64_t total = cluster_sample_time_ns_[c].load(std::memory_order_relaxed);
-        cluster_samples[c] = samples;
-        cluster_cost[c] =
-            samples > 0 && (!cluster_low_frequency[c] || samples >= kDynamicClusterMinSamples)
-                ? static_cast<double>(total) / static_cast<double>(samples)
-                : fallback;
+        const auto estimate = dynamicClusterRuntimeCost_(c);
+        cluster_cost[c] = estimate.cost;
+        cluster_cost_ready[c] = estimate.ready ? 1 : 0;
 
         size_t owner = cluster_runtime_owner_[c].load(std::memory_order_acquire);
         if (owner >= num_threads) owner = 0;
@@ -280,10 +253,7 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                 continue;
             }
             if (cluster_migration_pending_[c].load(std::memory_order_acquire) != 0) continue;
-            if (cluster_samples[c] == 0) continue;
-            if (cluster_low_frequency[c] && cluster_samples[c] < kDynamicClusterMinSamples) {
-                continue;
-            }
+            if (!cluster_cost_ready[c]) continue;
             if (cluster_cost[c] <= 0.0) continue;
             const uint64_t last_cycle = last_migration_cycle(c);
             if (in_history_cooldown(last_cycle)) continue;
@@ -328,10 +298,7 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                     continue;
                 }
                 if (cluster_migration_pending_[c].load(std::memory_order_acquire) != 0) continue;
-                if (cluster_samples[c] == 0) continue;
-                if (cluster_low_frequency[c] && cluster_samples[c] < kDynamicClusterMinSamples) {
-                    continue;
-                }
+                if (!cluster_cost_ready[c]) continue;
                 const uint64_t last_cycle = last_migration_cycle(c);
                 if (in_history_cooldown(last_cycle)) continue;
                 if (in_pingpong_cooldown(c, fallback_source, fallback_target, last_cycle)) continue;
@@ -503,27 +470,24 @@ void TickSimulation::serviceEpochFreeMigration_(size_t worker_thread) {
     }
 
     for (size_t c = 0; c < dynamic_runtime_cluster_count_; ++c) {
-        const uint64_t samples = cluster_sample_count_[c].load(std::memory_order_relaxed);
-        const uint64_t total = cluster_sample_time_ns_[c].load(std::memory_order_relaxed);
-        bool low_frequency = false;
-        if (c < clusters_.clusters.size()) {
-            for (size_t unit_idx : clusters_.clusters[c]) {
-                if (unit_idx < unit_ptrs_.size() &&
-                    (unit_ptrs_[unit_idx]->tickInterval() > 1 ||
-                     unit_ptrs_[unit_idx]->usesActivityScheduling())) {
-                    low_frequency = true;
-                    break;
-                }
-            }
-        }
-        if (samples > 0 && (!low_frequency || samples >= kDynamicClusterMinSamples) &&
-            c < clusters_.clusters.size() && !clusters_.clusters[c].empty()) {
-            const double avg = static_cast<double>(total) / static_cast<double>(samples);
-            const double per_unit =
-                std::max(0.001, avg / static_cast<double>(clusters_.clusters[c].size()));
+        const auto cluster_estimate = dynamicClusterRuntimeCost_(c);
+        if (cluster_estimate.ready && c < clusters_.clusters.size() &&
+            !clusters_.clusters[c].empty()) {
             if (unit_costs_.size() < unit_ptrs_.size()) unit_costs_.resize(unit_ptrs_.size(), 1.0);
-            for (size_t unit_idx : clusters_.clusters[c]) {
-                if (unit_idx < unit_costs_.size()) unit_costs_[unit_idx] = per_unit;
+            if (cluster_estimate.low_frequency) {
+                for (size_t unit_idx : clusters_.clusters[c]) {
+                    if (unit_idx >= unit_costs_.size()) continue;
+                    const auto unit_estimate =
+                        dynamicUnitRuntimeCost_(unit_idx, unit_costs_[unit_idx]);
+                    if (unit_estimate.ready) unit_costs_[unit_idx] = unit_estimate.cost;
+                }
+            } else {
+                const double per_unit =
+                    std::max(0.001, cluster_estimate.cost /
+                                        static_cast<double>(clusters_.clusters[c].size()));
+                for (size_t unit_idx : clusters_.clusters[c]) {
+                    if (unit_idx < unit_costs_.size()) unit_costs_[unit_idx] = per_unit;
+                }
             }
         }
         cluster_sample_time_ns_[c].store(0, std::memory_order_relaxed);
@@ -616,12 +580,8 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                 dynamic_cluster_blocker_wait_ns_
                     ? dynamic_cluster_blocker_wait_ns_[cluster].load(std::memory_order_relaxed)
                     : 0;
-            const uint64_t samples = cluster_sample_count_[cluster].load(std::memory_order_relaxed);
-            priority_cost_ns[cluster] =
-                samples > 0 ? static_cast<double>(cluster_sample_time_ns_[cluster].load(
-                                  std::memory_order_relaxed)) /
-                                  static_cast<double>(samples)
-                            : 0.0;
+            const auto estimate = dynamicClusterRuntimeCost_(cluster);
+            priority_cost_ns[cluster] = estimate.ready ? estimate.cost : 0.0;
         }
         std::sort(owned_clusters.begin(), owned_clusters.end(), [&](size_t a, size_t b) {
             const uint64_t a_blocker = priority_blocker_ns[a];
@@ -679,6 +639,22 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
         return true;
     };
 
+    auto enable_cluster_unit_sampling = [&](size_t cluster, uint64_t completed_cycle) {
+        if (cluster >= dynamic_cluster_unit_sampling_.size() ||
+            dynamic_cluster_unit_sampling_[cluster] != 0) {
+            return;
+        }
+        dynamic_cluster_unit_sampling_[cluster] = 1;
+        if (cluster >= clusters_.clusters.size()) return;
+        for (size_t unit : clusters_.clusters[cluster]) {
+            if (unit >= dynamic_runtime_unit_count_) continue;
+            dynamic_unit_last_active_sample_cycle_[unit] = completed_cycle;
+            dynamic_unit_last_inactive_sample_cycle_[unit] = completed_cycle;
+            dynamic_unit_last_activity_checkpoint_cycle_[unit] = completed_cycle;
+            dynamic_unit_active_ticks_since_checkpoint_[unit] = 0;
+        }
+    };
+
     while (!token.stop_requested()) {
         bool ownership_refreshed = false;
         const bool stable_sweep = prepare_stable_sweep(ownership_refreshed);
@@ -707,6 +683,12 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
 
             if (!stable_sweep && migration_blocks_cluster(cluster, cycle)) continue;
 
+            if (cluster < dynamic_cluster_unit_sampling_.size() &&
+                dynamic_cluster_unit_sampling_[cluster] == 0 && cluster_activity_scheduling_ &&
+                cluster_activity_scheduling_[cluster].enabled.load(std::memory_order_acquire)) {
+                enable_cluster_unit_sampling(cluster, cycle == 0 ? 0 : cycle - 1);
+            }
+
             BlockedClusterInfo candidate{};
             if (!cluster_can_advance_cached(cluster, cycle, candidate)) {
                 blocked_floor_needed =
@@ -724,8 +706,10 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                                                                  predecessor_cycles);
             }
             if (idle_target > cycle) {
+                const bool sample_units = cluster < dynamic_cluster_unit_sampling_.size() &&
+                                          dynamic_cluster_unit_sampling_[cluster] != 0;
                 SchedulerTimelineTrace::TimePoint idle_begin{};
-                if (trace_units) {
+                if (trace_units || sample_units) {
                     idle_begin = SchedulerTimelineTrace::Clock::now();
                 }
                 advanceClusterIdle_(cluster, idle_target - cycle);
@@ -743,20 +727,49 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                     recordClusterIdle_(thread_idx, cluster, cycle, reached_cycle - cycle,
                                        idle_begin, idle_end);
                 }
+                if (sample_units && reached_cycle > cycle && cluster < clusters_.clusters.size()) {
+                    const auto idle_end = SchedulerTimelineTrace::Clock::now();
+                    const uint64_t delta = reached_cycle - cycle;
+                    const uint64_t elapsed_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(idle_end - idle_begin)
+                            .count());
+                    const size_t units = std::max<size_t>(1, clusters_.clusters[cluster].size());
+                    const uint64_t per_unit_cycle_ns = elapsed_ns / delta / units;
+                    for (size_t unit : clusters_.clusters[cluster]) {
+                        if (unit >= dynamic_runtime_unit_count_) continue;
+                        if (detail::shouldSampleDynamicTick(
+                                reached_cycle - 1,
+                                dynamic_unit_last_inactive_sample_cycle_[unit])) {
+                            recordDynamicUnitTickSample_(unit, per_unit_cycle_ns, false);
+                            dynamic_unit_last_inactive_sample_cycle_[unit] = reached_cycle - 1;
+                        }
+
+                        const uint64_t last = dynamic_unit_last_activity_checkpoint_cycle_[unit];
+                        const uint64_t first_unobserved =
+                            last == detail::kNoDynamicTickSample ? 0 : last + 1;
+                        if (reached_cycle > first_unobserved) {
+                            dynamic_unit_observed_active_ticks_[unit].fetch_add(
+                                dynamic_unit_active_ticks_since_checkpoint_[unit],
+                                std::memory_order_relaxed);
+                            dynamic_unit_observed_cycles_[unit].fetch_add(
+                                reached_cycle - first_unobserved, std::memory_order_relaxed);
+                            dynamic_unit_active_ticks_since_checkpoint_[unit] = 0;
+                            dynamic_unit_last_activity_checkpoint_cycle_[unit] = reached_cycle - 1;
+                        }
+                    }
+                }
                 progress.store(reached_cycle, std::memory_order_release);
             } else {
                 const uint64_t burst_end = cycle + 1;
                 do {
+                    const bool sample_units = cluster < dynamic_cluster_unit_sampling_.size() &&
+                                              dynamic_cluster_unit_sampling_[cluster] != 0;
                     const uint64_t last_sample = dynamic_cluster_last_tick_sample_cycle_[cluster];
-                    const bool sample_due = detail::shouldSampleDynamicTick(cycle, last_sample);
                     const bool sample_tick =
-                        sample_due &&
-                        std::all_of(
-                            cluster_unit_ptrs_[cluster].begin(), cluster_unit_ptrs_[cluster].end(),
-                            [cycle](const auto* unit) { return unit->shouldRunTickAt(cycle); });
+                        !sample_units && detail::shouldSampleDynamicTick(cycle, last_sample);
                     SchedulerTimelineTrace::TimePoint begin{};
                     if (sample_tick) begin = SchedulerTimelineTrace::Clock::now();
-                    executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units);
+                    executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units, sample_units);
                     if (sample_tick) {
                         auto end = SchedulerTimelineTrace::Clock::now();
                         uint64_t elapsed_ns = static_cast<uint64_t>(
@@ -764,6 +777,11 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                                 .count());
                         recordClusterTickSample_(cluster, elapsed_ns, true);
                         dynamic_cluster_last_tick_sample_cycle_[cluster] = cycle;
+                    }
+                    if (!sample_units && cluster_activity_scheduling_ &&
+                        cluster_activity_scheduling_[cluster].enabled.load(
+                            std::memory_order_acquire)) {
+                        enable_cluster_unit_sampling(cluster, cycle);
                     }
                     ++cycle;
                     progress.store(cycle, std::memory_order_release);

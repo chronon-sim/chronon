@@ -382,6 +382,16 @@ private:
     bool parallelBeneficialWeighted_() const;
 
     void recordClusterTickSample_(size_t cluster, uint64_t ticks, bool active);
+    void recordDynamicUnitTickSample_(size_t unit, uint64_t ticks, bool active);
+
+    struct DynamicRuntimeCostEstimate {
+        double cost = 0.0;
+        uint64_t samples = 0;
+        bool ready = false;
+        bool low_frequency = false;
+    };
+    DynamicRuntimeCostEstimate dynamicUnitRuntimeCost_(size_t unit, double fallback) const;
+    DynamicRuntimeCostEstimate dynamicClusterRuntimeCost_(size_t cluster) const;
 
     /**
      * Topology-only cluster-aware placement (no cost profiling). Used as
@@ -554,7 +564,7 @@ private:
                              bool include_thread_cpu_time, ThreadTraceCpuPoint cpu_begin,
                              ThreadTraceCpuPoint cpu_end);
     void executeClusterOneCycle_(size_t thread_idx, size_t cluster, uint64_t cycle,
-                                 bool trace_units);
+                                 bool trace_units, bool sample_unit_activity = false);
 
     void initDynamicMigrationRuntime_();
     void rebuildThreadUnitsFromClusterOwners_();
@@ -672,18 +682,32 @@ private:
     std::unique_ptr<std::atomic<uint64_t>[]> cluster_sample_time_ns_;
     std::unique_ptr<std::atomic<uint64_t>[]> cluster_sample_count_;
     std::unique_ptr<std::atomic<uint64_t>[]> cluster_active_sample_count_;
+    // Low-frequency clusters use per-unit conditional timing plus windowed
+    // activity counts so periodic work remains a per-simulated-cycle cost.
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_unit_active_sample_time_ns_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_unit_active_sample_count_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_unit_inactive_sample_time_ns_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_unit_inactive_sample_count_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_unit_observed_active_ticks_;
+    std::unique_ptr<std::atomic<uint64_t>[]> dynamic_unit_observed_cycles_;
     std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_floor_wait_ns_;
     std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_dep_wait_ns_;
     std::unique_ptr<std::atomic<uint64_t>[]> dynamic_thread_no_ready_wait_ns_;
     std::unique_ptr<std::atomic<uint64_t>[]> dynamic_cluster_blocked_wait_ns_;
     std::unique_ptr<std::atomic<uint64_t>[]> dynamic_cluster_blocker_wait_ns_;
     std::vector<uint64_t> dynamic_cluster_last_tick_sample_cycle_;
+    std::vector<uint8_t> dynamic_cluster_unit_sampling_;
+    std::vector<uint64_t> dynamic_unit_last_active_sample_cycle_;
+    std::vector<uint64_t> dynamic_unit_last_inactive_sample_cycle_;
+    std::vector<uint64_t> dynamic_unit_last_activity_checkpoint_cycle_;
+    std::vector<uint64_t> dynamic_unit_active_ticks_since_checkpoint_;
     std::vector<uint64_t> dynamic_cluster_last_migration_cycle_;
     std::vector<size_t> dynamic_cluster_last_source_thread_;
     std::vector<size_t> dynamic_cluster_last_target_thread_;
     std::atomic<uint64_t> cluster_assignment_generation_{0};
     size_t dynamic_runtime_cluster_count_ = 0;
     size_t dynamic_runtime_thread_count_ = 0;
+    size_t dynamic_runtime_unit_count_ = 0;
     alignas(64) std::atomic<uint64_t> next_dynamic_rebalance_check_cycle_{0};
     alignas(64) std::atomic<bool> epoch_free_dynamic_runtime_active_{false};
     alignas(64) std::atomic_flag dynamic_planner_busy_ = ATOMIC_FLAG_INIT;
