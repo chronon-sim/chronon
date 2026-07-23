@@ -10,6 +10,7 @@
 /// Runtime cost sampling and activation-rate normalization.
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 
 #include "TickSimulation.hpp"
@@ -89,14 +90,19 @@ TickSimulation::DynamicRuntimeCostEstimate TickSimulation::dynamicUnitRuntimeCos
 }
 
 TickSimulation::DynamicRuntimeCostEstimate TickSimulation::dynamicClusterRuntimeCost_(
-    size_t cluster) const {
+    size_t cluster) {
     DynamicRuntimeCostEstimate estimate;
     if (cluster >= clusters_.clusters.size()) return estimate;
+
+    const auto load_unit_cost = [this](size_t unit) noexcept {
+        if (unit >= unit_costs_.size()) return 1.0;
+        return std::atomic_ref<double>(unit_costs_[unit]).load(std::memory_order_relaxed);
+    };
 
     double fallback = 0.0;
     bool low_frequency = false;
     for (size_t unit : clusters_.clusters[cluster]) {
-        fallback += unit < unit_costs_.size() ? unit_costs_[unit] : 1.0;
+        fallback += load_unit_cost(unit);
         if (unit < unit_ptrs_.size() &&
             (unit_ptrs_[unit]->tickInterval() > 1 || unit_ptrs_[unit]->usesActivityScheduling())) {
             low_frequency = true;
@@ -122,7 +128,7 @@ TickSimulation::DynamicRuntimeCostEstimate TickSimulation::dynamicClusterRuntime
     uint64_t confidence = std::numeric_limits<uint64_t>::max();
     bool ready = !clusters_.clusters[cluster].empty();
     for (size_t unit : clusters_.clusters[cluster]) {
-        const double unit_fallback = unit < unit_costs_.size() ? unit_costs_[unit] : 1.0;
+        const double unit_fallback = load_unit_cost(unit);
         const auto unit_estimate = dynamicUnitRuntimeCost_(unit, unit_fallback);
         measured_cost += unit_estimate.cost;
         confidence = std::min(confidence, unit_estimate.samples);

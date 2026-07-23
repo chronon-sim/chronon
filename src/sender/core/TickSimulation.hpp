@@ -391,7 +391,7 @@ private:
         bool low_frequency = false;
     };
     DynamicRuntimeCostEstimate dynamicUnitRuntimeCost_(size_t unit, double fallback) const;
-    DynamicRuntimeCostEstimate dynamicClusterRuntimeCost_(size_t cluster) const;
+    DynamicRuntimeCostEstimate dynamicClusterRuntimeCost_(size_t cluster);
 
     /**
      * Topology-only cluster-aware placement (no cost profiling). Used as

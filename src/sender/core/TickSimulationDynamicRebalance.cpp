@@ -473,20 +473,25 @@ void TickSimulation::serviceEpochFreeMigration_(size_t worker_thread) {
         const auto cluster_estimate = dynamicClusterRuntimeCost_(c);
         if (cluster_estimate.ready && c < clusters_.clusters.size() &&
             !clusters_.clusters[c].empty()) {
-            if (unit_costs_.size() < unit_ptrs_.size()) unit_costs_.resize(unit_ptrs_.size(), 1.0);
             if (cluster_estimate.low_frequency) {
                 for (size_t unit_idx : clusters_.clusters[c]) {
                     if (unit_idx >= unit_costs_.size()) continue;
-                    const auto unit_estimate =
-                        dynamicUnitRuntimeCost_(unit_idx, unit_costs_[unit_idx]);
-                    if (unit_estimate.ready) unit_costs_[unit_idx] = unit_estimate.cost;
+                    std::atomic_ref<double> unit_cost(unit_costs_[unit_idx]);
+                    const auto unit_estimate = dynamicUnitRuntimeCost_(
+                        unit_idx, unit_cost.load(std::memory_order_relaxed));
+                    if (unit_estimate.ready) {
+                        unit_cost.store(unit_estimate.cost, std::memory_order_relaxed);
+                    }
                 }
             } else {
                 const double per_unit =
                     std::max(0.001, cluster_estimate.cost /
                                         static_cast<double>(clusters_.clusters[c].size()));
                 for (size_t unit_idx : clusters_.clusters[c]) {
-                    if (unit_idx < unit_costs_.size()) unit_costs_[unit_idx] = per_unit;
+                    if (unit_idx < unit_costs_.size()) {
+                        std::atomic_ref<double>(unit_costs_[unit_idx])
+                            .store(per_unit, std::memory_order_relaxed);
+                    }
                 }
             }
         }

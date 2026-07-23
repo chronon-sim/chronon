@@ -44,6 +44,10 @@ void TickSimulation::initDynamicMigrationRuntime_() {
     if (num_clusters == 0 || thread_units_.empty()) return;
     const size_t num_threads = thread_units_.size();
     const size_t num_units = unit_ptrs_.size();
+    // Dynamic workers access these costs through atomic_ref while migrations
+    // publish new estimates. Fix the backing storage before any worker starts;
+    // resizing it during a run would invalidate every atomic_ref.
+    if (unit_costs_.size() < num_units) unit_costs_.resize(num_units, 1.0);
 
     const bool rebuild_clusters =
         dynamic_runtime_cluster_count_ != num_clusters || !cluster_runtime_owner_;
