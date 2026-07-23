@@ -36,27 +36,6 @@ uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
 
 }  // namespace
 
-void TickSimulation::recordDynamicWaitSample_(size_t thread_idx, const BlockedClusterInfo& blocker,
-                                              uint64_t wait_ns) {
-    if (thread_idx >= dynamic_runtime_thread_count_ || !dynamic_thread_floor_wait_ns_) return;
-    if (blocker.cluster == SIZE_MAX) {
-        dynamic_thread_no_ready_wait_ns_[thread_idx].fetch_add(wait_ns, std::memory_order_relaxed);
-    } else if (blocker.pred_cluster == SIZE_MAX) {
-        dynamic_thread_floor_wait_ns_[thread_idx].fetch_add(wait_ns, std::memory_order_relaxed);
-    } else {
-        dynamic_thread_dep_wait_ns_[thread_idx].fetch_add(wait_ns, std::memory_order_relaxed);
-        if (dynamic_cluster_blocked_wait_ns_ && blocker.cluster < dynamic_runtime_cluster_count_) {
-            dynamic_cluster_blocked_wait_ns_[blocker.cluster].fetch_add(wait_ns,
-                                                                        std::memory_order_relaxed);
-        }
-        if (dynamic_cluster_blocker_wait_ns_ &&
-            blocker.pred_cluster < dynamic_runtime_cluster_count_) {
-            dynamic_cluster_blocker_wait_ns_[blocker.pred_cluster].fetch_add(
-                wait_ns, std::memory_order_relaxed);
-        }
-    }
-}
-
 void TickSimulation::resetDynamicSchedulerMarkers_() {
     dynamic_scheduler_marker_count_.store(0, std::memory_order_relaxed);
     dynamic_scheduler_marker_drops_.store(0, std::memory_order_relaxed);
@@ -521,12 +500,25 @@ void TickSimulation::serviceEpochFreeMigration_(size_t worker_thread) {
     clearDynamicMigrationRequest_();
 }
 
+bool TickSimulation::dynamicMigrationBlocksCluster_(size_t cluster, uint64_t cycle) const {
+    if (cluster_migration_pending_[cluster].load(std::memory_order_acquire) == 0) return false;
+
+    const uint8_t state = migration_request_.state.load(std::memory_order_acquire);
+    const bool committing = state == static_cast<uint8_t>(MigrationRequestState::Quiescing) ||
+                            state == static_cast<uint8_t>(MigrationRequestState::ReadyToCommit);
+    if (!committing || migration_request_.cluster.load(std::memory_order_relaxed) != cluster) {
+        return false;
+    }
+    return cycle >= migration_request_.fence_cycle.load(std::memory_order_acquire);
+}
+
 template <bool PushPeriodicCounters>
 void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t end_cycle,
                                                   uint64_t run_start, uint64_t period,
                                                   stdexec::inplace_stop_token token) {
     const bool trace_units = timeline_trace_.traceUnits();
     const bool trace_waits = timeline_trace_.traceWaits();
+    const bool stop_on_first_blocker = !trace_waits;
     const uint64_t max_lookahead = config_.max_lookahead_cycles;
     const size_t num_clusters = dynamic_runtime_cluster_count_;
     std::vector<size_t> owned_clusters;
@@ -601,16 +593,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     };
 
     auto migration_blocks_cluster = [&](size_t cluster, uint64_t cycle) {
-        if (cluster_migration_pending_[cluster].load(std::memory_order_acquire) == 0) {
-            return false;
-        }
-        const uint8_t state = migration_request_.state.load(std::memory_order_acquire);
-        const bool committing = state == static_cast<uint8_t>(MigrationRequestState::Quiescing) ||
-                                state == static_cast<uint8_t>(MigrationRequestState::ReadyToCommit);
-        if (!committing || migration_request_.cluster.load(std::memory_order_relaxed) != cluster) {
-            return false;
-        }
-        return cycle >= migration_request_.fence_cycle.load(std::memory_order_acquire);
+        return dynamicMigrationBlocksCluster_(cluster, cycle);
     };
 
     auto prepare_stable_sweep = [&](bool& ownership_refreshed) {
@@ -627,7 +610,10 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     auto cluster_can_advance_cached = [&](size_t cluster, uint64_t cycle,
                                           BlockedClusterInfo& blocker) {
         if (cycle < ready_through_cycle[cluster]) return true;
-        if (!clusterCanAdvance_(cluster, cycle, blocker, predecessor_cycles)) return false;
+        if (!clusterCanAdvance_(cluster, cycle, blocker, predecessor_cycles,
+                                stop_on_first_blocker)) {
+            return false;
+        }
 
         uint64_t ready_through = std::numeric_limits<uint64_t>::max();
         if (cluster < thread_resolved_deps_.size()) {
@@ -857,6 +843,10 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
 
         constexpr uint64_t kWaitSampleMask = 0x0F;
         const bool sample_wait = trace_waits || ((wait_sample_sequence++ & kWaitSampleMask) == 0);
+        if (sample_wait && !trace_waits && blocker.cluster < num_clusters) {
+            refineDynamicWaitBlocker_(thread_idx, owned_clusters, stable_sweep, end_cycle,
+                                      predecessor_cycles, blocker);
+        }
         bool sampled_wait_on_floor = false;
         if (sample_wait && blocker.cluster < num_clusters) {
             // A worker ahead of the exact frontier is consuming lookahead

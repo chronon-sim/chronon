@@ -535,11 +535,12 @@ private:
     }
 
     bool clusterCanAdvance_(size_t cluster, uint64_t cycle, BlockedClusterInfo& blocker,
-                            uint64_t* predecessor_cache) const;
+                            uint64_t* predecessor_cache, bool stop_on_first_blocker = false) const;
     [[gnu::noinline]] bool refreshPredecessorMisses_(size_t cluster, uint64_t cycle,
                                                      BlockedClusterInfo& blocker,
                                                      uint64_t* predecessor_cache,
-                                                     uint64_t refresh_mask) const;
+                                                     uint64_t refresh_mask,
+                                                     bool stop_on_first_blocker) const;
     [[gnu::noinline]] bool clusterCanAdvanceScalarSlow_(size_t cluster, uint64_t cycle,
                                                         BlockedClusterInfo& blocker,
                                                         uint64_t* predecessor_cache) const;
@@ -571,8 +572,12 @@ private:
     bool maybeRequestEpochFreeMigration_(uint64_t cycle);
     void serviceEpochFreeMigration_(size_t worker_thread);
     void clearDynamicMigrationRequest_();
+    bool dynamicMigrationBlocksCluster_(size_t cluster, uint64_t cycle) const;
     void recordDynamicWaitSample_(size_t thread_idx, const BlockedClusterInfo& blocker,
                                   uint64_t wait_ns);
+    void refineDynamicWaitBlocker_(size_t thread_idx, const std::vector<size_t>& owned_clusters,
+                                   bool stable_sweep, uint64_t end_cycle,
+                                   uint64_t* predecessor_cache, BlockedClusterInfo& blocker) const;
     void resetDynamicSchedulerMarkers_();
     void recordDynamicSchedulerMarker_(std::string name, uint64_t cycle, std::string detail);
     void flushDynamicSchedulerMarkers_();
