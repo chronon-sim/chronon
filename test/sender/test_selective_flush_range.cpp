@@ -194,6 +194,72 @@ void verifyPredicateRetiresWhenDrainEmptiesQueue() {
     }
 }
 
+void verifyPredicateRetiresWhenQueueIsAlreadyEmpty() {
+    for (const PortPolicy policy : {PortPolicy::LegacyFastPath, PortPolicy::StageSelective}) {
+        ManualUnit producer("producer");
+        ManualUnit consumer("consumer");
+        OutPort<TaggedMessage> out{&producer, "out", 4};
+        InPort<TaggedMessage> in{&consumer, "in", 8, policy};
+        out.connect(&in, 2);
+
+        consumer.setCycle(5);
+        in.flush<&TaggedMessage::keyOf>(FlushRange::youngerThan(uint64_t{50}));
+        require(InPortSelectiveFlushTestAccess::activePredicateCount(in) == 1,
+                "flush predicate was not installed on an empty generic queue");
+
+        // The maximum incoming delay is two cycles. At cycle 6 the empty
+        // arrival frontier is 7, beyond the last arrival affected by the
+        // cycle-5 predicate, so a failed receive can retire it safely.
+        consumer.setCycle(6);
+        require(!in.tryReceive(6), "empty generic queue produced a message");
+        require(InPortSelectiveFlushTestAccess::activePredicateCount(in) == 0,
+                "predicate survived a stable empty generic queue frontier");
+    }
+
+    {
+        ManualUnit producer("producer");
+        ManualUnit consumer("consumer");
+        OutPort<TaggedMessage> out{&producer, "out", 4};
+        InPort<TaggedMessage> in{&consumer, "in", 8};
+        auto* connection = out.connect(&in, 2);
+        connection->optimizeForSPSC();
+        require(in.usesDirectSPSC(), "direct SPSC backend was not selected");
+
+        consumer.setCycle(5);
+        in.flush<&TaggedMessage::keyOf>(FlushRange::youngerThan(uint64_t{50}));
+        require(InPortSelectiveFlushTestAccess::activePredicateCount(in) == 1,
+                "flush predicate was not installed on an empty direct SPSC queue");
+
+        consumer.setCycle(6);
+        require(!in.tryReceive(6), "empty direct SPSC queue produced a message");
+        require(InPortSelectiveFlushTestAccess::activePredicateCount(in) == 0,
+                "predicate survived a stable empty direct SPSC frontier");
+    }
+
+    {
+        ManualUnit producer("producer");
+        ManualUnit first_consumer("first_consumer");
+        ManualUnit second_consumer("second_consumer");
+        OutPort<TaggedMessage> out{&producer, "out", 4};
+        InPort<TaggedMessage> first_in{&first_consumer, "first_in"};
+        InPort<TaggedMessage> second_in{&second_consumer, "second_in"};
+        out.connect(&first_in, 1);
+        out.connect(&second_in, 1);
+        require(out.enableTransparentBroadcast(4), "shared-broadcast backend could not be enabled");
+        require(first_in.usesTransparentBroadcast(), "shared-broadcast backend was not selected");
+
+        first_consumer.setCycle(5);
+        first_in.flush<&TaggedMessage::keyOf>(FlushRange::youngerThan(uint64_t{50}));
+        require(InPortSelectiveFlushTestAccess::activePredicateCount(first_in) == 1,
+                "flush predicate was not installed on an empty shared-broadcast queue");
+
+        first_consumer.setCycle(6);
+        require(!first_in.tryReceive(6), "empty shared-broadcast queue produced a message");
+        require(InPortSelectiveFlushTestAccess::activePredicateCount(first_in) == 0,
+                "predicate survived a stable empty shared-broadcast frontier");
+    }
+}
+
 void verifyHeterogeneousDelayMpscRetirement() {
     ManualUnit slow("slow");
     ManualUnit fast("fast");
@@ -504,6 +570,7 @@ int main() {
         verifyFullWidthBoundariesAndPolicyParity();
         verifyOverlapIsMonotonicAndOrderIndependent();
         verifyPredicateRetiresWhenDrainEmptiesQueue();
+        verifyPredicateRetiresWhenQueueIsAlreadyEmpty();
         verifyHeterogeneousDelayMpscRetirement();
         verifyEpochFreeFlushMatrix();
         std::cout << "Selective FlushRange tests passed.\n";

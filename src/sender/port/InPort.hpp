@@ -534,6 +534,7 @@ public:
                     retireSelectiveFlushesAtFront_(*shared_broadcast_queue_raw_, current_cycle);
                     if (!rejected) return std::move(message->data);
                 }
+                retireSelectiveFlushesAtFront_(*shared_broadcast_queue_raw_, current_cycle);
                 return std::nullopt;
             }
         }
@@ -756,7 +757,6 @@ private:
         uint64_t current_cycle, Filter& filter) {
         return tryReceiveFromConsumableQueue_(*shared_broadcast_queue_raw_, current_cycle, filter);
     }
-
     template <typename Queue, typename Filter>
     std::optional<T> tryReceiveFromConsumableQueue_(Queue& queue, uint64_t current_cycle,
                                                     Filter& filter) {
@@ -770,7 +770,10 @@ private:
                 result.emplace(std::move(msg.data));
             };
             const bool consumed = queue.consumeReady(current_cycle, visit);
-            if (!consumed) return std::nullopt;
+            if (!consumed) {
+                retireSelectiveFlushesAtFront_(queue, current_cycle);
+                return std::nullopt;
+            }
             retireSelectiveFlushesAtFront_(queue, current_cycle);
             if (result) return result;
         }
@@ -807,7 +810,10 @@ private:
     std::optional<T> tryReceiveFromQueue_(Queue& queue, uint64_t current_cycle, Filter& filter) {
         while (true) {
             auto msg = queue.tryPop(current_cycle);
-            if (!msg.has_value()) return std::nullopt;
+            if (!msg.has_value()) {
+                retireSelectiveFlushesAtFront_(queue, current_cycle);
+                return std::nullopt;
+            }
             const bool rejected = detail::isCanceled(*msg) || isReceiverCanceled_(*msg) ||
                                   !std::invoke(filter, std::as_const(msg->data));
             retireSelectiveFlushesAtFront_(queue, current_cycle);
