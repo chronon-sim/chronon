@@ -32,13 +32,15 @@ namespace chronon::sender {
 void TickSimulation::initialize() {
     if (initialized_) return;
 
+    if (clock_mode_) prepareClockTopology_();
+
     buildDependencyGraph();
     validateNoZeroDelayCycles_();
 
     // Topologically reorder unit_ptrs_ so zero-delay producers tick before
     // same-cycle consumers in the per-cycle loop. Full-graph SCC condensation
     // handles registered feedback; creation order is a tie-break only.
-    reorderUnitsTopologically_();
+    if (!clock_mode_) reorderUnitsTopologically_();
     buildDependencyGraph();
 
     // Remap pre-computed costs to the new index order.
@@ -140,6 +142,14 @@ void TickSimulation::initialize() {
     timeline_trace_.start(thread_units_, unit_ptrs_);
     initTimelineTraceScratch_();
 
+    if (clock_mode_) {
+        try {
+            initializeClockRuntime_();
+        } catch (...) {
+            clock_failed_ = true;
+            throw;
+        }
+    }
     initialized_ = true;
 }
 
@@ -148,6 +158,10 @@ void TickSimulation::initialize() {
 // ---------------------------------------------------------------------------
 
 uint64_t TickSimulation::run(uint64_t num_cycles) {
+    if (clock_mode_) {
+        throw std::logic_error(
+            "multiclock run limits require runDomainCycles, runUntilTime or runClockEvents");
+    }
     if (!initialized_) {
         initialize();
     }
@@ -164,6 +178,10 @@ uint64_t TickSimulation::run(uint64_t num_cycles) {
 }
 
 uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
+    if (clock_mode_) {
+        throw std::logic_error(
+            "multiclock termination: use runClockEvents or runUntilTime (both honor termination)");
+    }
     if (!initialized_) {
         initialize();
     }
@@ -223,6 +241,14 @@ void TickSimulation::selectExecutionMode_() {
     execution_mode_ = ExecutionMode::Sequential;
     parallel_beneficial_ = false;
     parallel_fallback_reason_.clear();
+
+    if (clock_mode_) {
+        parallel_fallback_reason_ =
+            "static multi-clock/CDC graph uses physical-time serial scheduling; epoch-free CDC "
+            "unsupported";
+        optimizeAllQueuesForSingleThread();
+        return;
+    }
 
     if (!(config_.enable_parallel && units_.size() > 1)) {
         optimizeAllQueuesForSingleThread();

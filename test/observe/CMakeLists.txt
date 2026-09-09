@@ -2,6 +2,11 @@
 # Author: Haomeng Wang <chang_yun@outlook.com>
 # SPDX-License-Identifier: MPL-2.0
 
+add_executable(test_clock_trace test_clock_trace.cpp)
+target_link_libraries(test_clock_trace PRIVATE chronon::observe)
+target_compile_options(test_clock_trace PRIVATE -UNDEBUG)
+add_test(NAME clock_trace_test COMMAND test_clock_trace)
+
 # Observe module tests
 #
 # Tests for high-performance observability system

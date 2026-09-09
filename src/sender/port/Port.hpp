@@ -300,6 +300,7 @@ private:
 
 template <typename T>
 class Connection;
+class ConnectionBase;
 class Unit;
 
 /// Defined in Unit.hpp; declared here so port constructors can register
@@ -375,6 +376,9 @@ public:
      * than a virtual call on every PortBase each cycle.
      */
     virtual void prepareConsumerCycle(uint64_t /*current_cycle*/) {}
+
+    /// Initialization-time discovery also covers direct OutPort::connect calls.
+    virtual void appendOutgoingConnections(std::vector<ConnectionBase*>&) const {}
 
 protected:
     PortBase(Unit* owner, std::string name) : owner_(owner), name_(std::move(name)) {

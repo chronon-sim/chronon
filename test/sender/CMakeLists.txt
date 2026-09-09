@@ -13,6 +13,23 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 # Test executables (prefixed with sender_ to avoid conflicts)
+foreach(clock_test clock_time async_fifo_circuit multiclock)
+    add_executable(sender_test_${clock_test} test_${clock_test}.cpp)
+    target_link_libraries(sender_test_${clock_test} PRIVATE chronon::core)
+    add_test(NAME sender_${clock_test} COMMAND sender_test_${clock_test})
+endforeach()
+
+set(CHRONON_TRACE_PROCESSOR "" CACHE FILEPATH "Optional real Perfetto Trace Processor for multiclock acceptance")
+if(CHRONON_TRACE_PROCESSOR)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME multiclock_trace_processor
+        COMMAND ${Python3_EXECUTABLE} ${chronon_SOURCE_DIR}/scripts/validate_clock_traces.py
+            --trace-processor ${CHRONON_TRACE_PROCESSOR}
+            --multiclock-binary $<TARGET_FILE:sender_test_multiclock>
+            --recorder-binary $<TARGET_FILE:test_clock_trace>
+            --check-prefix)
+    set_tests_properties(multiclock_trace_processor PROPERTIES TIMEOUT 180)
+endif()
 add_executable(sender_test_message_queue test_message_queue.cpp)
 add_executable(sender_test_lockfree_message_queue test_lockfree_message_queue.cpp)
 add_executable(sender_test_dependency_graph test_dependency_graph.cpp)

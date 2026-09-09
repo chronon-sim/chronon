@@ -70,6 +70,16 @@ using SimulationBuilder = sender::config::SenderSimulationBuilder;
 using FactoryRegistry = sender::factory::SenderFactoryRegistry;
 
 // --- Port ---
+using observe::ClockEventKind;
+using observe::ClockEventPhase;
+using observe::ClockTraceRecorder;
+using sender::AsyncFifo;
+using sender::AsyncFifoCircuit;
+using sender::AsyncFifoConfig;
+using sender::AsyncReadPort;
+using sender::AsyncWritePort;
+using sender::CdcPacket;
+using sender::CdcPayloadTraits;
 using sender::Connection;
 using sender::DelayOneBroadcastFabric;
 using sender::FlushRange;

@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include "../../observe/ClockTraceRecorder.hpp"
+#include "../../time/ClockDomain.hpp"
 #include "../../tree/TreeNode.hpp"
 #include "../port/Port.hpp"
 #include "Fwd.hpp"
@@ -107,6 +109,25 @@ public:
     /// TickSimulation::unit_progress_ atomics, not this counter.
     uint64_t localCycle() const noexcept { return local_cycle_; }
 
+    /// Edge number in this Unit's hardware domain, never a cross-domain timestamp.
+    ClockDomainId clockDomainId() const noexcept { return clock_ ? clock_->id() : 0; }
+    const ClockDomain& clockDomain() const {
+        if (!clock_) throw std::logic_error("Unit has no simulation clock binding");
+        return *clock_;
+    }
+    /// During tick(): exact physical time of the current local edge.
+    /// Outside tick(): time of this Unit's NEXT edge.
+    SimTime physicalTime() const { return clockDomain().edge(localCycle()); }
+    bool isClockEdgeExecuting() const noexcept { return clock_edge_executing_; }
+    bool clockTopologyFrozen() const noexcept { return clock_topology_frozen_; }
+    observe::ClockTraceStream* clockTraceStream() const noexcept { return clock_trace_stream_; }
+    void clockEvent(observe::ClockEventKind kind, uint64_t transaction = 0, uint64_t value = 0) {
+        if (clock_trace_stream_) {
+            if (!clock_edge_executing_) throw std::logic_error("clockEvent requires tick()");
+            clock_trace_stream_->record(localCycle(), kind, transaction, value);
+        }
+    }
+
     static constexpr uint64_t NEVER_ACTIVE = std::numeric_limits<uint64_t>::max();
 
     /// Opt in to scheduler-controlled activity before the first tick.
@@ -122,7 +143,7 @@ public:
     }
 
     /// Request that the unit's tick body next runs no earlier than @p cycle.
-    /// This is expressed in the global simulation cycle domain.
+    /// This is expressed in this Unit's local hardware clock edges.
     void sleepUntil(uint64_t cycle) noexcept {
         enableActivityScheduling_();
         wake_tracking_enabled_.store(true, std::memory_order_release);
@@ -403,6 +424,10 @@ private:
     }
 
     std::string name_;
+    const ClockDomain* clock_ = nullptr;
+    observe::ClockTraceStream* clock_trace_stream_ = nullptr;
+    bool clock_edge_executing_ = false;
+    bool clock_topology_frozen_ = false;
     char crash_name_[64] = {};    ///< fixed buffer for async-signal-safe crash reporting
     uint8_t crash_name_len_ = 0;  ///< precomputed length for memcpy
     UnitState state_;
@@ -494,6 +519,17 @@ inline void wakeUnitAt(Unit* unit, uint64_t cycle) {
 
 inline bool unitAcceptsPortWakeups(const Unit* unit) noexcept {
     return unit && unit->acceptsPortWakeups();
+}
+
+inline void validateOrdinaryConnection(const Unit* source, const Unit* destination) {
+    if ((source && source->clockTopologyFrozen()) ||
+        (destination && destination->clockTopologyFrozen())) {
+        throw std::logic_error("runtime connection changes in clock-domain graphs are unsupported");
+    }
+    if (source && destination && source->clockDomainId() != destination->clockDomainId()) {
+        throw std::invalid_argument(
+            "ordinary ports cannot cross hardware clock domains; declare an AsyncFifo");
+    }
 }
 
 inline uint64_t activitySchedulingGeneration(const Unit* unit) noexcept {

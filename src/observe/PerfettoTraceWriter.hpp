@@ -14,6 +14,8 @@
 #include <span>
 #include <string_view>
 
+#include "../time/ClockDomain.hpp"
+
 namespace chronon::observe {
 
 /**
@@ -96,6 +98,15 @@ public:
     void flush();
 
     void close();
+
+    /// Configure before events. Each stream gets its own sequence and local
+    /// incremental/absolute clocks (64/65), mapped to TRACE_FILE simulation ns.
+    /// Hardware frequencies are converted exactly before floor-to-ns encoding.
+    /// Native clock streams cannot share a file with legacy or host-time events.
+    uint32_t addClockStream(const ClockDomain& domain);
+    void clockInstant(uint32_t stream, uint64_t track_uuid, std::string_view category,
+                      std::string_view name, uint64_t local_cycle, uint64_t flow_id,
+                      std::span<const Annotation> annotations = {});
 
     /// @return Track UUID for a process-scoped group track (ProcessDescriptor).
     uint64_t addProcessTrack(std::string_view process_name, int32_t pid);

@@ -1,0 +1,325 @@
+// Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
+// SPDX-License-Identifier: MPL-2.0
+#include "ClockTraceRecorder.hpp"
+
+#include <fmt/format.h>
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <chrono>
+#include <exception>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <thread>
+
+namespace chronon::observe {
+
+ClockTraceStream::ClockTraceStream(size_t capacity, bool lossless, std::atomic<bool>* failed)
+    : ring_(capacity), lossless_(lossless), failed_(failed) {}
+
+void ClockTraceStream::record(uint64_t cycle, ClockEventKind kind, uint64_t transaction,
+                              uint64_t value, uint32_t fifo, ClockEventPhase phase) {
+    if (ordinal_ == UINT64_MAX) throw std::overflow_error("clock trace stream ordinal overflow");
+    const auto ordinal = ordinal_++;
+    const auto head = head_.load(std::memory_order_relaxed);
+    auto tail = tail_.load(std::memory_order_acquire);
+    while (head - tail == ring_.size()) {
+        if (failed_->load(std::memory_order_acquire))
+            throw std::runtime_error("clock trace backend failed or closed");
+        if (!lossless_) {
+            ++dropped_;
+            return;
+        }
+        // Host waiting never changes simulated time or acceptance decisions.
+        std::this_thread::yield();
+        tail = tail_.load(std::memory_order_acquire);
+    }
+    if (failed_->load(std::memory_order_acquire))
+        throw std::runtime_error("clock trace backend failed or closed");
+    ring_[head & (ring_.size() - 1)] = {cycle, transaction, value, ordinal, fifo, kind, phase};
+    peak_ = std::max(peak_, head - tail + 1);
+    head_.store(head + 1, std::memory_order_release);
+}
+
+namespace {
+void validateText(std::string_view value) {
+    if (value.empty() || value.size() > 1024)
+        throw std::invalid_argument("clock metadata string length outside [1,1024]");
+    for (unsigned char c : value) {
+        if (c < 32 || c >= 127)
+            throw std::invalid_argument("clock metadata requires printable ASCII");
+    }
+}
+}  // namespace
+
+struct ClockTraceRecorder::Impl {
+    explicit Impl(Config config_) : config(std::move(config_)) {}
+    Config config;
+    struct Stream {
+        ClockDomain domain;
+        uint32_t unit_id;
+        std::string unit_name;
+        std::unique_ptr<ClockTraceStream> queue;
+        uint32_t sequence = 0;
+        uint64_t track = 0;
+    };
+    struct TextSink {
+        std::ofstream file;
+        std::string buffer;
+    };
+    std::vector<Stream> streams;
+    std::map<ClockEventKind, std::string> names = {
+        {ClockEventKind::Write, "fifo.write"},     {ClockEventKind::Visible, "fifo.visible"},
+        {ClockEventKind::Read, "fifo.read"},       {ClockEventKind::Output, "fifo.output"},
+        {ClockEventKind::Consume, "fifo.consume"}, {ClockEventKind::Full, "fifo.full"},
+        {ClockEventKind::Empty, "fifo.empty"},     {ClockEventKind::User, "user"}};
+    std::map<ClockDomainId, TextSink> text;
+    PerfettoTraceWriter writer;
+    std::thread worker;
+    std::atomic<bool> stopping{false}, failed{false};
+    std::exception_ptr error;
+    bool started = false, closed = false;
+    Stats stats;
+
+    void writeManifest() {
+        std::ofstream file(config.output_dir / "clock-manifest.json");
+        file.exceptions(std::ios::badbit | std::ios::failbit);
+        file << "{\n  \"version\":1,\n  \"run_id\":" << std::quoted(config.run_id)
+             << ",\n  \"time_unit\":\"rational seconds\",\n  \"perfetto_unit\":\"ns (floor)\","
+             << "\n  \"lossless\":" << (config.lossless ? "true" : "false")
+             << ",\n  \"stream_capacity\":" << config.stream_capacity << ",\n  \"domains\":[";
+        std::map<ClockDomainId, const ClockDomain*> clocks;
+        for (const auto& stream : streams) clocks.emplace(stream.domain.id(), &stream.domain);
+        bool first = true;
+        for (const auto& [id, clock] : clocks) {
+            if (!first) file << ',';
+            first = false;
+            file << "\n    {\"id\":" << id << ",\"name\":" << std::quoted(clock->name())
+                 << ",\"period_num\":" << clock->period().numerator()
+                 << ",\"period_den\":" << clock->period().denominator()
+                 << ",\"phase_num\":" << clock->phase().numerator()
+                 << ",\"phase_den\":" << clock->phase().denominator() << '}';
+        }
+        file << "\n  ],\n  \"streams\":[";
+        first = true;
+        for (const auto& stream : streams) {
+            if (!first) file << ',';
+            first = false;
+            file << "\n    {\"unit_id\":" << stream.unit_id
+                 << ",\"unit\":" << std::quoted(stream.unit_name)
+                 << ",\"domain_id\":" << stream.domain.id() << ",\"sequence\":" << stream.sequence
+                 << ",\"track\":" << stream.track << '}';
+        }
+        file << "\n  ],\n  \"events\":{";
+        first = true;
+        for (const auto& [kind, name] : names) {
+            if (!first) file << ',';
+            first = false;
+            file << std::quoted(std::to_string(static_cast<uint16_t>(kind))) << ':'
+                 << std::quoted(name);
+        }
+        file << "}\n}\n";
+    }
+
+    void encode(Stream& stream, const ClockRecord& record) {
+        const auto& name = names.at(record.kind);
+        if (config.text) {
+            auto& sink = text.at(stream.domain.id());
+            fmt::format_to(std::back_inserter(sink.buffer), "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                           record.local_cycle, stream.unit_id, name,
+                           static_cast<unsigned>(record.phase), record.transaction_id,
+                           record.fifo_id, record.value, record.ordinal);
+            if (sink.buffer.size() >= 65536) {
+                sink.file.write(sink.buffer.data(),
+                                static_cast<std::streamsize>(sink.buffer.size()));
+                sink.buffer.clear();
+            }
+        }
+        if (config.perfetto) {
+            using A = PerfettoTraceWriter::Annotation;
+            const std::array<A, 6> annotations = {
+                {{"unit_id", A::Kind::Uint, stream.unit_id},
+                 {"fifo_id", A::Kind::Uint, record.fifo_id},
+                 {"transaction_id", A::Kind::Uint, record.transaction_id},
+                 {"phase", A::Kind::Uint, static_cast<uint64_t>(record.phase)},
+                 {"value", A::Kind::Uint, record.value},
+                 {"ordinal", A::Kind::Uint, record.ordinal}}};
+            writer.clockInstant(stream.sequence, stream.track, "clock", name, record.local_cycle,
+                                record.transaction_id, annotations);
+        }
+        ++stats.events;
+    }
+
+    void run() noexcept {
+        try {
+            for (;;) {
+                bool any = false;
+                for (size_t i = 0; i < streams.size(); ++i) {
+                    auto& stream = streams[config.reverse_drain ? streams.size() - 1 - i : i];
+                    auto& queue = *stream.queue;
+                    auto tail = queue.tail_.load(std::memory_order_relaxed);
+                    const auto head = queue.head_.load(std::memory_order_acquire);
+                    const auto end = tail + std::min<uint64_t>(head - tail, config.drain_batch);
+                    for (; tail != end; ++tail) {
+                        encode(stream, queue.ring_[tail & (queue.ring_.size() - 1)]);
+                        any = true;
+                    }
+                    queue.tail_.store(tail, std::memory_order_release);
+                }
+                if (!any) {
+                    if (stopping.load(std::memory_order_acquire)) break;
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
+            }
+            for (auto& [id, sink] : text) {
+                (void)id;
+                sink.file.write(sink.buffer.data(),
+                                static_cast<std::streamsize>(sink.buffer.size()));
+                sink.buffer.clear();
+                sink.file.close();
+            }
+            writer.close();
+        } catch (...) {
+            error = std::current_exception();
+            failed.store(true, std::memory_order_release);
+        }
+    }
+};
+
+ClockTraceRecorder::ClockTraceRecorder(Config config)
+    : impl_(std::make_unique<Impl>(std::move(config))) {
+    const auto& c = impl_->config;
+    validateText(c.run_id);
+    if (c.stream_capacity < 2 || c.stream_capacity > (1u << 20) ||
+        !std::has_single_bit(c.stream_capacity) || c.drain_batch == 0 ||
+        c.drain_batch > c.stream_capacity) {
+        throw std::invalid_argument(
+            "clock trace requires power-of-two capacity [2,2^20] and batch [1,capacity]");
+    }
+}
+ClockTraceRecorder::~ClockTraceRecorder() {
+    try {
+        close();
+    } catch (const std::exception& e) {
+        std::cerr << "[clock trace] " << e.what() << '\n';
+    }
+}
+bool ClockTraceRecorder::enabled() const noexcept {
+    return impl_->config.text || impl_->config.perfetto;
+}
+
+void ClockTraceRecorder::defineEvent(ClockEventKind kind, std::string name) {
+    if (impl_->started) throw std::logic_error("event metadata is immutable after start");
+    validateText(name);
+    if (name.size() > 128 || impl_->names.size() >= 1024 || impl_->names.contains(kind)) {
+        throw std::invalid_argument("duplicate/oversized clock event dictionary");
+    }
+    impl_->names.emplace(kind, std::move(name));
+}
+
+ClockTraceStream* ClockTraceRecorder::addStream(const ClockDomain& domain, uint32_t unit_id,
+                                                std::string unit_name) {
+    if (impl_->started) throw std::logic_error("clock streams must be declared before start");
+    if (!enabled()) return nullptr;
+    validateText(unit_name);
+    for (const auto& stream : impl_->streams) {
+        if (stream.unit_id == unit_id || stream.unit_name == unit_name) {
+            throw std::invalid_argument("clock streams require unique unit IDs and names");
+        }
+        if ((stream.domain.id() == domain.id() &&
+             (stream.domain.name() != domain.name() || stream.domain.period() != domain.period() ||
+              stream.domain.phase() != domain.phase())) ||
+            (stream.domain.name() == domain.name() && stream.domain.id() != domain.id())) {
+            throw std::invalid_argument("inconsistent clock metadata");
+        }
+    }
+    const auto bytes = impl_->config.stream_capacity * sizeof(ClockRecord);
+    if (impl_->stats.allocated_buffer_bytes + bytes > 256 * 1024 * 1024) {
+        throw std::invalid_argument("clock trace ingress budget exceeds 256 MiB");
+    }
+    auto queue = std::unique_ptr<ClockTraceStream>(new ClockTraceStream(
+        impl_->config.stream_capacity, impl_->config.lossless, &impl_->failed));
+    auto* result = queue.get();
+    impl_->streams.push_back({domain, unit_id, std::move(unit_name), std::move(queue)});
+    impl_->stats.allocated_buffer_bytes += bytes;
+    return result;
+}
+
+void ClockTraceRecorder::start() {
+    if (impl_->started) throw std::logic_error("clock recorder cannot be restarted");
+    if (!enabled()) {
+        impl_->started = true;
+        return;
+    }
+    const auto& config = impl_->config;
+    if (std::filesystem::exists(config.output_dir) &&
+        !std::filesystem::is_empty(config.output_dir)) {
+        throw std::invalid_argument("clock trace output directory must be new or empty");
+    }
+    std::filesystem::create_directories(config.output_dir);
+    if (config.perfetto) {
+        if (!impl_->writer.open(config.output_dir / "timeline.pftrace", config.perfetto_options)) {
+            throw std::runtime_error("cannot open clock Perfetto trace");
+        }
+        for (auto& stream : impl_->streams)
+            stream.sequence = impl_->writer.addClockStream(stream.domain);
+    }
+    std::map<ClockDomainId, uint64_t> domains;
+    for (auto& stream : impl_->streams) {
+        if (config.perfetto) {
+            auto [entry, inserted] = domains.try_emplace(stream.domain.id(), 0);
+            if (inserted) entry->second = impl_->writer.addTrack("domain-" + stream.domain.name());
+            stream.track = impl_->writer.addTrack(stream.unit_name, entry->second);
+        }
+        if (config.text && !impl_->text.contains(stream.domain.id())) {
+            auto& sink = impl_->text[stream.domain.id()];
+            sink.file.exceptions(std::ios::badbit | std::ios::failbit);
+            sink.file.open(config.output_dir / ("text-domain-" + stream.domain.name() + ".log"));
+            sink.buffer.reserve(66048);
+            sink.file
+                << "# run=" << config.run_id << " domain=" << stream.domain.id()
+                << " clock-manifest.json; per-stream order only\n"
+                << "# "
+                   "local_cycle\tunit_id\tevent\tphase\ttransaction_id\tfifo_id\tvalue\tordinal\n";
+        }
+    }
+    impl_->writeManifest();
+    impl_->started = true;
+    impl_->worker = std::thread([this] { impl_->run(); });
+}
+
+void ClockTraceRecorder::close() {
+    if (!impl_->started || impl_->closed) return;
+    impl_->stopping.store(true, std::memory_order_release);
+    if (impl_->worker.joinable()) impl_->worker.join();
+    impl_->failed.store(true, std::memory_order_release);
+    impl_->closed = true;
+    for (const auto& stream : impl_->streams) {
+        impl_->stats.dropped += stream.queue->dropped_;
+        impl_->stats.peak_buffer_bytes += stream.queue->peak_ * sizeof(ClockRecord);
+    }
+    if (impl_->error) std::rethrow_exception(impl_->error);
+    if (enabled()) {
+        std::ofstream report(impl_->config.output_dir / "clock-stats.json");
+        report.exceptions(std::ios::badbit | std::ios::failbit);
+        report << "{\"events\":" << impl_->stats.events
+               << ",\"dropped_events\":" << impl_->stats.dropped
+               << ",\"allocated_ingress_bytes\":" << impl_->stats.allocated_buffer_bytes
+               << ",\"peak_ingress_bytes_upper_bound\":" << impl_->stats.peak_buffer_bytes << "}\n";
+        report.close();
+        for (const auto& entry : std::filesystem::directory_iterator(impl_->config.output_dir)) {
+            if (entry.is_regular_file()) impl_->stats.file_bytes += entry.file_size();
+        }
+    }
+}
+
+ClockTraceRecorder::Stats ClockTraceRecorder::stats() const {
+    if (!impl_->closed)
+        throw std::logic_error("clock trace stats require close after producers stop");
+    return impl_->stats;
+}
+
+}  // namespace chronon::observe

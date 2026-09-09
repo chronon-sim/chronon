@@ -13,6 +13,7 @@
 #pragma once
 
 #include "../../observe/ObservationManager.hpp"
+#include "../port/AsyncFifo.hpp"
 #include "../port/Connection.hpp"
 #include "../port/Port.hpp"
 #include "../schedule/DependencyGraph.hpp"
@@ -37,6 +38,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <deque>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -75,6 +78,7 @@ public:
 
     explicit TickSimulation(const TickSimulationConfig& config = {})
         : config_(config),
+          default_clock_(ClockDomain::fromHz(0, "default", config.tick_frequency_hz)),
           current_cycle_(0),
           initialized_(false),
           pool_(static_cast<uint32_t>(normalizeThreadCount(config.num_threads))) {
@@ -113,8 +117,11 @@ public:
         static_assert(std::is_base_of_v<TickableUnit, UnitT>,
                       "UnitT must derive from TickableUnit");
 
+        if (initialized_) throw std::logic_error("cannot create units after initialization");
         auto unit = std::make_unique<UnitT>(std::forward<Args>(args)...);
         auto* ptr = unit.get();
+
+        ptr->clock_ = &default_clock_;
 
         ptr->setId(static_cast<uint32_t>(units_.size()));
         ptr->bindActivitySchedulingState_(&any_activity_scheduling_);
@@ -127,6 +134,12 @@ public:
 
     template <typename T>
     Connection<T>* connect(OutPort<T>& from, InPort<T>& to, uint32_t delay = 1) {
+        if (initialized_) throw std::logic_error("cannot connect after initialization");
+        if (from.owner() && to.owner() &&
+            from.owner()->clockDomainId() != to.owner()->clockDomainId()) {
+            throw std::invalid_argument(
+                "ordinary connections cannot cross clock domains; use connectAsyncFifo");
+        }
         auto* conn = from.connect(&to, delay);
         conn->setConnId(static_cast<uint32_t>(connections_.size()));
         connections_.push_back(conn);
@@ -136,6 +149,8 @@ public:
     /// For YAML-driven builders that create connections via type-erased port
     /// handles rather than the templated connect() above.
     void registerConnection(ConnectionBase* conn) {
+        if (clock_mode_ && initialized_)
+            throw std::logic_error("runtime connection registration is unsupported");
         if (conn) {
             conn->setConnId(static_cast<uint32_t>(connections_.size()));
             connections_.push_back(conn);
@@ -143,6 +158,49 @@ public:
     }
 
     void initialize();
+
+    /// Static configuration only. ID 0 is the legacy default clock; UINT32_MAX is reserved.
+    const ClockDomain& addClockDomain(ClockDomain domain);
+    const ClockDomain& clockDomain(ClockDomainId id) const;
+    void assignClockDomain(Unit& unit, ClockDomainId id);
+    template <typename UnitT, typename... Args>
+    UnitT* createUnitInDomain(ClockDomainId id, Args&&... args) {
+        (void)clockDomain(id);
+        auto* unit = createUnit<UnitT>(std::forward<Args>(args)...);
+        assignClockDomain(*unit, id);
+        return unit;
+    }
+    template <typename T>
+    AsyncFifo<T>* connectAsyncFifo(uint32_t id, AsyncWritePort<T>& write, AsyncReadPort<T>& read,
+                                   AsyncFifoConfig config = {}) {
+        if (initialized_) throw std::logic_error("cannot add CDC after initialization");
+        validateClockOwner_(write.owner());
+        validateClockOwner_(read.owner());
+        for (const auto& fifo : cdc_) {
+            if (fifo->id() == id) throw std::invalid_argument("duplicate CDC component ID");
+        }
+        auto fifo = std::make_unique<AsyncFifo<T>>(id, write, read, config);
+        auto* result = fifo.get();
+        cdc_.push_back(std::move(fifo));
+        clock_mode_ = true;
+        return result;
+    }
+    /// Multiclock limits are explicit: event batches, absolute exclusive time,
+    /// or a number of additional edges of one specified hardware domain.
+    uint64_t runClockEvents(uint64_t max_event_batches);
+    uint64_t runUntilTime(SimTime exclusive_limit);
+    uint64_t runDomainCycles(ClockDomainId id, uint64_t additional_edges);
+    uint64_t domainCycleCount(ClockDomainId id) const;
+    bool usesClockDomains() const noexcept { return clock_mode_; }
+    SimTime lastCommittedTime() const noexcept { return clock_time_; }
+    uint64_t schedulerSteps() const noexcept { return current_cycle_; }
+    const std::string& parallelFallbackReason() const noexcept { return parallel_fallback_reason_; }
+    bool cdcDrained() const noexcept;
+    /// Call after stopping producers; includes RAM, output registers and pointer synchronization.
+    uint64_t drainCdc(uint64_t max_event_batches);
+    void configureClockTrace(observe::ClockTraceRecorder::Config config);
+    observe::ClockTraceRecorder* clockTraceRecorder() noexcept { return clock_trace_.get(); }
+    void closeClockTrace();
 
     /// Resolve one producer-cluster completed-cycle atomic for each direct
     /// MPSC lane. Complete coverage is required by epoch-free lookahead.
@@ -163,7 +221,9 @@ public:
         while (executed < max_cycles && !should_stop()) {
             const uint64_t polling_interval = std::max<uint64_t>(1, config_.epoch_size);
             uint64_t batch = std::min(polling_interval, max_cycles - executed);
-            executed += run(batch);
+            const auto step = clock_mode_ ? runClockEvents(batch) : run(batch);
+            executed += step;
+            if (clock_mode_ && (!step || wasTerminationRequested())) break;
         }
         return executed;
     }
@@ -201,8 +261,9 @@ public:
     /// Externally-driven termination, e.g. signal handlers or API calls.
     void requestTermination(TerminationReason reason, int32_t exit_code = 0,
                             std::string_view message = "") {
-        termination_ctrl_.requestTermination(reason, exit_code, current_cycle_, "external",
-                                             message);
+        termination_ctrl_.requestTermination(
+            reason, exit_code, current_cycle_, "external", message, clock_mode_ ? UINT32_MAX : 0,
+            clock_mode_ ? std::optional<SimTime>(clock_time_) : std::nullopt);
     }
 
     /// Reconstructs the stop_source (inplace_stop_source is non-resettable).
@@ -303,6 +364,11 @@ public:
     void forceStableConnectionQueues() noexcept { force_stable_connection_queues_ = true; }
 
 private:
+    void validateClockOwner_(const Unit* unit) const;
+    void prepareClockTopology_();
+    void initializeClockRuntime_();
+    bool executeClockBatch_();
+    void requireClockRun_();
     enum class ExecutionMode {
         Sequential,
         EpochFree,
@@ -595,6 +661,20 @@ private:
     [[noreturn]] [[gnu::cold]] [[gnu::noinline]] static void throwTickException();
 
     TickSimulationConfig config_;
+    ClockDomain default_clock_;
+    std::deque<ClockDomain> clock_domains_;
+    bool clock_mode_ = false;
+    bool clock_failed_ = false;
+    SimTime clock_time_;
+    struct ClockRuntime {
+        const ClockDomain* clock = nullptr;
+        std::vector<TickableUnit*> units;
+        uint64_t next_cycle = 0;
+    };
+    std::map<ClockDomainId, ClockRuntime> clock_runtime_;
+    std::unique_ptr<ClockCalendar> clock_calendar_;
+    std::vector<std::unique_ptr<CdcComponent>> cdc_;
+    std::unique_ptr<observe::ClockTraceRecorder> clock_trace_;
     uint64_t current_cycle_;
     bool initialized_;
     ExecutionMode execution_mode_ = ExecutionMode::Sequential;
