@@ -10,6 +10,59 @@
 
 using namespace chronon;
 using namespace chronon::observe;
+
+void writerCollisions(const std::filesystem::path& root) {
+    using A = PerfettoTraceWriter::Annotation;
+    for (unsigned variant = 0; variant < 4; ++variant) {
+        PerfettoTraceWriter writer;
+        PerfettoTraceWriter::Options options;
+        options.compress = variant & 2;
+        options.checkpoint_interval_packets = 2;
+        // 160 records / 2 forces multiple bounded external merge passes.
+        options.clock_sort_run_records = 2;
+        assert(writer.open(root / ("writer-collision-" + std::to_string(variant) + ".pftrace"),
+                           options));
+        const auto clock = ClockDomain::fromHz(9, "four-ghz", 4'000'000'000ULL);
+        const auto source = writer.addClockStream(clock), target = writer.addClockStream(clock);
+        const auto source_track = writer.addTrack("z-source"),
+                   target_track = writer.addTrack("a-target");
+        const auto emit = [&](bool is_source) {
+            for (uint64_t i = 0; i < 80; ++i) {
+                const uint64_t n = variant & 1 ? 79 - i : i;
+                // Even: 0 ns -> 0.75 ns within one displayed ns.
+                // Odd: same exact time across units, Evaluate -> Commit.
+                const uint64_t cycle = n * 4 + (n & 1 ? 1 : is_source ? 0 : 3);
+                const uint64_t phase = (n & 1) && is_source ? 0 : 1;
+                std::string label = is_source ? "owned-source" : "owned-target";
+                const std::array<A, 4> annotations{{{"phase", A::Kind::Uint, phase},
+                                                    {"ordinal", A::Kind::Uint, n},
+                                                    {"transaction_id", A::Kind::Uint, 42 + n},
+                                                    {"label", A::Kind::String, 0, label}}};
+                writer.clockInstant(is_source ? source : target,
+                                    is_source ? source_track : target_track, "clock",
+                                    is_source ? "write" : "visible", cycle, 42 + n, annotations);
+                label.assign("mutated-after-record");
+                if (i % 17 == 0) writer.flush();
+            }
+        };
+        emit(!(variant & 1));
+        emit(variant & 1);
+        assert(writer.eventsWritten() == 160);
+        std::string oversized(65536, 'x');
+        const std::array<A, 1> bad{{{"label", A::Kind::String, 0, oversized}}};
+        bool rejected = false;
+        try {
+            writer.clockInstant(source, source_track, "clock", "oversized", 0, 0, bad);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        assert(rejected && writer.eventsWritten() == 160);
+        writer.close();
+        writer.close();
+        assert(writer.eventsWritten() == 160 && writer.bytesWritten() > 0);
+    }
+}
+
 int main(int argc, char** argv) {
     auto root =
         argc > 1
@@ -26,6 +79,7 @@ int main(int argc, char** argv) {
         config.reverse_drain = variant & 1;
         config.perfetto_options.compress = variant & 2;
         config.perfetto_options.checkpoint_interval_packets = 13;
+        config.perfetto_options.clock_sort_run_records = 1024;
         ClockTraceRecorder recorder(config);
         auto sm = ClockDomain::fromHz(1, "sm", 914'000'000);
         auto lts = ClockDomain::fromHz(2, "lts", 1'326'000'000, 1, SimTime::picoseconds(137));
@@ -38,7 +92,7 @@ int main(int argc, char** argv) {
         constexpr uint64_t count = 20000;
         for (unsigned i = 0; i < 4; ++i)
             workers.emplace_back([&, i] {
-                // At least 750 simulated seconds of cross-stream disorder. No runtime sorting.
+                // At least 750 simulated seconds of cross-stream disorder; sorting is offline.
                 const uint64_t start = (i & 1) ? 1'000'000'000'000ULL : 0;
                 for (uint64_t n = 0; n < count; ++n) {
                     streams[i]->record(start + n, ClockEventKind::User, 0, n);
@@ -64,8 +118,9 @@ int main(int argc, char** argv) {
         assert(std::filesystem::exists(config.output_dir / "text-domain-sm.log"));
         assert(std::filesystem::exists(config.output_dir / "text-domain-lts.log"));
     }
-    // Regressing timestamps within one sequence must use its absolute clock
-    // without corrupting the incremental baseline or checkpoint mappings.
+    writerCollisions(root);
+    // Regressing input is normalized before encoding without changing event times
+    // or checkpoint mappings.
     {
         PerfettoTraceWriter writer;
         PerfettoTraceWriter::Options options;

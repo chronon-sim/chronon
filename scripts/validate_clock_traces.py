@@ -138,7 +138,38 @@ def verify_regressing(processor, path):
     expected = {(n, int(Fraction(999, 1000) + Fraction(n * 1000, 1001))) for n in (1000, 1, 2000, 0, 3000)}
     if actual != expected:
         raise AssertionError(f"absolute fallback/checkpoint mismatch: {actual} vs {expected}")
-    print("PASS regressing sequence timestamps with incremental checkpoints")
+    print("PASS regressing input normalized with incremental checkpoints")
+
+
+def verify_writer_collisions(processor, path):
+    rows = query(processor, path, """
+        SELECT s.id, s.ts, t.name AS unit, s.name,
+               EXTRACT_ARG(s.arg_set_id, 'debug.local_cycle') AS cycle,
+               EXTRACT_ARG(s.arg_set_id, 'debug.transaction_id') AS transaction_id,
+               EXTRACT_ARG(s.arg_set_id, 'debug.phase') AS phase,
+               EXTRACT_ARG(s.arg_set_id, 'debug.label') AS label
+        FROM slice s JOIN track t ON t.id = s.track_id WHERE s.category = 'clock'
+    """)
+    expected = set()
+    for n in range(80):
+        for source in (True, False):
+            cycle = n * 4 + (1 if n & 1 else 0 if source else 3)
+            expected.add((n, 'z-source' if source else 'a-target',
+                          'write' if source else 'visible', cycle, 42 + n,
+                          0 if n & 1 and source else 1,
+                          'owned-source' if source else 'owned-target'))
+    actual = {(int(r['ts']), r['unit'], r['name'], int(r['cycle']),
+               int(r['transaction_id']), int(r['phase']), r['label']) for r in rows}
+    if len(rows) != 160 or actual != expected:
+        raise AssertionError(f'{path}: writer collision event/ownership mismatch')
+    endpoints = {(int(r['transaction_id']), r['unit']): int(r['id']) for r in rows}
+    expected_flows = {(endpoints[n + 42, 'z-source'], endpoints[n + 42, 'a-target']) for n in range(80)}
+    flows = query(processor, path, 'SELECT slice_out, slice_in FROM flow')
+    actual_flows = {(int(r['slice_out']), int(r['slice_in'])) for r in flows}
+    errors = query(processor, path, "SELECT name, value FROM stats WHERE severity = 'error' AND value != 0")
+    if len(flows) != 80 or actual_flows != expected_flows or errors:
+        raise AssertionError(f'{path}: same-ns/same-instant flow direction mismatch: {errors}')
+    print(f'PASS {path.name}: 80 same-ns flows, phase ordering, owned metadata, external merge passes')
 
 
 def run(args, root):
@@ -162,8 +193,13 @@ def run(args, root):
                  ("workers-0", "workers-1"), ("workers-0", "workers-2"), ("workers-0", "workers-3")):
         if a in digests and b in digests and digests[a] != digests[b]:
             raise AssertionError(f"execution/recording configuration changed semantics: {a}, {b}")
+    for name in ('collision-reverse', 'collision-batch1', 'collision-batch64', 'collision-lossy'):
+        if name in digests and digests[name] != digests.get('collision-forward'):
+            raise AssertionError(f'collision fixture changed hardware semantics: {name}')
     for path in root.rglob("regressing.pftrace"):
         verify_regressing(args.trace_processor, path)
+    for path in root.rglob('writer-collision-*.pftrace'):
+        verify_writer_collisions(args.trace_processor, path)
 
 
 def main():

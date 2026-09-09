@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "TimelineData.hpp"
+#include "detail/ClockEventSpool.hpp"
 
 namespace chronon::observe {
 
@@ -105,6 +106,9 @@ struct PerfettoTraceWriter::Impl {
     size_t packets_buffered = 0;
     Options options;
     std::unordered_map<uint64_t, int32_t> next_child_rank;
+    std::unordered_map<uint64_t, std::string> track_names;
+    std::filesystem::path destination;
+    std::unique_ptr<detail::ClockEventSpool> clock_spool;
 
     /// String → iid map for one InternedData field; iids restart at 1 after
     /// every SEQ_INCREMENTAL_STATE_CLEARED.
@@ -140,6 +144,7 @@ struct PerfettoTraceWriter::Impl {
         uint32_t id;
         bool uses_cycle_clock;
         std::optional<ClockDomain> hardware_clock;
+        uint64_t native_ordinal = 0;
         bool first_packet = true;
         bool needs_state_clear = true;
         uint64_t last_cycle = 0;  ///< Incremental clock state (cycle-clock sequences).
@@ -400,6 +405,9 @@ bool PerfettoTraceWriter::open(const std::filesystem::path& path, const Options&
     impl_->wall.reset();
     impl_->clock_streams.clear();
     impl_->next_child_rank.clear();
+    impl_->track_names.clear();
+    impl_->clock_spool.reset();
+    impl_->destination = path;
     next_uuid_ = 1;
     events_written_ = 0;
     bytes_written_ = 0;
@@ -427,6 +435,63 @@ void PerfettoTraceWriter::clockInstant(uint32_t stream, uint64_t track_uuid,
     if (annotations.size() > 6)
         throw std::invalid_argument("clock events allow six additional annotations");
     auto& seq = *impl_->clock_streams.at(stream);
+    const auto time = seq.hardware_clock->edge(local_cycle);
+    (void)time.floorNanoseconds();  // Reject display overflow before accepting a record.
+    if (events_written_ == UINT64_MAX || seq.native_ordinal == UINT64_MAX)
+        throw std::overflow_error("native clock event ordinal overflow");
+    const auto& track_name = impl_->track_names.at(track_uuid);
+    size_t bytes = 512;  // Conservative framing/field overhead, checked before copying strings.
+    const auto account = [&](std::string_view value) {
+        if (value.size() > detail::ClockEventSpool::MaxRecordBytes - bytes)
+            throw std::invalid_argument("native clock record exceeds 64 KiB");
+        bytes += value.size();
+    };
+    account(track_name);
+    account(category);
+    account(name);
+    for (const auto& annotation : annotations) {
+        account(annotation.name);
+        if (annotation.kind == Annotation::Kind::String) account(annotation.string);
+    }
+    detail::ClockEventSpool::Record record;
+    record.time = time;
+    record.track = track_uuid;
+    record.stream = stream;
+    record.cycle = local_cycle;
+    record.flow = flow_id;
+    record.ordinal = record.stream_order = seq.native_ordinal;
+    record.track_name = track_name;
+    record.category = category;
+    record.name = name;
+    record.annotation_count = annotations.size();
+    bool seen_phase = false, seen_ordinal = false;
+    for (size_t i = 0; i < annotations.size(); ++i) {
+        const auto& a = annotations[i];
+        if (a.name == "phase" || a.name == "ordinal") {
+            if (a.kind != Annotation::Kind::Uint)
+                throw std::invalid_argument("native clock phase/ordinal annotations must be Uint");
+            bool& seen = a.name == "phase" ? seen_phase : seen_ordinal;
+            if (seen) throw std::invalid_argument("duplicate native clock ordering annotation");
+            seen = true;
+            (a.name == "phase" ? record.phase : record.ordinal) = a.bits;
+        }
+        record.annotations[i] = {
+            std::string(a.name), a.kind, a.bits,
+            a.kind == Annotation::Kind::String ? std::string(a.string) : std::string{}};
+    }
+    if (!impl_->clock_spool)
+        impl_->clock_spool = std::make_unique<detail::ClockEventSpool>(
+            impl_->destination, impl_->options.clock_sort_run_records);
+    impl_->clock_spool->append(record);
+    ++seq.native_ordinal;
+    ++events_written_;
+}
+
+void PerfettoTraceWriter::writeClockInstant_(uint32_t stream, uint64_t track_uuid,
+                                             std::string_view category, std::string_view name,
+                                             uint64_t local_cycle, uint64_t flow_id,
+                                             std::span<const Annotation> annotations) {
+    auto& seq = *impl_->clock_streams.at(stream);
     const uint64_t ns = seq.hardware_clock->edge(local_cycle).floorNanoseconds();
     auto* packet = impl_->newPacket(seq, true);
     if (ns >= seq.last_cycle) {
@@ -451,12 +516,12 @@ void PerfettoTraceWriter::clockInstant(uint32_t stream, uint64_t track_uuid,
     if (strings.category_iid) event->add_category_iids(strings.category_iid);
     if (flow_id) event->add_flow_ids(flow_id);
     Impl::writeAnnotations(event, view, ids);
-    ++events_written_;
     if (impl_->packets_buffered >= FLUSH_PACKET_COUNT) flush();
 }
 
 uint64_t PerfettoTraceWriter::addProcessTrack(std::string_view process_name, int32_t pid) {
     const uint64_t uuid = next_uuid_++;
+    impl_->track_names.emplace(uuid, process_name);
     auto* td =
         impl_->newPacket(impl_->sim, /*needs_incremental_state=*/false)->set_track_descriptor();
     td->set_uuid(uuid);
@@ -470,6 +535,7 @@ uint64_t PerfettoTraceWriter::addProcessTrack(std::string_view process_name, int
 uint64_t PerfettoTraceWriter::addTrack(std::string_view name, uint64_t parent_uuid,
                                        int32_t sibling_order_rank) {
     const uint64_t uuid = next_uuid_++;
+    impl_->track_names.emplace(uuid, name);
     auto* td =
         impl_->newPacket(impl_->sim, /*needs_incremental_state=*/false)->set_track_descriptor();
     td->set_uuid(uuid);
@@ -485,6 +551,7 @@ uint64_t PerfettoTraceWriter::addTrack(std::string_view name, uint64_t parent_uu
 uint64_t PerfettoTraceWriter::addCounterTrack(std::string_view name, std::string_view unit_name,
                                               uint64_t parent_uuid, int32_t sibling_order_rank) {
     const uint64_t uuid = next_uuid_++;
+    impl_->track_names.emplace(uuid, name);
     auto* td =
         impl_->newPacket(impl_->sim, /*needs_incremental_state=*/false)->set_track_descriptor();
     td->set_uuid(uuid);
@@ -726,6 +793,7 @@ void PerfettoTraceWriter::flush() {
     if (!impl_->file.is_open()) {
         return;
     }
+    if (impl_->clock_spool) impl_->clock_spool->flush();
     if (impl_->packets_buffered > 0) {
         // Serialized Trace messages concatenate into a valid Perfetto trace,
         // so each flushed batch is appended as-is: raw, or split at packet
@@ -806,8 +874,30 @@ void PerfettoTraceWriter::close() {
     if (!impl_->file.is_open()) {
         return;
     }
-    flush();
-    impl_->file.close();
+    try {
+        if (impl_->clock_spool) {
+            impl_->clock_spool->replay([this](const detail::ClockEventSpool::Record& record) {
+                std::array<Annotation, 6> annotations{};
+                for (size_t i = 0; i < record.annotation_count; ++i) {
+                    const auto& a = record.annotations[i];
+                    annotations[i] = {a.name, a.kind, a.bits, a.string};
+                }
+                writeClockInstant_(
+                    record.stream, record.track, record.category, record.name, record.cycle,
+                    record.flow,
+                    std::span<const Annotation>(annotations.data(), record.annotation_count));
+            });
+            impl_->clock_spool.reset();
+        }
+        flush();
+        impl_->file.close();
+        if (!impl_->clock_streams.empty() && impl_->file.fail())
+            throw std::runtime_error("cannot finalize native clock trace");
+    } catch (...) {
+        impl_->clock_spool.reset();
+        impl_->file.close();
+        throw;
+    }
 }
 
 void writeTimeline(PerfettoTraceWriter& writer, const TimelineStreamData& data) {

@@ -85,7 +85,9 @@ public:
     void defineEvent(ClockEventKind kind, std::string name);
     ClockTraceStream* addStream(const ClockDomain& domain, uint32_t unit_id, std::string unit_name);
     void start();
-    /// Join and drain. I/O errors are surfaced here and to blocked producers.
+    /// Join/drain, then finalize Perfetto with a bounded-memory offline sort.
+    /// Native Perfetto output is ready only after successful close().
+    /// I/O errors are surfaced here and to blocked producers.
     void close();
     /// Valid after close(); includes metadata files and both enabled sinks.
     Stats stats() const;

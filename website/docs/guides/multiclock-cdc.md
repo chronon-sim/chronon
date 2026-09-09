@@ -349,8 +349,10 @@ cross-domain order. Guard expensive observation-only argument calculations with
 
 Each unit has a bounded SPSC record stream. Separate streams can be written by
 separate workers, including workers in the same domain. One backend drains
-batches without a global time heap or per-event global lock, converts physical
-time and formats/encodes output. Exactly one text sink exists per domain:
+batches without a global time heap or per-event global lock. Text is formatted
+and written immediately in batches; native Perfetto records are appended to
+private disk scratch storage for offline finalization. Exactly one text sink
+exists per domain:
 
 ```text
 clock-manifest.json
@@ -373,7 +375,8 @@ On a full observation ring, lossless recording blocks/yields the **host** until
 space exists; no simulated edge is added. Lossy recording drops the record and
 counts the drop. Metadata is not placed in a lossy queue. `clock-stats.json`
 reports total retained/dropped events and ingress memory. Close/join only after
-all producer threads have stopped. Backend failures unblock waiting producers
+all producer threads have stopped. Native Perfetto output is ready only after
+successful `close()` / `closeClockTrace()`. Backend failures unblock waiting producers
 and are surfaced as errors. Static metadata plus ring capacity are fixed before
 running; ring allocation is capped at 256 MiB across streams.
 
@@ -383,6 +386,19 @@ and dictionaries. Text buffers flush around 64 KiB per domain; the existing
 Perfetto writer flushes at 4096 packets and splits compressed wrappers at packet
 boundaries around 256 KiB of uncompressed input. Report process RSS as well as
 ingress statistics when assessing total memory.
+
+Native Perfetto finalization externally sorts owned records **before** protobuf
+encoding. Runs contain at most 8192 records and 4 MiB of serialized data;
+`perfetto_options.clock_sort_run_records` can lower the record bound to 2.
+An individual native record is limited to 64 KiB, including metadata. The
+merge uses at most 16 input files plus one output file, retaining one record per
+input. Run paths are numbered rather than stored in an event-sized in-memory
+index. Workspace is bounded independently of trace length by these record/byte
+limits, plus fixed record objects, file buffers, and allocator overhead.
+Temporary disk usage is O(trace data); disk errors are surfaced, not silently
+converted into dropped events. Scratch files live beside the output trace and
+are removed after finalization. No sorting, progress watermark, or additional
+ordering atomic is added to the simulation producer path.
 
 ## Perfetto clocks, precision and import
 
@@ -421,14 +437,22 @@ Display timestamps have a floor error in `[0,1)` ns, including over long runs.
 Encoding rejects values above `INT64_MAX` nanoseconds (about 292 years), and
 clock representation limits may be lower. Subnanosecond edges can share a display
 timestamp. `domain_id`, `local_cycle`, phase and ordinal retain their exact
-identity; reconstruct rational time using the manifest. Their rendered ordering
-at a quantized timestamp is not a subnanosecond physical-order guarantee.
+identity; reconstruct rational time using the manifest. Native events are
+ordered by exact physical time, phase, stable track name, and local ordinal
+before quantization. This matters because Perfetto chains equal-timestamp native
+flows in import order: `--full-sort` cannot recover lost subnanosecond order.
+The offline pass preserves FIFO flow direction even when several causal steps
+display at the same ns. For custom events, same-instant causal stages must be
+expressed by their Uint `phase`; independent events sharing a phase use stable
+track-name/ordinal presentation order, not an inferred hardware dependency.
 No picoseconds are mislabeled as nanoseconds. Unsigned debug fields can appear
 signed in PerfettoSQL; the validator restores their 64-bit representation.
 
-Real **Trace Processor v57.2** is tested with **full sorting**, including streams
-hundreds of seconds apart. Arbitrary file-order disorder is not promised to work
-in every default UI/import mode:
+Real **Trace Processor v57.2** is tested with **full sorting**, including input
+streams hundreds of seconds apart, 4 GHz same-ns collisions, reversed drain
+orders, and exact-time phase ties. Native output is finalized in the defined
+order; arbitrary externally reordered files are not promised to work in every
+default UI/import mode:
 
 ```bash
 trace_processor --full-sort query out/my-new-clock-run/timeline.pftrace \
@@ -452,7 +476,11 @@ exact time numerators/denominators and quantized display nanoseconds. Ties use
 phase, domain ID, unit identity and stream ordinal for presentation; this does
 not add hardware causality. Memory is proportional to the offline event count.
 
-Recovery copies a complete prefix of top-level protobuf packets verbatim,
+Recovery applies to finalized native traces, or complete encoded prefixes
+written during finalization. Before `close()`, the native output may contain
+only descriptors; private spool files are not a supported crash-recovery format.
+Text remains independently available during execution. Recovery copies a
+complete prefix of top-level protobuf packets verbatim,
 preserving sequence, clock, track and intern identities. An incomplete compressed
 wrapper is discarded in full. A file containing only one torn wrapper can
 legitimately recover zero events. Complete retained records must still match the

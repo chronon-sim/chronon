@@ -65,6 +65,8 @@ public:
         size_t checkpoint_interval_packets = 65536;
         /// Per-table intern cap; reaching it forces a checkpoint on that sequence.
         size_t max_interned_strings = 65536;
+        /// Native-clock offline sort: [2,8192] records and at most 4 MiB per run.
+        size_t clock_sort_run_records = 8192;
     };
 
     /**
@@ -94,15 +96,22 @@ public:
 
     [[nodiscard]] bool isOpen() const noexcept;
 
-    /// Writes buffered packets to the OS; does not close the file.
+    /// Writes buffers to the OS. Native clock events remain in private scratch
+    /// storage until close() externally sorts and encodes them.
     void flush();
 
+    /// Finalize native clock traces before opening/importing them. Temporary
+    /// disk space is O(events); memory and merge fan-in are bounded.
     void close();
 
     /// Configure before events. Each stream gets its own sequence and local
     /// incremental/absolute clocks (64/65), mapped to TRACE_FILE simulation ns.
     /// Hardware frequencies are converted exactly before floor-to-ns encoding.
     /// Native clock streams cannot share a file with legacy or host-time events.
+    /// Events are ordered before ns quantization at close(): exact time, Uint
+    /// "phase" (default 0), track name, Uint "ordinal" (default stream order).
+    /// Stable unique track names identify simultaneous independent streams.
+    /// Native records own their metadata and are limited to 64 KiB each.
     uint32_t addClockStream(const ClockDomain& domain);
     void clockInstant(uint32_t stream, uint64_t track_uuid, std::string_view category,
                       std::string_view name, uint64_t local_cycle, uint64_t flow_id,
@@ -175,6 +184,10 @@ private:
     void sliceBeginImpl_(uint64_t track_uuid, std::string_view category, std::string_view name,
                          uint64_t cycle, uint64_t flow_id, bool has_flow_id,
                          std::span<const Annotation> annotations);
+
+    void writeClockInstant_(uint32_t stream, uint64_t track_uuid, std::string_view category,
+                            std::string_view name, uint64_t local_cycle, uint64_t flow_id,
+                            std::span<const Annotation> annotations);
 
     std::unique_ptr<Impl> impl_;
 

@@ -20,6 +20,7 @@ add_library(chronon_observe
     ObservationManager.cpp
     PerfettoTraceWriter.cpp
     ClockTraceRecorder.cpp
+    detail/ClockEventSpool.cpp
     PipelineTraceFormat.cpp
     ReorderBuffer.cpp
     TimelineTrack.cpp

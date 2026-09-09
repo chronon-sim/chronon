@@ -62,7 +62,8 @@ void rejects(F&& f) {
 
 void runCase(uint64_t whz, uint64_t rhz, uint64_t phase, size_t depth, size_t stages,
              unsigned pattern, uint64_t steps, size_t threads = 1, bool reverse = false,
-             const std::filesystem::path& trace = {}, bool lossy = false, bool compress = true) {
+             const std::filesystem::path& trace = {}, bool lossy = false, bool compress = true,
+             size_t drain_batch = 11) {
     TickSimulationConfig config;
     config.num_threads = threads;
     config.enable_parallel = threads > 1;
@@ -89,7 +90,7 @@ void runCase(uint64_t whz, uint64_t rhz, uint64_t phase, size_t depth, size_t st
         recording.output_dir = trace;
         recording.run_id = "reference-9141326";
         recording.stream_capacity = lossy ? 2 : 64;
-        recording.drain_batch = lossy ? 1 : 11;
+        recording.drain_batch = lossy ? 1 : drain_batch;
         recording.reverse_drain = reverse;
         recording.lossless = !lossy;
         recording.perfetto_options.checkpoint_interval_packets = 7;
@@ -281,6 +282,18 @@ int main(int argc, char** argv) {
         runCase(1'000'000'000, 1'000'000'000, 0, 4, 3, 0, 3000, 1, false, root / "coincident",
                 false, false);
         runCase(1'000'000'000, 1'001'000'000, 1, 4, 2, 0, 10000, 1, false, root / "near");
+        runCase(4'000'000'000ULL, 4'000'000'000ULL, 0, 8, 2, 2, 4000, 1, false,
+                root / "collision-forward");
+        runCase(4'000'000'000ULL, 4'000'000'000ULL, 0, 8, 2, 2, 4000, 4, true,
+                root / "collision-reverse");
+        runCase(4'000'000'000ULL, 4'000'000'000ULL, 0, 8, 2, 2, 4000, 1, false,
+                root / "collision-batch1", false, false, 1);
+        runCase(4'000'000'000ULL, 4'000'000'000ULL, 0, 8, 2, 2, 4000, 4, true,
+                root / "collision-batch64", false, true, 64);
+        runCase(4'000'000'000ULL, 4'000'000'000ULL, 0, 8, 2, 2, 4000, 4, true,
+                root / "collision-lossy", true);
+        runCase(3'000'000'000ULL, 4'000'000'000ULL, 125, 8, 2, 2, 4000, 4, true,
+                root / "collision-phase");
     }
     std::cout << "multiclock: " << cases
               << " ratio/phase/depth/stage/stimulus cases, thread/order equivalence, long stress "

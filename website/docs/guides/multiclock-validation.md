@@ -60,7 +60,7 @@ byte-level output. The validator prints full SHA-256 reference identities.
 The tests check sequence-local clocks 64/65 and reference clock 11, imported
 timestamps across hundreds of simulated seconds of file disorder, checkpoint
 re-declarations, interning, and compressed batches. A separate sequence with
-local cycles `1000, 1, 2000, 0, 3000` checks the absolute timestamp fallback.
+local cycles `1000, 1, 2000, 0, 3000` checks normalization of regressing input.
 Trace Processor reported no nonzero error-severity import statistics.
 
 Truncation validation recovers complete top-level packet prefixes in raw and
@@ -72,7 +72,25 @@ The offline text merge reconstructed all 15,758 serial events, including exact
 rational physical times, and agreed with the independent reference. Its
 same-time presentation order is not a hardware causal relation.
 
+### Same-nanosecond native flow regression
+
+The original implementation allowed cross-stream drain order to reverse native
+flows after ns quantization. A deterministic 4 GHz writer fixture now covers
+`write@0 ns -> visible@0.75 ns` in both append orders, as well as exact-time
+Evaluate/Commit ties across units whose names sort in the opposite order.
+Four compression/order variants use two-record external-sort runs to exercise
+multiple merge passes, checkpoints, explicit flushes, and owned string metadata.
+Integrated 4 GHz FIFO fixtures cover forward/reverse drain, batch sizes 1 and 64,
+lossy recording, and 3/4 GHz clocks with a 125 ps phase offset. Expected FIFO
+events still come from the independent circuit reference. The importer checks
+the complete retained causal graph, not just nondecreasing rounded timestamps.
+
 ## Measured performance
+
+The measurements below are the original pre-finalization baseline. They predate
+the same-nanosecond flow fix and must not be used as performance claims for the
+new disk-backed offline finalizer. Re-run the supplied benchmark (whose wall
+timer includes `close()`) when measuring the finalizer's CPU and disk costs.
 
 Measured on 2026-09-09, Intel Core i9-14900K, Linux 6.1, GCC 12.2, Release.
 Processes were pinned to logical CPUs `0,1`. The tables below summarize a local
@@ -156,6 +174,50 @@ repetitions executes 100 million cycles after warmup.
 Candidate/baseline is `0.99830`, approximately -0.17%, within observed timing
 variation. This is evidence of no material regression in this microbenchmark,
 not a universal bound for all Chronon or SAGE workloads.
+
+## Post-fix finalization measurement
+
+The bounded offline flow-ordering fix was measured separately on 2026-09-09 on
+the same machine and Release configuration, pinned to CPUs `0,1`. These are
+medians of three interleaved runs of 100,000 scheduler steps, including recorder
+`close()` and its external sort. Each enabled observation mode retained 240,793
+events. This smaller workload is not a like-for-like comparison with the
+500,000-step historical table above.
+
+| Mode | Total wall time | Events/s | Total ns/event | Incremental ns/event | Final file bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Off | 0.008833 s | n/a | n/a | n/a | 0 |
+| Text | 0.045079 s | 5,341,602 | 187.21 | 150.53 | 8,900,141 |
+| Perfetto | 1.098050 s | 219,291 | 4,560.14 | 4,523.46 | 2,105,324 |
+| Both | 1.150590 s | 209,278 | 4,778.34 | 4,741.65 | 11,004,658 |
+
+The enabled modes allocated 327,680 bytes of ingress rings. Maximum sampled
+ingress occupancy across repetitions was 194,480 bytes for text and 199,440
+bytes for Perfetto/both. The harness reported maximum process RSS of 17,120 KiB
+for every mode; RSS is not an isolated measurement of the sorting buffers.
+File bytes exclude the temporary sorting workspace. Sorting uses the bounded
+run/record/fan-in limits documented in the timing guide, but requires additional
+temporary disk space proportional to the recorded events.
+
+Total wall-time ranges were 0.008810-0.008847 s (off), 0.045044-0.045136 s
+(text), 1.094380-1.104270 s (Perfetto), and 1.149960-1.153920 s (both).
+The scalar-body controls measured 1.91 ns/unit tick for the legacy single clock
+and 75.04 ns/unit tick for the exact multi-clock calendar.
+
+The finalization cost is substantial: this fix prioritizes correct native flow
+direction at colliding nanosecond timestamps over streaming Perfetto output.
+The producer still performs no global sorting, but the final Perfetto file is
+ready only after successful `close()`. These measurements supersede the
+historical table for claims about the current native Perfetto output path.
+
+Reproduce this measurement with:
+
+```bash
+python3 scripts/run_multiclock_benchmark.py \
+  --binary build-release/benchmark/chronon_multiclock_benchmark \
+  --steps 100000 --repetitions 3 \
+  --output-dir out/flow-ordering-benchmark
+```
 
 ## Reproduce
 
