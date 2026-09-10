@@ -1,7 +1,19 @@
 # SPDX-License-Identifier: MPL-2.0
 cmake_minimum_required(VERSION 3.25)
 project(chronon_installed_consumer LANGUAGES CXX)
+option(CHRONON_TEST_FMT_FALLBACK "Test consumption without a fmt CMake package" OFF)
+if(CHRONON_TEST_FMT_FALLBACK)
+    # Hide package discovery without removing usable system headers/libraries.
+    set(CMAKE_DISABLE_FIND_PACKAGE_fmt TRUE)
+endif()
 find_package(chronon 0.4 CONFIG REQUIRED)
+if(NOT TARGET fmt::fmt)
+    message(FATAL_ERROR "Chronon must provide its fmt dependency target")
+endif()
+if(CHRONON_TEST_FMT_FALLBACK AND
+   (NOT ChrononFmt_INCLUDE_DIR OR NOT ChrononFmt_LIBRARY))
+    message(FATAL_ERROR "The header/library fallback was not exercised")
+endif()
 add_executable(installed_consumer main.cpp)
 target_link_libraries(installed_consumer PRIVATE chronon::core)
 enable_testing()

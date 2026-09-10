@@ -112,6 +112,7 @@ if(CHRONON_INSTALL)
         VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/chronon-config.cmake
         ${CMAKE_CURRENT_BINARY_DIR}/chronon-config-version.cmake
+        ${PROJECT_SOURCE_DIR}/cmake/ChrononFindFmt.cmake
         DESTINATION lib/cmake/chronon)
 endif()
 

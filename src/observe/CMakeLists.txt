@@ -37,14 +37,12 @@ target_include_directories(chronon_observe
 # Dependencies
 # =============================================================================
 
-# Find and link fmt library
-find_package(fmt QUIET)
-if(fmt_FOUND)
-    target_link_libraries(chronon_observe PUBLIC fmt::fmt)
-else()
-    # Fallback to system fmt library
-    target_link_libraries(chronon_observe PUBLIC fmt)
+# Keep source-build and installed-package dependency resolution identical.
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ChrononFindFmt.cmake")
+if(NOT ChrononFmt_FOUND)
+    message(FATAL_ERROR "${ChrononFmt_NOT_FOUND_MESSAGE}")
 endif()
+target_link_libraries(chronon_observe PUBLIC fmt::fmt)
 
 # stdexec (header-only, for inplace_stop_token in ObservationBackend)
 target_link_libraries(chronon_observe PUBLIC STDEXEC::stdexec)
