@@ -169,7 +169,7 @@ def verify_writer_collisions(processor, path):
     errors = query(processor, path, "SELECT name, value FROM stats WHERE severity = 'error' AND value != 0")
     if len(flows) != 80 or actual_flows != expected_flows or errors:
         raise AssertionError(f'{path}: same-ns/same-instant flow direction mismatch: {errors}')
-    print(f'PASS {path.name}: 80 same-ns flows, phase ordering, owned metadata, external merge passes')
+    print(f'PASS {path.name}: 80 same-ns flows, phase ordering, owned metadata, closed buckets')
 
 
 def run(args, root):
@@ -200,6 +200,13 @@ def run(args, root):
         verify_regressing(args.trace_processor, path)
     for path in root.rglob('writer-collision-*.pftrace'):
         verify_writer_collisions(args.trace_processor, path)
+    for path in root.rglob('writer-live-*.pftrace'):
+        verify_writer_collisions(args.trace_processor, path)
+    for path in root.rglob('bounds.pftrace'):
+        rows = query(args.trace_processor, path, 'SELECT ts, name FROM slice')
+        if {(int(r['ts']), r['name']) for r in rows} != {
+                (0, 'first'), (0, 'last-in-bucket'), (1, 'boundary')} or len(rows) != 3:
+            raise AssertionError('bucket boundary/overflow/tail handling mismatch')
 
 
 def main():

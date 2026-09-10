@@ -95,11 +95,15 @@ int main(int argc, char** argv) {
         mode == "single" ? 2 * steps : sim.domainCycleCount(1) + sim.domainCycleCount(2);
     std::cout
         << "mode,steps,wall_s,run_s,events,dropped,events_per_s,ns_per_event,allocated_ingress_"
-           "bytes,peak_ingress_bytes,file_bytes,maxrss_kib,sent,received,checksum,unit_ticks\n"
+           "bytes,peak_ingress_bytes,file_bytes,maxrss_kib,sent,received,checksum,unit_ticks,"
+           "native_buffer_peak_bytes,native_buffer_peak_records,first_output_s,temporary_disk_"
+           "bytes\n"
         << mode << ',' << steps << ',' << seconds << ',' << run_seconds << ',' << stats.events
         << ',' << stats.dropped << ',' << (stats.events / seconds) << ','
         << (stats.events ? seconds * 1e9 / stats.events : 0) << ',' << stats.allocated_buffer_bytes
         << ',' << stats.peak_buffer_bytes << ',' << stats.file_bytes << ',' << usage.ru_maxrss
         << ',' << (producer ? producer->sent : 0) << ',' << (consumer ? consumer->received : 0)
-        << ',' << (consumer ? consumer->checksum : 0) << ',' << unit_ticks << '\n';
+        << ',' << (consumer ? consumer->checksum : 0) << ',' << unit_ticks << ','
+        << stats.native_buffer_peak_bytes << ',' << stats.native_buffer_peak_records << ','
+        << stats.first_output_ns / 1e9 << ",0\n";
 }

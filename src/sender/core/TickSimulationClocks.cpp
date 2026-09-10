@@ -166,6 +166,10 @@ bool TickSimulation::executeClockBatch_() {
             clock_runtime_.at(edge.domain->id()).next_cycle = edge.cycle + 1;
         clock_time_ = edges.front().time;
         ++current_cycle_;
+        // All queues publish before this safe point, including every CDC commit.
+        // Only observation time is quantized; the current ns bucket stays open.
+        if ((current_cycle_ & 63) == 0 && clock_trace_ && clock_trace_->needsProgress())
+            clock_trace_->advance(clock_time_.floorNanoseconds());
         return true;
     } catch (...) {
         for (auto* unit : unit_ptrs_) unit->clock_edge_executing_ = false;

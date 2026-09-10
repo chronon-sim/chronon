@@ -78,19 +78,28 @@ The original implementation allowed cross-stream drain order to reverse native
 flows after ns quantization. A deterministic 4 GHz writer fixture now covers
 `write@0 ns -> visible@0.75 ns` in both append orders, as well as exact-time
 Evaluate/Commit ties across units whose names sort in the opposite order.
-Four compression/order variants use two-record external-sort runs to exercise
-multiple merge passes, checkpoints, explicit flushes, and owned string metadata.
+Four compression/order variants exercise strict bucket boundaries, checkpoints,
+explicit flushes, owned string metadata and real imports of files copied before
+writer close. Separate capacity tests reject late records and exhausted buckets
+without accepting or duplicating them, then flush the unannounced tail.
 Integrated 4 GHz FIFO fixtures cover forward/reverse drain, batch sizes 1 and 64,
 lossy recording, and 3/4 GHz clocks with a 125 ps phase offset. Expected FIFO
 events still come from the independent circuit reference. The importer checks
 the complete retained causal graph, not just nondecreasing rounded timestamps.
 
+Concurrent streams now publish acknowledged progress every 16 records; hundreds
+of simulated seconds of skew remain bounded rather than being spooled to disk.
+A permanently empty stream explicitly finishes. A sleeping stream test publishes
+progress without any event, unblocking its peer; late and post-finish records are
+rejected. The integrated scheduler publishes after 64 completed edge batches and
+the existing reverse-drain, lossy, phase and prefix-recovery matrix remains active.
+
 ## Measured performance
 
 The measurements below are the original pre-finalization baseline. They predate
 the same-nanosecond flow fix and must not be used as performance claims for the
-new disk-backed offline finalizer. Re-run the supplied benchmark (whose wall
-timer includes `close()`) when measuring the finalizer's CPU and disk costs.
+current bounded streaming writer. Re-run the supplied benchmark (whose wall
+timer includes `close()`) when measuring the current path.
 
 Measured on 2026-09-09, Intel Core i9-14900K, Linux 6.1, GCC 12.2, Release.
 Processes were pinned to logical CPUs `0,1`. The tables below summarize a local
@@ -175,9 +184,9 @@ Candidate/baseline is `0.99830`, approximately -0.17%, within observed timing
 variation. This is evidence of no material regression in this microbenchmark,
 not a universal bound for all Chronon or SAGE workloads.
 
-## Post-fix finalization measurement
+## Historical disk-backed finalization measurement
 
-The bounded offline flow-ordering fix was measured separately on 2026-09-09 on
+The now-removed disk-backed flow-ordering fix was measured on 2026-09-09 on
 the same machine and Release configuration, pinned to CPUs `0,1`. These are
 medians of three interleaved runs of 100,000 scheduler steps, including recorder
 `close()` and its external sort. Each enabled observation mode retained 240,793
@@ -195,22 +204,22 @@ The enabled modes allocated 327,680 bytes of ingress rings. Maximum sampled
 ingress occupancy across repetitions was 194,480 bytes for text and 199,440
 bytes for Perfetto/both. The harness reported maximum process RSS of 17,120 KiB
 for every mode; RSS is not an isolated measurement of the sorting buffers.
-File bytes exclude the temporary sorting workspace. Sorting uses the bounded
-run/record/fan-in limits documented in the timing guide, but requires additional
-temporary disk space proportional to the recorded events.
+File bytes excluded the temporary sorting workspace. That removed implementation
+used 8192-record/4-MiB sort runs and a 16-way merge, with temporary disk space
+proportional to the recorded events.
 
 Total wall-time ranges were 0.008810-0.008847 s (off), 0.045044-0.045136 s
 (text), 1.094380-1.104270 s (Perfetto), and 1.149960-1.153920 s (both).
 The scalar-body controls measured 1.91 ns/unit tick for the legacy single clock
 and 75.04 ns/unit tick for the exact multi-clock calendar.
 
-The finalization cost is substantial: this fix prioritizes correct native flow
+The historical finalization cost was substantial: that fix prioritized correct native flow
 direction at colliding nanosecond timestamps over streaming Perfetto output.
-The producer still performs no global sorting, but the final Perfetto file is
-ready only after successful `close()`. These measurements supersede the
-historical table for claims about the current native Perfetto output path.
+It required successful `close()` before the final Perfetto file was ready.
+These numbers are a comparison baseline, not a performance claim for the new
+streaming implementation. There is no retained disk-backed runtime fallback.
 
-Reproduce this measurement with:
+Run the same workload on the current implementation with:
 
 ```bash
 python3 scripts/run_multiclock_benchmark.py \
@@ -218,6 +227,72 @@ python3 scripts/run_multiclock_benchmark.py \
   --steps 100000 --repetitions 3 \
   --output-dir out/flow-ordering-benchmark
 ```
+
+## Bounded streaming measurement
+
+Measured on the same host, GCC 12.2 Release, CPUs `0,1`, after builds and tests
+finished. The baseline is `e52983c`, measured again with its separately retained
+benchmark executable; no old implementation remains in the source/runtime path.
+Each 100,000-step variant used three fresh-process repetitions with fixed-seed
+interleaved observation modes. Baseline and current short-run sets were separate;
+the long Perfetto baseline/current runs were interleaved across three repetitions.
+All hardware counts/checksums matched, with zero dropped lossless events.
+
+| Mode, 100,000 steps | Baseline total | Streaming total | Streaming run | Streaming close | Events/s | Total ns/event | Final bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Off | 8.850 ms | 8.774 ms | 8.774 ms | <0.001 ms | n/a | n/a | 0 |
+| Text | 45.003 ms | 46.747 ms | 46.074 ms | 0.669 ms | 5,150,994 | 194.14 | 8,900,258 |
+| Perfetto | 1,106.290 ms | 428.315 ms | 426.218 ms | 2.113 ms | 562,187 | 1,778.77 | 2,105,453 |
+| Both | 1,161.080 ms | 486.133 ms | 484.039 ms | 2.120 ms | 495,323 | 2,018.88 | 11,004,787 |
+
+Enabled modes retained 240,793 events. Incremental cost relative to tracing off
+was 157.70 ns/event (text), 1,742.33 ns/event (Perfetto), and 1,982.45 ns/event
+(both). The respective total-time ranges were 46.652-46.804 ms, 428.236-430.872 ms,
+and 484.098-489.602 ms. Text was about 3.9% slower in this short-run comparison;
+this is not a claim that every mode improved. Perfetto total time improved 2.58x.
+
+| Perfetto, 1,000,000 steps / 2,408,026 events | Baseline | Streaming |
+| --- | ---: | ---: |
+| Median total wall time | 12.76370 s | 4.32751 s |
+| Median simulation-stage wall time | 2.06654 s | 4.32521 s |
+| Median close time | 10.69890 s | 0.00230 s |
+| First event-containing file batch | Only during finalization; not separately timed | 7.731 ms after writer open |
+| Final file bytes | 20,793,132 | 20,793,261 |
+| Maximum reported process RSS | 16,660 KiB | 16,660 KiB |
+
+Long-run total wall-time ranges were 12.72990-12.84060 s and 4.31546-4.33364 s:
+**2.95x total speedup**, not merely deferred work. Streaming throughput was about
+556,446 events/s (1,797.12 ns/event). The simulation-stage time is higher because
+encoding and acknowledged observation backpressure now happen during execution;
+this changes host pacing, never simulated clock edges or FIFO results.
+
+The native open-bucket peak was **163 records** in both 100,000- and
+1,000,000-step workloads. Its conservative fixed-storage/metadata bound was
+5,599,674 bytes. Ingress allocation remained 327,680 bytes; sampled ingress peaks
+were at most 6,240 bytes for streaming Perfetto/both and 199,400 bytes for text.
+The short-run harness reported 17,140 KiB maximum RSS for all current modes;
+RSS is a process-level value, not an isolated allocation measurement.
+First output was 7.710 ms for short Perfetto and 8.743 ms for both.
+
+Streaming temporary-file reads/writes are **zero**: there are no scratch files or
+spill path. This does not mean final-file IO is zero. Historical temporary IO was
+not separately instrumented, so no device-IO speedup is inferred. Measurements
+include close/drain but not fsync durability. The scripts retain raw timing,
+buffer, first-output and checksum fields for independent comparisons. Use the
+same reproduction command with `--steps 1000000` for the longer workload.
+
+The four skewed-worker fixtures retained 80,000 events each with **65** pending
+native records at peak and a 209,342-byte conservative native buffer bound,
+despite hundreds of simulated seconds of progress skew. There were no drops;
+these are bounded-buffer checks, not a same-workload baseline timing comparison.
+
+An additional three-repetition, interleaved 100-million-cycle empty-unit control
+measured 385.788 ms for the baseline and 407.127 ms for the current benchmark
+executable (200 million unit ticks in both): an observed **5.5% slowdown**.
+This is a residual performance regression, not a claim of single-clock timing
+equivalence. Its cause has not been isolated. The single-clock functional
+regressions still pass; do not generalize the multi-clock Perfetto speedup to
+all single-clock or text-only workloads.
 
 ## Reproduce
 

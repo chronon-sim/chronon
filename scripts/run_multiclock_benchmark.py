@@ -73,6 +73,8 @@ def main():
         wall = statistics.median(float(row["wall_s"]) for row in selected)
         event_count = int(selected[0]["events"])
         item = dict(mode=mode, wall_s=wall,
+                    run_s=statistics.median(float(r["run_s"]) for r in selected),
+                    close_s=statistics.median(float(r["wall_s"]) - float(r["run_s"]) for r in selected),
                     wall_min_s=min(float(r["wall_s"]) for r in selected),
                     wall_max_s=max(float(r["wall_s"]) for r in selected),
                     events=event_count, events_per_s=event_count / wall,
@@ -83,6 +85,11 @@ def main():
                     peak_ingress_bytes=max(int(r["peak_ingress_bytes"]) for r in selected),
                     file_bytes_median=statistics.median(int(r["file_bytes"]) for r in selected),
                     maxrss_kib=max(int(r["maxrss_kib"]) for r in selected))
+        for field in ("native_buffer_peak_bytes", "native_buffer_peak_records", "temporary_disk_bytes"):
+            if field in selected[0]:
+                item[field] = max(int(r[field]) for r in selected)
+        if "first_output_s" in selected[0]:
+            item["first_output_s"] = statistics.median(float(r["first_output_s"]) for r in selected)
         summary.append(item)
         print(json.dumps(item))
     with (args.output_dir / "summary.json").open("w") as file:

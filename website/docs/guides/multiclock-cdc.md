@@ -350,8 +350,8 @@ cross-domain order. Guard expensive observation-only argument calculations with
 Each unit has a bounded SPSC record stream. Separate streams can be written by
 separate workers, including workers in the same domain. One backend drains
 batches without a global time heap or per-event global lock. Text is formatted
-and written immediately in batches; native Perfetto records are appended to
-private disk scratch storage for offline finalization. Exactly one text sink
+and written immediately in batches; native Perfetto records use bounded open
+nanosecond buckets, closed by explicit producer progress. Exactly one text sink
 exists per domain:
 
 ```text
@@ -375,8 +375,8 @@ On a full observation ring, lossless recording blocks/yields the **host** until
 space exists; no simulated edge is added. Lossy recording drops the record and
 counts the drop. Metadata is not placed in a lossy queue. `clock-stats.json`
 reports total retained/dropped events and ingress memory. Close/join only after
-all producer threads have stopped. Native Perfetto output is ready only after
-successful `close()` / `closeClockTrace()`. Backend failures unblock waiting producers
+all producer threads have stopped. Native Perfetto packet prefixes become available
+during execution; `close()` / `closeClockTrace()` finishes the tail. Backend failures unblock waiting producers
 and are surfaced as errors. Static metadata plus ring capacity are fixed before
 running; ring allocation is capped at 256 MiB across streams.
 
@@ -387,18 +387,73 @@ Perfetto writer flushes at 4096 packets and splits compressed wrappers at packet
 boundaries around 256 KiB of uncompressed input. Report process RSS as well as
 ingress statistics when assessing total memory.
 
-Native Perfetto finalization externally sorts owned records **before** protobuf
-encoding. Runs contain at most 8192 records and 4 MiB of serialized data;
-`perfetto_options.clock_sort_run_records` can lower the record bound to 2.
-An individual native record is limited to 64 KiB, including metadata. The
-merge uses at most 16 input files plus one output file, retaining one record per
-input. Run paths are numbered rather than stored in an event-sized in-memory
-index. Workspace is bounded independently of trace length by these record/byte
-limits, plus fixed record objects, file buffers, and allocator overhead.
-Temporary disk usage is O(trace data); disk errors are surfaced, not silently
-converted into dropped events. Scratch files live beside the output trace and
-are removed after finalization. No sorting, progress watermark, or additional
-ordering atomic is added to the simulation producer path.
+Native Perfetto uses no temporary disk files and no whole-trace external sort.
+The buffer holds at most `perfetto_options.clock_buffer_records` owned records
+(default 8192, range 2..65536), plus a 4 MiB aggregate metadata/accounting budget.
+One record is limited to 64 KiB. Fixed record storage, string allocator overhead,
+encoder batches and dictionaries are additional; buffer statistics report a
+conservative bound and the benchmark also reports process RSS. Buffer exhaustion
+throws an explicit error and wakes blocked producers, never silently spills or
+drops accepted events. In particular, all events in one open ns bucket must fit;
+reduce publication batch size or increase the record bound for dense models.
+
+### Progress publication and bounded streaming
+
+`PerfettoTraceWriter::advanceClockWatermark(W)` promises that **all streams** have
+submitted every event with `floor(physical_time / 1 ns) < W`, and will never submit
+another. Only buckets strictly below W can be encoded. Bucket W remains open,
+including exact-edge phase ties. A decreasing promise or a late event is rejected.
+The writer allows out-of-order input within its bounded open window, not unlimited
+disorder without progress. `flush()` writes closed buckets already encoded;
+`close()` supplies the final promise and writes the unclosed tail.
+
+Independent producer threads using `ClockTraceRecorder` call
+`stream->advance(next_local_cycle)` after bounded batches, promising no future
+record below that cycle. It publishes `floor(E_domain(next_local_cycle) / 1 ns)`
+and **waits for the global safe frontier**. This is host backpressure, not a
+simulated delay. Quiet streams must publish progress too; permanently completed
+streams call nonblocking `finish()`, after which recording is rejected. Do not
+call blocking stream advances sequentially from one coordinator thread: use
+`recorder.advance(W)` at a safe point covering all producers instead.
+
+The serial multi-clock scheduler automatically publishes such a coordinator
+promise after every 64 complete physical-time edge batches, after all unit queue
+publishes and CDC commits. It covers inactive/quiet domains as well. It converts
+only this batch boundary to display ns; hardware time stays exact. No per-record
+global atomic, lock or ordering heap is added. Text-only mode does not wait on
+these promises. For custom execution drivers, producers must join before close.
+
+The backend acquires progress **before** capturing queue heads, drains every
+captured record (possibly in several configured batches), and only then closes
+buckets and acknowledges progress. Thus a watermark cannot overtake its published
+records. Merely seeing the last event, or an empty queue, never implies progress.
+Acknowledged batches bound skew from independent workers: fast workers wait while
+slower workers or explicitly progressing quiet streams catch up. Publication
+batch sizes and the aggregate in-flight records across streams must fit the
+configured bucket budget; violation fails explicitly rather than deadlocking.
+
+Closed windows are ordered by integer ns, with exact time/phase tie ordering
+inside a ns bucket. This retains native flow causality without changing simulation
+or CDC behavior. This is limited backend cross-stream coordination, replacing the
+previous offline-only contract, not a global order assigned by simulation producers.
+
+Existing `TickSimulation` users need no progress calls. For manually managed,
+independent producer threads, a typical bounded-batch loop is:
+
+```cpp
+for (uint64_t cycle = 0; cycle < count; ++cycle) {
+    stream->record(cycle, ClockEventKind::User);
+    if ((cycle & 15) == 15) stream->advance(cycle + 1);
+}
+stream->finish();
+```
+
+The batch sizes across all producers must fit the native bucket buffer. Each
+quiet producer also needs a progress/finish path; do not omit it from the
+protocol just because its queue is empty. The old `clock_sort_run_records`
+option and disk spool implementation have been removed. Direct writer callers
+with large, arbitrarily disordered input must now submit bounded windows and
+publish `advanceClockWatermark()` between them; there is no disk fallback.
 
 ## Perfetto clocks, precision and import
 
@@ -441,7 +496,7 @@ identity; reconstruct rational time using the manifest. Native events are
 ordered by exact physical time, phase, stable track name, and local ordinal
 before quantization. This matters because Perfetto chains equal-timestamp native
 flows in import order: `--full-sort` cannot recover lost subnanosecond order.
-The offline pass preserves FIFO flow direction even when several causal steps
+The bounded bucket pass preserves FIFO flow direction even when several causal steps
 display at the same ns. For custom events, same-instant causal stages must be
 expressed by their Uint `phase`; independent events sharing a phase use stable
 track-name/ordinal presentation order, not an inferred hardware dependency.
@@ -451,7 +506,7 @@ signed in PerfettoSQL; the validator restores their 64-bit representation.
 Real **Trace Processor v57.2** is tested with **full sorting**, including input
 streams hundreds of seconds apart, 4 GHz same-ns collisions, reversed drain
 orders, and exact-time phase ties. Native output is finalized in the defined
-order; arbitrary externally reordered files are not promised to work in every
+order as progress permits; arbitrary externally reordered files are not promised to work in every
 default UI/import mode:
 
 ```bash
@@ -476,10 +531,9 @@ exact time numerators/denominators and quantized display nanoseconds. Ties use
 phase, domain ID, unit identity and stream ordinal for presentation; this does
 not add hardware causality. Memory is proportional to the offline event count.
 
-Recovery applies to finalized native traces, or complete encoded prefixes
-written during finalization. Before `close()`, the native output may contain
-only descriptors; private spool files are not a supported crash-recovery format.
-Text remains independently available during execution. Recovery copies a
+Recovery applies to complete encoded prefixes during execution as well as closed
+traces. Open buckets and the current unflushed encoder batch are not crash durable;
+no fsync durability is promised. Text remains independently available. Recovery copies a
 complete prefix of top-level protobuf packets verbatim,
 preserving sequence, clock, track and intern identities. An incomplete compressed
 wrapper is discarded in full. A file containing only one torn wrapper can

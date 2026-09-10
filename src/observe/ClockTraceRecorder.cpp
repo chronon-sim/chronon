@@ -17,11 +17,35 @@
 
 namespace chronon::observe {
 
-ClockTraceStream::ClockTraceStream(size_t capacity, bool lossless, std::atomic<bool>* failed)
-    : ring_(capacity), lossless_(lossless), failed_(failed) {}
+ClockTraceStream::ClockTraceStream(size_t capacity, bool lossless, bool perfetto, ClockDomain clock,
+                                   std::atomic<bool>* failed)
+    : ring_(capacity),
+      lossless_(lossless),
+      failed_(failed),
+      perfetto_(perfetto),
+      clock_(std::move(clock)) {}
+
+void ClockTraceStream::advance(uint64_t next_cycle) {
+    if (finished_.load(std::memory_order_relaxed) || next_cycle < minimum_cycle_)
+        throw std::logic_error("invalid clock stream progress after finish or backwards");
+    const auto ns = perfetto_ ? clock_.edge(next_cycle).floorNanoseconds() : 0;
+    minimum_cycle_ = next_cycle;
+    watermark_.store(ns, std::memory_order_release);
+    while (perfetto_ && acknowledged_.load(std::memory_order_acquire) < ns) {
+        if (failed_->load(std::memory_order_acquire))
+            throw std::runtime_error("clock trace backend failed or closed");
+        std::this_thread::yield();
+    }
+    if (failed_->load(std::memory_order_acquire))
+        throw std::runtime_error("clock trace backend failed or closed");
+}
+
+void ClockTraceStream::finish() { finished_.store(true, std::memory_order_release); }
 
 void ClockTraceStream::record(uint64_t cycle, ClockEventKind kind, uint64_t transaction,
                               uint64_t value, uint32_t fifo, ClockEventPhase phase) {
+    if (cycle < minimum_cycle_ || finished_.load(std::memory_order_relaxed))
+        throw std::logic_error("clock record violates stream progress or finish");
     if (ordinal_ == UINT64_MAX) throw std::overflow_error("clock trace stream ordinal overflow");
     const auto ordinal = ordinal_++;
     const auto head = head_.load(std::memory_order_relaxed);
@@ -80,6 +104,7 @@ struct ClockTraceRecorder::Impl {
     PerfettoTraceWriter writer;
     std::thread worker;
     std::atomic<bool> stopping{false}, failed{false};
+    std::atomic<uint64_t> watermark{0}, acknowledged{0};
     std::exception_ptr error;
     bool started = false, closed = false;
     Stats stats;
@@ -155,24 +180,56 @@ struct ClockTraceRecorder::Impl {
 
     void run() noexcept {
         try {
+            std::vector<uint64_t> heads(streams.size());
+            unsigned idle = 0;
             for (;;) {
-                bool any = false;
-                for (size_t i = 0; i < streams.size(); ++i) {
-                    auto& stream = streams[config.reverse_drain ? streams.size() - 1 - i : i];
-                    auto& queue = *stream.queue;
-                    auto tail = queue.tail_.load(std::memory_order_relaxed);
-                    const auto head = queue.head_.load(std::memory_order_acquire);
-                    const auto end = tail + std::min<uint64_t>(head - tail, config.drain_batch);
-                    for (; tail != end; ++tail) {
-                        encode(stream, queue.ring_[tail & (queue.ring_.size() - 1)]);
-                        any = true;
+                const bool stop = stopping.load(std::memory_order_acquire);
+                uint64_t limit = UINT64_MAX;
+                // Read progress BEFORE the heads. Acquiring a promise then the
+                // heads includes every record whose publication preceded it.
+                if (config.perfetto && !stop) {
+                    for (const auto& stream : streams) {
+                        const auto& queue = *stream.queue;
+                        if (!queue.finished_.load(std::memory_order_acquire))
+                            limit =
+                                std::min(limit, queue.watermark_.load(std::memory_order_acquire));
                     }
-                    queue.tail_.store(tail, std::memory_order_release);
+                    limit = std::max(limit, watermark.load(std::memory_order_acquire));
                 }
-                if (!any) {
-                    if (stopping.load(std::memory_order_acquire)) break;
+                for (size_t i = 0; i < streams.size(); ++i)
+                    heads[i] = streams[i].queue->head_.load(std::memory_order_acquire);
+                bool any = false;
+                bool remaining;
+                do {
+                    remaining = false;
+                    for (size_t i = 0; i < streams.size(); ++i) {
+                        const auto index = config.reverse_drain ? streams.size() - 1 - i : i;
+                        auto& stream = streams[index];
+                        auto& queue = *stream.queue;
+                        auto tail = queue.tail_.load(std::memory_order_relaxed);
+                        const auto end =
+                            tail + std::min<uint64_t>(heads[index] - tail, config.drain_batch);
+                        for (; tail != end; ++tail) {
+                            encode(stream, queue.ring_[tail & (queue.ring_.size() - 1)]);
+                            any = true;
+                        }
+                        queue.tail_.store(tail, std::memory_order_release);
+                        remaining |= tail != heads[index];
+                    }
+                } while (remaining);
+                if (config.perfetto) {
+                    writer.advanceClockWatermark(limit);
+                    acknowledged.store(limit, std::memory_order_release);
+                    for (auto& stream : streams)
+                        stream.queue->acknowledged_.store(limit, std::memory_order_release);
+                }
+                if (stop) break;
+                if (any)
+                    idle = 0;
+                else if (config.perfetto && idle++ < 64)
+                    std::this_thread::yield();
+                else
                     std::this_thread::sleep_for(std::chrono::microseconds(50));
-                }
             }
             for (auto& [id, sink] : text) {
                 (void)id;
@@ -199,6 +256,9 @@ ClockTraceRecorder::ClockTraceRecorder(Config config)
         throw std::invalid_argument(
             "clock trace requires power-of-two capacity [2,2^20] and batch [1,capacity]");
     }
+    if (c.perfetto && (c.perfetto_options.clock_buffer_records < 2 ||
+                       c.perfetto_options.clock_buffer_records > 65536))
+        throw std::invalid_argument("clock buffer records must be in [2,65536]");
 }
 ClockTraceRecorder::~ClockTraceRecorder() {
     try {
@@ -240,8 +300,9 @@ ClockTraceStream* ClockTraceRecorder::addStream(const ClockDomain& domain, uint3
     if (impl_->stats.allocated_buffer_bytes + bytes > 256 * 1024 * 1024) {
         throw std::invalid_argument("clock trace ingress budget exceeds 256 MiB");
     }
-    auto queue = std::unique_ptr<ClockTraceStream>(new ClockTraceStream(
-        impl_->config.stream_capacity, impl_->config.lossless, &impl_->failed));
+    auto queue = std::unique_ptr<ClockTraceStream>(
+        new ClockTraceStream(impl_->config.stream_capacity, impl_->config.lossless,
+                             impl_->config.perfetto, domain, &impl_->failed));
     auto* result = queue.get();
     impl_->streams.push_back({domain, unit_id, std::move(unit_name), std::move(queue)});
     impl_->stats.allocated_buffer_bytes += bytes;
@@ -291,6 +352,26 @@ void ClockTraceRecorder::start() {
     impl_->worker = std::thread([this] { impl_->run(); });
 }
 
+bool ClockTraceRecorder::needsProgress() const noexcept {
+    return impl_->config.perfetto && !impl_->closed;
+}
+
+void ClockTraceRecorder::advance(uint64_t exclusive_ns) {
+    if (!impl_->started || impl_->closed)
+        throw std::logic_error("clock progress requires a running recorder");
+    if (!impl_->config.perfetto) return;
+    if (exclusive_ns < impl_->watermark.load(std::memory_order_relaxed))
+        throw std::invalid_argument("clock recorder watermark cannot move backwards");
+    impl_->watermark.store(exclusive_ns, std::memory_order_release);
+    while (impl_->acknowledged.load(std::memory_order_acquire) < exclusive_ns) {
+        if (impl_->failed.load(std::memory_order_acquire))
+            throw std::runtime_error("clock trace backend failed or closed");
+        std::this_thread::yield();
+    }
+    if (impl_->failed.load(std::memory_order_acquire))
+        throw std::runtime_error("clock trace backend failed or closed");
+}
+
 void ClockTraceRecorder::close() {
     if (!impl_->started || impl_->closed) return;
     impl_->stopping.store(true, std::memory_order_release);
@@ -302,13 +383,21 @@ void ClockTraceRecorder::close() {
         impl_->stats.peak_buffer_bytes += stream.queue->peak_ * sizeof(ClockRecord);
     }
     if (impl_->error) std::rethrow_exception(impl_->error);
+    impl_->stats.native_buffer_peak_bytes = impl_->writer.clockBufferPeakBytes();
+    impl_->stats.native_buffer_peak_records = impl_->writer.clockBufferPeakRecords();
+    impl_->stats.first_output_ns = impl_->writer.firstClockOutputNanoseconds();
     if (enabled()) {
         std::ofstream report(impl_->config.output_dir / "clock-stats.json");
         report.exceptions(std::ios::badbit | std::ios::failbit);
         report << "{\"events\":" << impl_->stats.events
                << ",\"dropped_events\":" << impl_->stats.dropped
                << ",\"allocated_ingress_bytes\":" << impl_->stats.allocated_buffer_bytes
-               << ",\"peak_ingress_bytes_upper_bound\":" << impl_->stats.peak_buffer_bytes << "}\n";
+               << ",\"peak_ingress_bytes_upper_bound\":" << impl_->stats.peak_buffer_bytes
+               << ",\"native_buffer_peak_bytes_upper_bound\":"
+               << impl_->stats.native_buffer_peak_bytes
+               << ",\"native_buffer_peak_records\":" << impl_->stats.native_buffer_peak_records
+               << ",\"first_output_ns\":" << impl_->stats.first_output_ns
+               << ",\"temporary_disk_bytes\":0}\n";
         report.close();
         for (const auto& entry : std::filesystem::directory_iterator(impl_->config.output_dir)) {
             if (entry.is_regular_file()) impl_->stats.file_bytes += entry.file_size();

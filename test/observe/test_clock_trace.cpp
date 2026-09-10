@@ -18,8 +18,7 @@ void writerCollisions(const std::filesystem::path& root) {
         PerfettoTraceWriter::Options options;
         options.compress = variant & 2;
         options.checkpoint_interval_packets = 2;
-        // 160 records / 2 forces multiple bounded external merge passes.
-        options.clock_sort_run_records = 2;
+        options.clock_buffer_records = 256;
         assert(writer.open(root / ("writer-collision-" + std::to_string(variant) + ".pftrace"),
                            options));
         const auto clock = ClockDomain::fromHz(9, "four-ghz", 4'000'000'000ULL);
@@ -57,6 +56,14 @@ void writerCollisions(const std::filesystem::path& root) {
             rejected = true;
         }
         assert(rejected && writer.eventsWritten() == 160);
+        // The strict bucket boundary excludes equal-ns records until the next promise.
+        writer.advanceClockWatermark(79);
+        writer.advanceClockWatermark(80);
+        writer.flush();
+        assert(writer.firstClockOutputNanoseconds() != 0);
+        std::filesystem::copy_file(
+            root / ("writer-collision-" + std::to_string(variant) + ".pftrace"),
+            root / ("writer-live-" + std::to_string(variant) + ".pftrace"));
         writer.close();
         writer.close();
         assert(writer.eventsWritten() == 160 && writer.bytesWritten() > 0);
@@ -79,7 +86,7 @@ int main(int argc, char** argv) {
         config.reverse_drain = variant & 1;
         config.perfetto_options.compress = variant & 2;
         config.perfetto_options.checkpoint_interval_packets = 13;
-        config.perfetto_options.clock_sort_run_records = 1024;
+        config.perfetto_options.clock_buffer_records = 256;
         ClockTraceRecorder recorder(config);
         auto sm = ClockDomain::fromHz(1, "sm", 914'000'000);
         auto lts = ClockDomain::fromHz(2, "lts", 1'326'000'000, 1, SimTime::picoseconds(137));
@@ -87,16 +94,21 @@ int main(int argc, char** argv) {
         for (unsigned i = 0; i < 4; ++i) {
             streams[i] = recorder.addStream(i < 2 ? sm : lts, i, "worker-" + std::to_string(i));
         }
+        auto* quiet = recorder.addStream(sm, 4, "quiet");
         recorder.start();
+        // An empty stream must explicitly finish; no event-derived progress inference.
+        quiet->finish();
         std::vector<std::thread> workers;
         constexpr uint64_t count = 20000;
         for (unsigned i = 0; i < 4; ++i)
             workers.emplace_back([&, i] {
-                // At least 750 simulated seconds of cross-stream disorder; sorting is offline.
+                // Hundreds of seconds of skew, bounded by acknowledged batch progress.
                 const uint64_t start = (i & 1) ? 1'000'000'000'000ULL : 0;
                 for (uint64_t n = 0; n < count; ++n) {
                     streams[i]->record(start + n, ClockEventKind::User, 0, n);
+                    if ((n & 15) == 15) streams[i]->advance(start + n + 1);
                 }
+                streams[i]->finish();
             });
         for (auto& worker : workers) worker.join();
         recorder.close();
@@ -119,6 +131,72 @@ int main(int argc, char** argv) {
         assert(std::filesystem::exists(config.output_dir / "text-domain-lts.log"));
     }
     writerCollisions(root);
+    {
+        PerfettoTraceWriter writer;
+        PerfettoTraceWriter::Options options;
+        options.clock_buffer_records = 2;
+        assert(writer.open(root / "bounds.pftrace", options));
+        const auto stream =
+            writer.addClockStream(ClockDomain::fromHz(1, "bounds", 4'000'000'000ULL));
+        const auto track = writer.addTrack("bounds");
+        const auto rejects = [](auto&& operation) {
+            bool failed = false;
+            try {
+                operation();
+            } catch (const std::exception&) {
+                failed = true;
+            }
+            assert(failed);
+        };
+        writer.clockInstant(stream, track, "clock", "first", 0, 0);
+        writer.clockInstant(stream, track, "clock", "last-in-bucket", 3, 0);
+        writer.advanceClockWatermark(0);  // Cannot close bucket 0.
+        rejects([&] { writer.clockInstant(stream, track, "clock", "overflow", 1, 0); });
+        assert(writer.eventsWritten() == 2);
+        writer.advanceClockWatermark(1);
+        rejects([&] { writer.clockInstant(stream, track, "clock", "late", 3, 0); });
+        rejects([&] { writer.advanceClockWatermark(0); });
+        writer.clockInstant(stream, track, "clock", "boundary", 4, 0);
+        writer.close();  // Flushes the unannounced tail bucket.
+        assert(writer.eventsWritten() == 3 && writer.clockBufferPeakRecords() == 2);
+    }
+    {
+        ClockTraceRecorder::Config config;
+        config.output_dir = root / "progress";
+        config.perfetto_options.clock_buffer_records = 8;
+        ClockTraceRecorder recorder(config);
+        auto* stream =
+            recorder.addStream(ClockDomain::fromHz(1, "progress", 1'000'000'000), 1, "progress");
+        auto* sleeping =
+            recorder.addStream(ClockDomain::fromHz(2, "sleeping", 1'000'000'000), 2, "sleeping");
+        recorder.start();
+        std::thread sleeper([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            sleeping->advance(1);  // Advances even though no record was emitted.
+            sleeping->finish();
+        });
+        stream->record(0, ClockEventKind::User);
+        stream->advance(1);
+        bool rejected = false;
+        try {
+            stream->record(0, ClockEventKind::User);
+        } catch (const std::logic_error&) {
+            rejected = true;
+        }
+        assert(rejected);
+        stream->record(1, ClockEventKind::User);
+        stream->finish();
+        rejected = false;
+        try {
+            stream->record(2, ClockEventKind::User);
+        } catch (const std::logic_error&) {
+            rejected = true;
+        }
+        assert(rejected);
+        sleeper.join();
+        recorder.close();
+        assert(recorder.stats().events == 2 && recorder.stats().native_buffer_peak_records <= 8);
+    }
     // Regressing input is normalized before encoding without changing event times
     // or checkpoint mappings.
     {
