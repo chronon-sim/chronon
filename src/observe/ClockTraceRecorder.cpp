@@ -15,6 +15,8 @@
 #include <map>
 #include <thread>
 
+#include "detail/ClockEventBuffer.hpp"
+
 namespace chronon::observe {
 
 ClockTraceStream::ClockTraceStream(size_t capacity, bool lossless, bool perfetto, ClockDomain clock,
@@ -26,6 +28,7 @@ ClockTraceStream::ClockTraceStream(size_t capacity, bool lossless, bool perfetto
       clock_(std::move(clock)) {}
 
 void ClockTraceStream::advance(uint64_t next_cycle) {
+    if (coordinator_) throw std::logic_error("coordinated streams use recorder progress");
     if (finished_.load(std::memory_order_relaxed) || next_cycle < minimum_cycle_)
         throw std::logic_error("invalid clock stream progress after finish or backwards");
     const auto ns = perfetto_ ? clock_.edge(next_cycle).floorNanoseconds() : 0;
@@ -40,7 +43,10 @@ void ClockTraceStream::advance(uint64_t next_cycle) {
         throw std::runtime_error("clock trace backend failed or closed");
 }
 
-void ClockTraceStream::finish() { finished_.store(true, std::memory_order_release); }
+void ClockTraceStream::finish() {
+    if (coordinator_) throw std::logic_error("coordinated streams finish with recorder close");
+    finished_.store(true, std::memory_order_release);
+}
 
 void ClockTraceStream::record(uint64_t cycle, ClockEventKind kind, uint64_t transaction,
                               uint64_t value, uint32_t fifo, ClockEventPhase phase) {
@@ -63,12 +69,17 @@ void ClockTraceStream::record(uint64_t cycle, ClockEventKind kind, uint64_t tran
     }
     if (failed_->load(std::memory_order_acquire))
         throw std::runtime_error("clock trace backend failed or closed");
+    if (coordinator_) coordinator_->reserveClockRecord(record_base_bytes_, kind);
     ring_[head & (ring_.size() - 1)] = {cycle, transaction, value, ordinal, fifo, kind, phase};
     peak_ = std::max(peak_, head - tail + 1);
     head_.store(head + 1, std::memory_order_release);
 }
 
 namespace {
+constexpr std::string_view ClockCategory = "clock";
+constexpr std::array<std::string_view, 6> ClockAnnotations = {
+    "unit_id", "fifo_id", "transaction_id", "phase", "value", "ordinal"};
+
 void validateText(std::string_view value) {
     if (value.empty() || value.size() > 1024)
         throw std::invalid_argument("clock metadata string length outside [1,1024]");
@@ -108,6 +119,12 @@ struct ClockTraceRecorder::Impl {
     std::exception_ptr error;
     bool started = false, closed = false;
     Stats stats;
+    // Producer-only resource reservations, not event ordering or hardware state.
+    bool coordinated = false, batch_active = false;
+    uint64_t bucket_ns = 0;
+    size_t pending_records = 0, pending_bytes = 0;
+    size_t bucket_records = 0, bucket_bytes = 0, batches = 0;
+    std::vector<uint16_t> event_name_bytes;
 
     void writeManifest() {
         std::ofstream file(config.output_dir / "clock-manifest.json");
@@ -166,14 +183,14 @@ struct ClockTraceRecorder::Impl {
         if (config.perfetto) {
             using A = PerfettoTraceWriter::Annotation;
             const std::array<A, 6> annotations = {
-                {{"unit_id", A::Kind::Uint, stream.unit_id},
-                 {"fifo_id", A::Kind::Uint, record.fifo_id},
-                 {"transaction_id", A::Kind::Uint, record.transaction_id},
-                 {"phase", A::Kind::Uint, static_cast<uint64_t>(record.phase)},
-                 {"value", A::Kind::Uint, record.value},
-                 {"ordinal", A::Kind::Uint, record.ordinal}}};
-            writer.clockInstant(stream.sequence, stream.track, "clock", name, record.local_cycle,
-                                record.transaction_id, annotations);
+                {{ClockAnnotations[0], A::Kind::Uint, stream.unit_id},
+                 {ClockAnnotations[1], A::Kind::Uint, record.fifo_id},
+                 {ClockAnnotations[2], A::Kind::Uint, record.transaction_id},
+                 {ClockAnnotations[3], A::Kind::Uint, static_cast<uint64_t>(record.phase)},
+                 {ClockAnnotations[4], A::Kind::Uint, record.value},
+                 {ClockAnnotations[5], A::Kind::Uint, record.ordinal}}};
+            writer.clockInstant(stream.sequence, stream.track, ClockCategory, name,
+                                record.local_cycle, record.transaction_id, annotations);
         }
         ++stats.events;
     }
@@ -309,13 +326,25 @@ ClockTraceStream* ClockTraceRecorder::addStream(const ClockDomain& domain, uint3
     return result;
 }
 
-void ClockTraceRecorder::start() {
+void ClockTraceRecorder::start(bool serial_coordinator) {
     if (impl_->started) throw std::logic_error("clock recorder cannot be restarted");
     if (!enabled()) {
         impl_->started = true;
         return;
     }
     const auto& config = impl_->config;
+    impl_->coordinated = serial_coordinator && config.perfetto;
+    if (impl_->coordinated) {
+        impl_->event_name_bytes.resize(1u << 16);
+        for (const auto& [kind, name] : impl_->names)
+            impl_->event_name_bytes[static_cast<uint16_t>(kind)] = name.size();
+        size_t base = detail::ClockEventBuffer::BaseRecordBytes + ClockCategory.size();
+        for (auto name : ClockAnnotations) base += name.size();
+        for (auto& stream : impl_->streams) {
+            stream.queue->coordinator_ = this;
+            stream.queue->record_base_bytes_ = base + stream.unit_name.size();
+        }
+    }
     if (std::filesystem::exists(config.output_dir) &&
         !std::filesystem::is_empty(config.output_dir)) {
         throw std::invalid_argument("clock trace output directory must be new or empty");
@@ -370,6 +399,57 @@ void ClockTraceRecorder::advance(uint64_t exclusive_ns) {
     }
     if (impl_->failed.load(std::memory_order_acquire))
         throw std::runtime_error("clock trace backend failed or closed");
+}
+
+void ClockTraceRecorder::beginClockBatch(const SimTime& time) {
+    auto& p = *impl_;
+    if (!p.started || p.closed || !p.coordinated || p.batch_active)
+        throw std::logic_error("invalid coordinated clock batch");
+    const auto ns = time.floorNanoseconds();
+    if (ns < p.bucket_ns || ns < p.watermark.load(std::memory_order_relaxed))
+        throw std::logic_error("clock batch precedes published progress");
+    if (ns != p.bucket_ns) {
+        p.bucket_records = p.bucket_bytes = 0;
+        p.bucket_ns = ns;
+    }
+    p.batch_active = true;
+}
+
+void ClockTraceRecorder::reserveClockRecord(size_t base_bytes, ClockEventKind kind) {
+    auto& p = *impl_;
+    if (!p.batch_active) throw std::logic_error("clock record outside coordinated batch");
+    const auto name_bytes = p.event_name_bytes[static_cast<uint16_t>(kind)];
+    if (!name_bytes) throw std::invalid_argument("undefined clock event kind");
+    const auto bytes = base_bytes + name_bytes;
+    const auto capacity = p.config.perfetto_options.clock_buffer_records;
+    constexpr auto byte_limit = detail::ClockEventBuffer::MaxPendingBytes;
+    if (p.bucket_records == capacity || bytes > byte_limit - p.bucket_bytes)
+        throw std::length_error(
+            "native clock single-nanosecond bucket exceeds record or 4 MiB byte budget");
+    if (p.pending_records == capacity || bytes > byte_limit - p.pending_bytes) {
+        // All older-ns events were published by this serial producer. Never
+        // close the current bucket, even if this happens midway through a tick.
+        advance(p.bucket_ns);
+        p.pending_records = p.bucket_records;
+        p.pending_bytes = p.bucket_bytes;
+        p.batches = 0;
+    }
+    ++p.pending_records;
+    ++p.bucket_records;
+    p.pending_bytes += bytes;
+    p.bucket_bytes += bytes;
+}
+
+void ClockTraceRecorder::endClockBatch() {
+    auto& p = *impl_;
+    if (!p.batch_active) throw std::logic_error("no coordinated clock batch to end");
+    if (++p.batches == 64) {
+        advance(p.bucket_ns);
+        p.pending_records = p.bucket_records;
+        p.pending_bytes = p.bucket_bytes;
+        p.batches = 0;
+    }
+    p.batch_active = false;
 }
 
 void ClockTraceRecorder::close() {

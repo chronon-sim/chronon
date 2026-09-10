@@ -4,6 +4,35 @@ sidebar_label: "Clock Domains and CDC"
 
 # Clock Domains and CDC
 
+## Automatic observation progress and installed consumers
+
+The scheduler's 64-batch observation interval is a maximum batching interval,
+not a requirement that all those batches fit in the native buffer. Serial clock
+execution reserves both a record slot and its conservative encoded metadata
+bytes **before** publishing each accepted ingress record. If either aggregate
+budget would be exceeded, it waits for the backend to release all older
+nanosecond buckets. The current nanosecond stays open, including when progress
+is published midway through a unit tick. This host wait adds no simulated edges.
+A single nanosecond bucket must still fit both `clock_buffer_records` and the
+fixed 4 MiB metadata budget; increasing the former cannot enlarge the latter.
+
+Reservations use producer-private counters, immutable event-name lengths and
+precomputed stream metadata sizes. They introduce no per-event allocation,
+time conversion, lock, atomic ordering counter or disk spill. The serial mode
+adds a bounded 128 KiB event-name-length table, separate from the reported ingress
+ring and native pending-buffer memory. Text-only and disabled tracing do not
+allocate this table. Independent concurrent recorder streams retain their
+explicit `advance()`/`finish()` protocol; they do not share serial reservations.
+
+Installable builds use `-DCHRONON_INSTALL=ON`. `cmake --install` preserves the
+public `chronon/`, `sender/`, `observe/`, `tree/`, `params/` and `time/` include
+trees, installs the static Perfetto dependency and the stdexec package, and
+provides `find_package(chronon CONFIG REQUIRED)` with `chronon::core` and
+`chronon::observe`. The consumer also needs fmt, yaml-cpp, ZLIB and Threads.
+The `installed_consumer` CTest installs into a temporary build-local `out/`
+prefix, relocates it, and builds/runs a separate two-clock FIFO consumer without
+Chronon source-tree include paths.
+
 Chronon supports static, independently phased hardware clocks and finite typed
 asynchronous FIFOs. Physical-time scheduling and CDC circuits are separate:
 the scheduler chooses edges; each FIFO implements its own pointer synchronizers,

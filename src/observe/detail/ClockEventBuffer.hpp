@@ -13,6 +13,7 @@ namespace chronon::observe::detail {
 /// Bounded open timestamp buckets. No scratch files or whole-trace sorting.
 class ClockEventBuffer {
 public:
+    static constexpr size_t BaseRecordBytes = 512;
     static constexpr size_t MaxRecordBytes = 64 * 1024;
     static constexpr size_t MaxPendingBytes = 4 * 1024 * 1024;
     static constexpr size_t MaxRecords = 65536;

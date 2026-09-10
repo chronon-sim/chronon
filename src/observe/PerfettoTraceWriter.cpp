@@ -443,7 +443,7 @@ void PerfettoTraceWriter::clockInstant(uint32_t stream, uint64_t track_uuid,
     if (events_written_ == UINT64_MAX || seq.native_ordinal == UINT64_MAX)
         throw std::overflow_error("native clock event ordinal overflow");
     const auto& track_name = impl_->track_names.at(track_uuid);
-    size_t bytes = 512;  // Conservative framing/field overhead, checked before copying strings.
+    size_t bytes = detail::ClockEventBuffer::BaseRecordBytes;
     const auto account = [&](std::string_view value) {
         if (value.size() > detail::ClockEventBuffer::MaxRecordBytes - bytes)
             throw std::invalid_argument("native clock record exceeds 64 KiB");

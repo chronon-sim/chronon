@@ -13,7 +13,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 # Test executables (prefixed with sender_ to avoid conflicts)
-foreach(clock_test clock_time async_fifo_circuit multiclock)
+foreach(clock_test clock_time async_fifo_circuit multiclock clock_trace_budget)
     add_executable(sender_test_${clock_test} test_${clock_test}.cpp)
     target_link_libraries(sender_test_${clock_test} PRIVATE chronon::core)
     add_test(NAME sender_${clock_test} COMMAND sender_test_${clock_test})

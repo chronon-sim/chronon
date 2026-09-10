@@ -134,7 +134,7 @@ void TickSimulation::initializeClockRuntime_() {
         clocks.push_back(runtime.clock);
     }
     clock_calendar_ = std::make_unique<ClockCalendar>(clocks);
-    if (clock_trace_) clock_trace_->start();
+    if (clock_trace_) clock_trace_->start(true);
     if (config_.enable_parallel) std::clog << "[chronon] " << parallel_fallback_reason_ << '\n';
 }
 
@@ -151,6 +151,8 @@ bool TickSimulation::executeClockBatch_() {
     if (current_cycle_ == UINT64_MAX) throw std::overflow_error("scheduler progress overflow");
     try {
         const auto edges = clock_calendar_->pop();
+        if (clock_trace_ && clock_trace_->needsProgress())
+            clock_trace_->beginClockBatch(edges.front().time);
         for (auto& fifo : cdc_) fifo->begin(edges);
         for (const auto& edge : edges) {
             auto& runtime = clock_runtime_.at(edge.domain->id());
@@ -168,8 +170,7 @@ bool TickSimulation::executeClockBatch_() {
         ++current_cycle_;
         // All queues publish before this safe point, including every CDC commit.
         // Only observation time is quantized; the current ns bucket stays open.
-        if ((current_cycle_ & 63) == 0 && clock_trace_ && clock_trace_->needsProgress())
-            clock_trace_->advance(clock_time_.floorNanoseconds());
+        if (clock_trace_ && clock_trace_->needsProgress()) clock_trace_->endClockBatch();
         return true;
     } catch (...) {
         for (auto* unit : unit_ptrs_) unit->clock_edge_executing_ = false;

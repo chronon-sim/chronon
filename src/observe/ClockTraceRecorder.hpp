@@ -39,6 +39,8 @@ static_assert(sizeof(ClockRecord) == 40);
 
 /// One producer at a time per stream, one backend consumer. Different streams
 /// may be written concurrently, including several streams in the same domain.
+class ClockTraceRecorder;
+
 class ClockTraceStream {
 public:
     void record(uint64_t cycle, ClockEventKind kind, uint64_t transaction = 0, uint64_t value = 0,
@@ -51,6 +53,8 @@ public:
 
 private:
     friend class ClockTraceRecorder;
+    ClockTraceRecorder* coordinator_ = nullptr;
+    size_t record_base_bytes_ = 0;
     ClockTraceStream(size_t capacity, bool lossless, bool perfetto, ClockDomain clock,
                      std::atomic<bool>* failed);
     std::vector<ClockRecord> ring_;
@@ -98,7 +102,12 @@ public:
     ClockTraceRecorder& operator=(const ClockTraceRecorder&) = delete;
     void defineEvent(ClockEventKind kind, std::string name);
     ClockTraceStream* addStream(const ClockDomain& domain, uint32_t unit_id, std::string unit_name);
-    void start();
+    /// Serial coordinator mode requires begin/endClockBatch around all producers.
+    /// All records must belong to that exact batch time; do not advance/finish
+    /// individual streams. Leave disabled for independent worker streams.
+    void start(bool serial_coordinator = false);
+    void beginClockBatch(const SimTime& time);
+    void endClockBatch();
     /// Coordinator-only alternative to per-stream advance: ALL producers must
     /// have published every event with floor(time/ns) < exclusive_ns before this
     /// call, and promise never to publish another. Waits for backend acknowledgement.
@@ -114,6 +123,8 @@ public:
     bool enabled() const noexcept;
 
 private:
+    friend class ClockTraceStream;
+    void reserveClockRecord(size_t base_bytes, ClockEventKind kind);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
