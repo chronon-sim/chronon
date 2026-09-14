@@ -13,6 +13,7 @@
 #pragma once
 
 #include "../../observe/ObservationManager.hpp"
+#include "../../params/ParameterSet.hpp"
 #include "../port/AsyncFifo.hpp"
 #include "../port/Connection.hpp"
 #include "../port/Port.hpp"
@@ -127,9 +128,38 @@ public:
         ptr->bindActivitySchedulingState_(&any_activity_scheduling_);
 
         units_.push_back(std::move(unit));
-        unit_ptrs_.push_back(ptr);
+        try {
+            unit_ptrs_.push_back(ptr);
+        } catch (...) {
+            // Registration must not leave a live unit behind on failure: its
+            // constructor arguments may belong to the caller's unwind scope.
+            units_.pop_back();
+            throw;
+        }
 
         return ptr;
+    }
+
+    /// Construct a unit from parameters owned by this simulation. Parameters
+    /// outlive every unit destructor and are released when the simulation ends.
+    /// A failed creation releases only that attempt's parameters.
+    template <typename UnitT, typename ParameterSetT>
+    UnitT* createUnitWithParameters(std::unique_ptr<ParameterSetT> parameters) {
+        static_assert(std::is_base_of_v<params::ParameterSet, ParameterSetT>,
+                      "ParameterSetT must derive from ParameterSet");
+        if (!parameters) throw std::invalid_argument("unit parameters must not be null");
+
+        auto* parameter_ptr = parameters.get();
+        const size_t index = unit_parameters_.size();
+        unit_parameters_.push_back(std::move(parameters));
+        try {
+            return createUnit<UnitT>(parameter_ptr);
+        } catch (...) {
+            // A constructor may have created other units recursively. Keep
+            // their parameters; the failed attempt is not necessarily last.
+            unit_parameters_.erase(unit_parameters_.begin() + index);
+            throw;
+        }
     }
 
     template <typename T>
@@ -693,6 +723,8 @@ private:
 
     ::exec::static_thread_pool pool_;
 
+    // Reverse member destruction keeps parameters valid through unit teardown.
+    std::vector<std::unique_ptr<params::ParameterSet>> unit_parameters_;
     std::vector<std::unique_ptr<TickableUnit>> units_;
     std::vector<TickableUnit*> unit_ptrs_;
 

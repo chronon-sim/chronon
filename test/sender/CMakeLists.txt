@@ -30,6 +30,25 @@ if(CHRONON_TRACE_PROCESSOR)
             --check-prefix)
     set_tests_properties(multiclock_trace_processor PROPERTIES TIMEOUT 180)
 endif()
+
+add_executable(sender_test_factory_parameter_lifetime test_factory_parameter_lifetime.cpp)
+target_link_libraries(sender_test_factory_parameter_lifetime
+    PRIVATE chronon::core yaml-cpp::yaml-cpp chronon_compile_options)
+foreach(mode success constructor deserialize builder overlapping nested initialized)
+    add_test(NAME sender_factory_parameters_${mode}
+        COMMAND sender_test_factory_parameter_lifetime ${mode})
+    set_tests_properties(sender_factory_parameters_${mode} PROPERTIES TIMEOUT 45 LABELS "sender")
+endforeach()
+add_executable(sender_test_factory_parameter_allocation_failure
+    test_factory_parameter_allocation_failure.cpp)
+target_link_libraries(sender_test_factory_parameter_allocation_failure
+    PRIVATE chronon::core yaml-cpp::yaml-cpp chronon_compile_options)
+add_test(NAME sender_factory_parameters_allocation_failure
+    COMMAND sender_test_factory_parameter_allocation_failure)
+set_tests_properties(sender_factory_parameters_allocation_failure PROPERTIES TIMEOUT 45 LABELS "sender")
+add_dependencies(regress sender_test_factory_parameter_lifetime
+    sender_test_factory_parameter_allocation_failure)
+
 add_executable(sender_test_message_queue test_message_queue.cpp)
 add_executable(sender_test_lockfree_message_queue test_lockfree_message_queue.cpp)
 add_executable(sender_test_dependency_graph test_dependency_graph.cpp)
