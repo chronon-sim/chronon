@@ -56,7 +56,8 @@ public:
  *
  * UnitT must derive from sender::Unit, declare `using ParameterSet = ...`, define
  * `static constexpr const char* unit_type_name` and `unit_description`, and accept
- * a `const ParameterSet*` via `sim->createUnit<UnitT>(params)`.
+ * a `const ParameterSet*`. The simulation owns parameters until all its units
+ * have been destroyed; the factory retains no per-instance state.
  */
 template <SenderFactoryUnit UnitT>
 class SenderFactory : public ISenderFactory {
@@ -71,24 +72,17 @@ public:
 
     Unit* createUnit(TickSimulation* sim, [[maybe_unused]] const std::string& name,
                      const YAML::Node& yaml_params) override {
-        auto params = std::make_shared<ParameterSetT>();
+        auto params = std::make_unique<ParameterSetT>();
         if (yaml_params.IsDefined() && !yaml_params.IsNull()) {
             params->deserializeYAML(&yaml_params);
         }
 
-        // Keep params alive for the unit's full lifetime.
-        params_storage_.push_back(params);
-
-        UnitT* unit = sim->createUnit<UnitT>(params.get());
-
-        return unit;
+        return sim->createUnitWithParameters<UnitT>(std::move(params));
     }
 
 private:
     std::string type_name_;
     std::string description_;
-
-    std::vector<std::shared_ptr<ParameterSetT>> params_storage_;
 };
 
 /** @brief Thread-safe singleton registry of unit factories keyed by YAML type name. */

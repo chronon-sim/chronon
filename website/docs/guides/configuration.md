@@ -79,6 +79,17 @@ auto* unit2 = sim.createUnit<MyUnit>();  // Defaults
 // type: MyUnit, params: {width: 8, depth: 16}
 ```
 
+For factory-created units, the simulation owns each `ParameterSet` and keeps it
+alive until all unit destructors have finished. Destroying a simulation releases
+its parameters without affecting other simulations or unregistering factories.
+Failed unit creation and failed YAML builds also release the parameters they no
+longer need.
+
+Direct C++ code can transfer the same ownership explicitly with
+`sim.createUnitWithParameters<MyUnit>(std::make_unique<MyUnitParams>())`.
+Passing a raw parameter pointer to `createUnit` keeps ownership with the caller,
+who must keep the parameters alive through unit destruction.
+
 ## SimulationApp
 
 Unified entry point with CLI support:
