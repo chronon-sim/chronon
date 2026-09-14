@@ -7,6 +7,20 @@ target_link_libraries(test_clock_trace PRIVATE chronon::observe)
 target_compile_options(test_clock_trace PRIVATE -UNDEBUG)
 add_test(NAME clock_trace_test COMMAND test_clock_trace)
 
+add_executable(test_timeline_registry_lifecycle test_timeline_registry_lifecycle.cpp)
+target_link_libraries(test_timeline_registry_lifecycle
+    PRIVATE chronon::observe chronon_compile_options)
+foreach(mode disabled enabled late_enable identity caches concurrent)
+    add_test(NAME timeline_registry_${mode}_test COMMAND test_timeline_registry_lifecycle ${mode})
+    set_tests_properties(timeline_registry_${mode}_test PROPERTIES TIMEOUT 45)
+endforeach()
+add_executable(test_timeline_registry_backend test_timeline_registry_backend.cpp)
+target_link_libraries(test_timeline_registry_backend
+    PRIVATE chronon::observe chronon_compile_options ZLIB::ZLIB)
+add_test(NAME timeline_registry_backend_test COMMAND test_timeline_registry_backend)
+set_tests_properties(timeline_registry_backend_test PROPERTIES TIMEOUT 45)
+add_dependencies(regress test_timeline_registry_lifecycle test_timeline_registry_backend)
+
 # Observe module tests
 #
 # Tests for high-performance observability system

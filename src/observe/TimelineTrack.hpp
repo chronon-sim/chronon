@@ -28,7 +28,7 @@ class ObservableUnit;
 
 /**
  * @brief Base for declarative timeline tracks; handles owner registration and
- * context attach (track-id assignment).
+ * context attach and deferred track-id assignment when recording is enabled.
  */
 class TimelineTrackBase {
 public:
@@ -45,18 +45,21 @@ public:
 private:
     friend class ObservableUnit;
 
-    /// Called by ObservableUnit when the observation context attaches:
-    /// registers the track and caches its id for the hot path.
+    /// Attach the context; register immediately only if recording is enabled.
     void onContextAttached(ObservationContext* ctx);
 
 protected:
     /// Stamps the owner's cycle into the context.
     void stampCycle_() noexcept;
 
+    /// Resolve immutable metadata once, including after late trace enabling.
+    void ensureRegistered_();
+
     ObservableUnit* owner_ = nullptr;
     ObservationContext* ctx_ = nullptr;
     std::string name_;
     uint32_t track_id_ = 0;
+    uint32_t declaration_index_ = 0;
     uint16_t lanes_ = 1;
     bool registered_ = false;
 };
@@ -135,7 +138,7 @@ private:
         static_assert(MAX_ITEMS - FLOW_ITEMS <= MAX_TIMELINE_ARGS,
                       "too many typed timeline args (max 8)");
 
-        if (!ctx_ || !ctx_->timelineProducerEnabled() || !registered_) {
+        if (!ctx_ || !ctx_->timelineProducerEnabled()) {
             return false;
         }
         // Stamp the owner's cycle BEFORE the filter check: temporal filters
@@ -145,6 +148,9 @@ private:
         const CategoryMask cat_mask = static_cast<CategoryMask>(category);
         if (!ctx_->shouldTrace(cat_mask)) {
             return false;
+        }
+        if (OBSERVE_UNLIKELY(!registered_)) {
+            ensureRegistered_();
         }
 
         return timeline_detail::emitEventWithItems(ctx_, cat_mask, kind, track_id_, slot, name,

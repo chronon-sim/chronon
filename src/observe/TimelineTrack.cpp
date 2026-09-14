@@ -20,9 +20,9 @@ namespace chronon::observe {
 TimelineTrackBase::TimelineTrackBase(ObservableUnit* owner, std::string_view name, uint16_t lanes)
     : owner_(owner), name_(name), lanes_(lanes) {
     if (owner_) {
-        owner_->registerTimelineTrack(this);
+        declaration_index_ = owner_->registerTimelineTrack(this);
         // Late declaration: if the unit's context is already attached,
-        // register immediately (mirrors Counter).
+        // attach immediately (mirrors Counter).
         if (owner_->observationContext()) {
             onContextAttached(owner_->observationContext());
         }
@@ -34,7 +34,14 @@ void TimelineTrackBase::onContextAttached(ObservationContext* ctx) {
         return;
     }
     ctx_ = ctx;
-    track_id_ = TimelineTrackRegistry::instance().registerTrack({name_, ctx_->sourceId(), lanes_});
+    if (ctx_->timelineProducerEnabled()) {
+        ensureRegistered_();
+    }
+}
+
+void TimelineTrackBase::ensureRegistered_() {
+    track_id_ = TimelineTrackRegistry::instance().registerTrack({name_, ctx_->sourceId(), lanes_},
+                                                                declaration_index_);
     registered_ = track_id_ != 0;
 }
 

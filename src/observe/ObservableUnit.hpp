@@ -93,9 +93,12 @@ public:
      * Register a timeline lane/counter for initialization when context is attached.
      *
      * Called by TimelineTrackBase constructor.
+     * Returns a stable 1-based declaration index, including for late members
+     * created after the pending list has been consumed by context attachment.
      */
-    void registerTimelineTrack(TimelineTrackBase* track) {
+    uint32_t registerTimelineTrack(TimelineTrackBase* track) {
         pending_timeline_tracks_.push_back(track);
+        return ++timeline_track_count_;
     }
 
     /**
@@ -292,6 +295,7 @@ private:
 
     // Pending timeline lanes/counters to be initialized when context is attached
     std::vector<TimelineTrackBase*> pending_timeline_tracks_;
+    uint32_t timeline_track_count_ = 0;
 
     /**
      * Initialize all pending counters.
