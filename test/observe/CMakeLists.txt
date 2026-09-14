@@ -40,6 +40,22 @@ add_test(
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
 
+add_executable(test_thread_context_lifecycle test_thread_context_lifecycle.cpp)
+target_link_libraries(test_thread_context_lifecycle PRIVATE chronon::observe chronon_compile_options)
+add_dependencies(regress test_thread_context_lifecycle)
+foreach(mode sequential concurrent_limit late_tls unread consumer wakeup flush_exit)
+    add_test(NAME thread_context_${mode}_test COMMAND test_thread_context_lifecycle ${mode})
+    set_tests_properties(thread_context_${mode}_test PROPERTIES TIMEOUT 45)
+endforeach()
+
+add_executable(test_thread_context_backend test_thread_context_backend.cpp)
+target_link_libraries(test_thread_context_backend PRIVATE chronon::observe chronon_compile_options)
+add_dependencies(regress test_thread_context_backend)
+foreach(mode backend reordered_backend shutdown)
+    add_test(NAME thread_context_${mode}_test COMMAND test_thread_context_backend ${mode})
+    set_tests_properties(thread_context_${mode}_test PROPERTIES TIMEOUT 45)
+endforeach()
+
 # ==============================================================================
 # Sparse Counter Architecture Test
 # ==============================================================================

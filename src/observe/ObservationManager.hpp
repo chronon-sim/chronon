@@ -175,7 +175,7 @@ public:
     size_t contextCount() const noexcept;
 
 private:
-    ObservationManager() = default;
+    ObservationManager();
     ~ObservationManager();
 
     ObservationManager(const ObservationManager&) = delete;

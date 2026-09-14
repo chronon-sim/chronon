@@ -470,6 +470,21 @@ Trade-offs:
 - **More memory** (one queue per thread)
 - **Out-of-order events** (backend sees events from different threads)
 
+The pool supports up to 64 producer slots. On thread exit, the final partial
+batch is published and the backend is notified. Once the consumer has drained
+and acknowledged that queue, a later thread can reuse its slot. Repeated thread
+creation therefore does not consume an ever-growing number of slots.
+
+Queues with unread records still occupy slots after their producer exits. If all
+64 slots have live producers or unread data, context acquisition fails and normal
+trace/log emission records a drop until a slot becomes reusable. Queue storage
+is cached up to the allocation high-water mark (at most 64 queues), with stable
+addresses and IDs for backend readers; handoff never resets consumer cursors or
+discards records. `activeThreadCount()` reports currently attached producers;
+`allocatedContextCount()` reports cached queues, including retired producers.
+Emission attempted by another TLS destructor after the observation producer has
+retired is rejected instead of creating an attachment that cannot be retired.
+
 ## ReorderBuffer
 
 The backend can reorder events by cycle for deterministic output:

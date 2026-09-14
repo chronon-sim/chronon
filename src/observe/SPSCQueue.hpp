@@ -183,6 +183,14 @@ public:
         return written - read;
     }
 
+    /// Safe for a successor producer after the previous producer has exited
+    /// and force-published its tail. Acquire the consumer's acknowledgement
+    /// without accessing its private cursors or resetting the queue.
+    [[nodiscard]] bool isDrained() const noexcept {
+        const size_t written = atomic_writer_pos_.load(std::memory_order_acquire);
+        return atomic_reader_pos_.load(std::memory_order_acquire) == written;
+    }
+
 private:
     static size_t roundUpToPowerOf2(size_t n) {
         if (n == 0) return 1;
