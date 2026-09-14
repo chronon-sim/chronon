@@ -239,6 +239,9 @@ public:
     }
 
     const std::vector<std::unique_ptr<Connection<T>>>& connections() const { return connections_; }
+    void appendOutgoingConnections(std::vector<ConnectionBase*>& result) const override {
+        for (const auto& connection : connections_) result.push_back(connection.get());
+    }
     bool isConnected() const { return !connections_.empty(); }
     size_t connectionCount() const { return connections_.size(); }
 

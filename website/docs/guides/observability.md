@@ -8,6 +8,12 @@ sidebar_label: "Observability System"
 
 Chronon provides a unified observability system with three integrated capabilities:
 
+Explicit hardware clock domains use the separate native
+[ClockTraceRecorder](multiclock-cdc.md#native-recording), with exact time conversion,
+sequence-local Perfetto clocks and one text file per domain. The legacy backend
+and APIs below remain the default single-clock interface and are not silently
+reinterpreted as multi-clock records.
+
 | Feature | Purpose | API | Hot Path |
 |---------|---------|-----|----------|
 | Counters | Statistics collection | `++counter_` / `counter_ += n` | ~1-2ns |

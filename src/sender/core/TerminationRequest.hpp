@@ -19,8 +19,11 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+
+#include "../../time/ClockDomain.hpp"
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
@@ -46,6 +49,8 @@ struct TerminationRequest {
     TerminationReason reason = TerminationReason::None;
     int32_t exit_code = 0;
     uint64_t cycle = 0;
+    ClockDomainId clock_domain_id = 0;
+    std::optional<SimTime> physical_time;
     std::string unit_name;
     std::string message;
 
@@ -96,8 +101,9 @@ public:
      * @return true if this was the first request, false if already terminated.
      */
     bool requestTermination(TerminationReason reason, int32_t exit_code = 0, uint64_t cycle = 0,
-                            std::string_view unit_name = "",
-                            std::string_view message = "") noexcept {
+                            std::string_view unit_name = "", std::string_view message = "",
+                            ClockDomainId clock_domain_id = 0,
+                            std::optional<SimTime> physical_time = std::nullopt) noexcept {
         if (termination_requested_.load(std::memory_order_relaxed)) {
             return false;
         }
@@ -111,6 +117,8 @@ public:
         request_.reason = reason;
         request_.exit_code = exit_code;
         request_.cycle = cycle;
+        request_.clock_domain_id = clock_domain_id;
+        request_.physical_time = physical_time;
         request_.unit_name = std::string(unit_name);
         request_.message = std::string(message);
 

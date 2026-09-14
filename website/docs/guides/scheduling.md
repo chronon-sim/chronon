@@ -8,6 +8,10 @@ sidebar_label: "Scheduling and Parallelization"
 
 Chronon automatically parallelizes simulation based on dependency analysis and lookahead scheduling.
 
+For explicit hardware clocks, exact physical-time limits and the conservative
+CDC scheduling fallback, see [Clock Domains and CDC](multiclock-cdc.md).
+The cycle-weighted lookahead described below applies to the default single-clock path.
+
 For wall-clock scheduler diagnosis, Chronon can also emit a Perfetto/Chrome
 Trace timeline of logical execution streams, unit tick slices, cross-thread
 dependency spin waits, and epoch spans. See

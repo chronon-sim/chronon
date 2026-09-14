@@ -9,6 +9,10 @@
 
 cmake_minimum_required(VERSION 3.17)
 
+add_executable(multiclock_cdc_example multiclock_cdc.cpp)
+target_link_libraries(multiclock_cdc_example PRIVATE chronon::core chronon_compile_options)
+add_test(NAME multiclock_cdc_example COMMAND multiclock_cdc_example)
+
 # ==============================================================================
 # CPU Pipeline Example (Tick-based with stdexec parallel execution)
 # ==============================================================================

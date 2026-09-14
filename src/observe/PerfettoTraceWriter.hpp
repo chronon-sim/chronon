@@ -14,6 +14,8 @@
 #include <span>
 #include <string_view>
 
+#include "../time/ClockDomain.hpp"
+
 namespace chronon::observe {
 
 /**
@@ -63,6 +65,8 @@ public:
         size_t checkpoint_interval_packets = 65536;
         /// Per-table intern cap; reaching it forces a checkpoint on that sequence.
         size_t max_interned_strings = 65536;
+        /// Open native timestamp buckets: [2,65536] records, 4 MiB metadata budget.
+        size_t clock_buffer_records = 8192;
     };
 
     /**
@@ -92,10 +96,34 @@ public:
 
     [[nodiscard]] bool isOpen() const noexcept;
 
-    /// Writes buffered packets to the OS; does not close the file.
+    /// Write encoded packets to the OS; open native buckets require a watermark.
     void flush();
 
+    /// Finish remaining native buckets, flush and close. No temporary disk files.
     void close();
+
+    /// Promise that every future native event has floor(time/ns) >= exclusive_ns.
+    /// All earlier records must already have been submitted, across ALL streams.
+    /// Emit closed buckets; equal-ns events remain buffered. Monotonic, single writer.
+    void advanceClockWatermark(uint64_t exclusive_ns);
+    uint64_t clockBufferPeakBytes() const noexcept;
+    uint64_t clockBufferPeakRecords() const noexcept;
+    /// Host time since open() until the first event-containing packet batch is written.
+    uint64_t firstClockOutputNanoseconds() const noexcept;
+
+    /// Configure before events. Each stream gets its own sequence and local
+    /// incremental/absolute clocks (64/65), mapped to TRACE_FILE simulation ns.
+    /// Hardware frequencies are converted exactly before floor-to-ns encoding.
+    /// Native clock streams cannot share a file with legacy or host-time events.
+    /// Closed buckets are ordered before encoding: exact time, Uint
+    /// "phase" (default 0), track name, Uint "ordinal" (default stream order).
+    /// Stable unique track names identify simultaneous independent streams.
+    /// Native records own metadata, at most 64 KiB each. Publish watermarks in
+    /// bounded batches; late events and exhausted buckets throw, never spill to disk.
+    uint32_t addClockStream(const ClockDomain& domain);
+    void clockInstant(uint32_t stream, uint64_t track_uuid, std::string_view category,
+                      std::string_view name, uint64_t local_cycle, uint64_t flow_id,
+                      std::span<const Annotation> annotations = {});
 
     /// @return Track UUID for a process-scoped group track (ProcessDescriptor).
     uint64_t addProcessTrack(std::string_view process_name, int32_t pid);
@@ -164,6 +192,10 @@ private:
     void sliceBeginImpl_(uint64_t track_uuid, std::string_view category, std::string_view name,
                          uint64_t cycle, uint64_t flow_id, bool has_flow_id,
                          std::span<const Annotation> annotations);
+
+    void writeClockInstant_(uint32_t stream, uint64_t track_uuid, std::string_view category,
+                            std::string_view name, uint64_t local_cycle, uint64_t flow_id,
+                            std::span<const Annotation> annotations);
 
     std::unique_ptr<Impl> impl_;
 

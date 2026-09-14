@@ -14,6 +14,7 @@ const sidebars: SidebarsConfig = {
         'guides/versioned-register',
         'guides/priority-arbiter',
         'guides/scheduling',
+        'guides/multiclock-cdc',
       ],
     },
     {
@@ -53,6 +54,7 @@ const sidebars: SidebarsConfig = {
       label: 'Reference',
       items: [
         'guides/performance',
+        'guides/multiclock-validation',
         'guides/faq',
         'guides/changelog',
       ],

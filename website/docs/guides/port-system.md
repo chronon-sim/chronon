@@ -8,6 +8,10 @@ sidebar_label: "Port System"
 
 Ports provide type-safe communication between units with timestamped message queues for deterministic delivery. The connection delay determines latency; the queue type is automatically selected based on thread topology during simulation initialization.
 
+Ordinary connection delays are measured in the endpoints' same hardware clock
+domain. Cross-domain ordinary connections are rejected. Use the finite typed
+asynchronous FIFO and explicit read handshake in [Clock Domains and CDC](multiclock-cdc.md).
+
 For the queue layout, memory-ordering contract, deterministic fan-in proof, and
 performance rationale, see [Port Transport Architecture](mpsc-atomic-publish.md).
 

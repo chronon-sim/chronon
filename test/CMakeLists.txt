@@ -109,3 +109,14 @@ add_subdirectory(sender)
 
 add_subdirectory(observe)
 
+if(CHRONON_INSTALL)
+    add_test(NAME installed_consumer
+        COMMAND ${CMAKE_COMMAND}
+            -DCHRONON_BUILD_DIR=${CMAKE_BINARY_DIR}
+            -DCONSUMER_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/install
+            -DWORK_DIR=${PROJECT_BINARY_DIR}/out/install-consumer
+            -DCXX=${CMAKE_CXX_COMPILER}
+            -DCONFIG=$<CONFIG>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/install/run.cmake)
+    set_tests_properties(installed_consumer PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+endif()

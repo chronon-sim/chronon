@@ -113,7 +113,8 @@ protected:
     void requestTermination(TerminationReason reason, int32_t exit_code = 0,
                             std::string_view message = "") {
         if (termination_ctrl_) {
-            termination_ctrl_->requestTermination(reason, exit_code, localCycle(), name(), message);
+            termination_ctrl_->requestTermination(reason, exit_code, localCycle(), name(), message,
+                                                  clockDomainId(), physicalTime());
         }
     }
 
@@ -122,7 +123,8 @@ protected:
     void requestTermination(TerminationReason reason, int32_t exit_code, uint64_t cycle,
                             std::string_view message) {
         if (termination_ctrl_) {
-            termination_ctrl_->requestTermination(reason, exit_code, cycle, name(), message);
+            termination_ctrl_->requestTermination(reason, exit_code, cycle, name(), message,
+                                                  clockDomainId(), clockDomain().edge(cycle));
         }
     }
 

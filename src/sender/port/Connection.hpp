@@ -20,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -39,12 +40,9 @@ class IMultiProducerPort;
 void wakeUnitAt(Unit* unit, uint64_t cycle);
 bool unitAcceptsPortWakeups(const Unit* unit) noexcept;
 uint64_t activitySchedulingGeneration(const Unit* unit) noexcept;
+void validateOrdinaryConnection(const Unit* source, const Unit* destination);
 
-/**
- * ConnectionBase - Type-erased base class for connections.
- *
- * Enables storing heterogeneous connections in containers.
- */
+/// Type-erased base class for storing heterogeneous connections.
 class ConnectionBase {
 public:
     virtual ~ConnectionBase() = default;
@@ -54,6 +52,8 @@ public:
     virtual Unit* destination() const noexcept = 0;
     virtual void* sourcePortPtr() const noexcept { return nullptr; }
     virtual void* destPortPtr() const noexcept = 0;
+    virtual std::string_view sourcePortName() const noexcept { return {}; }
+    virtual std::string_view destinationPortName() const noexcept { return {}; }
 
     /// True when this edge can participate in the automatic delay-one
     /// shared-broadcast transport without changing model-visible semantics.
@@ -105,12 +105,9 @@ public:
      */
     virtual void optimizeForSPSC() = 0;
 
-    /**
-     * Optimize destination port for cross-thread MPSC access.
-     *
-     * Switches InPort to use MultiProducerQueueAdapter with one producer
-     * queue per Connection.
-     */
+    /// Optimize destination port for cross-thread MPSC access.
+    /// Switches InPort to MultiProducerQueueAdapter with one producer queue
+    /// per Connection.
     virtual void optimizeForMPSC() = 0;
 
     /// Configure the registered edge modeled by this connection. `capacity`
@@ -290,6 +287,7 @@ public:
      */
     Connection(OutPort<T>* from, InPort<T>* to, uint32_t delay)
         : from_(from), to_(to), delay_(delay) {
+        validateOrdinaryConnection(from_ ? from_->owner() : nullptr, to_ ? to_->owner() : nullptr);
         if (to_) {
             to_->registerIncomingDelay(delay_);
             transaction_group_ =
@@ -498,6 +496,12 @@ public:
     Unit* destination() const noexcept override;
     void* sourcePortPtr() const noexcept override { return static_cast<void*>(from_); }
     void* destPortPtr() const noexcept override { return static_cast<void*>(to_); }
+    std::string_view sourcePortName() const noexcept override {
+        return from_ ? from_->name() : std::string_view{};
+    }
+    std::string_view destinationPortName() const noexcept override {
+        return to_ ? to_->name() : std::string_view{};
+    }
     IMultiProducerPort* registerOnDestMPSC() override;
 
     void setDependencyOnlyTransport(
