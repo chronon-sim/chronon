@@ -256,6 +256,7 @@ void pendingLifetime() {
     Unit live;
     live.setObservationContext(&ctx);
     {
+        // This declaration must leave the pending list before recording resumes.
         TimelineLane destroyed_late(&live, "removed");
     }
     ctx.setTraceChannelEnabled(true);
