@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 #include "ThreadContext.hpp"
 #include "Types.hpp"
@@ -21,8 +22,9 @@ namespace chronon::observe {
 /**
  * @brief Singleton managing per-thread observability contexts.
  *
- * Bounded context pool, thread-local pointer cache, lock-free publication and
- * hot path.
+ * Bounded, reusable context pool with a thread-local pointer cache. Queue
+ * addresses and IDs stay stable for backend readers. Only producer handoff
+ * and backend wakeups take locks; event writes and consumer scans do not.
  */
 class ThreadContextManager {
 public:
@@ -35,7 +37,10 @@ public:
 
     /**
      * @brief Get or create the calling thread's context.
-     * @return Thread context, or nullptr if MAX_THREADS exceeded.
+     * @return Thread context, or nullptr if all MAX_THREADS slots have a live
+     * producer or unconsumed records from an exited producer, or the calling
+     * thread has already retired its producer during TLS destruction.
+     * The producer pointer is valid for the calling thread's lifetime only.
      */
     [[nodiscard]] [[gnu::always_inline]] ThreadContext* getContext() noexcept {
         if (OBSERVE_LIKELY(tls_context_ != nullptr)) {
@@ -44,10 +49,12 @@ public:
         return allocateContext();
     }
 
-    /// Thread-safe; safe to call while other threads are using their contexts.
+    /// Visits allocated queues, including exited producers' unread records.
+    /// Addresses remain stable across producer handoff. Queue reads still
+    /// require a single consumer, which must commit reads before reuse.
     template <typename Fn>
     void forEachContext(Fn&& fn) {
-        uint32_t count = active_count_.load(std::memory_order_acquire);
+        uint32_t count = allocated_count_.load(std::memory_order_acquire);
         for (uint32_t i = 0; i < count && i < MAX_THREADS; ++i) {
             ThreadContext* ctx = contexts_[i].load(std::memory_order_acquire);
             if (ctx) {
@@ -60,9 +67,14 @@ public:
         return active_count_.load(std::memory_order_relaxed);
     }
 
+    /// Pool high-water allocation, bounded by MAX_THREADS and reused after drain.
+    [[nodiscard]] size_t allocatedContextCount() const noexcept {
+        return allocated_count_.load(std::memory_order_acquire);
+    }
+
     [[nodiscard]] uint64_t totalDroppedCount() const noexcept {
         uint64_t total = 0;
-        uint32_t count = active_count_.load(std::memory_order_acquire);
+        uint32_t count = allocated_count_.load(std::memory_order_acquire);
         for (uint32_t i = 0; i < count && i < MAX_THREADS; ++i) {
             if (ThreadContext* ctx = contexts_[i].load(std::memory_order_acquire)) {
                 total += ctx->droppedCount();
@@ -75,7 +87,7 @@ public:
 
     /// PRECONDITION: must be called before any thread calls getContext().
     void setQueueCapacity(size_t capacity) noexcept {
-        if (active_count_.load(std::memory_order_relaxed) == 0) {
+        if (allocated_count_.load(std::memory_order_relaxed) == 0) {
             queue_capacity_ = capacity;
         }
     }
@@ -122,27 +134,31 @@ public:
     /**
      * @brief Register a callback the backend uses to be woken by producers.
      *
-     * Indirected through atomics to avoid a circular header dependency.
-     * Written once at startup, read on hot path — acquire/release suffices.
+     * Removing/replacing the callback waits for in-flight wakeups, including
+     * exiting producers, before the backend can be destroyed. The callback
+     * must not recursively change or invoke this notification registration.
      */
     void setBackendWakeup(void (*fn)(void*), void* ctx) noexcept {
-        wakeup_ctx_.store(ctx, std::memory_order_release);
-        wakeup_fn_.store(fn, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(wakeup_mutex_);
+        wakeup_ctx_ = ctx;
+        wakeup_fn_ = fn;
     }
 
     /// Safe to call from any producer thread.
     [[nodiscard]] bool wakeBackend() noexcept {
-        auto fn = wakeup_fn_.load(std::memory_order_acquire);
-        if (fn) {
-            fn(wakeup_ctx_.load(std::memory_order_acquire));
+        std::lock_guard<std::mutex> lock(wakeup_mutex_);
+        if (wakeup_fn_) {
+            wakeup_fn_(wakeup_ctx_);
             return true;
         }
         return false;
     }
 
-    /// Force-publish writer positions on all queues. Used during shutdown.
+    /// Event writers must be quiescent. Registration and TLS retirement may
+    /// still run: serialize their writer-state handoff with this final flush.
     void flushAll() noexcept {
-        uint32_t count = active_count_.load(std::memory_order_acquire);
+        std::lock_guard<std::mutex> lock(pool_mutex_);
+        uint32_t count = allocated_count_.load(std::memory_order_acquire);
         for (uint32_t i = 0; i < count && i < MAX_THREADS; ++i) {
             if (ThreadContext* ctx = contexts_[i].load(std::memory_order_acquire)) {
                 ctx->queue().forceCommitWrite();
@@ -156,51 +172,84 @@ private:
     ThreadContextManager(const ThreadContextManager&) = delete;
     ThreadContextManager& operator=(const ThreadContextManager&) = delete;
 
-    ThreadContext* allocateContext() noexcept {
-        uint32_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
-        if (id >= MAX_THREADS) {
-            next_id_.fetch_sub(1, std::memory_order_relaxed);
-            return nullptr;
-        }
-
-        std::unique_ptr<ThreadContext> owned;
-        try {
-            owned = std::make_unique<ThreadContext>(id, queue_capacity_);
-        } catch (...) {
-            return nullptr;
-        }
-        ThreadContext* context = owned.get();
-        owned_contexts_[id] = std::move(owned);
-        // Backend scans use only this atomic publication array. Ownership is
-        // kept in a separate single-writer slot, so late producer registration
-        // never races a reader of std::unique_ptr state.
-        contexts_[id].store(context, std::memory_order_release);
-
-        // Monotonic max via CAS loop: concurrent allocations may get IDs out of
-        // order, so a plain store(id+1) could shrink active_count_ and hide a
-        // higher-id context from forEachContext().
-        uint32_t expected = active_count_.load(std::memory_order_relaxed);
-        uint32_t desired = id + 1;
-        while (desired > expected) {
-            if (active_count_.compare_exchange_weak(expected, desired, std::memory_order_release,
-                                                    std::memory_order_relaxed)) {
+    // Keep handoff/TLS setup out of the hot caller's register allocation.
+    [[gnu::noinline]] ThreadContext* allocateContext() noexcept {
+        // Another TLS object's destructor can emit after our lease destructor.
+        // Do not resurrect an attachment whose exit callback cannot run again.
+        if (tls_retired_) return nullptr;
+        std::lock_guard<std::mutex> lock(pool_mutex_);
+        const uint32_t count = allocated_count_.load(std::memory_order_relaxed);
+        uint32_t id = 0;
+        for (; id < count; ++id) {
+            if (!producer_attached_[id] && owned_contexts_[id]->queue().isDrained()) {
                 break;
             }
         }
+        if (id == count) {
+            if (count == MAX_THREADS) return nullptr;
+            try {
+                owned_contexts_[id] = std::make_unique<ThreadContext>(id, queue_capacity_);
+            } catch (...) {
+                // Failed allocations do not consume a slot.
+                return nullptr;
+            }
+            contexts_[id].store(owned_contexts_[id].get(), std::memory_order_release);
+            allocated_count_.store(count + 1, std::memory_order_release);
+        }
 
-        tls_context_ = context;
+        // The mutex transfers the old producer's private queue state to its
+        // successor. Keep all cursors, storage, IDs and cumulative drop counts:
+        // backend readers may still hold the stable context address.
+        producer_attached_[id] = true;
+        active_count_.fetch_add(1, std::memory_order_relaxed);
+        tls_context_ = owned_contexts_[id].get();
+        tls_lease_.manager = this;
         return tls_context_;
     }
 
-    static inline thread_local ThreadContext* tls_context_ = nullptr;
+    void retireContext(ThreadContext* context) noexcept {
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex_);
+            // Publish even a sub-batch tail before making the slot reusable.
+            context->queue().forceCommitWrite();
+            producer_attached_[context->id()] = false;
+            active_count_.fetch_sub(1, std::memory_order_relaxed);
+        }
+        // The backend can sleep indefinitely. Notify after publication and
+        // outside the pool lock; callback removal synchronizes with this call.
+        (void)wakeBackend();
+    }
 
+    struct ContextLease {
+        ThreadContextManager* manager;
+
+        ContextLease() noexcept : manager(nullptr) {}
+
+        ~ContextLease() {
+            tls_retired_ = true;
+            if (manager && tls_context_) {
+                ThreadContext* context = tls_context_;
+                tls_context_ = nullptr;
+                manager->retireContext(context);
+            }
+        }
+    };
+
+    // Keep TLS destructor registration off the already-attached hot path.
+    static inline thread_local ThreadContext* tls_context_ = nullptr;
+    static inline thread_local bool tls_retired_ = false;
+    static inline thread_local ContextLease tls_lease_{};
+
+    std::mutex pool_mutex_;
+    std::array<bool, MAX_THREADS> producer_attached_{};  // protected by pool_mutex_
     std::array<std::unique_ptr<ThreadContext>, MAX_THREADS> owned_contexts_;
     std::array<std::atomic<ThreadContext*>, MAX_THREADS> contexts_{};
-    std::atomic<uint32_t> next_id_{0};
+    std::atomic<uint32_t> allocated_count_{0};
     std::atomic<uint32_t> active_count_{0};
 
-    std::atomic<void (*)(void*)> wakeup_fn_{nullptr};
-    std::atomic<void*> wakeup_ctx_{nullptr};
+    std::mutex wakeup_mutex_;
+    void (*wakeup_fn_)(void*) = nullptr;
+    void* wakeup_ctx_ = nullptr;
 
     bool initialized_ = false;
     size_t queue_capacity_ = SPSCQueue::DEFAULT_CAPACITY;

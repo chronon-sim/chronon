@@ -73,8 +73,9 @@ struct SizeCacheVector {
  * Each simulation thread that emits traces/logs gets its own ThreadContext
  * with a dedicated SPSC queue. This eliminates mutex contention between threads.
  *
- * The ThreadContext is allocated once per thread (on first use) and reused
- * for the lifetime of the thread.
+ * A thread leases a context on first use and owns its producer state until
+ * exit. Storage stays in the manager's bounded pool; once the consumer has
+ * acknowledged the final records, another thread may lease the same slot.
  */
 class ThreadContext {
 public:

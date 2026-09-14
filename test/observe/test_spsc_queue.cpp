@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <latch>
 #include <thread>
 #include <vector>
 
@@ -306,6 +307,7 @@ void test_context_manager_multiple_threads() {
 
     std::vector<ThreadContext*> contexts;
     std::mutex mutex;
+    std::latch all_attached(4);
 
     std::vector<std::thread> threads;
     for (int i = 0; i < 4; ++i) {
@@ -313,8 +315,12 @@ void test_context_manager_multiple_threads() {
             ThreadContext* ctx = ThreadContextManager::instance().getContext();
             assert(ctx != nullptr);
 
-            std::lock_guard<std::mutex> lock(mutex);
-            contexts.push_back(ctx);
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                contexts.push_back(ctx);
+            }
+            // Only simultaneously live producers need distinct slots.
+            all_attached.arrive_and_wait();
         });
     }
 
@@ -335,7 +341,7 @@ void test_context_manager_multiple_threads() {
 void test_context_manager_foreach() {
     std::cout << "Testing ThreadContextManager forEachContext... ";
 
-    // Count active contexts
+    // Scans include cached queues whose producers have exited.
     size_t count = 0;
     ThreadContextManager::instance().forEachContext([&](ThreadContext* c) {
         assert(c != nullptr);
@@ -344,7 +350,8 @@ void test_context_manager_foreach() {
     });
 
     assert(count >= 1);  // At least the main thread context
-    assert(count == ThreadContextManager::instance().activeThreadCount());
+    assert(count == ThreadContextManager::instance().allocatedContextCount());
+    assert(ThreadContextManager::instance().activeThreadCount() == 1);
 
     std::cout << "PASSED\n";
 }

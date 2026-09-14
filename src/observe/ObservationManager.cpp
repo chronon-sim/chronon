@@ -22,6 +22,13 @@ ObservationManager& ObservationManager::instance() {
     return mgr;
 }
 
+ObservationManager::ObservationManager() {
+    // Construct the queue pool before registering this singleton's destructor.
+    // The backend's final drain must finish before cached queues are destroyed,
+    // including when the application relies on automatic process-exit cleanup.
+    (void)ThreadContextManager::instance();
+}
+
 ObservationManager::~ObservationManager() { shutdown(); }
 
 void ObservationManager::initialize(const ObservationYAMLConfig& config) {
