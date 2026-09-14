@@ -43,6 +43,22 @@ add_executable(sender_test_factory_parameter_allocation_failure
     test_factory_parameter_allocation_failure.cpp)
 target_link_libraries(sender_test_factory_parameter_allocation_failure
     PRIVATE chronon::core yaml-cpp::yaml-cpp chronon_compile_options)
+# Wrap operator new instead of replacing it: Clang TSan supplies strong
+# new/delete definitions that cannot coexist with replacements in the test.
+include(CheckLinkerFlag)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(CHRONON_TEST_NEW_SYMBOL _Znwm)
+else()
+    set(CHRONON_TEST_NEW_SYMBOL _Znwj)
+endif()
+check_linker_flag(CXX "LINKER:--wrap=${CHRONON_TEST_NEW_SYMBOL}" CHRONON_TEST_HAS_WRAP_NEW)
+if(CHRONON_TEST_HAS_WRAP_NEW)
+    target_link_options(sender_test_factory_parameter_allocation_failure
+        PRIVATE "LINKER:--wrap=${CHRONON_TEST_NEW_SYMBOL}")
+    target_compile_definitions(sender_test_factory_parameter_allocation_failure PRIVATE
+        CHRONON_TEST_WRAP_NEW=__wrap_${CHRONON_TEST_NEW_SYMBOL}
+        CHRONON_TEST_REAL_NEW=__real_${CHRONON_TEST_NEW_SYMBOL})
+endif()
 add_test(NAME sender_factory_parameters_allocation_failure
     COMMAND sender_test_factory_parameter_allocation_failure)
 set_tests_properties(sender_factory_parameters_allocation_failure PROPERTIES TIMEOUT 45 LABELS "sender")

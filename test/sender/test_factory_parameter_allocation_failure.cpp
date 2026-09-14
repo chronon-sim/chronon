@@ -17,18 +17,33 @@ namespace {
 // Arm only after the unit constructor has finished allocating. The next two
 // allocations grow the simulation's owning-unit and borrowed-pointer vectors.
 thread_local int allocations_before_failure = -1;
-}  // namespace
 
-[[gnu::noinline]] void* operator new(std::size_t size) {
+void maybeFailAllocation() {
     if (allocations_before_failure >= 0 && allocations_before_failure-- == 0) {
         throw std::bad_alloc();
     }
+}
+}  // namespace
+
+#if defined(CHRONON_TEST_WRAP_NEW)
+// Keep the runtime's allocator, including TSan's strong operator new/delete
+// definitions. Only calls made by this executable need fault injection.
+extern "C" void* CHRONON_TEST_REAL_NEW(std::size_t size);
+extern "C" [[gnu::noinline]] void* CHRONON_TEST_WRAP_NEW(std::size_t size) {
+    maybeFailAllocation();
+    return CHRONON_TEST_REAL_NEW(size);
+}
+#else
+// Fallback for linkers without --wrap support.
+[[gnu::noinline]] void* operator new(std::size_t size) {
+    maybeFailAllocation();
     if (auto* pointer = std::malloc(size == 0 ? 1 : size)) return pointer;
     throw std::bad_alloc();
 }
 
 [[gnu::noinline]] void operator delete(void* pointer) noexcept { std::free(pointer); }
 [[gnu::noinline]] void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
+#endif
 
 using namespace chronon;
 
