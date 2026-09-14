@@ -52,7 +52,7 @@ void test_timeline_event_producer_gate() {
     ctx.setLookaheadMode(true);
     ctx.setTraceChannelEnabled(true);
     CHECK(ctx.filter().shouldObserve(category::TRACE));
-    CHECK(TimelineTrackRegistry::instance().size() == tracks_before);
+    CHECK(TimelineTrackRegistry::instance().size() == tracks_before + 1);
     unit.cycle = 24;
     CHECK(unit.lane.instant(0, GATE_CAT, "enabled_later"_ev));
     CHECK(unit.lane.isRegistered());

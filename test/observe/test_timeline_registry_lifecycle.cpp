@@ -4,6 +4,7 @@
 
 #include <array>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -102,15 +103,17 @@ void lateEnable() {
     ctx.setTraceChannelEnabled(true);
     CHECK(!unit.lane.begin(0, CAT, "disabled"_ev));
     CHECK(registry.size() == before);
-    ctx.setTimelineEventsEnabled(true);
     CHECK(!unit.lane.end(0));  // An orphan end must not register a track.
+    ctx.setTimelineEventsEnabled(true);
+    CHECK(unit.lane.isRegistered() && late.isRegistered());
+    CHECK(registry.size() == before + 2);
     ctx.filter().addCycleRange(10, 20);
     CHECK(!unit.lane.instant(0, CAT, "filtered"_ev));
-    CHECK(registry.size() == before);
+    CHECK(registry.size() == before + 2);
     unit.cycle = 10;
     CHECK(unit.lane.begin(0, CAT, "enabled_later"_ev));
     const uint32_t id = unit.lane.trackId();
-    CHECK(id != 0 && registry.size() == before + 1);
+    CHECK(id != 0 && registry.size() == before + 2);
     unit.cycle = 12;
     CHECK(unit.lane.end(0));
     CHECK(late.instant(0, CAT, "late_member"_ev));
@@ -224,6 +227,40 @@ void concurrent() {
     for (size_t t = 1; t < threads; ++t) CHECK(ids[t] == ids[0]);
     CHECK(registry.size() == before + keys);
 }
+void pendingLifetime() {
+    auto& registry = TimelineTrackRegistry::instance();
+    const size_t before = registry.size();
+    {
+        ObservationContext ctx(nullptr, [] { return 0ULL; }, 0, "unit", 1);
+        ctx.setTraceChannelEnabled(false);
+        {
+            Unit destroyed;
+            destroyed.setObservationContext(&ctx);
+        }
+        ctx.setTraceChannelEnabled(true);
+        CHECK(registry.size() == before);
+    }
+    auto survivor = std::make_unique<Unit>();
+    {
+        ObservationContext ctx(nullptr, [] { return 0ULL; }, 0, "unit", 1);
+        ctx.setTimelineEventsEnabled(false);
+        survivor->setObservationContext(&ctx);
+    }
+    CHECK(survivor->lane.observationContext() == nullptr);
+    CHECK(!survivor->lane.isRegistered() && survivor->lane.trackId() == 0);
+    survivor.reset();
+    CHECK(registry.size() == before);
+
+    ObservationContext ctx(nullptr, [] { return 0ULL; }, 0, "unit", 1);
+    ctx.setTraceChannelEnabled(false);
+    Unit live;
+    live.setObservationContext(&ctx);
+    {
+        TimelineLane destroyed_late(&live, "removed");
+    }
+    ctx.setTraceChannelEnabled(true);
+    CHECK(live.lane.isRegistered() && registry.size() == before + 1);
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -241,6 +278,8 @@ int main(int argc, char** argv) {
         caches();
     else if (mode == "concurrent")
         concurrent();
+    else if (mode == "pending_lifetime")
+        pendingLifetime();
     else
         CHECK(false);
     std::cout << "Timeline registry " << mode << ": PASSED\n";

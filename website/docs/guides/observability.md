@@ -294,13 +294,15 @@ is transparent to ui.perfetto.dev and `trace_processor`:
 ## Timeline Lanes and Events
 
 Attaching a counter-only observation context does not register lane metadata when
-the trace channel or timeline events are disabled. If recording is enabled later,
-the first eligible lane event registers its track automatically. Existing track
-IDs stay stable across recording toggles.
+the trace channel or timeline events are disabled. Enabling recording later
+registers the pending tracks at that quiescent configuration point, so event
+emission needs no lazy-registration work. Existing track IDs stay stable across
+recording toggles.
 
 Track metadata is shared across repeated sessions with the same topology (source
-ID, track name, lane count, layout, and member declaration position). Distinct
-same-name lane members remain separate tracks. Metadata and IDs remain valid for
+ID, track name, lane count, layout, and declaration attachment order within each
+context). Same-name lane members remain separate tracks, including those on
+different units sharing one context. Metadata and IDs remain valid for
 queued events and cached template API IDs for the process lifetime; storage scales
 with distinct topology declarations, not the number of simulation runs. Generating
 new track names or topologies indefinitely can still grow this registry.

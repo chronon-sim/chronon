@@ -126,11 +126,16 @@ void test_filtered_string_args_do_not_intern_values() {
 
     ctx.setTimelineEventsEnabled(false);
     unit.event<"filtered">(LANE_CAT, arg<"text">(std::string_view("timeline-disabled")));
+    CHECK(!unit.port.instant(0, LANE_CAT, "filtered"_ev,
+                             arg<"text">(std::string_view("lane-disabled"))));
     CHECK(AnnotationValueRegistry::instance().size() == values_before);
 
     ctx.setTimelineEventsEnabled(true);
     ctx.disableCategory(category::TRACE | LANE_CAT.mask());
     unit.event<"filtered">(LANE_CAT, arg<"text">(std::string_view("category-disabled")));
+    CHECK(!unit.port.begin(0, LANE_CAT, "filtered"_ev,
+                           arg<"text">(std::string_view("lane-category-disabled"))));
+    CHECK(!unit.port.instant(0, LANE_CAT, "filtered"_ev));
     CHECK(AnnotationValueRegistry::instance().size() == values_before);
 
     ctx.enableCategory(category::TRACE | LANE_CAT.mask());
@@ -138,6 +143,14 @@ void test_filtered_string_args_do_not_intern_values() {
     unit.cycle = 30;
     unit.event<"filtered">(LANE_CAT, arg<"text">(std::string_view("out-of-window")));
     unit.pipeStage<7, "FILTERED">(LANE_CAT, 1, arg<"text">(std::string_view("pipeline-filtered")));
+    // A shared context can retain another owner's cycle inside the window.
+    // The lane must stamp its own cycle before the typed emitter filters it.
+    ctx.setCurrentCycleValue(15);
+    CHECK(!unit.port.begin(0, LANE_CAT, "filtered"_ev,
+                           arg<"text">(std::string_view("lane-out-of-window"))));
+    ctx.setCurrentCycleValue(15);
+    CHECK(!unit.port.instant(0, LANE_CAT, "filtered"_ev));
+    CHECK(ctx.checkpointPendingTimelineStrings() == 0);
     CHECK(AnnotationValueRegistry::instance().size() == values_before);
 
     std::cout << "PASSED\n";

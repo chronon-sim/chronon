@@ -28,38 +28,39 @@ class ObservableUnit;
 
 /**
  * @brief Base for declarative timeline tracks; handles owner registration and
- * context attach and deferred track-id assignment when recording is enabled.
+ * context attach and track-id assignment when recording is enabled.
  */
 class TimelineTrackBase {
 public:
     TimelineTrackBase(ObservableUnit* owner, std::string_view name, uint16_t lanes);
+    ~TimelineTrackBase() noexcept;
 
     TimelineTrackBase(const TimelineTrackBase&) = delete;
     TimelineTrackBase& operator=(const TimelineTrackBase&) = delete;
 
     [[nodiscard]] bool isRegistered() const noexcept { return registered_; }
-    [[nodiscard]] uint32_t trackId() const noexcept { return track_id_; }
+    [[nodiscard]] uint32_t trackId() const noexcept { return registered_ ? track_id_ : 0; }
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
     [[nodiscard]] ObservationContext* observationContext() const noexcept { return ctx_; }
 
 private:
     friend class ObservableUnit;
+    friend class ObservationContext;
 
     /// Attach the context; register immediately only if recording is enabled.
     void onContextAttached(ObservationContext* ctx);
+    void register_();
 
 protected:
     /// Stamps the owner's cycle into the context.
     void stampCycle_() noexcept;
 
-    /// Resolve immutable metadata once, including after late trace enabling.
-    void ensureRegistered_();
-
     ObservableUnit* owner_ = nullptr;
     ObservationContext* ctx_ = nullptr;
     std::string name_;
+    // Before registration, stores the context-local declaration index. Once
+    // registered_, stores the immutable global ID used by event emission.
     uint32_t track_id_ = 0;
-    uint32_t declaration_index_ = 0;
     uint16_t lanes_ = 1;
     bool registered_ = false;
 };
@@ -138,7 +139,7 @@ private:
         static_assert(MAX_ITEMS - FLOW_ITEMS <= MAX_TIMELINE_ARGS,
                       "too many typed timeline args (max 8)");
 
-        if (!ctx_ || !ctx_->timelineProducerEnabled()) {
+        if (!ctx_ || !ctx_->timelineProducerEnabled() || !registered_) {
             return false;
         }
         // Stamp the owner's cycle BEFORE the filter check: temporal filters
@@ -146,13 +147,6 @@ private:
         // thread-local that may still hold another unit's value.
         stampCycle_();
         const CategoryMask cat_mask = static_cast<CategoryMask>(category);
-        if (!ctx_->shouldTrace(cat_mask)) {
-            return false;
-        }
-        if (OBSERVE_UNLIKELY(!registered_)) {
-            ensureRegistered_();
-        }
-
         return timeline_detail::emitEventWithItems(ctx_, cat_mask, kind, track_id_, slot, name,
                                                    items...);
     }

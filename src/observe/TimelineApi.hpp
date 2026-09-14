@@ -248,7 +248,7 @@ public:
         return registry;
     }
 
-    // declaration_index is a 1-based member position within an ObservableUnit;
+    // declaration_index is a 1-based position across all owners sharing a context;
     // 0 identifies the shared tracks used by the template-based event APIs.
     uint32_t registerTrack(TimelineTrackInfo info, uint32_t declaration_index = 0) {
         std::lock_guard<std::mutex> lock(mutex_);
