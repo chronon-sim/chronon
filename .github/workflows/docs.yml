@@ -117,6 +117,16 @@ jobs:
         working-directory: website
         run: npm ci
 
+      - name: Audit dependencies
+        working-directory: website
+        run: npm audit --audit-level=low
+
+      - name: Check types and dependency compatibility
+        working-directory: website
+        run: |
+          npm run typecheck
+          npm run test:dependencies
+
       - name: Build site
         working-directory: website
         run: npm run build
