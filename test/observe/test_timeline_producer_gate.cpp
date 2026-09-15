@@ -39,9 +39,9 @@ void test_timeline_event_producer_gate() {
     const size_t tracks_before = TimelineTrackRegistry::instance().size();
     GateTestUnit unit;
     unit.setObservationContext(&ctx);
-    CHECK(unit.lane.isRegistered());
-    CHECK(unit.lane.trackId() == tracks_before + 1);
-    CHECK(TimelineTrackRegistry::instance().size() == tracks_before + 1);
+    CHECK(!unit.lane.isRegistered());
+    CHECK(unit.lane.trackId() == 0);
+    CHECK(TimelineTrackRegistry::instance().size() == tracks_before);
     unit.cycle = 20;
     CHECK(!unit.lane.instant(0, GATE_CAT, "disabled"_ev));
     CHECK(!unit.lane.end(0));
@@ -55,6 +55,8 @@ void test_timeline_event_producer_gate() {
     CHECK(TimelineTrackRegistry::instance().size() == tracks_before + 1);
     unit.cycle = 24;
     CHECK(unit.lane.instant(0, GATE_CAT, "enabled_later"_ev));
+    CHECK(unit.lane.isRegistered());
+    CHECK(unit.lane.trackId() == tracks_before + 1);
     CHECK(TimelineTrackRegistry::instance().size() == tracks_before + 1);
     CHECK(unit.cycle_reads == 1 && trace_stats.emitted == 1 && trace_stats.dropped == 0);
     ctx.rollbackEpoch();

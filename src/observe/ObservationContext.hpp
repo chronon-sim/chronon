@@ -31,6 +31,16 @@
 
 namespace chronon::observe {
 
+class TimelineTrackBase;
+class ObservationContext;
+
+namespace timeline_detail {
+template <typename... Items>
+bool emitEventWithItems(ObservationContext* ctx, CategoryMask category, TimelineEventKind kind,
+                        uint32_t track_id, uint16_t slot, EventNameRef name,
+                        Items&&... items) noexcept;
+}
+
 /**
  * @brief Per-unit central context for counters, tracing, logging, and epochs.
  *
@@ -72,7 +82,10 @@ public:
         counters_.ensureCapacity(64);
     }
 
-    ~ObservationContext() noexcept { detachLookaheadSyncNodes_(); }
+    ~ObservationContext() noexcept {
+        detachLookaheadSyncNodes_();
+        if (!pending_timeline_tracks_.empty()) detachPendingTimelineTracks_();
+    }
 
     /**
      * @brief Increment a counter.
@@ -96,10 +109,18 @@ public:
         } else {
             filter_.disableCategory(category::TRACE);
         }
+        if (timelineProducerEnabled() && !pending_timeline_tracks_.empty()) {
+            initializePendingTimelineTracks_();
+        }
     }
 
     bool timelineEventsEnabled() const noexcept { return timeline_events_enabled_; }
-    void setTimelineEventsEnabled(bool enabled) noexcept { timeline_events_enabled_ = enabled; }
+    void setTimelineEventsEnabled(bool enabled) noexcept {
+        timeline_events_enabled_ = enabled;
+        if (timelineProducerEnabled() && !pending_timeline_tracks_.empty()) {
+            initializePendingTimelineTracks_();
+        }
+    }
 
     [[gnu::always_inline]] bool timelineProducerEnabled() const noexcept {
         return trace_channel_enabled_ && timeline_events_enabled_;
@@ -322,7 +343,22 @@ public:
         if (OBSERVE_LIKELY(!shouldEmitTimelineEvent(category, kind))) {
             return false;
         }
+        return emitTimelineRecord_(category, kind, track_id, slot, name_id, payload, args,
+                                   arg_count, flags);
+    }
 
+private:
+    template <typename... Items>
+    friend bool timeline_detail::emitEventWithItems(ObservationContext*, CategoryMask,
+                                                    TimelineEventKind, uint32_t, uint16_t,
+                                                    EventNameRef, Items&&...) noexcept;
+
+    // The typed emitter filters before normalizing string arguments. Let it
+    // write the accepted event without evaluating the same filter again.
+    bool emitTimelineRecord_(CategoryMask category, TimelineEventKind kind, uint32_t track_id,
+                             uint16_t slot, uint16_t name_id, uint64_t payload,
+                             const TimelineArgValue* args, size_t arg_count,
+                             uint8_t flags = 0) noexcept {
         const size_t payload_size = sizeof(TimelineRecord) + arg_count * TIMELINE_ARG_SIZE;
 
         if (lookahead_mode_) {
@@ -374,7 +410,6 @@ public:
         return true;
     }
 
-private:
     void fillTimelineRecord_(std::byte* dest, CategoryMask category, TimelineEventKind kind,
                              uint32_t track_id, uint16_t slot, uint16_t name_id, uint64_t payload,
                              const TimelineArgValue* args, size_t arg_count,
@@ -714,6 +749,16 @@ private:
     LookaheadSyncNode* lookahead_sync_head_ = nullptr;
 
     ObservationStats stats_{};
+
+    // Deferred declarations belong to this context, including when several
+    // ObservableUnits share it. Gate changes happen at quiescent points.
+    friend class TimelineTrackBase;
+    std::vector<TimelineTrackBase*> pending_timeline_tracks_;
+    uint32_t timeline_declaration_count_ = 0;
+    uint32_t attachTimelineTrack_(TimelineTrackBase* track);
+    void removePendingTimelineTrack_(TimelineTrackBase* track) noexcept;
+    void initializePendingTimelineTracks_();
+    void detachPendingTimelineTracks_() noexcept;
 
     void recordLookaheadTransition_(LookaheadTransition transition) noexcept {
         if (lookahead_history_size_ < LOOKAHEAD_TRANSITION_HISTORY_CAPACITY) {

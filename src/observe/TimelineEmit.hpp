@@ -57,8 +57,8 @@ bool emitEventWithItems(ObservationContext* ctx, CategoryMask category, Timeline
         size_t arg_count = 0;
         uint64_t flow_id = 0;
         (foldTimelineItem(ctx, args, arg_count, flow_id, std::forward<Items>(items)), ...);
-        const bool emitted =
-            ctx->timelineEvent(category, kind, track_id, slot, name.id, flow_id, args, arg_count);
+        const bool emitted = ctx->emitTimelineRecord_(category, kind, track_id, slot, name.id,
+                                                      flow_id, args, arg_count);
         if (!emitted || !ctx->isLookaheadMode()) {
             ctx->restorePendingTimelineStrings(string_checkpoint);
         }

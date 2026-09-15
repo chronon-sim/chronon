@@ -21,7 +21,9 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -235,8 +237,9 @@ struct TimelineTrackInfo {
 /**
  * @brief Global registry mapping track ids to their declaration metadata.
  *
- * Tracks register when a unit's observation context attaches (before the
- * simulation runs); the backend resolves ids lazily and caches per id.
+ * Identical declarations reuse an immutable entry. Storage grows with distinct
+ * topology metadata, not repeated sessions; ids and references remain valid for
+ * queued events and the producer/backend caches for the process lifetime.
  */
 class TimelineTrackRegistry {
 public:
@@ -245,10 +248,27 @@ public:
         return registry;
     }
 
-    uint32_t registerTrack(TimelineTrackInfo info) {
+    // declaration_index is a 1-based position across all owners sharing a context;
+    // 0 identifies the shared tracks used by the template-based event APIs.
+    uint32_t registerTrack(TimelineTrackInfo info, uint32_t declaration_index = 0) {
         std::lock_guard<std::mutex> lock(mutex_);
+        TrackKey key{info.name, info.source_id, info.lanes, info.layout, declaration_index};
+        if (auto it = ids_.find(key); it != ids_.end()) {
+            return it->second;
+        }
+        if (tracks_.size() == std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error("timeline track ids exhausted");
+        }
         tracks_.push_back(std::move(info));
-        return static_cast<uint32_t>(tracks_.size());  // 1-based; 0 = invalid.
+        const auto id = static_cast<uint32_t>(tracks_.size());  // 1-based; 0 = invalid.
+        key.name = tracks_.back().name;
+        try {
+            ids_.emplace(key, id);
+        } catch (...) {
+            tracks_.pop_back();
+            throw;
+        }
+        return id;
     }
 
     /// @return Stable reference (deque storage); empty-name sentinel when unknown.
@@ -267,8 +287,33 @@ public:
     }
 
 private:
+    struct TrackKey {
+        std::string_view name;  // Owned by the immutable deque entry.
+        uint16_t source_id;
+        uint16_t lanes;
+        TimelineTrackInfo::Layout layout;
+        uint32_t declaration_index;
+
+        bool operator==(const TrackKey&) const = default;
+    };
+
+    struct TrackKeyHash {
+        size_t operator()(const TrackKey& key) const noexcept {
+            size_t hash = std::hash<std::string_view>{}(key.name);
+            const auto combine = [&hash](size_t value) {
+                hash ^= value + 0x9e3779b9U + (hash << 6) + (hash >> 2);
+            };
+            combine(key.source_id);
+            combine(key.lanes);
+            combine(static_cast<size_t>(key.layout));
+            combine(key.declaration_index);
+            return hash;
+        }
+    };
+
     mutable std::mutex mutex_;
     std::deque<TimelineTrackInfo> tracks_;
+    std::unordered_map<TrackKey, uint32_t, TrackKeyHash> ids_;
 };
 
 namespace timeline_detail {
