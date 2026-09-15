@@ -270,6 +270,13 @@ private:
             }
         }
 
+        // A previous drop means reclamation confirmed that every credit was
+        // consumed. This writer can count further drops without shared state.
+        if (budget.dropped != 0) {
+            ++budget.dropped;
+            return false;
+        }
+
         std::lock_guard lock(event_budget_mutex_);
         if (reserved_events_ == config_.max_events) {
             // Credits are local atomics so reclaim races linearly with their

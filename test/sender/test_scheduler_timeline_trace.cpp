@@ -5,6 +5,7 @@
 #include <zlib.h>
 
 #include <array>
+#include <barrier>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -21,6 +22,22 @@
 #include "sender/schedule/SchedulerTimelineTrace.hpp"
 
 using namespace chronon::sender;
+
+#if defined(CHRONON_TEST_WRAP_MUTEX)
+#include <pthread.h>
+
+namespace {
+thread_local bool count_mutex_locks = false;
+thread_local size_t mutex_locks = 0;
+}  // namespace
+
+// Forward to the real function so sanitizer mutex instrumentation is preserved.
+extern "C" int __real_pthread_mutex_lock(pthread_mutex_t* mutex) noexcept;
+extern "C" int __wrap_pthread_mutex_lock(pthread_mutex_t* mutex) noexcept {
+    if (count_mutex_locks) ++mutex_locks;
+    return __real_pthread_mutex_lock(mutex);
+}
+#endif
 
 namespace {
 
@@ -261,8 +278,10 @@ void testConcurrentChunkReclamationPreservesExactCap() {
     constexpr uint64_t kEventsPerWorker = 2'000;
     const auto now = SchedulerTimelineTrace::Clock::now();
     std::array<std::thread, kWorkers> workers;
+    std::barrier start(static_cast<std::ptrdiff_t>(kWorkers));
     for (size_t stream = 0; stream < kWorkers; ++stream) {
         workers[stream] = std::thread([&, stream] {
+            start.arrive_and_wait();
             for (uint64_t cycle = 0; cycle < kEventsPerWorker; ++cycle) {
                 trace.recordInstant(stream, "unit", "worker", cycle, now);
             }
@@ -279,6 +298,68 @@ void testConcurrentChunkReclamationPreservesExactCap() {
     }
     REQUIRE(recorded == config.max_events);
     REQUIRE(data.dropped_events == kWorkers * kEventsPerWorker - config.max_events);
+}
+
+void testExhaustedBudgetAvoidsRepeatedLocking() {
+    constexpr size_t kWorkers = 4;
+    constexpr uint64_t kAttempts = 1'000;
+    SchedulerTimelineTrace trace;
+    // Reuse the recorder across zero, single-event, and chunked budgets. Each
+    // configure() must clear any exhaustion remembered by the previous run.
+    for (const uint64_t limit : {0ULL, 1ULL, 1'279ULL, 1'280ULL, 4'097ULL}) {
+        SchedulerTimelineTraceConfig config;
+        config.enabled = true;
+        config.max_events = limit;
+        config.start_cycle = 10;
+        config.end_cycle = 20;
+        config.min_duration_ns = 5;
+        trace.configure(config);
+        trace.start({{0}, {1}, {2}, {3}}, {});
+        const auto now = SchedulerTimelineTrace::Clock::now();
+        for (uint64_t i = 0; i < limit; ++i) {
+            trace.recordInstant(0, "unit", "retained", 10, now);
+        }
+
+        std::array<std::thread, kWorkers> workers;
+        std::array<size_t, kWorkers> locks{};
+        std::barrier start(static_cast<std::ptrdiff_t>(kWorkers));
+        for (size_t stream = 0; stream < kWorkers; ++stream) {
+            workers[stream] = std::thread([&, stream] {
+                start.arrive_and_wait();
+                // Each writer may discover exhaustion once. Subsequent valid
+                // events must still count as drops without contending on a lock.
+                trace.recordInstant(stream, "unit", "first drop", 10, now);
+#if defined(CHRONON_TEST_WRAP_MUTEX)
+                mutex_locks = 0;
+                count_mutex_locks = true;
+#endif
+                for (uint64_t i = 0; i < kAttempts; ++i) {
+                    trace.recordDuration(stream, "unit", "drop", 10, now,
+                                         now + std::chrono::nanoseconds(5));
+                    trace.recordInstant(stream, "unit", "drop", 19, now);
+                    // Filtering retains precedence over budget/drop accounting.
+                    trace.recordInstant(stream, "unit", "early", 9, now);
+                    trace.recordInstant(stream, "unit", "late", 20, now);
+                    trace.recordDuration(stream, "unit", "short", 10, now,
+                                         now + std::chrono::nanoseconds(4));
+                }
+#if defined(CHRONON_TEST_WRAP_MUTEX)
+                count_mutex_locks = false;
+                locks[stream] = mutex_locks;
+#endif
+            });
+        }
+        for (auto& worker : workers) worker.join();
+        for (const size_t count : locks) REQUIRE(count == 0);
+        // A previously unused scheduler stream must also observe the full cap.
+        trace.recordInstant(trace.schedulerStream(), "scheduler", "late drop", 10, now);
+        const auto data = trace.exportData();
+        REQUIRE(data.streams[0].size() == limit);
+        for (size_t stream = 1; stream < data.streams.size(); ++stream) {
+            REQUIRE(data.streams[stream].empty());
+        }
+        REQUIRE(data.dropped_events == kWorkers * (1 + 2 * kAttempts) + 1);
+    }
 }
 
 void testStandaloneWriteAndStyleMapping() {
@@ -376,6 +457,7 @@ int main() {
     testChunkedBudgetAcrossStreams();
     testChunkedBudgetReclaimsSparseStreams();
     testConcurrentChunkReclamationPreservesExactCap();
+    testExhaustedBudgetAvoidsRepeatedLocking();
     testStandaloneWriteAndStyleMapping();
     testSimulationTimelineIncludesThreadCpuDiagnostics();
     return chronon::test::failureCount() == 0 ? 0 : 1;
