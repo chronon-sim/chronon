@@ -101,7 +101,7 @@ int main(int argc, char* argv[]) {
     return chronon::SimulationApp("CPU Simulator")
         .setDefaultConfig("config.yaml")
         .setConfigSearchPaths({".", "../configs"})
-        .setVersion("0.4.2")
+        .setVersion("0.5.0")
         .onPostBuild([](auto& result) {
             // Custom setup after build
         })
