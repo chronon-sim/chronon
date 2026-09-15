@@ -96,8 +96,13 @@ public:
 
     void start();
 
-    /// Drains remaining events before stopping.
+    /// Drains remaining events before stopping; discards them if output failed.
+    /// PRECONDITION: producers have stopped submitting records.
     void stop() noexcept;
+
+    /// Rethrow the first worker/output failure, retained until the next start().
+    /// Thread-safe. Call after stop() to include final flush/close failures.
+    void rethrowIfFailed();
 
     /**
      * @brief Set an optional observation-lifetime stop token.
@@ -115,7 +120,7 @@ public:
     const std::filesystem::path& outputDir() const noexcept { return output_dir_; }
 
     /// True when this backend has an open Perfetto timeline sink. Reports false
-    /// when the timeline is disabled by config or the file failed to open, so
+    /// when the timeline is disabled by config or opening/writing failed, so
     /// callers (scheduler timeline handoff) can fall back to standalone output.
     bool timelineEnabled() const noexcept {
         return timeline_sink_open_.load(std::memory_order_acquire);
@@ -192,6 +197,7 @@ private:
         }
     };
 
+    void recordFailure_(std::exception_ptr error) noexcept;
     void run_();
     size_t drainQueue_();
     size_t drainPerThreadQueues_();
@@ -378,7 +384,7 @@ private:
     bool io_worker_stop_ = false;
     std::mutex io_wait_mutex_;
     std::condition_variable io_wait_cv_;
-    std::exception_ptr io_async_error_{};
+    std::exception_ptr output_error_{};
     uint32_t io_wait_timeout_count_ = 0;
     static constexpr std::chrono::milliseconds ASYNC_IO_WAIT_TIMEOUT{250};
 

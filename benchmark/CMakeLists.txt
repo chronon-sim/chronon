@@ -5,6 +5,8 @@ add_executable(chronon_multiclock_benchmark multiclock_benchmark.cpp)
 target_link_libraries(chronon_multiclock_benchmark PRIVATE chronon::core chronon_compile_options)
 add_executable(chronon_single_clock_regression_benchmark single_clock_regression.cpp)
 target_link_libraries(chronon_single_clock_regression_benchmark PRIVATE chronon::core chronon_compile_options)
+add_executable(chronon_trace_output_benchmark trace_output_benchmark.cpp)
+target_link_libraries(chronon_trace_output_benchmark PRIVATE chronon::observe chronon_compile_options)
 
 add_executable(chronon_counter_periodic_benchmark
     counter_periodic_benchmark.cpp

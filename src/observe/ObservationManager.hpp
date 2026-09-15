@@ -86,6 +86,7 @@ public:
 
     void startBackend();
     /// Drains remaining events before stopping.
+    /// Rethrows output failures after joining workers and unfreezing source registration.
     void stopBackend();
     bool isBackendRunning() const noexcept;
 
@@ -165,6 +166,7 @@ public:
     std::string_view getSourceName(uint16_t source_id) const noexcept;
 
     /// Stops the backend and releases all resources; initialize() must be called again to reuse.
+    /// Releases all resources, then rethrows any backend output failure.
     void shutdown();
 
     /// Equivalent to shutdown() plus full state clear; intended for tests.

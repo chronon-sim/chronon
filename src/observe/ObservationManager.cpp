@@ -29,7 +29,13 @@ ObservationManager::ObservationManager() {
     (void)ThreadContextManager::instance();
 }
 
-ObservationManager::~ObservationManager() { shutdown(); }
+ObservationManager::~ObservationManager() {
+    try {
+        shutdown();
+    } catch (...) {
+        // The backend already reported the failure; destructors cannot propagate it.
+    }
+}
 
 void ObservationManager::initialize(const ObservationYAMLConfig& config) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -224,6 +230,7 @@ void ObservationManager::stopBackend() {
     }
 
     source_registry_.unfreeze();
+    if (backend_) backend_->rethrowIfFailed();
 }
 
 bool ObservationManager::isBackendRunning() const noexcept {
@@ -251,8 +258,14 @@ void ObservationManager::shutdown() {
 }
 
 void ObservationManager::shutdownLocked_() {
-    if (backend_ && backend_->isRunning()) {
+    std::exception_ptr error;
+    if (backend_) {
         backend_->stop();
+        try {
+            backend_->rethrowIfFailed();
+        } catch (...) {
+            error = std::current_exception();
+        }
     }
 
     contexts_.clear();
@@ -263,12 +276,13 @@ void ObservationManager::shutdownLocked_() {
 
     enabled_ = false;
     initialized_ = false;
+    if (error) std::rethrow_exception(error);
 }
 
 void ObservationManager::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
-    shutdownLocked_();
     config_ = ObservationYAMLConfig{};
+    shutdownLocked_();
 }
 
 uint16_t ObservationManager::registerSourceName(const std::string& name) {
