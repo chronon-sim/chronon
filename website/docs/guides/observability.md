@@ -291,6 +291,23 @@ is transparent to ui.perfetto.dev and `trace_processor`:
   the timeline shrinks from ~115 MB to ~17 MB (~7×) with no measurable change
   in simulation wall time (encoding runs on the backend thread).
 
+### Output failures
+
+Trace write, flush, and close failures (for example, a full filesystem) report the
+output path. The backend retains its first failure and releases producers waiting
+on full queues. `ObservationManager::stopBackend()` and `shutdown()` rethrow the
+failure after stopping the workers; `shutdown()` also releases the manager's
+resources before throwing. `SimulationApp` returns a nonzero status when trace
+output fails.
+
+Code that owns an `ObservationBackend` directly should call `stop()` followed by
+`rethrowIfFailed()`. `stop()` and destructors remain nonthrowing, and worker failures
+are also logged. Restarting the backend clears the previous failure. A standalone
+`PerfettoTraceWriter` throws from the write-triggering event, `flush()`, or `close()`;
+close a failed writer before reopening it. Its `bytesWritten()` counts only fully
+successful flushes, excluding a partially failed batch. It does not imply `fsync`
+durability.
+
 ## Timeline Lanes and Events
 
 Attaching a counter-only observation context does not register lane metadata when

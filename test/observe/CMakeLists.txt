@@ -34,6 +34,21 @@ add_dependencies(regress test_timeline_shared_context)
 #
 # Tests for high-performance observability system
 
+if(UNIX)
+    add_executable(test_trace_output_failure test_trace_output_failure.cpp)
+    target_link_libraries(test_trace_output_failure
+        PRIVATE chronon::core chronon_compile_options ZLIB::ZLIB)
+    add_dependencies(regress test_trace_output_failure)
+    foreach(mode raw compressed immediate async final_flush manager_stop manager_shutdown app app_crash)
+        add_test(NAME trace_output_failure_${mode}_test COMMAND test_trace_output_failure ${mode})
+        set_tests_properties(trace_output_failure_${mode}_test PROPERTIES TIMEOUT 45)
+    endforeach()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME trace_output_failure_full_device_test COMMAND test_trace_output_failure full_device)
+        set_tests_properties(trace_output_failure_full_device_test PROPERTIES TIMEOUT 45)
+    endif()
+endif()
+
 # ==============================================================================
 # SPSC Queue and Thread Context Tests
 # ==============================================================================

@@ -97,9 +97,11 @@ public:
     [[nodiscard]] bool isOpen() const noexcept;
 
     /// Write encoded packets to the OS; open native buckets require a watermark.
+    /// Throws on write/flush failure; close the failed writer before reopening it.
     void flush();
 
     /// Finish remaining native buckets, flush and close. No temporary disk files.
+    /// Throws on output failure after releasing the file.
     void close();
 
     /// Promise that every future native event has floor(time/ns) >= exclusive_ns.
@@ -180,6 +182,8 @@ public:
     void counterValue(uint64_t track_uuid, uint64_t cycle, int64_t value);
 
     [[nodiscard]] uint64_t eventsWritten() const noexcept { return events_written_; }
+    /// Bytes in completely successful flushes (excludes any partially failed batch).
+    /// This is OS write completion, not a durability guarantee from fsync.
     [[nodiscard]] uint64_t bytesWritten() const noexcept { return bytes_written_; }
 
 private:

@@ -38,7 +38,7 @@ void ObservationBackend::start() {
     io_in_flight_.store(false, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(io_wait_mutex_);
-        io_async_error_ = nullptr;
+        output_error_ = nullptr;
         io_wait_timeout_count_ = 0;
     }
     {
@@ -66,7 +66,6 @@ void ObservationBackend::start() {
 
     should_stop_.store(false, std::memory_order_relaxed);
     running_.store(true, std::memory_order_release);
-    worker_thread_ = std::thread([this]() { run_(); });
 
     // Dedicated I/O thread is optional; if creation fails, fall back to
     // synchronous processing in processReorderBuffer_().
@@ -80,6 +79,19 @@ void ObservationBackend::start() {
             std::cerr << "[observe] failed to start dedicated I/O thread "
                          "(falling back to synchronous output)\n";
         }
+    }
+    // Publish the optional I/O thread before the drain thread reads joinable().
+    try {
+        worker_thread_ = std::thread([this]() {
+            try {
+                run_();
+            } catch (...) {
+                recordFailure_(std::current_exception());
+            }
+        });
+    } catch (...) {
+        stop();
+        throw;
     }
 }
 
@@ -107,7 +119,65 @@ void ObservationBackend::stop() noexcept {
         io_worker_thread_.join();
     }
 
+    // Both consumers are joined before touching their output state.
+    try {
+        if (perfetto_writer_) perfetto_writer_->close();
+    } catch (...) {
+        recordFailure_(std::current_exception());
+    }
+    timeline_sink_open_.store(false, std::memory_order_release);
+    if (counter_file_.is_open()) counter_file_.close();
+    if (default_sink_ && default_sink_->file.is_open()) default_sink_->file.close();
+    for (auto& [name, sink] : custom_sinks_) {
+        if (sink->file.is_open()) sink->file.close();
+    }
+    if (output_error_) {
+        // The caller has quiesced producers, as for a normal final drain.
+        // Discard unread records so a later run cannot replay stale source IDs.
+        ThreadContextManager::instance().flushAll();
+        ThreadContextManager::instance().forEachContext([](ThreadContext* ctx) {
+            auto& q = ctx->queue();
+            while (auto* ptr = q.prepareRead())
+                q.finishRead(reinterpret_cast<ObservationQueue::RecordHeader*>(ptr)->total_size);
+            q.eagerCommitRead();
+        });
+        while (auto* ptr = queue_.prepareRead())
+            queue_.finishRead(reinterpret_cast<ObservationQueue::RecordHeader*>(ptr)->total_size);
+        queue_.forceCommitRead();
+        reorder_buffer_.reset();
+        ready_buffer_.clear();
+        io_buffer_.clear();
+        io_arena_ = {};
+        std::lock_guard<std::mutex> lock(timeline_submit_mutex_);
+        submitted_timelines_.clear();
+    }
     running_.store(false, std::memory_order_release);
+}
+
+void ObservationBackend::rethrowIfFailed() {
+    std::lock_guard<std::mutex> lock(io_wait_mutex_);
+    if (output_error_) std::rethrow_exception(output_error_);
+}
+
+void ObservationBackend::recordFailure_(std::exception_ptr error) noexcept {
+    {
+        std::lock_guard<std::mutex> lock(io_wait_mutex_);
+        if (!output_error_) {
+            output_error_ = error;
+            try {
+                std::rethrow_exception(error);
+            } catch (const std::exception& e) {
+                std::cerr << "[observe] output failed: " << e.what() << '\n';
+            } catch (...) {
+                std::cerr << "[observe] output failed with unknown exception\n";
+            }
+        }
+    }
+    // A failed consumer must not leave SpinWait producers waiting on a full queue.
+    timeline_sink_open_.store(false, std::memory_order_release);
+    ThreadContextManager::instance().setBackendWakeup(nullptr, nullptr);
+    should_stop_.store(true, std::memory_order_release);
+    wakeUp();
 }
 
 void ObservationBackend::wakeUp() noexcept {
@@ -215,6 +285,11 @@ void ObservationBackend::run_() {
         wake_flag_.store(false, std::memory_order_relaxed);
     }
 
+    // An asynchronous failure can stop us while producers are still running.
+    // Do not force-publish their private write positions in that case: stop()
+    // discards the failed run's queues once the caller has quiesced producers.
+    rethrowIfFailed();
+
     // Flush all per-thread queues before final drain
     ThreadContextManager::instance().flushAll();
 
@@ -242,13 +317,6 @@ void ObservationBackend::run_() {
     // the Perfetto file. Must run after the final drain so simulation trace
     // events and counter samples are already written.
     finalizeTimeline_();
-
-    // Close files
-    if (counter_file_.is_open()) counter_file_.close();
-    if (default_sink_ && default_sink_->file.is_open()) default_sink_->file.close();
-    for (auto& [name, sink] : custom_sinks_) {
-        if (sink->file.is_open()) sink->file.close();
-    }
 }
 
 void ObservationBackend::submitTimeline(TimelineStreamData&& data) {
@@ -519,18 +587,7 @@ void ObservationBackend::waitForAsyncIO_() {
         }
     }
 
-    if (io_async_error_) {
-        try {
-            std::rethrow_exception(io_async_error_);
-        } catch (const std::exception& e) {
-            std::cerr << "[observe] async I/O worker failed: " << e.what()
-                      << " (falling back to synchronized pipeline)\n";
-        } catch (...) {
-            std::cerr << "[observe] async I/O worker failed with unknown exception "
-                         "(falling back to synchronized pipeline)\n";
-        }
-        io_async_error_ = nullptr;
-    }
+    if (output_error_) std::rethrow_exception(output_error_);
 
     io_wait_timeout_count_ = 0;
 }
@@ -561,7 +618,10 @@ void ObservationBackend::ioWorkerLoop_() {
         struct CompletionGuard {
             ObservationBackend* self;
             ~CompletionGuard() {
-                self->io_in_flight_.store(false, std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lock(self->io_wait_mutex_);
+                    self->io_in_flight_.store(false, std::memory_order_release);
+                }
                 self->io_wait_cv_.notify_all();
             }
         } done{this};
@@ -582,10 +642,7 @@ void ObservationBackend::ioWorkerLoop_() {
             }
             flush_();
         } catch (...) {
-            std::lock_guard<std::mutex> lock(io_wait_mutex_);
-            if (!io_async_error_) {
-                io_async_error_ = std::current_exception();
-            }
+            recordFailure_(std::current_exception());
         }
     }
 }

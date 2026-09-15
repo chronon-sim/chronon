@@ -135,7 +135,12 @@ void CrashHandler::emergencyFlush() {
 
     auto& obs_mgr = observe::ObservationManager::instance();
     if (obs_mgr.isEnabled() && obs_mgr.isBackendRunning()) {
-        obs_mgr.stopBackend();
+        try {
+            obs_mgr.stopBackend();
+        } catch (...) {
+            // Best-effort cleanup must preserve the original simulation exception.
+            // ObservationBackend has already printed the output failure.
+        }
     }
 }
 

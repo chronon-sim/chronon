@@ -34,6 +34,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "TimelineData.hpp"
@@ -102,6 +103,20 @@ size_t nextTopLevelPacketEnd(const uint8_t* data, size_t size, size_t pos) {
 
 struct PerfettoTraceWriter::Impl {
     std::ofstream file;
+    std::filesystem::path path;
+    uint64_t pending_bytes = 0;
+
+    void checkOutput(const char* operation) const {
+        if (!file)
+            throw std::runtime_error("Perfetto trace " + std::string(operation) +
+                                     " failed: " + path.string());
+    }
+    void write(const uint8_t* data, size_t size) {
+        file.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+        checkOutput("write");
+        pending_bytes += size;
+    }
+
     protozero::HeapBuffered<pbz::Trace> trace;
     std::vector<uint8_t> compression_buffer;
     size_t packets_buffered = 0;
@@ -394,11 +409,14 @@ bool PerfettoTraceWriter::open(const std::filesystem::path& path, const Options&
     if (impl_->file.is_open()) {
         return false;
     }
+    impl_->file.clear();
     impl_->file.open(path, std::ios::binary | std::ios::trunc);
     if (!impl_->file.is_open()) {
         return false;
     }
 
+    impl_->path = path;
+    impl_->pending_bytes = 0;
     impl_->trace.Reset();
     impl_->packets_buffered = 0;
     impl_->options = options;
@@ -799,6 +817,7 @@ void PerfettoTraceWriter::flush() {
     if (!impl_->file.is_open()) {
         return;
     }
+    impl_->checkOutput("write");
     if (impl_->packets_buffered > 0) {
         // Serialized Trace messages concatenate into a valid Perfetto trace,
         // so each flushed batch is appended as-is: raw, or split at packet
@@ -837,15 +856,12 @@ void PerfettoTraceWriter::flush() {
                 pos = chunk_end;
             }
         } else {
-            impl_->file.write(reinterpret_cast<const char*>(bytes.data()),
-                              static_cast<std::streamsize>(bytes.size()));
-            bytes_written_ += bytes.size();
+            impl_->write(bytes.data(), bytes.size());
         }
     }
     impl_->file.flush();
-    if (!impl_->file && !impl_->clock_streams.empty()) {
-        throw std::runtime_error("native clock trace write failed");
-    }
+    impl_->checkOutput("flush");
+    bytes_written_ += std::exchange(impl_->pending_bytes, 0);
     if (impl_->clock_encoded && !impl_->first_clock_output_ns)
         impl_->first_clock_output_ns =
             std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -869,14 +885,11 @@ void PerfettoTraceWriter::writeChunk_(const uint8_t* data, size_t size) {
         pkt->set_trusted_packet_sequence_id(WRAPPER_SEQUENCE_ID);
         pkt->set_compressed_packets(compressed.data(), compressed_size);
         std::vector<uint8_t> wrapped = wrapper.SerializeAsArray();
-        impl_->file.write(reinterpret_cast<const char*>(wrapped.data()),
-                          static_cast<std::streamsize>(wrapped.size()));
-        bytes_written_ += wrapped.size();
+        impl_->write(wrapped.data(), wrapped.size());
     } else {
         std::cerr << "[observe] timeline deflate failed (rc=" << rc
                   << "); writing chunk uncompressed\n";
-        impl_->file.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
-        bytes_written_ += size;
+        impl_->write(data, size);
     }
 }
 
@@ -922,8 +935,7 @@ void PerfettoTraceWriter::close() {
         if (!impl_->clock_streams.empty()) advanceClockWatermark(UINT64_MAX);
         flush();
         impl_->file.close();
-        if (!impl_->clock_streams.empty() && impl_->file.fail())
-            throw std::runtime_error("cannot finalize native clock trace");
+        impl_->checkOutput("close");
     } catch (...) {
         impl_->file.close();
         throw;
