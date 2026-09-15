@@ -394,6 +394,25 @@ Long wait slices usually indicate that one predecessor cluster is on the
 critical path, that low-delay edges are forcing near-lockstep execution, or that
 the current partition assigned too much work to a dependency anchor stream.
 
+`start_cycle` is inclusive and `end_cycle` is exclusive. Scheduler tracing checks
+this window before collecting unit timestamps, thread CPU diagnostics, or
+trace-only scratch and strings. Wait events and rebalance markers also obey the
+window.
+Dynamic rebalance keeps its own sparse timing samples outside the capture window;
+these samples are needed for scheduling independently of trace output.
+
+Timestamp and active-state scratch share one buffer; CPU diagnostics use an
+additional buffer when enabled. Each worker allocates its buffers on its first
+captured cluster and reuses them across clusters and run calls. Buffers grow
+only when that worker captures a larger cluster. Each stream's mutable
+event and string-arena state is isolated on cache lines during capture, then
+moved into the export containers after the workers join.
+
+Duration events are selected by their starting simulation cycle. An admitted
+run, idle interval, or wait retains its complete duration even if it spans the
+end of the window. An idle hop or run starting before the window is omitted;
+tracing does not split the simulation's idle hops or runs to align their spans.
+
 ## Configuration
 
 ```cpp

@@ -65,6 +65,37 @@ set_tests_properties(sender_factory_parameters_allocation_failure PROPERTIES TIM
 add_dependencies(regress sender_test_factory_parameter_lifetime
     sender_test_factory_parameter_allocation_failure)
 
+add_executable(sender_test_scheduler_timeline_window test_scheduler_timeline_window.cpp)
+target_link_libraries(sender_test_scheduler_timeline_window
+    PRIVATE chronon::core chronon_compile_options)
+# The event/cycle checks are portable. Static Linux builds with libstdc++ can
+# additionally count clock reads and allocations without replacing sanitizer
+# runtime functions. Probe the symbol so other standard libraries still build.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CHRONON_TEST_HAS_WRAP_NEW AND NOT BUILD_SHARED_LIBS)
+    set(CHRONON_TEST_CLOCK_SYMBOL _ZNSt6chrono3_V212steady_clock3nowEv)
+    include(CheckCXXSourceCompiles)
+    check_cxx_source_compiles("
+        extern \"C\" void ${CHRONON_TEST_CLOCK_SYMBOL}();
+        int main() { ${CHRONON_TEST_CLOCK_SYMBOL}(); }
+    " CHRONON_TEST_HAS_CLOCK_SYMBOL)
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CHRONON_TEST_HAS_WRAP_NEW AND
+   NOT BUILD_SHARED_LIBS AND CHRONON_TEST_HAS_CLOCK_SYMBOL)
+    target_link_options(sender_test_scheduler_timeline_window PRIVATE
+        "LINKER:--wrap=${CHRONON_TEST_NEW_SYMBOL}"
+        "LINKER:--wrap=${CHRONON_TEST_CLOCK_SYMBOL}" "LINKER:--wrap=clock_gettime")
+    target_compile_definitions(sender_test_scheduler_timeline_window PRIVATE
+        CHRONON_TEST_WRAP_NEW=__wrap_${CHRONON_TEST_NEW_SYMBOL}
+        CHRONON_TEST_REAL_NEW=__real_${CHRONON_TEST_NEW_SYMBOL}
+        CHRONON_TEST_WRAP_CLOCK=__wrap_${CHRONON_TEST_CLOCK_SYMBOL}
+        CHRONON_TEST_REAL_CLOCK=__real_${CHRONON_TEST_CLOCK_SYMBOL})
+endif()
+foreach(mode static dynamic static_crossing dynamic_crossing idle_static idle_dynamic waits epochs empty zero_start dynamic_zero_start mixed_static mixed_dynamic markers)
+    add_test(NAME sender_timeline_window_${mode} COMMAND sender_test_scheduler_timeline_window ${mode})
+    set_tests_properties(sender_timeline_window_${mode} PROPERTIES TIMEOUT 45 LABELS "sender")
+endforeach()
+add_dependencies(regress sender_test_scheduler_timeline_window)
+
 add_executable(sender_test_message_queue test_message_queue.cpp)
 add_executable(sender_test_lockfree_message_queue test_lockfree_message_queue.cpp)
 add_executable(sender_test_dependency_graph test_dependency_graph.cpp)

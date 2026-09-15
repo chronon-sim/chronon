@@ -195,6 +195,13 @@ void testReconfigureRebuildsRecorderState() {
     REQUIRE(data.streams[1].size() == 1);
     REQUIRE(data.streams[trace.schedulerStream()].empty());
     REQUIRE(data.dropped_events == 1);
+    const auto& event = data.streams[1].front();
+    REQUIRE(eventString(data, 1, event.cat_off, event.cat_len) == "new");
+    REQUIRE(eventString(data, 1, event.name_off, event.name_len) == "event");
+    // Export owns even short arena strings after producer state is destroyed.
+    trace.recordInstant(1, "after", "export", 0, restarted);
+    REQUIRE(trace.exportData().empty());
+    REQUIRE(eventString(data, 1, event.name_off, event.name_len) == "event");
 }
 
 void testChunkedBudgetAcrossStreams() {
