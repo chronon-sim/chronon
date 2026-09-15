@@ -42,14 +42,11 @@ void TickSimulation::initTimelineTraceScratch_() {
     if (!timeline_trace_.traceUnits() || thread_units_.empty()) return;
 
     thread_trace_points_.resize(thread_units_.size());
+    // Workers allocate their buffers on first capture. Eagerly allocating small
+    // timestamp arrays here can put different writers on the same cache line.
+    // Buffers then grow only when needed and are reused across run calls.
     if (timeline_trace_.traceThreadCpuTime()) {
         thread_trace_cpu_points_.resize(thread_units_.size());
-    }
-    for (size_t t = 0; t < thread_units_.size(); ++t) {
-        thread_trace_points_[t].resize(thread_units_[t].size() + 1);
-        if (!thread_trace_cpu_points_.empty()) {
-            thread_trace_cpu_points_[t].resize(thread_units_[t].size() + 1);
-        }
     }
 }
 
@@ -85,6 +82,53 @@ void TickSimulation::recordUnitDuration_(size_t thread_idx, std::string_view cat
     enriched += " cpu_end=" + std::to_string(cpu_end.cpu);
 
     timeline_trace_.recordDuration(thread_idx, category, name, cycle, begin, end, enriched);
+}
+
+void TickSimulation::resetDynamicSchedulerMarkers_() {
+    dynamic_scheduler_marker_count_.store(0, std::memory_order_relaxed);
+    dynamic_scheduler_marker_drops_.store(0, std::memory_order_relaxed);
+}
+
+void TickSimulation::recordDynamicSchedulerMarker_(std::string_view name, uint64_t cycle,
+                                                   std::string_view detail) {
+    if (!timeline_trace_.capturesCycle(cycle)) return;
+    const size_t slot = dynamic_scheduler_marker_count_.fetch_add(1, std::memory_order_relaxed);
+    if (slot >= dynamic_scheduler_markers_.size()) {
+        dynamic_scheduler_marker_drops_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    auto& marker = dynamic_scheduler_markers_[slot];
+    marker.time = SchedulerTimelineTrace::Clock::now();
+    marker.cycle = cycle;
+    marker.name = name;
+    marker.detail = detail;
+}
+
+void TickSimulation::flushDynamicSchedulerMarkers_() {
+    if (!timeline_trace_.enabled()) {
+        resetDynamicSchedulerMarkers_();
+        return;
+    }
+
+    const size_t count = std::min(dynamic_scheduler_marker_count_.load(std::memory_order_relaxed),
+                                  dynamic_scheduler_markers_.size());
+    for (size_t i = 0; i < count; ++i) {
+        const auto& marker = dynamic_scheduler_markers_[i];
+        if (marker.name.empty()) continue;
+        timeline_trace_.recordInstant(timeline_trace_.schedulerStream(), "scheduler rebalance",
+                                      marker.name, marker.cycle, marker.time, marker.detail);
+    }
+
+    const uint64_t drops = dynamic_scheduler_marker_drops_.load(std::memory_order_relaxed);
+    if (drops > 0 && timeline_trace_.capturesCycle(current_cycle_)) {
+        const auto now = SchedulerTimelineTrace::Clock::now();
+        timeline_trace_.recordInstant(timeline_trace_.schedulerStream(), "scheduler rebalance",
+                                      "Chronon epoch-free rebalance markers dropped",
+                                      current_cycle_, now, "drops=" + std::to_string(drops));
+    }
+
+    resetDynamicSchedulerMarkers_();
 }
 
 }  // namespace chronon::sender

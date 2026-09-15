@@ -42,53 +42,6 @@ uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
 
 }  // namespace
 
-void TickSimulation::resetDynamicSchedulerMarkers_() {
-    dynamic_scheduler_marker_count_.store(0, std::memory_order_relaxed);
-    dynamic_scheduler_marker_drops_.store(0, std::memory_order_relaxed);
-}
-
-void TickSimulation::recordDynamicSchedulerMarker_(std::string name, uint64_t cycle,
-                                                   std::string detail) {
-    if (!timeline_trace_.enabled()) return;
-    const size_t slot = dynamic_scheduler_marker_count_.fetch_add(1, std::memory_order_relaxed);
-    if (slot >= dynamic_scheduler_markers_.size()) {
-        dynamic_scheduler_marker_drops_.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-
-    auto& marker = dynamic_scheduler_markers_[slot];
-    marker.time = SchedulerTimelineTrace::Clock::now();
-    marker.cycle = cycle;
-    marker.name = std::move(name);
-    marker.detail = std::move(detail);
-}
-
-void TickSimulation::flushDynamicSchedulerMarkers_() {
-    if (!timeline_trace_.enabled()) {
-        resetDynamicSchedulerMarkers_();
-        return;
-    }
-
-    const size_t count = std::min(dynamic_scheduler_marker_count_.load(std::memory_order_relaxed),
-                                  dynamic_scheduler_markers_.size());
-    for (size_t i = 0; i < count; ++i) {
-        const auto& marker = dynamic_scheduler_markers_[i];
-        if (marker.name.empty()) continue;
-        timeline_trace_.recordInstant(timeline_trace_.schedulerStream(), "scheduler rebalance",
-                                      marker.name, marker.cycle, marker.time, marker.detail);
-    }
-
-    const uint64_t drops = dynamic_scheduler_marker_drops_.load(std::memory_order_relaxed);
-    if (drops > 0) {
-        const auto now = SchedulerTimelineTrace::Clock::now();
-        timeline_trace_.recordInstant(timeline_trace_.schedulerStream(), "scheduler rebalance",
-                                      "Chronon epoch-free rebalance markers dropped",
-                                      current_cycle_, now, "drops=" + std::to_string(drops));
-    }
-
-    resetDynamicSchedulerMarkers_();
-}
-
 bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     if (!config_.enable_dynamic_rebalance || !cluster_runtime_owner_ ||
         dynamic_runtime_cluster_count_ == 0 || config_.num_threads < 2) {
@@ -518,14 +471,18 @@ bool TickSimulation::dynamicMigrationBlocksCluster_(size_t cluster, uint64_t cyc
     return cycle >= migration_request_.fence_cycle.load(std::memory_order_acquire);
 }
 
-template <bool PushPeriodicCounters>
+template <bool PushPeriodicCounters, bool TraceEnabled, bool CheckTraceWindow>
 void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t end_cycle,
                                                   uint64_t run_start, uint64_t period,
                                                   stdexec::inplace_stop_token token) {
-    const bool trace_units = timeline_trace_.traceUnits();
-    const bool trace_waits = timeline_trace_.traceWaits();
-    const bool stop_on_first_blocker = !trace_waits;
     const uint64_t max_lookahead = config_.max_lookahead_cycles;
+    const bool trace_units_enabled = TraceEnabled && timeline_trace_.traceUnits();
+    bool trace_units = trace_units_enabled;
+    const bool trace_waits_enabled = TraceEnabled && timeline_trace_.traceWaits();
+    const auto trace_cycle = [&](bool enabled, uint64_t cycle) {
+        if constexpr (CheckTraceWindow) return enabled && timeline_trace_.capturesCycle(cycle);
+        return enabled;
+    };
     const size_t num_clusters = dynamic_runtime_cluster_count_;
     std::vector<size_t> owned_clusters;
     std::vector<size_t> refreshed_clusters;
@@ -617,7 +574,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                                           BlockedClusterInfo& blocker) {
         if (cycle < ready_through_cycle[cluster]) return true;
         if (!clusterCanAdvance_(cluster, cycle, blocker, predecessor_cycles,
-                                stop_on_first_blocker)) {
+                                !trace_cycle(trace_waits_enabled, cycle))) {
             return false;
         }
 
@@ -703,6 +660,9 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                                                                  predecessor_cycles);
             }
             if (idle_target > cycle) {
+                if constexpr (CheckTraceWindow) {
+                    trace_units = trace_cycle(trace_units_enabled, cycle);
+                }
                 const bool sample_units = cluster < dynamic_cluster_unit_sampling_.size() &&
                                           dynamic_cluster_unit_sampling_[cluster] != 0;
                 SchedulerTimelineTrace::TimePoint idle_begin{};
@@ -771,7 +731,18 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                         !sample_units && detail::shouldSampleDynamicTick(cycle, last_sample);
                     SchedulerTimelineTrace::TimePoint begin{};
                     if (sample_tick) begin = SchedulerTimelineTrace::Clock::now();
-                    executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units, sample_units);
+                    if constexpr (CheckTraceWindow) {
+                        trace_units = trace_cycle(trace_units_enabled, cycle);
+                    }
+                    if (!trace_units && !sample_units) {
+                        // No trace scratch or per-unit samples are needed in this hot path.
+                        for (auto* unit : cluster_unit_ptrs_[cluster]) {
+                            executeUnitCycle_(unit, cycle);
+                        }
+                    } else {
+                        executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units,
+                                                sample_units);
+                    }
                     if (sample_tick) {
                         auto end = SchedulerTimelineTrace::Clock::now();
                         uint64_t elapsed_ns = static_cast<uint64_t>(
@@ -853,6 +824,14 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
         }
 
         constexpr uint64_t kWaitSampleMask = 0x0F;
+        uint64_t wait_cycle = 0;
+        if (trace_waits_enabled) {
+            wait_cycle = blocker.cluster == SIZE_MAX
+                             ? current_cycle_
+                             : thread_progress_array_[blocker.cluster].completed_cycle.load(
+                                   std::memory_order_relaxed);
+        }
+        const bool trace_waits = trace_cycle(trace_waits_enabled, wait_cycle);
         const bool sample_wait = trace_waits || ((wait_sample_sequence++ & kWaitSampleMask) == 0);
         if (sample_wait && !trace_waits && blocker.cluster < num_clusters) {
             refineDynamicWaitBlocker_(thread_idx, owned_clusters, stable_sweep, end_cycle,
@@ -974,26 +953,37 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                                      : blocker.pred_cluster == SIZE_MAX ? "stall: lookahead-floor"
                                                                         : "stall: cluster-dep";
             const auto stall_style = schedulerStallStyle(stall_name);
-            timeline_trace_.recordDuration(
-                thread_idx, stall_style.category, stall_style.name,
-                blocker.cluster == SIZE_MAX
-                    ? current_cycle_
-                    : thread_progress_array_[blocker.cluster].completed_cycle.load(
-                          std::memory_order_relaxed),
-                wait_begin, wait_end, formatBlockerDetail_(blocker));
+            timeline_trace_.recordDuration(thread_idx, stall_style.category, stall_style.name,
+                                           wait_cycle, wait_begin, wait_end,
+                                           formatBlockerDetail_(blocker));
         }
     }
 }
 
 void TickSimulation::executeThreadRunDynamic_(size_t thread_idx, uint64_t end_cycle,
                                               stdexec::inplace_stop_token token) {
-    executeThreadRunDynamicImpl_<false>(thread_idx, end_cycle, 0, 0, token);
+    if (!timeline_trace_.needsWorkerTracing(end_cycle)) {
+        executeThreadRunDynamicImpl_<false, false, false>(thread_idx, end_cycle, 0, 0, token);
+    } else if (timeline_trace_.needsWorkerCycleChecks(end_cycle)) {
+        executeThreadRunDynamicImpl_<false, true, true>(thread_idx, end_cycle, 0, 0, token);
+    } else {
+        executeThreadRunDynamicImpl_<false, true, false>(thread_idx, end_cycle, 0, 0, token);
+    }
 }
 
 void TickSimulation::executeThreadRunDynamicWithPeriodicCounters_(
     size_t thread_idx, uint64_t end_cycle, uint64_t run_start, uint64_t period,
     stdexec::inplace_stop_token token) {
-    executeThreadRunDynamicImpl_<true>(thread_idx, end_cycle, run_start, period, token);
+    if (!timeline_trace_.needsWorkerTracing(end_cycle)) {
+        executeThreadRunDynamicImpl_<true, false, false>(thread_idx, end_cycle, run_start, period,
+                                                         token);
+    } else if (timeline_trace_.needsWorkerCycleChecks(end_cycle)) {
+        executeThreadRunDynamicImpl_<true, true, true>(thread_idx, end_cycle, run_start, period,
+                                                       token);
+    } else {
+        executeThreadRunDynamicImpl_<true, true, false>(thread_idx, end_cycle, run_start, period,
+                                                        token);
+    }
 }
 
 }  // namespace chronon::sender

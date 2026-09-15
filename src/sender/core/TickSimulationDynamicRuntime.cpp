@@ -171,7 +171,8 @@ uint64_t TickSimulation::executeRunEpochFreeDynamic_(uint64_t total_cycles) {
     epoch_free_dynamic_runtime_active_.store(true, std::memory_order_release);
 
     SchedulerTimelineTrace::TimePoint run_begin{};
-    if (timeline_trace_.traceEpochs()) {
+    const bool trace_run = timeline_trace_.traceEpochsAt(run_start);
+    if (trace_run) {
         run_begin = SchedulerTimelineTrace::Clock::now();
     }
     resetDynamicSchedulerMarkers_();
@@ -204,7 +205,7 @@ uint64_t TickSimulation::executeRunEpochFreeDynamic_(uint64_t total_cycles) {
 
     flushDynamicSchedulerMarkers_();
 
-    if (timeline_trace_.traceEpochs()) {
+    if (trace_run) {
         auto run_end = SchedulerTimelineTrace::Clock::now();
         timeline_trace_.recordDuration(timeline_trace_.schedulerStream(), "scheduler",
                                        "epoch-free dynamic lookahead run", run_start, run_begin,

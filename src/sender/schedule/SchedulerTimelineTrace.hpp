@@ -75,8 +75,8 @@ public:
         scheduler_stream_ = 0;
         data_ = observe::TimelineStreamData{};
         reserved_events_ = 0;
-        stream_budgets_.reset();
-        stream_budget_count_ = 0;
+        stream_states_.reset();
+        stream_count_ = 0;
     }
 
     bool enabled() const noexcept { return configured_; }
@@ -84,6 +84,24 @@ public:
     bool traceWaits() const noexcept { return trace_waits_; }
     bool traceEpochs() const noexcept { return trace_epochs_; }
     bool traceThreadCpuTime() const noexcept { return trace_thread_cpu_time_; }
+
+    // Check before taking timestamps or preparing trace-only scratch. Duration
+    // events are selected by their starting cycle, including run/idle/wait spans.
+    bool capturesCycle(uint64_t cycle) const noexcept {
+        return configured_ && cycle >= config_.start_cycle && cycle < config_.end_cycle;
+    }
+    bool traceEpochsAt(uint64_t cycle) const noexcept {
+        return trace_epochs_ && capturesCycle(cycle);
+    }
+    // Workers can resume at different cycles after an interrupted run. Use
+    // [0, end_cycle) as a conservative bound instead of assuming equal progress.
+    bool needsWorkerTracing(uint64_t end_cycle) const noexcept {
+        return (trace_units_ || trace_waits_) && config_.start_cycle < config_.end_cycle &&
+               config_.start_cycle < end_cycle;
+    }
+    bool needsWorkerCycleChecks(uint64_t end_cycle) const noexcept {
+        return !(capturesCycle(0) && capturesCycle(end_cycle - 1));
+    }
 
     void start(const std::vector<std::vector<size_t>>& thread_units,
                const std::vector<TickableUnit*>& unit_ptrs) {
@@ -93,20 +111,19 @@ public:
         base_time_ = Clock::now();
         const size_t stream_count = thread_units.empty() ? 1 : thread_units.size();
         data_ = observe::TimelineStreamData{};
-        data_.streams.resize(stream_count + 1);  // Last stream is the scheduler lane.
-        data_.arenas.resize(stream_count + 1);
-        stream_budget_count_ = stream_count + 1;
-        stream_budgets_ = std::make_unique<StreamBudget[]>(stream_budget_count_);
+        // Last stream is the scheduler lane. Keep each producer's mutable
+        // vector/string metadata on separate cache lines until export.
+        stream_count_ = stream_count + 1;
+        // Reserve the export containers now so shutdown only moves ownership.
+        data_.streams.resize(stream_count_);
+        data_.arenas.resize(stream_count_);
+        stream_states_ = std::make_unique<StreamState[]>(stream_count_);
         event_budget_chunk_ =
-            config_.max_events / data_.streams.size() < kEventBudgetChunk ? 1 : kEventBudgetChunk;
-        const size_t reserve_per = config_.max_events / data_.streams.size();
-        for (auto& s : data_.streams) {
-            s.reserve(reserve_per);
-        }
-        // Pre-size each string arena to its share of events (~16 B/event heuristic)
-        // so the common case appends without reallocating.
-        for (auto& a : data_.arenas) {
-            a.reserve(reserve_per * 16);
+            config_.max_events / stream_count_ < kEventBudgetChunk ? 1 : kEventBudgetChunk;
+        const size_t reserve_per = config_.max_events / stream_count_;
+        for (size_t i = 0; i < stream_count_; ++i) {
+            stream_states_[i].events.reserve(reserve_per);
+            stream_states_[i].arena.reserve(reserve_per * 16);
         }
         data_.stream_names.reserve(stream_count + 1);
 
@@ -130,7 +147,7 @@ public:
     void recordDuration(size_t stream, std::string_view category, std::string_view name,
                         uint64_t cycle, TimePoint begin, TimePoint end,
                         std::string_view detail = {}) {
-        if (!started_ || stream >= data_.streams.size()) return;
+        if (!started_ || stream >= stream_count_) return;
         if (cycle < config_.start_cycle || cycle >= config_.end_cycle) return;
         if (end < begin) return;
 
@@ -145,7 +162,7 @@ public:
         // reused across events), and because the bytes are copied here the trace
         // owns them — caller-supplied temporaries are safe. Per the contract above,
         // a given stream's arena is written by exactly one thread at a time.
-        std::string& arena = data_.arenas[stream];
+        std::string& arena = stream_states_[stream].arena;
         const auto intern = [&arena](std::string_view s) -> std::pair<uint32_t, uint32_t> {
             const uint32_t off = static_cast<uint32_t>(arena.size());
             arena.append(s.data(), s.size());
@@ -154,19 +171,19 @@ public:
         const auto [cat_off, cat_len] = intern(category);
         const auto [name_off, name_len] = intern(name);
         const auto [detail_off, detail_len] = intern(detail);
-        data_.streams[stream].push_back({cat_off, cat_len, name_off, name_len, detail_off,
-                                         detail_len, cycle, relNs(begin), duration_ns});
+        stream_states_[stream].events.push_back({cat_off, cat_len, name_off, name_len, detail_off,
+                                                 detail_len, cycle, relNs(begin), duration_ns});
     }
 
     /// Record a point event in a stream.
     void recordInstant(size_t stream, std::string_view category, std::string_view name,
                        uint64_t cycle, TimePoint time, std::string_view detail = {}) {
-        if (!started_ || stream >= data_.streams.size()) return;
+        if (!started_ || stream >= stream_count_) return;
         if (cycle < config_.start_cycle || cycle >= config_.end_cycle) return;
 
         if (!claimEventSlot_(stream)) return;
 
-        std::string& arena = data_.arenas[stream];
+        std::string& arena = stream_states_[stream].arena;
         const auto intern = [&arena](std::string_view s) -> std::pair<uint32_t, uint32_t> {
             const uint32_t off = static_cast<uint32_t>(arena.size());
             arena.append(s.data(), s.size());
@@ -175,8 +192,8 @@ public:
         const auto [cat_off, cat_len] = intern(category);
         const auto [name_off, name_len] = intern(name);
         const auto [detail_off, detail_len] = intern(detail);
-        data_.streams[stream].push_back({cat_off, cat_len, name_off, name_len, detail_off,
-                                         detail_len, cycle, relNs(time), 0, true});
+        stream_states_[stream].events.push_back({cat_off, cat_len, name_off, name_len, detail_off,
+                                                 detail_len, cycle, relNs(time), 0, true});
     }
 
     size_t schedulerStream() const noexcept { return scheduler_stream_; }
@@ -190,7 +207,7 @@ public:
      */
     observe::TimelineStreamData exportData() {
         written_ = true;
-        data_.dropped_events = droppedEvents_();
+        collectStreams_();
         return std::move(data_);
     }
 
@@ -224,15 +241,26 @@ private:
             return;
         }
 
-        data_.dropped_events = droppedEvents_();
+        collectStreams_();
         observe::writeTimeline(writer, data_);
         writer.close();
+    }
+
+    void collectStreams_() {
+        if (stream_count_ == 0) return;
+        data_.dropped_events = droppedEvents_();
+        for (size_t i = 0; i < stream_count_; ++i) {
+            data_.streams[i] = std::move(stream_states_[i].events);
+            data_.arenas[i] = std::move(stream_states_[i].arena);
+        }
+        stream_count_ = 0;
+        stream_states_.reset();
     }
 
     bool claimEventSlot_(size_t stream) noexcept {
         // Each stream has one writer. Reserve global capacity in blocks so the
         // common event path only advances stream-local, cache-line-isolated state.
-        auto& budget = stream_budgets_[stream];
+        auto& budget = stream_states_[stream];
         uint64_t available = budget.available.load(std::memory_order_relaxed);
         while (available != 0) {
             if (budget.available.compare_exchange_weak(available, available - 1,
@@ -248,9 +276,8 @@ private:
             // single writer. A successful writer CAS consumes the credit first;
             // otherwise exchange() reclaims it for another stream.
             uint64_t reclaimed = 0;
-            for (size_t index = 0; index < stream_budget_count_; ++index) {
-                reclaimed +=
-                    stream_budgets_[index].available.exchange(0, std::memory_order_relaxed);
+            for (size_t index = 0; index < stream_count_; ++index) {
+                reclaimed += stream_states_[index].available.exchange(0, std::memory_order_relaxed);
             }
             reserved_events_ -= reclaimed;
         }
@@ -268,8 +295,8 @@ private:
 
     uint64_t droppedEvents_() const noexcept {
         uint64_t total = 0;
-        for (size_t index = 0; index < stream_budget_count_; ++index) {
-            total += stream_budgets_[index].dropped;
+        for (size_t index = 0; index < stream_count_; ++index) {
+            total += stream_states_[index].dropped;
         }
         return total;
     }
@@ -290,14 +317,16 @@ private:
     TimePoint base_time_{};
     size_t scheduler_stream_ = 0;
     static constexpr uint64_t kEventBudgetChunk = 256;
-    struct alignas(64) StreamBudget {
+    struct alignas(64) StreamState {
         std::atomic<uint64_t> available{0};
         uint64_t dropped = 0;
+        std::vector<observe::TimelineStreamData::Event> events;
+        std::string arena;
     };
     /// Recorded streams: slices, per-stream byte arenas, lane names.
     observe::TimelineStreamData data_;
-    std::unique_ptr<StreamBudget[]> stream_budgets_;
-    size_t stream_budget_count_ = 0;
+    std::unique_ptr<StreamState[]> stream_states_;
+    size_t stream_count_ = 0;
     uint64_t event_budget_chunk_ = 1;
     uint64_t reserved_events_ = 0;
     std::mutex event_budget_mutex_;

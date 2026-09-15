@@ -572,7 +572,7 @@ private:
     void executeThreadRunDynamicWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
                                                       uint64_t run_start, uint64_t period,
                                                       stdexec::inplace_stop_token token);
-    template <bool PushPeriodicCounters>
+    template <bool PushPeriodicCounters, bool TraceEnabled, bool CheckTraceWindow>
     void executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t end_cycle, uint64_t run_start,
                                       uint64_t period, stdexec::inplace_stop_token token);
 
@@ -649,6 +649,10 @@ private:
                             SchedulerTimelineTrace::TimePoint begin,
                             SchedulerTimelineTrace::TimePoint end);
     std::string formatBlockerDetail_(const BlockedClusterInfo& blocker) const;
+    struct ThreadTracePoint {
+        SchedulerTimelineTrace::TimePoint time{};
+        bool active = false;
+    };
     struct ThreadTraceCpuPoint {
         uint64_t cpu_time_ns = 0;
         uint32_t tid = 0;
@@ -675,7 +679,8 @@ private:
                                    bool stable_sweep, uint64_t end_cycle,
                                    uint64_t* predecessor_cache, BlockedClusterInfo& blocker) const;
     void resetDynamicSchedulerMarkers_();
-    void recordDynamicSchedulerMarker_(std::string name, uint64_t cycle, std::string detail);
+    void recordDynamicSchedulerMarker_(std::string_view name, uint64_t cycle,
+                                       std::string_view detail);
     void flushDynamicSchedulerMarkers_();
 
     /**
@@ -771,7 +776,7 @@ private:
     std::vector<std::vector<TickableUnit*>> thread_unit_ptrs_;
     std::vector<std::vector<size_t>> thread_clusters_;
     std::vector<std::vector<TickableUnit*>> cluster_unit_ptrs_;
-    std::vector<std::vector<SchedulerTimelineTrace::TimePoint>> thread_trace_points_;
+    std::vector<std::vector<ThreadTracePoint>> thread_trace_points_;
     std::vector<std::vector<ThreadTraceCpuPoint>> thread_trace_cpu_points_;
 
     enum class MigrationRequestState : uint8_t {

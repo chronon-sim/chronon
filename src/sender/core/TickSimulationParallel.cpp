@@ -263,7 +263,8 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
     lookahead_floor_.store(run_start, std::memory_order_relaxed);
 
     SchedulerTimelineTrace::TimePoint run_begin{};
-    if (timeline_trace_.traceEpochs()) {
+    const bool trace_run = timeline_trace_.traceEpochsAt(run_start);
+    if (trace_run) {
         run_begin = SchedulerTimelineTrace::Clock::now();
     }
 
@@ -294,7 +295,7 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
 
     if (captured) std::rethrow_exception(captured);
 
-    if (timeline_trace_.traceEpochs()) {
+    if (trace_run) {
         auto run_end = SchedulerTimelineTrace::Clock::now();
         timeline_trace_.recordDuration(timeline_trace_.schedulerStream(), "scheduler",
                                        "epoch-free lookahead run", run_start, run_begin, run_end,
@@ -318,12 +319,15 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
                                            stdexec::inplace_stop_token token) {
     const auto& clusters = thread_clusters_[thread_idx];
     const bool trace_units = timeline_trace_.traceUnits();
+    const bool trace_waits_enabled = timeline_trace_.traceWaits();
+    const bool stop_on_first_blocker = !trace_waits_enabled;
+    const auto trace_cycle = [&](bool enabled, uint64_t cycle) {
+        return enabled && timeline_trace_.capturesCycle(cycle);
+    };
     // This cache spans the worker invocation (the entire run in EpochFree mode),
     // allowing all locally-owned clusters to reuse acquired predecessor progress.
     WorkerPredecessorCycleCache predecessor_cache(thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
-    const bool trace_waits = timeline_trace_.traceWaits();
-    const bool stop_on_first_blocker = !trace_waits;
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;
     if constexpr (PushPeriodicCounters) {
@@ -358,7 +362,7 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
             }
             if (idle_target > cycle) {
                 SchedulerTimelineTrace::TimePoint idle_begin{};
-                if (trace_units) {
+                if (trace_cycle(trace_units, cycle)) {
                     idle_begin = SchedulerTimelineTrace::Clock::now();
                 }
                 advanceClusterIdle_(cluster, idle_target - cycle);
@@ -375,7 +379,7 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
                         unit->setLocalCycle(reached_cycle);
                     }
                 }
-                if (trace_units) {
+                if (trace_cycle(trace_units, cycle)) {
                     auto idle_end = SchedulerTimelineTrace::Clock::now();
                     recordClusterIdle_(thread_idx, cluster, cycle, reached_cycle - cycle,
                                        idle_begin, idle_end);
@@ -425,6 +429,14 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
             continue;
         }
 
+        uint64_t wait_cycle = 0;
+        if (trace_waits_enabled) {
+            wait_cycle = blocker.cluster == SIZE_MAX
+                             ? current_cycle_
+                             : thread_progress_array_[blocker.cluster].completed_cycle.load(
+                                   std::memory_order_relaxed);
+        }
+        const bool trace_waits = trace_cycle(trace_waits_enabled, wait_cycle);
         SchedulerTimelineTrace::TimePoint wait_begin{};
         if (trace_waits) {
             wait_begin = SchedulerTimelineTrace::Clock::now();
@@ -462,13 +474,9 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
                                      : blocker.pred_cluster == SIZE_MAX ? "stall: lookahead-floor"
                                                                         : "stall: cluster-dep";
             const auto stall_style = schedulerStallStyle(stall_name);
-            timeline_trace_.recordDuration(
-                thread_idx, stall_style.category, stall_style.name,
-                blocker.cluster == SIZE_MAX
-                    ? current_cycle_
-                    : thread_progress_array_[blocker.cluster].completed_cycle.load(
-                          std::memory_order_relaxed),
-                wait_begin, wait_end, formatBlockerDetail_(blocker));
+            timeline_trace_.recordDuration(thread_idx, stall_style.category, stall_style.name,
+                                           wait_cycle, wait_begin, wait_end,
+                                           formatBlockerDetail_(blocker));
         }
     }
 }
@@ -691,41 +699,44 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
         last = cycle;
     };
 
-    if (trace_units) {
-        auto& points = thread_trace_points_[thread_idx];
-        if (points.size() < num_units + 1) {
-            points.resize(num_units + 1);
+    if (trace_units && timeline_trace_.capturesCycle(cycle)) {
+        auto& point_scratch = thread_trace_points_[thread_idx];
+        if (point_scratch.size() < num_units + 1) {
+            point_scratch.resize(num_units + 1);
         }
+        auto* const points = point_scratch.data();
         const bool trace_thread_cpu = timeline_trace_.traceThreadCpuTime();
-        auto* cpu_points = trace_thread_cpu ? &thread_trace_cpu_points_[thread_idx] : nullptr;
-        if (cpu_points && cpu_points->size() < num_units + 1) {
-            cpu_points->resize(num_units + 1);
+        ThreadTraceCpuPoint* cpu_points = nullptr;
+        if (trace_thread_cpu) {
+            auto& cpu_scratch = thread_trace_cpu_points_[thread_idx];
+            if (cpu_scratch.size() < num_units + 1) cpu_scratch.resize(num_units + 1);
+            cpu_points = cpu_scratch.data();
         }
-        std::vector<char> active(num_units, 0);
-        points[0] = SchedulerTimelineTrace::Clock::now();
+        points[0].time = SchedulerTimelineTrace::Clock::now();
         if (cpu_points) {
-            (*cpu_points)[0] = threadTraceCpuPoint_();
+            cpu_points[0] = threadTraceCpuPoint_();
         }
         for (size_t u = 0; u < num_units; ++u) {
-            active[u] = executeUnitCycle_(units[u], cycle);
-            points[u + 1] = SchedulerTimelineTrace::Clock::now();
+            points[u].active = executeUnitCycle_(units[u], cycle);
+            points[u + 1].time = SchedulerTimelineTrace::Clock::now();
             if (cpu_points) {
-                (*cpu_points)[u + 1] = threadTraceCpuPoint_();
+                cpu_points[u + 1] = threadTraceCpuPoint_();
             }
         }
         for (size_t u = 0; u < num_units; ++u) {
-            recordUnitDuration_(thread_idx, active[u] ? "unit" : "unit idle", units[u]->name(),
-                                cycle, points[u], points[u + 1], active[u] ? "" : "cycles=1",
-                                trace_thread_cpu,
-                                cpu_points ? (*cpu_points)[u] : ThreadTraceCpuPoint{},
-                                cpu_points ? (*cpu_points)[u + 1] : ThreadTraceCpuPoint{});
+            recordUnitDuration_(thread_idx, points[u].active ? "unit" : "unit idle",
+                                units[u]->name(), cycle, points[u].time, points[u + 1].time,
+                                points[u].active ? "" : "cycles=1", trace_thread_cpu,
+                                cpu_points ? cpu_points[u] : ThreadTraceCpuPoint{},
+                                cpu_points ? cpu_points[u + 1] : ThreadTraceCpuPoint{});
             if (sample_unit_activity) {
                 const size_t unit = unit_index(u);
-                const uint64_t elapsed_ns = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(points[u + 1] - points[u])
-                        .count());
-                record_cost_sample(unit, active[u] != 0, elapsed_ns);
-                record_activity(unit, active[u] != 0);
+                const uint64_t elapsed_ns =
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              points[u + 1].time - points[u].time)
+                                              .count());
+                record_cost_sample(unit, points[u].active != 0, elapsed_ns);
+                record_activity(unit, points[u].active != 0);
             }
         }
     } else {
