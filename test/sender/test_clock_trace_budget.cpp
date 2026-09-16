@@ -9,6 +9,33 @@
 
 using namespace chronon;
 
+#if defined(CHRONON_TEST_WRAP_NEW)
+namespace {
+thread_local bool count_allocations = false;
+thread_local size_t allocation_count = 0, large_allocations = 0, large_bytes = 0;
+
+void observeAllocation(size_t bytes) {
+    if (!count_allocations) return;
+    ++allocation_count;
+    if (bytes >= 1024 * 1024) {
+        ++large_allocations;
+        large_bytes += bytes;
+    }
+}
+}  // namespace
+
+extern "C" void* CHRONON_TEST_REAL_NEW(std::size_t size);
+extern "C" void* CHRONON_TEST_REAL_NEW_ARRAY(std::size_t size);
+extern "C" [[gnu::noinline]] void* CHRONON_TEST_WRAP_NEW(std::size_t size) {
+    observeAllocation(size);
+    return CHRONON_TEST_REAL_NEW(size);
+}
+extern "C" [[gnu::noinline]] void* CHRONON_TEST_WRAP_NEW_ARRAY(std::size_t size) {
+    observeAllocation(size);
+    return CHRONON_TEST_REAL_NEW_ARRAY(size);
+}
+#endif
+
 struct DenseUnit : TickableUnit {
     size_t per_edge;
     bool burst;
@@ -87,8 +114,52 @@ Result run(const std::filesystem::path& output, size_t units, size_t per_edge,
     return result;
 }
 
+void stagingAllocationBudget(const std::filesystem::path& output) {
+    using observe::ClockRecord;
+    std::filesystem::remove_all(output);
+    ClockTraceRecorder::Config config;
+    config.output_dir = output;
+    config.perfetto = false;  // Isolate staging, without a native writer allocation.
+    config.stream_capacity = 2;
+    config.drain_batch = 2;
+    config.perfetto_options.clock_buffer_records = 2;
+    ClockTraceRecorder recorder(config);
+    recorder.addStream(ClockDomain::fromHz(1, "clock", 1'000'000'000), 0, "unit");
+#if defined(CHRONON_TEST_WRAP_NEW)
+    allocation_count = large_allocations = large_bytes = 0;
+    count_allocations = true;
+#endif
+    recorder.startParallel(UINT32_MAX);
+#if defined(CHRONON_TEST_WRAP_NEW)
+    count_allocations = false;
+    // Exactly two large allocations; no allocation per admitted bucket.
+    assert(large_allocations == 2 && allocation_count < 100);
+#endif
+    constexpr size_t budget = 256 * 1024 * 1024;
+    // No watermark publication: admission stops at the actual reserved slots.
+    // This independently checks capacity rather than trusting the byte counter.
+    size_t admitted = 0;
+    while (recorder.tryAdmitClockBatch(SimTime::nanoseconds(admitted))) {
+        ++admitted;
+        assert(admitted <= budget / (2 * sizeof(ClockRecord)));
+    }
+    recorder.close();
+    const auto stats = recorder.stats();
+    assert(admitted > 1'000'000);
+    assert(stats.allocated_buffer_bytes + stats.allocated_staging_bytes <= budget);
+    const size_t minimum_slot_bytes = 2 * (sizeof(ClockRecord) + sizeof(SimTime) + sizeof(size_t)) +
+                                      sizeof(uint64_t) + sizeof(size_t);
+    assert(stats.allocated_staging_bytes >= admitted * minimum_slot_bytes);
+#if defined(CHRONON_TEST_WRAP_NEW)
+    // Both descriptor storage and record storage must be reported, not just
+    // a payload-only estimate that repeats the implementation's budget formula.
+    assert(stats.allocated_staging_bytes == large_bytes);
+#endif
+}
+
 int main(int argc, char** argv) {
     const std::filesystem::path root = argc > 1 ? argv[1] : "out/clock-trace-budget";
+    stagingAllocationBudget(root / "staging-allocation-budget");
     const auto reference = run(root / "off", 128, 1, 65536, false, 0);
     for (unsigned mode : {1u, 2u, 3u}) {
         const auto result =

@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <span>
 #include <thread>
 #include <tuple>
 
@@ -181,9 +182,14 @@ struct ClockTraceRecorder::Impl {
     struct Bucket {
         uint64_t ns = 0;
         size_t bytes = 0;
-        std::vector<PendingRecord> records;
+        size_t size = 0;
+        PendingRecord* records = nullptr;
     };
-    std::vector<Bucket> buckets;
+    // Two fixed allocations, not one allocation per bucket. Include BOTH
+    // arrays in the budget; allocator bookkeeping no longer scales with slots.
+    std::unique_ptr<PendingRecord[]> staging;
+    std::unique_ptr<Bucket[]> bucket_storage;
+    std::span<Bucket> buckets;
     alignas(64) std::atomic<uint64_t> bucket_head{0};
     alignas(64) std::atomic<uint64_t> bucket_tail{0};
     size_t staged_records = 0;
@@ -212,11 +218,11 @@ struct ClockTraceRecorder::Impl {
         if (first != head && buckets[first % buckets.size()].ns == ns) {
             auto& bucket = buckets[first % buckets.size()];
             const auto bytes = stream.queue->record_base_bytes_ + names.at(record.kind).size();
-            if (bucket.records.size() == bucket_capacity ||
+            if (bucket.size == bucket_capacity ||
                 bytes > detail::ClockEventBuffer::MaxPendingBytes - bucket.bytes)
                 throw std::length_error(
                     "native clock single-nanosecond bucket exceeds record or 4 MiB byte budget");
-            bucket.records.push_back({record, time, stream_index});
+            bucket.records[bucket.size++] = {record, time, stream_index};
             bucket.bytes += bytes;
             stats.peak_staging_records =
                 std::max<uint64_t>(stats.peak_staging_records, ++staged_records);
@@ -231,19 +237,19 @@ struct ClockTraceRecorder::Impl {
         while (tail != head) {
             auto& bucket = buckets[tail % buckets.size()];
             if (!stop && bucket.ns >= limit) break;
-            std::sort(bucket.records.begin(), bucket.records.end(),
-                      [&](const auto& a, const auto& b) {
-                          if (a.time != b.time) return a.time < b.time;
-                          const auto& sa = streams[a.stream];
-                          const auto& sb = streams[b.stream];
-                          return std::tuple{static_cast<uint8_t>(a.record.phase) & 127,
-                                            std::string_view(sa.unit_name), sa.producer_order,
-                                            a.record.ordinal} <
-                                 std::tuple{static_cast<uint8_t>(b.record.phase) & 127,
-                                            std::string_view(sb.unit_name), sb.producer_order,
-                                            b.record.ordinal};
-                      });
-            for (auto& pending : bucket.records) {
+            const std::span records(bucket.records, bucket.size);
+            std::sort(records.begin(), records.end(), [&](const auto& a, const auto& b) {
+                if (a.time != b.time) return a.time < b.time;
+                const auto& sa = streams[a.stream];
+                const auto& sb = streams[b.stream];
+                return std::tuple{static_cast<uint8_t>(a.record.phase) & 127,
+                                  std::string_view(sa.unit_name), sa.producer_order,
+                                  a.record.ordinal} <
+                       std::tuple{static_cast<uint8_t>(b.record.phase) & 127,
+                                  std::string_view(sb.unit_name), sb.producer_order,
+                                  b.record.ordinal};
+            });
+            for (auto& pending : records) {
                 auto& stream = streams[pending.stream];
                 auto& ordinal = streams[stream.logical_unit].encoded_ordinal;
                 if (static_cast<uint8_t>(pending.record.phase) & 128) {
@@ -260,8 +266,8 @@ struct ClockTraceRecorder::Impl {
             // later bucket enters the writer until this one has been emitted.
             if (config.perfetto)
                 writer.advanceClockWatermark(bucket.ns == UINT64_MAX ? UINT64_MAX : bucket.ns + 1);
-            staged_records -= bucket.records.size();
-            bucket.records.clear();
+            staged_records -= bucket.size;
+            bucket.size = 0;
             bucket.bytes = 0;
             bucket_tail.store(++tail, std::memory_order_release);
         }
@@ -515,15 +521,19 @@ void ClockTraceRecorder::startParallel(size_t lookahead_batches) {
         detail::ClockEventBuffer::MaxPendingBytes / detail::ClockEventBuffer::BaseRecordBytes);
     if (records < 2)
         throw std::invalid_argument("parallel clock bucket needs at least two records");
-    const auto slot_bytes = records * sizeof(Impl::PendingRecord);
+    const auto slot_bytes = records * sizeof(Impl::PendingRecord) + sizeof(Impl::Bucket);
     const auto available = 256 * 1024 * 1024 - p.stats.allocated_buffer_bytes;
     const auto max_slots = available / slot_bytes;
     if (!max_slots)
         throw std::invalid_argument("parallel clock ingress/staging budget exceeds 256 MiB");
     const auto slots = std::min(lookahead_batches, max_slots - 1) + 1;
-    p.buckets.resize(slots);
+    auto buckets = std::make_unique<Impl::Bucket[]>(slots);
+    auto staging = std::make_unique<Impl::PendingRecord[]>(slots * records);
+    for (size_t i = 0; i < slots; ++i) buckets[i].records = staging.get() + i * records;
+    p.bucket_storage = std::move(buckets);
+    p.staging = std::move(staging);
+    p.buckets = {p.bucket_storage.get(), slots};
     p.bucket_capacity = records;
-    for (auto& bucket : p.buckets) bucket.records.reserve(records);
     p.stats.allocated_staging_bytes = slots * slot_bytes;
     start();
 }

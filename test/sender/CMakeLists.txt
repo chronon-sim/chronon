@@ -60,8 +60,10 @@ target_link_libraries(sender_test_factory_parameter_allocation_failure
 include(CheckLinkerFlag)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(CHRONON_TEST_NEW_SYMBOL _Znwm)
+    set(CHRONON_TEST_NEW_ARRAY_SYMBOL _Znam)
 else()
     set(CHRONON_TEST_NEW_SYMBOL _Znwj)
+    set(CHRONON_TEST_NEW_ARRAY_SYMBOL _Znaj)
 endif()
 check_linker_flag(CXX "LINKER:--wrap=${CHRONON_TEST_NEW_SYMBOL}" CHRONON_TEST_HAS_WRAP_NEW)
 if(CHRONON_TEST_HAS_WRAP_NEW)
@@ -70,6 +72,21 @@ if(CHRONON_TEST_HAS_WRAP_NEW)
     target_compile_definitions(sender_test_factory_parameter_allocation_failure PRIVATE
         CHRONON_TEST_WRAP_NEW=__wrap_${CHRONON_TEST_NEW_SYMBOL}
         CHRONON_TEST_REAL_NEW=__real_${CHRONON_TEST_NEW_SYMBOL})
+endif()
+# Count actual staging allocation requests independently of recorder statistics.
+# Preserve the sanitizer's allocators, just as the allocation-failure test does.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CHRONON_TEST_HAS_WRAP_NEW AND NOT BUILD_SHARED_LIBS)
+    check_linker_flag(CXX "LINKER:--wrap=${CHRONON_TEST_NEW_ARRAY_SYMBOL}" CHRONON_TEST_HAS_WRAP_NEW_ARRAY)
+    if(CHRONON_TEST_HAS_WRAP_NEW_ARRAY)
+        target_link_options(sender_test_clock_trace_budget PRIVATE
+            "LINKER:--wrap=${CHRONON_TEST_NEW_SYMBOL}"
+            "LINKER:--wrap=${CHRONON_TEST_NEW_ARRAY_SYMBOL}")
+        target_compile_definitions(sender_test_clock_trace_budget PRIVATE
+            CHRONON_TEST_WRAP_NEW=__wrap_${CHRONON_TEST_NEW_SYMBOL}
+            CHRONON_TEST_REAL_NEW=__real_${CHRONON_TEST_NEW_SYMBOL}
+            CHRONON_TEST_WRAP_NEW_ARRAY=__wrap_${CHRONON_TEST_NEW_ARRAY_SYMBOL}
+            CHRONON_TEST_REAL_NEW_ARRAY=__real_${CHRONON_TEST_NEW_ARRAY_SYMBOL})
+    endif()
 endif()
 add_test(NAME sender_factory_parameters_allocation_failure
     COMMAND sender_test_factory_parameter_allocation_failure)

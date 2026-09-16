@@ -539,6 +539,10 @@ during execution; `close()` / `closeClockTrace()` finishes the tail. Backend fai
 and are surfaced as errors. Static metadata plus ring capacity are fixed before
 running; combined ring and parallel compact-record staging allocation is capped
 at 256 MiB across streams (separate from the native encoder's storage).
+Parallel staging uses two contiguous arrays, for records and bucket descriptors;
+both count toward this cap and `allocated_staging_bytes`. There is no per-bucket
+heap allocation. These are requested storage bytes, not a process RSS limit:
+allocator bookkeeping/page rounding and other recorder/encoder state are separate.
 
 The ingress peak is the sum of per-stream high-water marks, a conservative bound
 on simultaneous queued bytes. It excludes bounded text/Perfetto encoder batches

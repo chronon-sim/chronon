@@ -97,8 +97,8 @@ public:
         uint64_t file_bytes = 0;
         uint64_t native_buffer_peak_bytes = 0;
         uint64_t native_buffer_peak_records = 0;
-        uint64_t first_output_ns = 0;  // Host time since native writer open().
-        uint64_t allocated_staging_bytes = 0;
+        uint64_t first_output_ns = 0;          // Host time since native writer open().
+        uint64_t allocated_staging_bytes = 0;  // Record + bucket descriptor array allocation bytes.
         uint64_t peak_staging_records = 0;
     };
 
