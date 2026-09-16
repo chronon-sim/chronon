@@ -276,6 +276,11 @@ worker progress and can be later than the request time; arbitrary model state
 is not rolled back. Read termination details after the run returns. Resume with
 `resetTermination()`. A failed evaluation or time overflow cannot be resumed.
 
+If an external stop is already pending when a clock run API is called, the call
+reports the existing `lastCommittedTime()` as `settled_time` without advancing
+any unit or bridge. This also applies to zero-length runs and already-drained
+`drainCdc()` calls. Resetting termination clears the reported stop boundary.
+
 ## Coincident edges and pipeline registers
 
 At each physical instant:

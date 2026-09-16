@@ -151,6 +151,9 @@ void TickSimulation::requireClockRun_() {
     if (clock_failed_)
         throw std::logic_error("multiclock simulation cannot resume after an evaluation failure");
     if (!initialized_) initialize();
+    // All previous work is settled at public run entry. Publish the boundary
+    // for an existing external stop even if the selected run attempts no batch.
+    termination_ctrl_.setSettledTime(clock_time_);
 }
 
 bool TickSimulation::executeClockBatch_() {

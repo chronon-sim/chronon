@@ -4,6 +4,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <optional>
 #include <span>
@@ -346,6 +347,58 @@ void terminationAndResume(const std::filesystem::path& output = {}) {
     sim.closeClockTrace();
 }
 
+void externalTerminationBetweenRuns(size_t threads, uint64_t warmup) {
+    TickSimulationConfig config;
+    config.num_threads = threads;
+    config.enable_parallel = threads > 1;
+    config.enable_dynamic_rebalance = threads == 4;
+    TickSimulation sim(config);
+    sim.addClockDomain(ClockDomain::fromHz(1, "fast", 3'000'000'000));
+    sim.addClockDomain(ClockDomain::fromHz(2, "slow", 600'000'000, 1, SimTime::picoseconds(137)));
+    auto* a = sim.createUnitInDomain<Stopper>(1, "a", UINT64_MAX);
+    auto* b = sim.createUnitInDomain<Stopper>(2, "b", UINT64_MAX);
+    if (warmup) assert(sim.runClockEvents(warmup) == warmup);
+    const auto boundary = sim.lastCommittedTime();
+    const auto ac = sim.domainCycleCount(1), bc = sim.domainCycleCount(2);
+    const auto runs_before = sim.epochFreeRunCount();
+    const Digest events_before{a->events, b->events};
+    const std::array<std::function<uint64_t()>, 8> runs{
+        [&] { return sim.runClockEvents(100); },
+        [&] { return sim.runClockEvents(0); },
+        [&] { return sim.runUntilTime(SimTime::nanoseconds(1000)); },
+        [&] { return sim.runUntilTime(boundary); },
+        [&] { return sim.runDomainCycles(1, 100); },
+        [&] { return sim.runDomainCycles(1, 0); },
+        [&] { return sim.drainCdc(100); },  // Already drained; no batch is attempted.
+        [&] { return sim.drainCdc(0); }};
+    for (const auto& run : runs) {
+        // Fresh request for EACH entry point, so a previous run cannot hide
+        // missing publication on a zero-work path.
+        sim.requestTermination(TerminationReason::UserInterrupted, 7, "between clock runs");
+        const auto original = sim.terminationRequest();
+        assert(!original.settled_time);
+        assert(run() == 0);
+        assert(sim.useParallelExecution() == (threads > 1));
+        const auto& request = sim.terminationRequest();
+        assert(request.settled_time == boundary && sim.lastCommittedTime() == boundary);
+        assert(request.reason == original.reason && request.exit_code == original.exit_code);
+        assert(request.cycle == original.cycle && request.physical_time == original.physical_time);
+        assert(request.clock_domain_id == original.clock_domain_id);
+        assert(request.unit_name == original.unit_name && request.message == original.message);
+        assert(sim.schedulerSteps() == warmup && sim.epochFreeRunCount() == runs_before);
+        assert(sim.domainCycleCount(1) == ac && sim.domainCycleCount(2) == bc);
+        assert(a->localCycle() == ac && b->localCycle() == bc);
+        assert((Digest{a->events, b->events} == events_before));
+        assert(sim.runClockEvents(1) == 0 && sim.terminationRequest().settled_time == boundary);
+        sim.resetTermination();
+        assert(!sim.wasTerminationRequested() && !sim.terminationRequest().settled_time);
+        assert(sim.runClockEvents(0) == 0 && !sim.terminationRequest().settled_time);
+    }
+    assert(sim.runClockEvents(23) == 23);
+    assert(sim.schedulerSteps() == warmup + 23 && !sim.wasTerminationRequested());
+    assert(!sim.terminationRequest().settled_time);
+}
+
 struct Throws : TickableUnit {
     Throws() : TickableUnit("throws") {}
     void tick() override {
@@ -458,6 +511,8 @@ Digest runSelfLoop(size_t threads, const std::filesystem::path& output, unsigned
 int main(int argc, char** argv) {
     const std::filesystem::path root = argc > 1 ? argv[1] : "out/clock-parallel";
     std::filesystem::remove_all(root);
+    for (size_t threads : {1, 2, 4})
+        for (uint64_t warmup : {0, 37}) externalTerminationBetweenRuns(threads, warmup);
     Digest self_loop_reference;
     for (unsigned mode : {0u, 1u, 2u, 3u}) {
         std::vector<std::string> reference;
