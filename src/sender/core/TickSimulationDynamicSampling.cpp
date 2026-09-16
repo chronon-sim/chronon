@@ -151,7 +151,7 @@ TickSimulation::DynamicRuntimeCostEstimate TickSimulation::dynamicClusterRuntime
     };
 
     double fallback = 0.0;
-    bool low_frequency = false;
+    bool low_frequency = clock_mode_;
     for (size_t unit : clusters_.clusters[cluster]) {
         fallback += load_unit_cost(unit);
         if (unit < unit_ptrs_.size() &&

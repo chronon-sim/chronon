@@ -11,6 +11,7 @@
 #include <tuple>
 #include <vector>
 
+#include "ClockMigrationTestAccess.hpp"
 #include "chronon/Chronon.hpp"
 
 using namespace chronon;
@@ -53,6 +54,7 @@ struct Writer : Recorded {
     InPort<uint64_t> in{this, "in", 8};
     AsyncWritePort<uint64_t> out{this, "out"};
     std::optional<uint64_t> pending;
+    std::function<void(uint64_t)> after_tick;
     Writer() : Recorded("writer") {}
     void tick() override {
         if (!pending) pending = in.tryReceive(localCycle());
@@ -66,6 +68,7 @@ struct Writer : Recorded {
             }
         }
         record(sent, full, pending.value_or(0));
+        if (after_tick) after_tick(localCycle());
     }
 };
 
@@ -98,11 +101,12 @@ using Digest = std::vector<std::vector<uint64_t>>;
 Digest runGraph(size_t threads, uint64_t whz, uint64_t rhz, uint64_t phase, size_t depth, bool lazy,
                 bool segmented, uint32_t window, bool dynamic,
                 const std::filesystem::path& output = {}, unsigned trace_mode = 3,
-                std::vector<std::string>* trace_records = nullptr) {
+                std::vector<std::string>* trace_records = nullptr, bool hot_migrations = false) {
     TickSimulationConfig config;
     config.num_threads = threads;
     config.enable_parallel = threads > 1;
     config.enable_dynamic_rebalance = dynamic;
+    if (hot_migrations) config.rebalance_check_interval_cycles = UINT64_MAX;
     config.max_lookahead_cycles = window;
     TickSimulation sim(config);
     sim.addClockDomain(ClockDomain::fromHz(1, "source", whz));
@@ -131,6 +135,22 @@ Digest runGraph(size_t threads, uint64_t whz, uint64_t rhz, uint64_t phase, size
     }
     sim.initialize();
     assert(sim.useParallelExecution() == (threads > 1));
+    size_t requests = 0;
+    if (hot_migrations) {
+        assert(dynamic && threads > 1);
+        using Access = sender::DynamicMigrationTestAccess;
+        const std::vector<size_t> actors{Access::bridge(sim, 0),  Access::cluster(sim, w),
+                                         Access::bridge(sim, 1),  Access::bridge(sim, 2),
+                                         Access::cluster(sim, b), Access::cluster(sim, m),
+                                         Access::cluster(sim, c), Access::bridge(sim, 0)};
+        w->after_tick = [&, actors](uint64_t cycle) {
+            // The first request is inside the writer's tick: its bridge has
+            // already begun, but cannot commit until this tick completes.
+            if (requests < actors.size() && cycle >= 11 + 64 * requests &&
+                Access::request(sim, actors[requests]))
+                ++requests;
+        };
+    }
     if (segmented) {
         for (size_t i = 0; i < 20; ++i) assert(sim.runClockEvents(37) == 37);
     } else {
@@ -142,7 +162,13 @@ Digest runGraph(size_t threads, uint64_t whz, uint64_t rhz, uint64_t phase, size
     assert(sim.totalTransportOverflowEvents() == 0);
     if (threads > 1) {
         assert(a->worker == w->worker);  // Same-cycle ordinary dependency.
-        assert(a->worker != m->worker || a->worker != c->worker || a->worker != b->worker);
+        if (!hot_migrations)
+            assert(a->worker != m->worker || a->worker != c->worker || a->worker != b->worker);
+    }
+    if (hot_migrations) {
+        assert(requests == 8 && sim.rebalanceCount() == requests);
+        sender::DynamicMigrationTestAccess::assertIdle(sim);
+        assert(sim.assignedThread(a) == sim.assignedThread(w));
     }
     sim.closeClockTrace();
     if (!output.empty()) {
@@ -354,6 +380,10 @@ int main(int argc, char** argv) {
             const auto reference = runGraph(1, w, r, phase, 2, lazy, false, 32, false);
             for (const size_t threads : {2, 4})
                 for (const uint32_t window : {1, 32})
+                    assert(runGraph(threads, w, r, phase, 2, lazy, true, window, true, {}, 3,
+                                    nullptr, true) == reference);
+            for (const size_t threads : {2, 4})
+                for (const uint32_t window : {1, 32})
                     for (const bool dynamic : {false, true}) {
                         assert(runGraph(threads, w, r, phase, 2, lazy, false, window, dynamic) ==
                                reference);
@@ -377,8 +407,8 @@ int main(int argc, char** argv) {
                 const auto output = root / ("graph-" + std::to_string(mode) + "-" +
                                             std::to_string(threads) + "-" + std::to_string(window));
                 assert(runGraph(threads, 3'000'000'000ULL, 4'000'000'000ULL, 125, 4, true, true,
-                                window, true, output, mode,
-                                mode & 1 ? &actual : nullptr) == expected);
+                                window, true, output, mode, mode & 1 ? &actual : nullptr,
+                                true) == expected);
                 assert(actual == reference);
             }
         }

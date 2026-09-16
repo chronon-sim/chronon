@@ -30,6 +30,7 @@ struct PartitionInput {
         size_t neighbor;
         size_t num_connections;
         uint32_t min_delay;
+        double activity_rate = 1.0;  ///< Edges per reference-clock cycle (runtime clock mode).
     };
     std::vector<std::vector<EdgeInfo>> adjacency;
 };

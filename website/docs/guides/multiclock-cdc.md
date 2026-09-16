@@ -55,10 +55,28 @@ dependencies still compare local edges within one domain; bridge tasks compare
 exact physical edge times. Only the bridge's two endpoints participate in its
 sampling/commit handshake. No simulation state rollback is used.
 
-The clock runtime uses static cluster/bridge placement; runtime migration is not
-currently performed, even if `enable_dynamic_rebalance` is set. Disabled parallel
-or lookahead settings, a single cluster, and unproven ordinary-port transport
-headroom retain explicit sequential fallback reasons. `configureClockTrace`
+With `enable_dynamic_rebalance`, the clock runtime reuses the epoch-free
+one-actor migration planner, owner/generation publication, gain thresholds and
+cooldown policy. Ordinary zero-delay clusters remain indivisible; a CDC bridge
+is also a migratable actor. Only the losing owner publishes a handoff, after its
+complete sweep: clusters transfer after a completed tick, and bridges transfer
+only after commit, never between begin and commit. The receiving worker acquires
+the existing circuit, queues, sampling state and logical trace producers; no
+whole-domain fence, queue reconstruction, or simulation rollback is introduced.
+
+Sparse active/inactive unit timing is weighted by the domain's edge rate. Bridge
+timing charges begin and commit work, excluding time waiting for endpoints, and
+accounts for coincident edges. The planner's compute and handshake costs use a
+common reference-clock basis. In clock mode, `rebalance_check_interval_cycles`
+and `rebalance_cooldown_cycles` mean **cycles at `tick_frequency_hz` of retired
+physical time**, not domain-local cycles or calendar batches. Ownership and
+sampling history survive segmented run calls; an unfinished migration request
+is canceled after workers join at a run/stop boundary, before stop settlement.
+Already committed migrations remain in effect. `rebalanceCount()` reports actual
+handoffs and `assignedThread(unit)` reflects the joined runtime placement.
+
+Disabled parallel or lookahead settings, a single cluster, and unproven
+ordinary-port transport headroom retain explicit sequential fallback reasons. `configureClockTrace`
 supports epoch-free execution with text, Perfetto, or both sinks; enabling it
 does not select a different simulation execution mode. The default
 single-clock paths are unchanged. This infrastructure does not choose or calibrate
@@ -71,20 +89,19 @@ been removed. Unit and bridge actors now have independent producer streams,
 bridge-aware progress publication, and bounded asynchronous observation credits
 (see below). The following capability and performance gaps remain:
 
-- **Dynamic placement is not implemented for clock actors.**
-  `enable_dynamic_rebalance` does not migrate clusters or bridges in explicit
-  clock mode. The worker task lists are static. A follow-up must connect them to
-  the existing owner/generation handoff protocol: clusters may transfer after a
-  completed tick, and bridges can transfer after commit, with exactly one owner.
-  Load estimates and rebalance intervals also need a common physical-time basis
-  instead of comparing raw local cycles from different domains.
+- **Dynamic placement is heuristic, not a speedup guarantee.** Sparse samples
+  need warmup, and slowly ticking domains take longer to build confidence.
+  Initial placement still uses the static unit-cost partition and a bridge-count
+  heuristic; frequency normalization and measured bridge costs apply to runtime
+  migration. Clock mode uses the shared compute/topology score, but does not yet
+  attribute sampled worker stalls to physical-time critical dependency edges.
 - **Scheduling scalability and speedup remain to be characterized.** Admission
   and retirement use one coordinator, which scans cluster/bridge progress for
   each physical-time batch; workers poll their assigned tasks. Correctness tests
   demonstrate concurrent execution, but do not establish a speedup for cheap
   ticks, skewed workloads, or large domain/bridge counts. Static placement does
-  not currently normalize tick costs by domain frequency or profile bridge cost.
-  Frequency-aware placement, indexed readiness checks and representative
+  not currently normalize initial tick costs by domain frequency.
+  Frequency-aware initial placement, indexed readiness checks and representative
   multiclock benchmarks are follow-up work.
 
 Two intentional semantics should not be mistaken for missing correctness fixes:

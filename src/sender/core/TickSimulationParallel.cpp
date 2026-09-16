@@ -672,6 +672,14 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
     auto* const* units = cluster_unit_ptrs_[cluster].data();
     const size_t num_units = cluster_unit_ptrs_[cluster].size();
 
+    const auto execute = [&](TickableUnit* unit) {
+        if (!clock_mode_) return executeUnitCycle_(unit, cycle);
+        unit->clock_edge_executing_ = true;
+        const bool active = executeUnitCycle_(unit, cycle);
+        unit->clock_edge_executing_ = false;
+        if (auto* stream = unit->clockTraceStream()) stream->endEdge();
+        return active;
+    };
     auto unit_index = [&](size_t offset) {
         return cluster < clusters_.clusters.size() && offset < clusters_.clusters[cluster].size()
                    ? clusters_.clusters[cluster][offset]
@@ -717,7 +725,7 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
             cpu_points[0] = threadTraceCpuPoint_();
         }
         for (size_t u = 0; u < num_units; ++u) {
-            points[u].active = executeUnitCycle_(units[u], cycle);
+            points[u].active = execute(units[u]);
             points[u + 1].time = SchedulerTimelineTrace::Clock::now();
             if (cpu_points) {
                 cpu_points[u + 1] = threadTraceCpuPoint_();
@@ -742,7 +750,7 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
     } else {
         for (size_t u = 0; u < num_units; ++u) {
             if (!sample_unit_activity) {
-                executeUnitCycle_(units[u], cycle);
+                execute(units[u]);
                 continue;
             }
 
@@ -761,7 +769,7 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
             }
             SchedulerTimelineTrace::TimePoint begin{};
             if (time_sample) begin = SchedulerTimelineTrace::Clock::now();
-            const bool active = executeUnitCycle_(units[u], cycle);
+            const bool active = execute(units[u]);
             if (time_sample && active == expected_active) {
                 const auto end = SchedulerTimelineTrace::Clock::now();
                 const uint64_t elapsed_ns = static_cast<uint64_t>(

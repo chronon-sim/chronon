@@ -120,7 +120,7 @@ inline double edgePressure(const PartitionInput& input,
     const double delay_weight = edge.min_delay == 0   ? 100.0
                                 : edge.min_delay == 1 ? 1.50
                                                       : 1.0 / static_cast<double>(edge.min_delay);
-    return sync * static_cast<double>(edge.num_connections) * delay_weight;
+    return sync * static_cast<double>(edge.num_connections) * delay_weight * edge.activity_rate;
 }
 
 inline double waitAt(const std::vector<uint64_t>* values, size_t idx) noexcept {

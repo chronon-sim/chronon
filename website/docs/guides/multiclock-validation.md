@@ -36,9 +36,19 @@ actual parallel execution for requested 2/4-worker clock graphs, including text,
 Perfetto and combined recording. `sender_multiclock_epoch_free` additionally
 checks multi-bridge feedback graphs against serial execution, two-record ingress
 rings, segmented runs, termination/resume, and independent same-domain progress
-while another actor is stalled. `sender_clock_trace_budget` covers parallel dense
+while another actor is stalled. Its parallel trace fixtures force eight live
+handoffs per run, moving both ordinary clusters and all three bridges, including
+a request while a bridge is between begin and commit. Text events, native events
+and flows must remain identical to serial execution. `sender_multiclock_migration`
+also tests autonomous measured-load migration, planner-selected bridge migration,
+physical-time cost/cooldown normalization, source-only safe-point publication,
+and cancellation of pending requests on stop, resume and exceptions.
+`sender_clock_trace_budget` covers parallel dense
 bursts, record/byte pressure, lossy accounting and terminal bucket overflow.
-The clock simulation/recorder tests have also passed an instrumented TSan run.
+The migration follow-up passes the full Release suite (122 tests) and an
+instrumented TSan subset (8 tests, including clock migration/recording and the
+shared single-clock rebalance/equivalence paths). The autonomous migration test
+also passes 20 consecutive Release runs.
 The parallel multi-bridge trace fixture imports 39,169 events and 7,575 flow edges:
 serial and 2/4-worker runs with lookahead windows 1/32 have identical normalized
 records. The parallel output-failure test injects `EFBIG` while producers share
@@ -374,8 +384,11 @@ compiler or optimization setting and call it an exact main-branch baseline.
 Clock frequencies and phases are fixed for a run.
 The FIFO is a deterministic digital CDC model, not an analog metastability or
 MTBF model. Only power-of-two FIFO depths and registered synchronous reads are
-implemented. Explicit multi-clock execution supports epoch-free scheduling and
-clock tracing; dynamic migration of clock actors is not yet implemented.
+implemented. Explicit multi-clock execution supports epoch-free scheduling,
+clock tracing and dynamic cluster/bridge migration. Migration profitability and
+large-graph scheduling scalability still require representative benchmarks;
+clock-specific critical-wait attribution and frequency-aware initial placement
+remain follow-up work.
 Legacy observation entry points and YAML clock-domain configuration are not
 automatically migrated; use the C++ clock/CDC and native recorder APIs in the
 guide. Legacy multi-clock observation is rejected rather than mis-timestamped.

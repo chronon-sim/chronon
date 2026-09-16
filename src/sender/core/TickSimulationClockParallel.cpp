@@ -4,46 +4,9 @@
 #include <exception>
 
 #include "../../chronon/CpuPause.hpp"
-#include "TickSimulation.hpp"
+#include "TickSimulationClockRuntime.hpp"
 
 namespace chronon::sender {
-
-// A bridge is a scheduled actor, not a dependency between whole clock domains.
-// Its begin publication grants its endpoint clusters an edge. Their completion
-// publications transfer pending port commands back to the bridge for commit.
-// The next begin cannot overtake that commit. Consequently the existing circuit
-// can retain its ordinary, non-atomic registers and exact pre-edge sampling.
-struct TickSimulation::ClockParallelRuntime {
-    struct alignas(64) Cluster {
-        const ClockDomain* clock = nullptr;
-        std::atomic<uint64_t> allowed{0};
-        std::vector<const std::atomic<uint64_t>*> bridges;
-    };
-    struct alignas(64) Endpoint {
-        size_t cluster = 0;
-        const ClockDomain* clock = nullptr;
-        uint64_t next = 0;  // Bridge-owner private.
-        std::atomic<uint64_t> prepared{0};
-        std::atomic<uint64_t> completed{0};
-    };
-    struct Bridge {
-        CdcComponent* circuit = nullptr;
-        std::array<Endpoint, 2> endpoints;
-        std::array<ClockEdge, 2> edges;
-        std::array<bool, 2> participating{};
-        std::array<observe::ClockTraceStream*, 2> trace{};
-        size_t edge_count = 0;
-    };
-    struct Batch {
-        SimTime time;
-        std::vector<ClockEdge> edges;
-    };
-
-    std::unique_ptr<Cluster[]> clusters;
-    std::vector<std::unique_ptr<Bridge>> bridges;
-    std::vector<std::vector<size_t>> worker_bridges;
-    std::deque<Batch> pending;
-};
 
 void TickSimulation::selectClockExecutionMode_() {
     const auto fallback = [&](std::string reason) {
@@ -111,6 +74,7 @@ void TickSimulation::initializeClockParallel_() {
         runtime.worker_bridges[worker].push_back(runtime.bridges.size());
         runtime.bridges.push_back(std::move(bridge));
     }
+    if (config_.enable_dynamic_rebalance) initializeClockMigration_();
 }
 
 uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<SimTime> limit,
@@ -129,6 +93,11 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
     std::atomic_flag error_set = ATOMIC_FLAG_INIT;
     const auto token = stop_source_->get_token();
     auto* trace = clock_trace_ && clock_trace_->parallelActive() ? clock_trace_.get() : nullptr;
+    const bool dynamic = config_.enable_dynamic_rebalance;
+    if (dynamic) {
+        epoch_free_dynamic_runtime_active_.store(true, std::memory_order_release);
+        resetDynamicSchedulerMarkers_();
+    }
 
     // Only worker zero manipulates the calendar. It grants a rolling bounded
     // window, never waits for a whole window, and retires individual completed
@@ -163,6 +132,9 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             runtime.pending.pop_front();
             progress = true;
         }
+        if (dynamic && progress)
+            runtime.rebalance_cycle.store(clockRebalanceCycle_(clock_time_),
+                                          std::memory_order_release);
         // Retirement observes both unit and bridge completion with acquire.
         // Publish without waiting: actors sharing this worker must keep running
         // while the backend drains its bounded observation window.
@@ -193,7 +165,10 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         return progress;
     };
 
-    const auto bridge_step = [&](ClockParallelRuntime::Bridge& bridge) {
+    const auto bridge_step = [&](size_t index) {
+        auto& bridge = *runtime.bridges[index];
+        const size_t actor = clusters_.numClusters() + index;
+        const uint64_t cycle = dynamic ? bridge.completed.load(std::memory_order_relaxed) : 0;
         if (bridge.edge_count) {
             for (size_t side = 0; side < 2; ++side) {
                 const auto& endpoint = bridge.endpoints[side];
@@ -202,6 +177,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                         std::memory_order_acquire) <= endpoint.next)
                     return false;
             }
+            SchedulerTimelineTrace::TimePoint begin{};
+            if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
             bridge.circuit->commit();
             for (size_t side = 0; side < 2; ++side) {
                 auto& endpoint = bridge.endpoints[side];
@@ -211,9 +188,22 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     endpoint.completed.store(endpoint.next, std::memory_order_release);
                 }
             }
+            if (bridge.sample) {
+                bridge.sample_ns +=
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              SchedulerTimelineTrace::Clock::now() - begin)
+                                              .count());
+                cluster_sample_time_ns_[actor].fetch_add(bridge.sample_ns,
+                                                         std::memory_order_relaxed);
+                cluster_sample_count_[actor].fetch_add(bridge.edge_count,
+                                                       std::memory_order_relaxed);
+                cluster_active_sample_count_[actor].fetch_add(1, std::memory_order_relaxed);
+            }
             bridge.edge_count = 0;
+            if (dynamic) bridge.completed.store(cycle + 1, std::memory_order_release);
             return true;
         }
+        if (dynamic && dynamicMigrationBlocksCluster_(actor, cycle)) return false;
         const auto write_time = bridge.endpoints[0].clock->edge(bridge.endpoints[0].next);
         const auto read_time = bridge.endpoints[1].clock->edge(bridge.endpoints[1].next);
         const auto time = std::min(write_time, read_time);
@@ -229,7 +219,18 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             if (bridge.participating[side])
                 bridge.edges[bridge.edge_count++] = {endpoint.clock, endpoint.next, time};
         }
+        bridge.sample = dynamic && detail::shouldSampleDynamicTick(
+                                       cycle, dynamic_cluster_last_tick_sample_cycle_[actor]);
+        SchedulerTimelineTrace::TimePoint begin{};
+        if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
         bridge.circuit->begin(std::span(bridge.edges.data(), bridge.edge_count));
+        if (bridge.sample) {
+            dynamic_cluster_last_tick_sample_cycle_[actor] = cycle;
+            bridge.sample_ns =
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          SchedulerTimelineTrace::Clock::now() - begin)
+                                          .count());
+        }
         for (size_t side = 0; side < 2; ++side) {
             auto& endpoint = bridge.endpoints[side];
             if (bridge.participating[side])
@@ -243,16 +244,44 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             stdexec::bulk(stdexec::just(), stdexec::par, thread_units_.size(), [&](size_t worker) {
                 try {
                     WorkerPredecessorCycleCache cache(thread_progress_count_);
+                    auto owned_clusters = thread_clusters_[worker];
+                    auto owned_bridges = runtime.worker_bridges[worker];
+                    std::vector<size_t> owned_actors, ownership_scratch;
+                    uint64_t seen_generation = 0;
+                    const auto refresh = [&] {
+                        refreshDynamicOwnedActors_(worker, owned_actors, ownership_scratch,
+                                                   seen_generation);
+                        owned_clusters.clear();
+                        owned_bridges.clear();
+                        for (const size_t actor : owned_actors) {
+                            if (actor < clusters_.numClusters())
+                                owned_clusters.push_back(actor);
+                            else
+                                owned_bridges.push_back(actor - clusters_.numClusters());
+                        }
+                    };
                     while (!failed.load(std::memory_order_acquire) &&
                            !done.load(std::memory_order_acquire) &&
                            (settling || !token.stop_requested())) {
                         bool progress = worker == 0 && coordinate(settling);
-                        for (const auto index : runtime.worker_bridges[worker])
-                            progress = bridge_step(*runtime.bridges[index]) || progress;
-                        for (const auto c : thread_clusters_[worker]) {
+                        if (dynamic && seen_generation != cluster_assignment_generation_.load(
+                                                              std::memory_order_acquire))
+                            refresh();
+                        for (const auto index : owned_bridges) {
+                            if (dynamic &&
+                                cluster_runtime_owner_[clusters_.numClusters() + index].load(
+                                    std::memory_order_acquire) != worker)
+                                continue;
+                            progress = bridge_step(index) || progress;
+                        }
+                        for (const auto c : owned_clusters) {
+                            if (dynamic &&
+                                cluster_runtime_owner_[c].load(std::memory_order_acquire) != worker)
+                                continue;
                             auto& state = runtime.clusters[c];
                             auto& published = thread_progress_array_[c].completed_cycle;
                             const auto cycle = published.load(std::memory_order_relaxed);
+                            if (dynamic && dynamicMigrationBlocksCluster_(c, cycle)) continue;
                             if (cycle >= state.allowed.load(std::memory_order_acquire)) continue;
                             bool ready = true;
                             for (const auto* bridge : state.bridges)
@@ -260,14 +289,17 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             BlockedClusterInfo blocker;
                             if (!ready || !clusterCanAdvance_(c, cycle, blocker, cache.data()))
                                 continue;
-                            for (auto* unit : cluster_unit_ptrs_[c]) {
-                                unit->clock_edge_executing_ = true;
-                                executeUnitCycle_(unit, cycle);
-                                unit->clock_edge_executing_ = false;
-                                if (auto* stream = unit->clockTraceStream()) stream->endEdge();
-                            }
+                            executeClusterOneCycle_(worker, c, cycle, false, dynamic);
                             published.store(cycle + 1, std::memory_order_release);
                             progress = true;
+                        }
+                        if (dynamic && !settling) {
+                            if (worker == 0)
+                                maybeRequestEpochFreeMigration_(dynamicMigrationCycle_());
+                            // Only the source can publish an owner change, after
+                            // its entire sweep; targets acquire actor-private
+                            // circuit, unit sampling and SPSC producer state.
+                            serviceEpochFreeMigration_(worker);
                         }
                         if (!progress) cpuPause();
                     }
@@ -283,6 +315,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
 
     try {
         execute(false);
+        finishClockMigrationRun_();
         if (error) std::rethrow_exception(error);
         if (!runtime.pending.empty()) {
             // Termination freezes admission. After joining the workers, settle
@@ -317,10 +350,14 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             if (error) std::rethrow_exception(error);
         }
     } catch (...) {
+        epoch_free_dynamic_runtime_active_.store(false, std::memory_order_release);
+        finishClockMigrationRun_();
         for (auto* unit : unit_ptrs_) unit->clock_edge_executing_ = false;
         clock_failed_ = true;
         throw;
     }
+    epoch_free_dynamic_runtime_active_.store(false, std::memory_order_release);
+    if (dynamic) flushDynamicSchedulerMarkers_();
     for (size_t i = 0; i < unit_ptrs_.size(); ++i)
         unit_progress_[i].store(unit_ptrs_[i]->localCycle(), std::memory_order_release);
     termination_ctrl_.setSettledTime(clock_time_);

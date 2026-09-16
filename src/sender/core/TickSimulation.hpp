@@ -494,6 +494,7 @@ private:
     };
     DynamicRuntimeCostEstimate dynamicUnitRuntimeCost_(size_t unit, double fallback) const;
     DynamicRuntimeCostEstimate dynamicClusterRuntimeCost_(size_t cluster);
+    DynamicRuntimeCostEstimate dynamicClockActorCost_(size_t actor);
 
     /**
      * Topology-only cluster-aware placement (no cost profiling). Used as
@@ -674,6 +675,14 @@ private:
                                  bool trace_units, bool sample_unit_activity = false);
 
     void initDynamicMigrationRuntime_();
+    void refreshDynamicOwnedActors_(size_t worker, std::vector<size_t>& owned,
+                                    std::vector<size_t>& scratch, uint64_t& seen_generation) const;
+    void initializeClockMigration_();
+    uint64_t clockRebalanceCycle_(SimTime time) const noexcept;
+    uint64_t dynamicMigrationCycle_() const;
+    uint64_t dynamicActorProgress_(size_t actor) const;
+    bool clockActorCanMigrate_(size_t actor) const;
+    void finishClockMigrationRun_();
     void rebuildThreadUnitsFromClusterOwners_();
     bool maybeRequestEpochFreeMigration_(uint64_t cycle);
     void serviceEpochFreeMigration_(size_t worker_thread);

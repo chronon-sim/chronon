@@ -302,10 +302,13 @@ initialization and reports the veto reason. `epoch_size` is now only a host
 predicate and Sequential `runUntilTermination()` polling interval.
 Scheduler timeline tracing does not veto epoch-free execution.
 
-Dynamic rebalance remains opt-in. When `enable_dynamic_rebalance: true` and the
+When `enable_dynamic_rebalance: true` (the default) and the
 epoch-free dependency gate holds, Chronon commits whole-cluster migrations only
 at scheduler fence points. A safety-gate rejection selects Sequential and does
-not run dynamic migration.
+not run dynamic migration. Explicit clock mode reuses this protocol for both
+clusters and CDC bridge actors; a bridge can transfer only after commit. Costs
+are edge-rate weighted, and check/cooldown intervals use retired physical time
+in `tick_frequency_hz` reference cycles. See [Clock Domains and CDC](multiclock-cdc.md).
 
 Each EpochFree worker keeps a private shadow of the last acquired progress value
 for every predecessor cluster. Cluster progress is release-published and
