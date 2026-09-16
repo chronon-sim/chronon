@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <thread>
 #include <tuple>
@@ -98,6 +99,40 @@ struct Forward : Recorded {
 
 using Digest = std::vector<std::vector<uint64_t>>;
 
+std::vector<std::string> readTrace(const std::filesystem::path& output,
+                                   std::span<Recorded* const> units, bool native) {
+    std::vector<std::string> records;
+    for (const auto& entry : std::filesystem::directory_iterator(output)) {
+        if (!entry.path().filename().string().starts_with("text-domain-")) continue;
+        std::ifstream file(entry.path());
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.starts_with('#')) continue;
+            std::istringstream row(line);
+            uint64_t cycle, id, phase, transaction, fifo, value, ordinal;
+            std::string kind;
+            row >> cycle >> id >> kind >> phase >> transaction >> fifo >> value >> ordinal;
+            assert(row);
+            const auto unit =
+                std::find_if(units.begin(), units.end(), [&](auto* u) { return u->id() == id; });
+            assert(unit != units.end());
+            std::ostringstream normalized;
+            normalized << (*unit)->clockDomain().edge(cycle).floorNanoseconds() << '\t'
+                       << (*unit)->fullPath() << '\t' << cycle << '\t' << kind << '\t' << phase
+                       << '\t' << transaction << '\t' << fifo << '\t' << value << '\t' << ordinal;
+            records.push_back(normalized.str());
+        }
+    }
+    std::sort(records.begin(), records.end());
+    if (native) {
+        std::ofstream reference(output / "reference.tsv");
+        reference
+            << "ts\tunit\tlocal_cycle\tevent\tphase\ttransaction_id\tfifo_id\tvalue\tordinal\n";
+        for (const auto& row : records) reference << row << '\n';
+    }
+    return records;
+}
+
 Digest runGraph(size_t threads, uint64_t whz, uint64_t rhz, uint64_t phase, size_t depth, bool lazy,
                 bool segmented, uint32_t window, bool dynamic,
                 const std::filesystem::path& output = {}, unsigned trace_mode = 3,
@@ -180,35 +215,7 @@ Digest runGraph(size_t threads, uint64_t whz, uint64_t rhz, uint64_t phase, size
     }
     if (trace_records) {
         const std::array<Recorded*, 5> units{a, b, w, m, c};
-        for (const auto& entry : std::filesystem::directory_iterator(output)) {
-            if (!entry.path().filename().string().starts_with("text-domain-")) continue;
-            std::ifstream file(entry.path());
-            std::string line;
-            while (std::getline(file, line)) {
-                if (line.starts_with('#')) continue;
-                std::istringstream row(line);
-                uint64_t cycle, id, phase_, transaction, fifo, value, ordinal;
-                std::string kind;
-                row >> cycle >> id >> kind >> phase_ >> transaction >> fifo >> value >> ordinal;
-                assert(row);
-                const auto unit = std::find_if(units.begin(), units.end(),
-                                               [&](auto* u) { return u->id() == id; });
-                assert(unit != units.end());
-                std::ostringstream normalized;
-                normalized << (*unit)->clockDomain().edge(cycle).floorNanoseconds() << '\t'
-                           << (*unit)->fullPath() << '\t' << cycle << '\t' << kind << '\t' << phase_
-                           << '\t' << transaction << '\t' << fifo << '\t' << value << '\t'
-                           << ordinal;
-                trace_records->push_back(normalized.str());
-            }
-        }
-        std::sort(trace_records->begin(), trace_records->end());
-        if (trace_mode & 2) {
-            std::ofstream reference(output / "reference.tsv");
-            reference
-                << "ts\tunit\tlocal_cycle\tevent\tphase\ttransaction_id\tfifo_id\tvalue\tordinal\n";
-            for (const auto& row : *trace_records) reference << row << '\n';
-        }
+        *trace_records = readTrace(output, units, trace_mode & 2);
     }
     const auto state = [](const auto* fifo) {
         auto s = fifo->diagnostics();
@@ -369,9 +376,105 @@ void exceptionStopsPeers() {
     assert(caught);
 }
 
+struct Loopback : Recorded {
+    AsyncWritePort<uint64_t> out{this, "out"};
+    AsyncReadPort<uint64_t> in{this, "in"};
+    uint64_t sent = 0, received = 0;
+    std::function<void(uint64_t)> after_tick;
+    Loopback() : Recorded("loopback") {}
+    void tick() override {
+        if (localCycle() % 13 < 9) {
+            if (auto packet = in.take()) {
+                assert(packet->transaction_id == ++received && packet->data == received);
+            }
+        }
+        const bool read = in.requestRead();
+        if (out.send({sent + 1, sent + 1})) ++sent;
+        record(sent, received, read);
+        if (after_tick) after_tick(localCycle());
+    }
+};
+
+Digest runSelfLoop(size_t threads, const std::filesystem::path& output, unsigned mode, bool dynamic,
+                   std::vector<std::string>& records) {
+    TickSimulationConfig config;
+    config.num_threads = threads;
+    config.enable_parallel = threads > 1;
+    config.enable_dynamic_rebalance = dynamic;
+    config.rebalance_check_interval_cycles = UINT64_MAX;
+    TickSimulation sim(config);
+    sim.addClockDomain(ClockDomain::fromHz(1, "loop", 3'000'000'000));
+    auto* loop = sim.createUnitInDomain<Loopback>(1);
+    // Keep a second cluster so this tests the parallel path, not its fallback.
+    auto* peer = sim.createUnitInDomain<Stopper>(1, "peer", UINT64_MAX);
+    auto* fifo = sim.connectAsyncFifo(1, loop->out, loop->in, {2, 2});
+    if (mode) {
+        ClockTraceRecorder::Config trace;
+        trace.output_dir = output;
+        trace.text = mode & 1;
+        trace.perfetto = mode & 2;
+        trace.stream_capacity = 2;
+        trace.drain_batch = 1;
+        trace.reverse_drain = threads > 1;
+        trace.perfetto_options.clock_buffer_records = 128;
+        sim.configureClockTrace(trace);
+    }
+    sim.initialize();
+    assert(sim.useParallelExecution() == (threads > 1));
+    size_t requests = 0;
+    if (dynamic) {
+        using Access = sender::DynamicMigrationTestAccess;
+        const std::array actors{Access::bridge(sim, 0), Access::cluster(sim, loop)};
+        loop->after_tick = [&, actors](uint64_t cycle) {
+            if (requests < actors.size() && cycle >= 17 + 64 * requests &&
+                Access::request(sim, actors[requests]))
+                ++requests;
+        };
+    }
+    for (size_t i = 0; i < 8; ++i) assert(sim.runClockEvents(37) == 37);
+    assert(loop->received > 20 && sim.totalTransportOverflowEvents() == 0);
+    if (dynamic) {
+        assert(requests == 2 && sim.rebalanceCount() == requests);
+        sender::DynamicMigrationTestAccess::assertIdle(sim);
+    }
+    sim.closeClockTrace();
+    if (mode) {
+        const auto stats = sim.clockTraceRecorder()->stats();
+        assert(!stats.dropped && stats.events > 2 * 296);
+        if (mode & 1) {
+            const std::array<Recorded*, 2> units{loop, peer};
+            records = readTrace(output, units, mode & 2);
+            assert(records.size() == stats.events);
+        }
+    }
+    const auto s = fifo->diagnostics();
+    assert(s.writes == loop->sent && s.reads >= loop->received);
+    return {loop->events,
+            peer->events,
+            {s.write_binary, s.read_binary, s.write_sync, s.read_sync, s.full, s.empty,
+             s.output_valid, s.ram_occupancy, s.writes, s.reads}};
+}
+
 int main(int argc, char** argv) {
     const std::filesystem::path root = argc > 1 ? argv[1] : "out/clock-parallel";
     std::filesystem::remove_all(root);
+    Digest self_loop_reference;
+    for (unsigned mode : {0u, 1u, 2u, 3u}) {
+        std::vector<std::string> reference;
+        const auto prefix = "self-loop-" + std::to_string(mode);
+        const auto expected = runSelfLoop(1, root / (prefix + "-serial"), mode, false, reference);
+        if (!mode) self_loop_reference = expected;
+        assert(expected == self_loop_reference);
+        for (size_t threads : {2, 4}) {
+            for (bool dynamic : {false, true}) {
+                std::vector<std::string> actual;
+                const auto output =
+                    root / (prefix + "-" + std::to_string(threads) + "-" + std::to_string(dynamic));
+                assert(runSelfLoop(threads, output, mode, dynamic, actual) == expected);
+                assert(actual == reference);
+            }
+        }
+    }
     for (const auto& [w, r, phase] : {std::tuple{1'000'000'000ULL, 1'000'000'000ULL, 0ULL},
                                       std::tuple{914'000'000ULL, 1'326'000'000ULL, 137ULL},
                                       std::tuple{2'000'000'000ULL, 500'000'000ULL, 1ULL},

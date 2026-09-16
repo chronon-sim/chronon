@@ -65,9 +65,14 @@ void TickSimulation::initializeClockParallel_() {
             // Stable logical producers survive host placement changes. Units
             // record evaluate events; only this bridge writes its commit streams.
             const auto producer = uint64_t{fifo->id()} + 1;
-            bridge->trace = {
-                clock_trace_->addProducerStream(owners[0]->clockTraceStream(), producer),
-                clock_trace_->addProducerStream(owners[1]->clockTraceStream(), producer)};
+            bridge->trace[0] =
+                clock_trace_->addProducerStream(owners[0]->clockTraceStream(), producer);
+            // A self-loop has one logical unit and one bridge producer. Share
+            // its stream to preserve the FIFO's write/read commit event order.
+            bridge->trace[1] =
+                owners[0] == owners[1]
+                    ? bridge->trace[0]
+                    : clock_trace_->addProducerStream(owners[1]->clockTraceStream(), producer);
             fifo->setClockTraceStreams(bridge->trace[0], bridge->trace[1]);
         }
         for (size_t side = 0; side < owners.size(); ++side) {
