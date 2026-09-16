@@ -114,7 +114,8 @@ protected:
                             std::string_view message = "") {
         if (termination_ctrl_) {
             termination_ctrl_->requestTermination(reason, exit_code, localCycle(), name(), message,
-                                                  clockDomainId(), physicalTime());
+                                                  clockDomainId(), physicalTime(),
+                                                  termination_order_);
         }
     }
 
@@ -124,7 +125,8 @@ protected:
                             std::string_view message) {
         if (termination_ctrl_) {
             termination_ctrl_->requestTermination(reason, exit_code, cycle, name(), message,
-                                                  clockDomainId(), clockDomain().edge(cycle));
+                                                  clockDomainId(), clockDomain().edge(cycle),
+                                                  termination_order_);
         }
     }
 
@@ -144,6 +146,7 @@ private:
     }
 
     TerminationController* termination_ctrl_ = nullptr;
+    uint64_t termination_order_ = UINT64_MAX;
 };
 
 }  // namespace chronon::sender

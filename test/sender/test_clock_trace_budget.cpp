@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
     // each bucket individually fits. Publication must work mid-tick.
     run(root / "burst", 64, 80, 65536, true);
     run(root / "record-pressure", 32, 2, 128);
-    for (const auto [events, capacity] : {std::pair{3u, 2u}, std::pair{8000u, 65536u}}) {
+    for (const auto& [events, capacity] : {std::pair{3u, 2u}, std::pair{8000u, 65536u}}) {
         bool rejected = false;
         try {
             run(root / ("single-bucket-overflow-" + std::to_string(capacity)), 1, events, capacity);

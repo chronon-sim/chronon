@@ -39,10 +39,73 @@ the scheduler chooses edges; each FIFO implements its own pointer synchronizers,
 registered full/empty flags, RAM and output register. An ordinary delayed queue
 is not a CDC circuit.
 
-The initial implementation executes explicitly configured clock-domain graphs
-serially. Requests for parallel execution have a visible fallback reason. The
-existing default single-clock sequential and epoch-free paths remain available.
-This infrastructure does not choose or calibrate SAGE/GPU clock parameters.
+Explicit clock-domain graphs support epoch-free parallel execution. Same-domain
+zero-delay connections form indivisible clusters; each CDC FIFO is an independent
+bridge task with its own two-endpoint edge calendar. A bridge snapshots old state,
+publishes edge readiness to its endpoint clusters, then commits when those
+clusters publish completion. Other units in either domain need not wait for that
+bridge. The circuit's synchronizers, finite storage and full/empty rules are
+unchanged; CDC is not approximated by a constant-delay ordinary connection.
+
+Persistent workers run for the entire run call, without per-edge or per-epoch
+barriers. A coordinator admits a rolling window of at most
+`max_lookahead_cycles` **physical-time batches**, retires completed instants, and
+refills available space without waiting for the whole window. Ordinary port
+dependencies still compare local edges within one domain; bridge tasks compare
+exact physical edge times. Only the bridge's two endpoints participate in its
+sampling/commit handshake. No simulation state rollback is used.
+
+The clock runtime uses static cluster/bridge placement; runtime migration is not
+currently performed, even if `enable_dynamic_rebalance` is set. Disabled parallel
+or lookahead settings, a single cluster, and unproven ordinary-port transport
+headroom retain explicit sequential fallback reasons. Enabled `configureClockTrace`
+recording also selects the serial path: its shared stream and memory-reservation
+protocol is not yet connected to independent bridge workers. The default
+single-clock paths are unchanged. This infrastructure does not choose or calibrate
+SAGE/GPU clock parameters.
+
+## Known limitations and follow-up work
+
+The initial epoch-free CDC implementation has the following capability and
+performance gaps:
+
+- **Clock tracing still forces sequential execution.** This applies to enabled
+  `configureClockTrace` recording, including text-only recording, not to all
+  observation APIs. Unit evaluation and CDC bridge commits currently emit into
+  the same per-unit single-producer stream; independent bridge workers cannot
+  safely share that stream. Parallel support needs logically owned producer
+  streams, progress accounting that includes bridge commits, and nonblocking
+  watermark/backpressure handling that preserves bounded memory. Blocking a
+  worker until other actors on that same worker advance could deadlock. These
+  recorder changes do not require a simulation-wide clock-domain barrier.
+- **Dynamic placement is not implemented for clock actors.**
+  `enable_dynamic_rebalance` does not migrate clusters or bridges in explicit
+  clock mode. The worker task lists are static. A follow-up must connect them to
+  the existing owner/generation handoff protocol: clusters may transfer after a
+  completed tick, and bridges can transfer after commit, with exactly one owner.
+  Load estimates and rebalance intervals also need a common physical-time basis
+  instead of comparing raw local cycles from different domains.
+- **Scheduling scalability and speedup remain to be characterized.** Admission
+  and retirement use one coordinator, which scans cluster/bridge progress for
+  each physical-time batch; workers poll their assigned tasks. Correctness tests
+  demonstrate concurrent execution, but do not establish a speedup for cheap
+  ticks, skewed workloads, or large domain/bridge counts. Static placement does
+  not currently normalize tick costs by domain frequency or profile bridge cost.
+  Frequency-aware placement, indexed readiness checks and representative
+  multiclock benchmarks are follow-up work.
+
+Two intentional semantics should not be mistaken for missing correctness fixes:
+
+- **Termination permits bounded runahead, without rollback.** The request time
+  and the settled stop boundary are recorded separately as `physical_time` and
+  `settled_time`. The latter can vary with host scheduling. State at the request
+  instant is not promised; all work through the reported settled boundary is
+  complete. See the termination contract below.
+- **One CDC FIFO bridge processes its two endpoints in physical-time order.**
+  This is the expected per-circuit ordering, including old-state sampling at
+  coincident edges, not a whole-domain synchronization requirement. Exploiting
+  synchronizer latency to let the two sides run farther apart is an optional
+  future optimization, not required to fix parallel execution of the graph.
 
 ## Configure and run
 
@@ -128,7 +191,7 @@ of representable physical time. Check `maxEdgeIndex()` for the actual configured
 clock; do not assume every phase has the default clock's horizon. The tests check
 a million consecutive calendar batches and direct mappings at edge `10^12`.
 
-For `D` active domains, `K` coincident edges, `U` units on those edges and `F`
+For serial execution with `D` active domains, `K` coincident edges, `U` units on those edges and `F`
 FIFOs, a batch costs `O(K log D + U + F*K + active synchronizer registers)`.
 Tracing additionally visits newly visible entries, at most the FIFO depth per
 read edge. Calendar memory is `O(D)`; FIFO storage is `O(depth + stages)` packets
@@ -154,14 +217,30 @@ their cycle limit is ambiguous. Use `runClockEvents(N)`, `runUntilTime(t)`, or
 after the entire coincident batch, and do not manufacture a termination request
 when their budget runs out. `runUntil(predicate, N)` uses a batch budget in this
 mode and retains the configured predicate polling interval. For an exact stopping
-edge, request termination from a unit.
+edge without earlier termination, use a physical-time/domain-cycle run limit.
 
 Termination records include a domain ID, local edge number, and exact physical
 time. An external request uses the last completed physical instant, scheduler
 progress and domain sentinel `UINT32_MAX`. Simultaneous unit requests have a
 deterministic winner: domain ID, then the domain's canonical zero-delay topological
-order, with `fullPath()` as the tie-break. All units and CDC commits at that
-instant finish before stopping. Resume after a normal stop with
+order, with `fullPath()` as the tie-break.
+
+In serial mode all units and CDC commits at the request instant finish before
+stopping. In epoch-free mode independent clusters may already have started later
+edges. A termination request freezes admission; workers join and the scheduler
+settles all units and bridges through the latest already-started edge (including
+bridge snapshots). Unstarted work beyond that boundary is discarded. This is
+bounded by the admitted lookahead window, and never exceeds the caller's run
+limit. Earlier requests discovered during settlement win over later requests;
+requests at the same instant use the canonical ordering above.
+
+After return, `terminationRequest().physical_time` is the request time,
+`terminationRequest().settled_time` and `lastCommittedTime()` record the settled
+stop boundary, `domainCycleCount(id)` is
+that domain's completed edge count at the boundary, and the return value counts
+all completed batches including settlement. The stop boundary can depend on
+worker progress and can be later than the request time; arbitrary model state
+is not rolled back. Read termination details after the run returns. Resume with
 `resetTermination()`. A failed evaluation or time overflow cannot be resumed.
 
 ## Coincident edges and pipeline registers
@@ -172,6 +251,12 @@ At each physical instant:
 2. Units on participating domains evaluate their local interfaces.
 3. Every CDC circuit commits RAM operations, pointer flops, synchronizer flops,
    flag flops and its read output register from the captured state.
+
+These are per-circuit ordering requirements, not a global barrier between
+independent circuits. The current parallel bridge task processes its two clocks
+in physical-time order; it does not yet exploit synchronizer depth to run the
+two sides of one FIFO independently ahead of each other. Parallel speedup depends
+on available independent cluster/bridge work and tick cost.
 
 Thus a pointer newly committed at time `t` cannot be sampled by another domain
 at that same `t`, regardless of host execution order. This is a deterministic

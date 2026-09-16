@@ -134,8 +134,10 @@ void TickSimulation::initializeClockRuntime_() {
         clocks.push_back(runtime.clock);
     }
     clock_calendar_ = std::make_unique<ClockCalendar>(clocks);
+    if (shouldUseParallelExecution_()) initializeClockParallel_();
     if (clock_trace_) clock_trace_->start(true);
-    if (config_.enable_parallel) std::clog << "[chronon] " << parallel_fallback_reason_ << '\n';
+    if (config_.enable_parallel && !shouldUseParallelExecution_())
+        std::clog << "[chronon] " << parallel_fallback_reason_ << '\n';
 }
 
 void TickSimulation::requireClockRun_() {
@@ -168,6 +170,7 @@ bool TickSimulation::executeClockBatch_() {
             clock_runtime_.at(edge.domain->id()).next_cycle = edge.cycle + 1;
         clock_time_ = edges.front().time;
         ++current_cycle_;
+        termination_ctrl_.setSettledTime(clock_time_);
         // All queues publish before this safe point, including every CDC commit.
         // Only observation time is quantized; the current ns bucket stays open.
         if (clock_trace_ && clock_trace_->needsProgress()) clock_trace_->endClockBatch();
@@ -181,6 +184,7 @@ bool TickSimulation::executeClockBatch_() {
 
 uint64_t TickSimulation::runClockEvents(uint64_t max_event_batches) {
     requireClockRun_();
+    if (shouldUseParallelExecution_()) return runClockEpochFree_(max_event_batches);
     uint64_t count = 0;
     while (count < max_event_batches && executeClockBatch_()) ++count;
     return count;
@@ -190,6 +194,7 @@ uint64_t TickSimulation::runUntilTime(SimTime exclusive_limit) {
     requireClockRun_();
     if (exclusive_limit < clock_time_)
         throw std::invalid_argument("cannot run backwards in physical time");
+    if (shouldUseParallelExecution_()) return runClockEpochFree_(UINT64_MAX, exclusive_limit);
     uint64_t count = 0;
     while (!clock_calendar_->empty() && clock_calendar_->nextTime() < exclusive_limit &&
            executeClockBatch_())
@@ -204,6 +209,7 @@ uint64_t TickSimulation::runDomainCycles(ClockDomainId id, uint64_t additional_e
     const auto last =
         clock_detail::narrow(clock_detail::Wide(runtime.next_cycle) + additional_edges - 1);
     const auto end = runtime.clock->edge(last);
+    if (shouldUseParallelExecution_()) return runClockEpochFree_(UINT64_MAX, end, true);
     uint64_t count = 0;
     while (!clock_calendar_->empty() && clock_calendar_->nextTime() <= end && executeClockBatch_())
         ++count;
@@ -223,7 +229,10 @@ bool TickSimulation::cdcDrained() const noexcept {
 uint64_t TickSimulation::drainCdc(uint64_t max_event_batches) {
     requireClockRun_();
     uint64_t count = 0;
-    while (count < max_event_batches && !cdcDrained() && executeClockBatch_()) ++count;
+    while (count < max_event_batches && !cdcDrained()) {
+        if (!runClockEvents(1)) break;
+        ++count;
+    }
     return count;
 }
 

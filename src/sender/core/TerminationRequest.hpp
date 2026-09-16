@@ -11,7 +11,7 @@
 ///
 /// Design goals:
 /// - Very low hot-path overhead (~1-2ns per epoch, ~64 cycles)
-/// - First request wins (thread-safe)
+/// - First request wins, or canonical physical-time ordering for clock actors
 /// - Rich context: reason, exit code, cycle, unit name, message
 
 #pragma once
@@ -22,6 +22,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 
 #include "../../time/ClockDomain.hpp"
 
@@ -53,6 +54,9 @@ struct TerminationRequest {
     std::optional<SimTime> physical_time;
     std::string unit_name;
     std::string message;
+    /// Clock-mode stop boundary, populated after all started work has settled.
+    /// Can be later than physical_time under epoch-free lookahead.
+    std::optional<SimTime> settled_time;
 
     bool isRequested() const noexcept { return reason != TerminationReason::None; }
 
@@ -82,8 +86,9 @@ struct TerminationRequest {
  * Thread-safe controller for simulation termination.
  *
  * Hot-path check is a single relaxed atomic load (~1-2ns), called once per
- * epoch (~64 cycles). Request submission is mutex-protected and first-wins;
- * the cost (~80ns) is paid at most once per run.
+ * epoch (~64 cycles). Request submission is mutex-protected and first-wins
+ * by default. Explicit parallel clock graphs opt into physical-time ordering
+ * so requests discovered while settling do not depend on host arrival order.
  */
 class TerminationController {
 public:
@@ -96,22 +101,27 @@ public:
     TerminationController& operator=(TerminationController&&) = delete;
 
     /**
-     * Request simulation termination. Thread-safe; first request wins.
+     * Request simulation termination. Thread-safe; first request wins unless
+     * ordered clock requests were enabled before starting the workers.
      *
-     * @return true if this was the first request, false if already terminated.
+     * @return true if accepted (including replacement by an earlier clock request).
      */
     bool requestTermination(TerminationReason reason, int32_t exit_code = 0, uint64_t cycle = 0,
                             std::string_view unit_name = "", std::string_view message = "",
                             ClockDomainId clock_domain_id = 0,
-                            std::optional<SimTime> physical_time = std::nullopt) noexcept {
-        if (termination_requested_.load(std::memory_order_relaxed)) {
+                            std::optional<SimTime> physical_time = std::nullopt,
+                            uint64_t canonical_order = UINT64_MAX) noexcept {
+        if (!ordered_clocks_ && termination_requested_.load(std::memory_order_relaxed)) {
             return false;
         }
 
         std::lock_guard<std::mutex> lock(request_mutex_);
 
         if (termination_requested_.load(std::memory_order_relaxed)) {
-            return false;
+            if (!ordered_clocks_ || !physical_time || !request_.physical_time ||
+                std::tuple{*physical_time, clock_domain_id, canonical_order} >=
+                    std::tuple{*request_.physical_time, request_.clock_domain_id, request_order_})
+                return false;
         }
 
         request_.reason = reason;
@@ -121,6 +131,7 @@ public:
         request_.physical_time = physical_time;
         request_.unit_name = std::string(unit_name);
         request_.message = std::string(message);
+        request_order_ = canonical_order;
 
         // Release ordering pairs with acquire in getRequest() so consumers
         // observe the fully-populated request_ once the flag is set.
@@ -137,7 +148,8 @@ public:
         return termination_requested_.load(std::memory_order_relaxed);
     }
 
-    /// Only valid after isTerminationRequested() returns true.
+    /// For ordered clocks, read only after the workers have joined: earlier
+    /// requests discovered while settling can replace the initial request.
     const TerminationRequest& getRequest() const noexcept {
         // Acquire load pairs with release in requestTermination().
         (void)termination_requested_.load(std::memory_order_acquire);
@@ -150,10 +162,23 @@ public:
      */
     void setStopSource(stdexec::inplace_stop_source* src) noexcept { stop_source_ = src; }
 
+    /// Configure before workers start. Clock requests choose the earliest
+    /// physical instant, domain ID, then canonical unit order.
+    void setOrderedClocks(bool enabled) noexcept { ordered_clocks_ = enabled; }
+
+    /// Scheduler-only: call after clock workers have joined or a serial batch
+    /// has finished. Does not change the original request timestamp.
+    void setSettledTime(SimTime time) noexcept {
+        if (!isTerminationRequested()) return;
+        std::lock_guard<std::mutex> lock(request_mutex_);
+        request_.settled_time = time;
+    }
+
     /// Not thread-safe — call only when simulation is stopped.
     void reset() noexcept {
         termination_requested_.store(false, std::memory_order_relaxed);
         request_ = TerminationRequest{};
+        request_order_ = UINT64_MAX;
     }
 
 private:
@@ -161,6 +186,8 @@ private:
     TerminationRequest request_;
     mutable std::mutex request_mutex_;
     stdexec::inplace_stop_source* stop_source_ = nullptr;
+    bool ordered_clocks_ = false;
+    uint64_t request_order_ = UINT64_MAX;
 };
 
 }  // namespace chronon::sender

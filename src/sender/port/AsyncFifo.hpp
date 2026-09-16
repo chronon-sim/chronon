@@ -235,6 +235,8 @@ class CdcComponent {
 public:
     virtual ~CdcComponent() = default;
     virtual uint32_t id() const noexcept = 0;
+    virtual Unit* writeOwner() const noexcept = 0;
+    virtual Unit* readOwner() const noexcept = 0;
     virtual void begin(std::span<const ClockEdge> edges) = 0;
     virtual void commit() = 0;
     virtual bool drained() const noexcept = 0;
@@ -315,6 +317,8 @@ public:
         read.fifo_ = this;
     }
     uint32_t id() const noexcept override { return id_; }
+    Unit* writeOwner() const noexcept override { return write_.owner(); }
+    Unit* readOwner() const noexcept override { return read_.owner(); }
     void begin(std::span<const ClockEdge> edges) override {
         bool w = false, r = false;
         for (const auto& edge : edges) {

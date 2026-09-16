@@ -217,6 +217,8 @@ public:
     }
     /// Multiclock limits are explicit: event batches, absolute exclusive time,
     /// or a number of additional edges of one specified hardware domain.
+    /// Parallel termination settles through the latest already-started edge;
+    /// lastCommittedTime() can therefore exceed the termination request time.
     uint64_t runClockEvents(uint64_t max_event_batches);
     uint64_t runUntilTime(SimTime exclusive_limit);
     uint64_t runDomainCycles(ClockDomainId id, uint64_t additional_edges);
@@ -397,6 +399,10 @@ private:
     void validateClockOwner_(const Unit* unit) const;
     void prepareClockTopology_();
     void initializeClockRuntime_();
+    void selectClockExecutionMode_();
+    void initializeClockParallel_();
+    uint64_t runClockEpochFree_(uint64_t max_batches, std::optional<SimTime> limit = {},
+                                bool inclusive = false);
     bool executeClockBatch_();
     void requireClockRun_();
     enum class ExecutionMode {
@@ -708,6 +714,9 @@ private:
     };
     std::map<ClockDomainId, ClockRuntime> clock_runtime_;
     std::unique_ptr<ClockCalendar> clock_calendar_;
+    struct ClockParallelRuntime;
+    // The out-of-line runtime owns bridge tasks and their progress atomics.
+    std::shared_ptr<ClockParallelRuntime> clock_parallel_;
     std::vector<std::unique_ptr<CdcComponent>> cdc_;
     std::unique_ptr<observe::ClockTraceRecorder> clock_trace_;
     uint64_t current_cycle_;

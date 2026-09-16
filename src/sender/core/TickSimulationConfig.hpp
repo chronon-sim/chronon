@@ -41,6 +41,7 @@ struct TickSimulationConfig {
     /// per-cycle barrier scheduler is no longer selectable.
     bool enable_lookahead = true;
 
+    /// In explicit clock mode, bounds the rolling physical-time batch window.
     uint32_t max_lookahead_cycles = 100;
     /// Host predicate and Sequential termination polling interval. Epoch-free
     /// runUntilTermination ignores this value because stop propagates directly.
@@ -67,6 +68,7 @@ struct TickSimulationConfig {
     /// back to the legacy topology-only thread assignment.
     bool enable_weighted_partitioning = true;
 
+    /// Explicit clock graphs currently retain their initial actor placement.
     bool enable_dynamic_rebalance = true;
     double rebalance_imbalance_threshold = 1.03;
     uint64_t rebalance_check_interval_cycles = 2048;

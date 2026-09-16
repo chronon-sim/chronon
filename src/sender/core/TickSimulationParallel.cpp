@@ -128,7 +128,7 @@ void TickSimulation::initProgressSync() {
         // num_clusters is its reserved cache slot; blocker diagnostics map it
         // back to SIZE_MAX because it is not a real predecessor cluster.
         // A zero window disables epoch-free execution before progress setup.
-        if (config_.max_lookahead_cycles > 0) {
+        if (!clock_mode_ && config_.max_lookahead_cycles > 0) {
             thread_resolved_deps_[c].push_back(
                 {&lookahead_floor_, config_.max_lookahead_cycles, /*pred_id=*/num_clusters});
         }
@@ -166,7 +166,7 @@ void TickSimulation::initProgressSync() {
             observe_ctx_, num_clusters, num_threads);
     }
 
-    if (config_.enable_dynamic_rebalance) {
+    if (!clock_mode_ && config_.enable_dynamic_rebalance) {
         initDynamicMigrationRuntime_();
     }
 }
