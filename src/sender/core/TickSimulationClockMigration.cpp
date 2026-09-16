@@ -5,6 +5,41 @@
 
 namespace chronon::sender {
 
+namespace {
+double edgeRate(const ClockDomain& clock, uint64_t reference_hz) {
+    return static_cast<double>(clock.period().denominator()) /
+           static_cast<double>(clock.period().numerator()) / reference_hz;
+}
+}  // namespace
+
+void TickSimulation::addClockPartitionActors_(
+    PartitionInput& input, const std::unordered_map<Unit*, size_t>& unit_indices) const {
+    const auto rate = [&](const ClockDomain& clock) {
+        return edgeRate(clock, config_.tick_frequency_hz);
+    };
+    const size_t clusters = clusters_.numClusters();
+    input.num_units += cdc_.size();
+    input.unit_cost_ns.resize(input.num_units);
+    input.adjacency.resize(input.num_units);
+    for (size_t c = 0; c < clusters; ++c) {
+        const auto& clock = unit_ptrs_[clusters_.clusters[c].front()]->clockDomain();
+        input.unit_cost_ns[c] *= rate(clock);
+        for (auto& edge : input.adjacency[c]) edge.activity_rate = rate(clock);
+    }
+    for (size_t b = 0; b < cdc_.size(); ++b) {
+        const size_t actor = clusters + b;
+        for (auto* unit : {cdc_[b]->writeOwner(), cdc_[b]->readOwner()}) {
+            const size_t endpoint = unit_to_cluster_[unit_indices.at(unit)];
+            const double frequency = rate(unit->clockDomain());
+            // No speculative simulation warmup: use the existing uniform-cost
+            // prior for each endpoint until live bridge samples become ready.
+            input.unit_cost_ns[actor] += frequency;
+            input.adjacency[actor].push_back({endpoint, 1, 1, frequency});
+            input.adjacency[endpoint].push_back({actor, 1, 1, frequency});
+        }
+    }
+}
+
 uint64_t TickSimulation::clockRebalanceCycle_(SimTime time) const noexcept {
     const auto cycles =
         clock_detail::Wide(time.numerator()) * config_.tick_frequency_hz / time.denominator();
@@ -30,6 +65,25 @@ bool TickSimulation::clockActorCanMigrate_(size_t actor) const {
            clock_parallel_->bridges.at(actor - clusters_.numClusters())->edge_count == 0;
 }
 
+void TickSimulation::recordClockWaitSample_(size_t worker, const BlockedClusterInfo& blocker,
+                                            SimTime edge_time, uint64_t elapsed_ns) {
+    if (blocker.pred_cluster != SIZE_MAX) {
+        // Credit only a dependency at the exact physical retirement frontier.
+        // Stale per-domain publications can suppress a sample, never turn a
+        // hidden runahead wait into critical-path loss. Local cycle numbers
+        // (or rounded nanoseconds) are not comparable across clock domains.
+        bool at_frontier = false;
+        for (const auto& [id, domain] : clock_parallel_->domains) {
+            (void)id;
+            const auto next = domain.clock->edge(domain.retired.load(std::memory_order_acquire));
+            if (next < edge_time) return;
+            at_frontier |= next == edge_time;
+        }
+        if (!at_frontier) return;
+    }
+    recordDynamicWaitSample_(worker, blocker, elapsed_ns);
+}
+
 void TickSimulation::initializeClockMigration_() {
     auto& runtime = *clock_parallel_;
     const size_t clusters = clusters_.numClusters();
@@ -41,14 +95,24 @@ void TickSimulation::initializeClockMigration_() {
     // Work and synchronization costs must have the same physical-time basis.
     // Floating point is confined to placement heuristics, never edge ordering.
     const auto rate = [&](const ClockDomain& clock) {
-        return static_cast<double>(clock.period().denominator()) /
-               static_cast<double>(clock.period().numerator()) /
-               static_cast<double>(config_.tick_frequency_hz);
+        return edgeRate(clock, config_.tick_frequency_hz);
     };
     runtime.actor_rates.resize(dynamic_runtime_cluster_count_);
     dynamic_rebalance_adjacency_.resize(dynamic_runtime_cluster_count_);
     for (size_t c = 0; c < clusters; ++c) {
-        runtime.actor_rates[c] = rate(*runtime.clusters[c].clock);
+        auto& state = runtime.clusters[c];
+        runtime.actor_rates[c] = rate(*state.clock);
+        // Reuse the sparse unit sampler on a common physical-time cadence.
+        // Slow domains must not need 1024 local edges before their first ready
+        // estimate. Round up to a whole local edge; keep four-sample confidence
+        // and exact local activity-window accounting unchanged.
+        const auto numerator = clock_detail::Wide(detail::kDynamicTickSampleInterval) *
+                               state.clock->period().denominator();
+        const auto denominator =
+            clock_detail::Wide(state.clock->period().numerator()) * config_.tick_frequency_hz;
+        state.sample_interval = static_cast<uint64_t>(
+            std::clamp(numerator / denominator + (numerator % denominator != 0),
+                       clock_detail::Wide(1), clock_detail::Wide(UINT64_MAX)));
         for (auto& edge : dynamic_rebalance_adjacency_[c])
             edge.activity_rate = runtime.actor_rates[c];
     }

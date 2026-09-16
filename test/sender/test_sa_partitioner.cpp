@@ -319,6 +319,38 @@ void test_sync_heavy_no_thread_degeneration() {
     std::cout << "PASSED\n";
 }
 
+void test_frequency_weighted_edges() {
+    PartitionInput input;
+    input.num_units = 6;
+    input.num_threads = 3;
+    input.unit_cost_ns = {200, 100, 300, 400, 250, 150};
+    input.sync_cost_ns = 40;
+    input.adjacency.resize(6);
+    input.adjacency[0] = {{1, 1, 0}, {2, 2, 1, 0.25}};
+    input.adjacency[1] = {{2, 3, 1, 2.0}};  // Same reduced edge, different activity rates.
+    input.adjacency[2] = {{3, 1, 1, 0.5}};
+    input.adjacency[3] = {{4, 2, 1, 2.0}};
+    input.adjacency[4] = {{5, 1, 1, 0.25}};
+    auto equivalent = input;
+    equivalent.sync_cost_ns /= 4;
+    for (auto& edges : equivalent.adjacency)
+        for (auto& edge : edges) {
+            edge.num_connections *= static_cast<size_t>(4 * edge.activity_rate);
+            edge.activity_rate = 1;
+        }
+    for (PartitionSolver solver : {PartitionSolver(&WeightedPartitioner::partition),
+                                   PartitionSolver(&SimulatedAnnealingPartitioner::partition)}) {
+        const auto result = solver(input);
+        const auto expanded = solver(equivalent);
+        REQUIRE(result.unit_to_thread == expanded.unit_to_thread);
+        REQUIRE(std::abs(result.estimated_max_thread_time_ns -
+                         expanded.estimated_max_thread_time_ns) < 1e-9);
+    }
+    const auto times = WeightedPartitioner::evaluatePerThread(input, {0, 0, 1, 2, 2, 2});
+    const auto expected = WeightedPartitioner::evaluatePerThread(equivalent, {0, 0, 1, 2, 2, 2});
+    REQUIRE(times == expected);
+}
+
 int main() {
     std::cout << "=== SimulatedAnnealingPartitioner Tests ===\n\n";
 
@@ -333,6 +365,7 @@ int main() {
     test_deterministic();
     test_mixed_topology();
     test_sync_heavy_no_thread_degeneration();
+    test_frequency_weighted_edges();
 
     std::cout << "\n=== All SimulatedAnnealingPartitioner tests PASSED ===\n";
     return 0;

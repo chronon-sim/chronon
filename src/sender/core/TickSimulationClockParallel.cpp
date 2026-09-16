@@ -25,7 +25,10 @@ void TickSimulation::selectClockExecutionMode_() {
                       ? precomputed_unit_costs_
                       : std::vector<double>(unit_ptrs_.size(), 1.0);
     const size_t workers = std::min(config_.num_threads, unit_ptrs_.size() + cdc_.size());
-    applyClusteredThreadAssignment_(workers, 0.0);
+    platform_metrics_ = has_precomputed_costs_ ? precomputed_platform_metrics_ : PlatformMetrics{};
+    applyClusteredThreadAssignment_(workers, has_precomputed_costs_
+                                                 ? platform_metrics_.atomic_roundtrip_ns
+                                                 : config_.initial_partition_sync_cost_ns);
     if (clusters_.numClusters() < 2) return fallback("only one clock cluster");
     // Keep members in the canonical same-domain zero-delay topological order.
     for (auto& cluster : clusters_.clusters) std::sort(cluster.begin(), cluster.end());
@@ -40,12 +43,14 @@ void TickSimulation::initializeClockParallel_() {
     auto& runtime = *clock_parallel_;
     runtime.clusters = std::make_unique<ClockParallelRuntime::Cluster[]>(clusters_.numClusters());
     runtime.worker_bridges.resize(thread_units_.size());
-    std::vector<size_t> load;
-    for (const auto& units : thread_units_) load.push_back(units.size());
     std::unordered_map<Unit*, size_t> cluster_of;
     for (size_t c = 0; c < clusters_.numClusters(); ++c) {
         auto& state = runtime.clusters[c];
         state.clock = &cluster_unit_ptrs_[c].front()->clockDomain();
+        auto& domain = runtime.domains[state.clock->id()];
+        domain.clock = state.clock;
+        domain.completions.push_back(&thread_progress_array_[c].completed_cycle);
+        state.domain = &domain;
         for (auto* unit : cluster_unit_ptrs_[c]) {
             if (unit->clockDomainId() != state.clock->id())
                 throw std::logic_error("clock cluster spans hardware domains");
@@ -69,10 +74,12 @@ void TickSimulation::initializeClockParallel_() {
             auto& endpoint = bridge->endpoints[side];
             endpoint.cluster = cluster_of.at(owners[side]);
             endpoint.clock = &owners[side]->clockDomain();
-            runtime.clusters[endpoint.cluster].bridges.push_back(&endpoint.prepared);
+            endpoint.next_time = endpoint.clock->edge(0);
+            runtime.clusters[endpoint.cluster].bridges.push_back(
+                {clusters_.numClusters() + runtime.bridges.size(), &endpoint.prepared});
+            runtime.domains.at(endpoint.clock->id()).completions.push_back(&endpoint.completed);
         }
-        const size_t worker = std::min_element(load.begin(), load.end()) - load.begin();
-        ++load[worker];
+        const size_t worker = clock_bridge_owners_.at(runtime.bridges.size());
         runtime.worker_bridges[worker].push_back(runtime.bridges.size());
         runtime.bridges.push_back(std::move(bridge));
     }
@@ -110,24 +117,23 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             const auto& batch = runtime.pending.front();
             bool ready = true;
             for (const auto& edge : batch.edges) {
-                for (size_t c = 0; c < clusters_.numClusters(); ++c) {
-                    if (runtime.clusters[c].clock->id() == edge.domain->id() &&
-                        thread_progress_array_[c].completed_cycle.load(std::memory_order_acquire) <=
-                            edge.cycle)
+                for (const auto* progress : runtime.domains.at(edge.domain->id()).completions) {
+                    if (progress->load(std::memory_order_acquire) <= edge.cycle) {
                         ready = false;
+                        break;
+                    }
                 }
-                for (const auto& bridge : runtime.bridges)
-                    for (const auto& endpoint : bridge->endpoints)
-                        if (endpoint.clock->id() == edge.domain->id() &&
-                            endpoint.completed.load(std::memory_order_acquire) <= edge.cycle)
-                            ready = false;
+                if (!ready) break;
             }
             if (!ready) break;
             if (current_cycle_ == UINT64_MAX)
                 throw std::overflow_error("scheduler progress overflow");
             (void)clock_calendar_->pop();
-            for (const auto& edge : batch.edges)
+            for (const auto& edge : batch.edges) {
                 clock_runtime_.at(edge.domain->id()).next_cycle = edge.cycle + 1;
+                runtime.domains.at(edge.domain->id())
+                    .retired.store(edge.cycle + 1, std::memory_order_release);
+            }
             clock_time_ = batch.time;
             ++current_cycle_;
             ++completed;
@@ -151,10 +157,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                 const auto edges = calendar.pop();  // Validates representable successor edges.
                 runtime.pending.push_back({edges.front().time, {edges.begin(), edges.end()}});
                 for (const auto& edge : edges) {
-                    for (size_t c = 0; c < clusters_.numClusters(); ++c)
-                        if (runtime.clusters[c].clock->id() == edge.domain->id())
-                            runtime.clusters[c].allowed.store(edge.cycle + 1,
-                                                              std::memory_order_release);
+                    runtime.domains.at(edge.domain->id())
+                        .allowed.store(edge.cycle + 1, std::memory_order_release);
                 }
                 ++scheduled;
                 progress = true;
@@ -167,7 +171,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         return progress;
     };
 
-    const auto bridge_step = [&](size_t index) {
+    const auto bridge_step = [&](size_t index, auto&& blocked) {
         auto& bridge = *runtime.bridges[index];
         const size_t actor = clusters_.numClusters() + index;
         const uint64_t cycle = dynamic ? bridge.completed.load(std::memory_order_relaxed) : 0;
@@ -176,8 +180,10 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                 const auto& endpoint = bridge.endpoints[side];
                 if (bridge.participating[side] &&
                     thread_progress_array_[endpoint.cluster].completed_cycle.load(
-                        std::memory_order_acquire) <= endpoint.next)
+                        std::memory_order_acquire) <= endpoint.next) {
+                    blocked(actor, endpoint.cluster, bridge.edges[0].time);
                     return false;
+                }
             }
             SchedulerTimelineTrace::TimePoint begin{};
             if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
@@ -187,6 +193,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                 if (bridge.participating[side]) {
                     if (trace && bridge.trace[side]) bridge.trace[side]->endEdge();
                     ++endpoint.next;
+                    endpoint.next_time = endpoint.clock->edge(endpoint.next);
                     endpoint.completed.store(endpoint.next, std::memory_order_release);
                 }
             }
@@ -206,15 +213,18 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             return true;
         }
         if (dynamic && dynamicMigrationBlocksCluster_(actor, cycle)) return false;
-        const auto write_time = bridge.endpoints[0].clock->edge(bridge.endpoints[0].next);
-        const auto read_time = bridge.endpoints[1].clock->edge(bridge.endpoints[1].next);
+        const auto write_time = bridge.endpoints[0].next_time;
+        const auto read_time = bridge.endpoints[1].next_time;
         const auto time = std::min(write_time, read_time);
         bridge.participating = {write_time == time, read_time == time};
         for (size_t side = 0; side < 2; ++side) {
             const auto& endpoint = bridge.endpoints[side];
-            if (bridge.participating[side] && runtime.clusters[endpoint.cluster].allowed.load(
-                                                  std::memory_order_acquire) <= endpoint.next)
+            if (bridge.participating[side] &&
+                runtime.clusters[endpoint.cluster].domain->allowed.load(
+                    std::memory_order_acquire) <= endpoint.next) {
+                blocked(actor, SIZE_MAX, time);
                 return false;
+            }
         }
         for (size_t side = 0; side < 2; ++side) {
             const auto& endpoint = bridge.endpoints[side];
@@ -251,6 +261,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     std::vector<size_t> owned_actors, ownership_scratch;
                     uint64_t seen_generation = 0;
                     uint64_t idle_sweeps = 0;
+                    uint64_t wait_sequence = 0;
                     const auto refresh = [&] {
                         refreshDynamicOwnedActors_(worker, owned_actors, ownership_scratch,
                                                    seen_generation);
@@ -267,6 +278,20 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                            !done.load(std::memory_order_acquire) &&
                            (settling || !token.stop_requested())) {
                         bool progress = worker == 0 && coordinate(settling);
+                        const bool sample_wait =
+                            dynamic && !settling && (wait_sequence++ & 63) == 0;
+                        BlockedClusterInfo wait_blocker;
+                        SimTime wait_time;
+                        const auto blocked = [&](size_t actor, size_t predecessor, SimTime time) {
+                            if (sample_wait &&
+                                (wait_blocker.cluster == SIZE_MAX || time < wait_time)) {
+                                wait_blocker.cluster = actor;
+                                wait_blocker.pred_cluster = predecessor;
+                                wait_time = time;
+                            }
+                        };
+                        SchedulerTimelineTrace::TimePoint wait_begin{};
+                        if (sample_wait) wait_begin = SchedulerTimelineTrace::Clock::now();
                         if (dynamic && seen_generation != cluster_assignment_generation_.load(
                                                               std::memory_order_acquire))
                             refresh();
@@ -275,7 +300,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                                 cluster_runtime_owner_[clusters_.numClusters() + index].load(
                                     std::memory_order_acquire) != worker)
                                 continue;
-                            progress = bridge_step(index) || progress;
+                            progress = bridge_step(index, blocked) || progress;
                         }
                         for (const auto c : owned_clusters) {
                             if (dynamic &&
@@ -285,16 +310,38 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             auto& published = thread_progress_array_[c].completed_cycle;
                             const auto cycle = published.load(std::memory_order_relaxed);
                             if (dynamic && dynamicMigrationBlocksCluster_(c, cycle)) continue;
-                            if (cycle >= state.allowed.load(std::memory_order_acquire)) continue;
-                            bool ready = true;
-                            for (const auto* bridge : state.bridges)
-                                if (bridge->load(std::memory_order_acquire) <= cycle) ready = false;
-                            BlockedClusterInfo blocker;
-                            if (!ready || !clusterCanAdvance_(c, cycle, blocker, cache.data()))
+                            if (cycle >= state.domain->allowed.load(std::memory_order_acquire)) {
+                                if (sample_wait) blocked(c, SIZE_MAX, state.clock->edge(cycle));
                                 continue;
-                            executeClusterOneCycle_(worker, c, cycle, false, dynamic);
+                            }
+                            bool ready = true;
+                            for (const auto& bridge : state.bridges) {
+                                if (bridge.progress->load(std::memory_order_acquire) <= cycle) {
+                                    ready = false;
+                                    if (sample_wait)
+                                        blocked(c, bridge.actor, state.clock->edge(cycle));
+                                    break;
+                                }
+                            }
+                            BlockedClusterInfo blocker;
+                            if (!ready) continue;
+                            if (!clusterCanAdvance_(c, cycle, blocker, cache.data())) {
+                                if (sample_wait)
+                                    blocked(c, blocker.pred_cluster, state.clock->edge(cycle));
+                                continue;
+                            }
+                            executeClusterOneCycle_(worker, c, cycle, false, dynamic,
+                                                    state.sample_interval);
                             published.store(cycle + 1, std::memory_order_release);
                             progress = true;
+                        }
+                        if (sample_wait && !progress) {
+                            const auto elapsed =
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    SchedulerTimelineTrace::Clock::now() - wait_begin)
+                                    .count();
+                            recordClockWaitSample_(worker, wait_blocker, wait_time,
+                                                   static_cast<uint64_t>(elapsed));
                         }
                         if (dynamic && !settling) {
                             if (worker == 0)
@@ -350,13 +397,12 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                 }
             while (!runtime.pending.empty() && runtime.pending.back().time > boundary)
                 runtime.pending.pop_back();
-            for (size_t c = 0; c < clusters_.numClusters(); ++c) {
-                auto& cluster = runtime.clusters[c];
-                auto target = clock_runtime_.at(cluster.clock->id()).next_cycle;
+            for (auto& [id, domain] : runtime.domains) {
+                auto target = clock_runtime_.at(id).next_cycle;
                 for (const auto& batch : runtime.pending)
                     for (const auto& edge : batch.edges)
-                        if (edge.domain->id() == cluster.clock->id()) target = edge.cycle + 1;
-                cluster.allowed.store(target, std::memory_order_relaxed);
+                        if (edge.domain->id() == id) target = edge.cycle + 1;
+                domain.allowed.store(target, std::memory_order_relaxed);
             }
             done.store(runtime.pending.empty(), std::memory_order_relaxed);
             execute(true);

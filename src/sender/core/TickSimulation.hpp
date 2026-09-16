@@ -401,6 +401,8 @@ private:
     void initializeClockRuntime_();
     void selectClockExecutionMode_();
     void initializeClockParallel_();
+    void addClockPartitionActors_(PartitionInput& input,
+                                  const std::unordered_map<Unit*, size_t>& unit_indices) const;
     uint64_t runClockEpochFree_(uint64_t max_batches, std::optional<SimTime> limit = {},
                                 bool inclusive = false);
     bool executeClockBatch_();
@@ -672,7 +674,8 @@ private:
                              bool include_thread_cpu_time, ThreadTraceCpuPoint cpu_begin,
                              ThreadTraceCpuPoint cpu_end);
     void executeClusterOneCycle_(size_t thread_idx, size_t cluster, uint64_t cycle,
-                                 bool trace_units, bool sample_unit_activity = false);
+                                 bool trace_units, bool sample_unit_activity = false,
+                                 uint64_t sample_interval = detail::kDynamicTickSampleInterval);
 
     void initDynamicMigrationRuntime_();
     void refreshDynamicOwnedActors_(size_t worker, std::vector<size_t>& owned,
@@ -682,6 +685,8 @@ private:
     uint64_t dynamicMigrationCycle_() const;
     uint64_t dynamicActorProgress_(size_t actor) const;
     bool clockActorCanMigrate_(size_t actor) const;
+    void recordClockWaitSample_(size_t worker, const BlockedClusterInfo& blocker, SimTime edge_time,
+                                uint64_t elapsed_ns);
     void finishClockMigrationRun_();
     void rebuildThreadUnitsFromClusterOwners_();
     bool maybeRequestEpochFreeMigration_(uint64_t cycle);
@@ -726,6 +731,7 @@ private:
     struct ClockParallelRuntime;
     // The out-of-line runtime owns bridge tasks and their progress atomics.
     std::shared_ptr<ClockParallelRuntime> clock_parallel_;
+    std::vector<size_t> clock_bridge_owners_;
     std::vector<std::unique_ptr<CdcComponent>> cdc_;
     std::unique_ptr<observe::ClockTraceRecorder> clock_trace_;
     uint64_t current_cycle_;

@@ -247,6 +247,7 @@ class SimulatedAnnealingPartitioner {
         // Linear scan is fine: groups are small enough that a hash map would be slower.
         for (size_t g = 0; g < num_groups; ++g) {
             std::vector<std::pair<size_t, uint32_t>> edge_map;
+            std::vector<double> edge_activity;
             std::vector<size_t> neighbor_groups;
 
             for (size_t u : rp.group_units[g]) {
@@ -257,6 +258,7 @@ class SimulatedAnnealingPartitioner {
                     bool found = false;
                     for (size_t i = 0; i < neighbor_groups.size(); ++i) {
                         if (neighbor_groups[i] == ng) {
+                            edge_activity[i] += edge.activity_rate * edge.num_connections;
                             edge_map[i].first += edge.num_connections;
                             edge_map[i].second = std::min(edge_map[i].second, edge.min_delay);
                             found = true;
@@ -265,6 +267,7 @@ class SimulatedAnnealingPartitioner {
                     }
                     if (!found) {
                         neighbor_groups.push_back(ng);
+                        edge_activity.push_back(edge.activity_rate * edge.num_connections);
                         edge_map.push_back({edge.num_connections,
                                             edge.min_delay == 0 ? uint32_t(1) : edge.min_delay});
                     }
@@ -273,7 +276,9 @@ class SimulatedAnnealingPartitioner {
 
             for (size_t i = 0; i < neighbor_groups.size(); ++i) {
                 ri.adjacency[g].push_back(
-                    {neighbor_groups[i], edge_map[i].first, edge_map[i].second});
+                    {neighbor_groups[i], edge_map[i].first, edge_map[i].second,
+                     edge_map[i].first ? edge_activity[i] / static_cast<double>(edge_map[i].first)
+                                       : 0.0});
             }
         }
 

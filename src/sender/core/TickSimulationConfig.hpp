@@ -68,7 +68,7 @@ struct TickSimulationConfig {
     /// back to the legacy topology-only thread assignment.
     bool enable_weighted_partitioning = true;
 
-    /// Explicit clock graphs currently retain their initial actor placement.
+    /// Reuses actor-local safe points for single-clock and explicit-clock graphs.
     bool enable_dynamic_rebalance = true;
     double rebalance_imbalance_threshold = 1.03;
     uint64_t rebalance_check_interval_cycles = 2048;

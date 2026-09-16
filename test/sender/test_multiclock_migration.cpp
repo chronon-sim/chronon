@@ -80,6 +80,17 @@ void autonomousMigration() {
     std::cout << "autonomous clock migrations: " << sim.rebalanceCount() << '\n';
 }
 
+void physicalSampleCadence() {
+    auto cfg = config();
+    cfg.rebalance_check_interval_cycles = UINT64_MAX;
+    TickSimulation sim(cfg);
+    populate(sim);
+    sim.runUntilTime(SimTime::nanoseconds(1000));
+    Access::assertCostsReady(sim, false);
+    sim.runUntilTime(SimTime::nanoseconds(1200));
+    Access::assertCostsReady(sim, true);  // Both 2 GHz and 100 MHz, not 1024 local edges.
+}
+
 void bridgePlanner() {
     TickSimulation sim(config());
     populate(sim);
@@ -148,12 +159,23 @@ int main() {
     {
         auto cfg = config();
         cfg.tick_frequency_hz = 250'000'000;
+        cfg.partition_solver = TickSimulationConfig::PartitionSolverType::Weighted;
         TickSimulation sim(cfg);
         populate(sim);
+        Access::verifyPlacementAndWaits(sim);
         Access::verifyRates(sim);
         Access::verifySafePoints(sim);
     }
     autonomousMigration();
+    physicalSampleCadence();
+    {
+        auto cfg = config();
+        cfg.partition_solver = TickSimulationConfig::PartitionSolverType::SA;
+        TickSimulation sim(cfg);
+        populate(sim);
+        Access::verifyPlacementAndWaits(sim);
+        assert(sim.runClockEvents(100) == 100);
+    }
     bridgePlanner();
     stopWithPending(false);
     stopWithPending(true);

@@ -212,6 +212,7 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
         cluster_input.adjacency[key.u].push_back({key.v, info.first, info.second});
     }
 
+    if (clock_mode_) addClockPartitionActors_(cluster_input, unit_ptr_to_idx);
     auto result = runPartitionSolver_(cluster_input);
     if (config_.enable_lookahead && config_.enable_epoch_free_lookahead && num_threads > 1) {
         auto improved = epoch_free_cost::improveInitialPlacement(
@@ -227,6 +228,9 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
     for (size_t c = 0; c < num_clusters; ++c) {
         cluster_to_thread_[c] = result.unit_to_thread[c];
     }
+    if (clock_mode_)
+        clock_bridge_owners_.assign(result.unit_to_thread.begin() + num_clusters,
+                                    result.unit_to_thread.end());
 
     thread_units_.resize(num_threads);
     for (auto& tu : thread_units_) {

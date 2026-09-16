@@ -96,6 +96,8 @@ struct DynamicMigrationTestAccess {
             }
             const double rate = expected_rate(*runtime.clusters[c].clock);
             assert(std::abs(runtime.actor_rates[c] - rate) < 1e-9);
+            assert(runtime.clusters[c].sample_interval ==
+                   static_cast<uint64_t>(std::ceil(detail::kDynamicTickSampleInterval * rate)));
             const double expected = 100.0 * sim.clusters_.clusters[c].size() * rate;
             const auto cost = sim.dynamicClockActorCost_(c);
             assert(cost.ready && std::abs(cost.cost - expected) < 1e-9);
@@ -119,11 +121,68 @@ struct DynamicMigrationTestAccess {
         assert(sim.clockRebalanceCycle_(SimTime(UINT64_MAX)) == UINT64_MAX);
     }
 
+    static void verifyPlacementAndWaits(TickSimulation& sim) {
+        const size_t count = sim.clusters_.numClusters();
+        PartitionInput input;
+        input.num_units = count;
+        input.num_threads = sim.thread_units_.size();
+        input.sync_cost_ns = sim.config_.initial_partition_sync_cost_ns;
+        input.unit_cost_ns.assign(count, 1.0);
+        input.adjacency.resize(count);
+        std::unordered_map<Unit*, size_t> indices;
+        for (size_t u = 0; u < sim.unit_ptrs_.size(); ++u) indices.emplace(sim.unit_ptrs_[u], u);
+        sim.addClockPartitionActors_(input, indices);
+        assert(input.num_units == count + sim.cdc_.size());
+        for (size_t c = 0; c < count; ++c) {
+            const auto& state = sim.clock_parallel_->clusters[c];
+            const double expected =
+                (state.clock->id() == 1 ? 2'000'000'000.0 : 100'000'000.0) / sim.tickFrequencyHz();
+            assert(std::abs(input.unit_cost_ns[c] - expected) < 1e-9);
+            assert(state.domain->completions.size() == 6);  // Three units and three FIFO endpoints.
+        }
+        for (size_t b = count; b < input.num_units; ++b)
+            assert(std::abs(input.unit_cost_ns[b] - 2'100'000'000.0 / sim.tickFrequencyHz()) <
+                   1e-9);
+        std::vector<double> per_thread(input.num_threads);
+        std::vector<size_t> placement(count, 0);
+        placement.insert(placement.end(), sim.clock_bridge_owners_.begin(),
+                         sim.clock_bridge_owners_.end());
+        for (size_t c = 0; c < count; ++c) placement[c] = sim.cluster_to_thread_[c];
+        partition_utils::computeThreadTimes(input, placement, per_thread);
+        assert(*std::min_element(per_thread.begin(), per_thread.end()) > 0);
+
+        auto& runtime = *sim.clock_parallel_;
+        const size_t b = bridge(sim, 0);
+        const size_t c = runtime.bridges[0]->endpoints[0].cluster;
+        BlockedClusterInfo dependency;
+        dependency.cluster = b;
+        dependency.pred_cluster = c;
+        sim.recordClockWaitSample_(0, dependency, SimTime{}, 100);
+        assert(sim.dynamic_thread_dep_wait_ns_[0].load() == 100);
+        assert(sim.dynamic_cluster_blocked_wait_ns_[b].load() == 100);
+        assert(sim.dynamic_cluster_blocker_wait_ns_[c].load() == 100);
+        // Same local cycle, but the phased slow edge is later than fast edge 0.
+        sim.recordClockWaitSample_(0, dependency, SimTime::picoseconds(137), 50);
+        assert(sim.dynamic_thread_dep_wait_ns_[0].load() == 100);
+        runtime.domains.at(1).retired.store(1);
+        sim.recordClockWaitSample_(0, dependency, SimTime::picoseconds(137), 50);
+        assert(sim.dynamic_thread_dep_wait_ns_[0].load() == 150);
+        runtime.domains.at(1).retired.store(0);
+        dependency.pred_cluster = SIZE_MAX;
+        sim.recordClockWaitSample_(0, dependency, SimTime::nanoseconds(1), 25);
+        assert(sim.dynamic_thread_floor_wait_ns_[0].load() == 25);
+    }
+
     static void placeAllOnWorkerZero(TickSimulation& sim) {
         for (size_t a = 0; a < sim.dynamic_runtime_cluster_count_; ++a)
             sim.cluster_runtime_owner_[a].store(0);
         sim.cluster_assignment_generation_.fetch_add(1);
         sim.finishClockMigrationRun_();
+    }
+
+    static void assertCostsReady(TickSimulation& sim, bool ready) {
+        for (size_t c = 0; c < sim.clusters_.numClusters(); ++c)
+            assert(sim.dynamicClockActorCost_(c).ready == ready);
     }
 
     static size_t planBridge(TickSimulation& sim) {

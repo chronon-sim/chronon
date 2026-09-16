@@ -668,7 +668,8 @@ std::string TickSimulation::formatBlockerDetail_(const BlockedClusterInfo& block
 }
 
 void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, uint64_t cycle,
-                                             bool trace_units, bool sample_unit_activity) {
+                                             bool trace_units, bool sample_unit_activity,
+                                             uint64_t sample_interval) {
     auto* const* units = cluster_unit_ptrs_[cluster].data();
     const size_t num_units = cluster_unit_ptrs_[cluster].size();
 
@@ -689,7 +690,7 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
         if (unit >= dynamic_runtime_unit_count_) return;
         if (active) ++dynamic_unit_active_ticks_since_checkpoint_[unit];
         const uint64_t last = dynamic_unit_last_activity_checkpoint_cycle_[unit];
-        if (!detail::shouldSampleDynamicTick(cycle, last)) return;
+        if (!detail::shouldSampleDynamicTick(cycle, last, sample_interval)) return;
         const uint64_t window_cycles =
             last == detail::kNoDynamicTickSample ? cycle + 1 : cycle - last;
         dynamic_unit_observed_active_ticks_[unit].fetch_add(
@@ -702,7 +703,7 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
         if (unit >= dynamic_runtime_unit_count_) return;
         auto& last = active ? dynamic_unit_last_active_sample_cycle_[unit]
                             : dynamic_unit_last_inactive_sample_cycle_[unit];
-        if (!detail::shouldSampleDynamicTick(cycle, last)) return;
+        if (!detail::shouldSampleDynamicTick(cycle, last, sample_interval)) return;
         recordDynamicUnitTickSample_(unit, elapsed_ns, active);
         last = cycle;
     };
@@ -759,9 +760,9 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
             bool time_sample = false;
             if (unit < dynamic_runtime_unit_count_) {
                 const bool active_due = detail::shouldSampleDynamicTick(
-                    cycle, dynamic_unit_last_active_sample_cycle_[unit]);
+                    cycle, dynamic_unit_last_active_sample_cycle_[unit], sample_interval);
                 const bool inactive_due = detail::shouldSampleDynamicTick(
-                    cycle, dynamic_unit_last_inactive_sample_cycle_[unit]);
+                    cycle, dynamic_unit_last_inactive_sample_cycle_[unit], sample_interval);
                 if (active_due || inactive_due) {
                     expected_active = units[u]->shouldRunTickAt(cycle);
                     time_sample = expected_active ? active_due : inactive_due;

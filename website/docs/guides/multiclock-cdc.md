@@ -55,6 +55,18 @@ dependencies still compare local edges within one domain; bridge tasks compare
 exact physical edge times. Only the bridge's two endpoints participate in its
 sampling/commit handshake. No simulation state rollback is used.
 
+Initial placement reuses the configured Weighted/SA solver and epoch-free
+topology refinement. Its graph contains both real clusters and CDC bridge actors:
+unit costs are multiplied by their domain edge rate, and endpoint-specific
+begin/commit handshake edges carry the corresponding rate. Without precomputed
+costs, bridges use a uniform cost prior per endpoint, not a bridge-count placement
+pass. No speculative model ticks are executed to profile initialization.
+
+Admission publishes once per participating domain; retirement checks only that
+domain's indexed cluster and bridge-endpoint completions. This is an index over
+progress, not a domain execution barrier. Bridge successor timestamps are cached
+until commit, avoiding repeated rational edge construction during polling.
+
 With `enable_dynamic_rebalance`, the clock runtime reuses the epoch-free
 one-actor migration planner, owner/generation publication, gain thresholds and
 cooldown policy. Ordinary zero-delay clusters remain indivisible; a CDC bridge
@@ -67,7 +79,17 @@ whole-domain fence, queue reconstruction, or simulation rollback is introduced.
 Sparse active/inactive unit timing is weighted by the domain's edge rate. Bridge
 timing charges begin and commit work, excluding time waiting for endpoints, and
 accounts for coincident edges. The planner's compute and handshake costs use a
-common reference-clock basis. In clock mode, `rebalance_check_interval_cycles`
+common reference-clock basis. Unit sampling uses the existing sparse sampler
+with `ceil(256 * domain_hz / tick_frequency_hz)` local edges between samples
+(at least one). Four-sample confidence and local active/inactive accounting are
+unchanged, so slow domains no longer require 1024 local edges merely to become
+measurable. Bridge sampling remains every 256 merged transactions.
+Sampled unsuccessful worker sweeps reuse the existing wait counters and scorer;
+dependency waits are credited only at the exact physical retirement frontier.
+Later runahead waits are not treated as critical-path loss. These are sparse
+heuristic samples, not exhaustive wall-time accounting.
+
+In clock mode, `rebalance_check_interval_cycles`
 and `rebalance_cooldown_cycles` mean **cycles at `tick_frequency_hz` of retired
 physical time**, not domain-local cycles or calendar batches. Ownership and
 sampling history survive segmented run calls; an unfinished migration request
@@ -87,22 +109,23 @@ SAGE/GPU clock parameters.
 The clock-tracing fallback from the initial epoch-free CDC implementation has
 been removed. Unit and bridge actors now have independent producer streams,
 bridge-aware progress publication, and bounded asynchronous observation credits
-(see below). The following capability and performance gaps remain:
+(see below). Placement/profiling and the first scaling characterization are also
+implemented; measured benefits and regressions are recorded in
+[Multi-clock validation and performance](./multiclock-validation.md#epoch-free-placement-and-scaling).
+The following performance limits remain:
 
-- **Dynamic placement is heuristic, not a speedup guarantee.** Sparse samples
-  need warmup, and slowly ticking domains take longer to build confidence.
-  Initial placement still uses the static unit-cost partition and a bridge-count
-  heuristic; frequency normalization and measured bridge costs apply to runtime
-  migration. Clock mode uses the shared compute/topology score, but does not yet
-  attribute sampled worker stalls to physical-time critical dependency edges.
-- **Scheduling scalability and speedup remain to be characterized.** Admission
-  and retirement use one coordinator, which scans cluster/bridge progress for
-  each physical-time batch; workers poll their assigned tasks. Correctness tests
-  demonstrate concurrent execution, but do not establish a speedup for cheap
-  ticks, skewed workloads, or large domain/bridge counts. Static placement does
-  not currently normalize initial tick costs by domain frequency.
-  Frequency-aware initial placement, indexed readiness checks and representative
-  multiclock benchmarks are follow-up work.
+- **Dynamic placement is heuristic, not a speedup guarantee.** Initial uniform
+  cost priors cannot predict an expensive unit. Short skewed runs may end before
+  enough migration checks correct that placement; measured regressions are
+  included, not hidden by reporting balanced workloads alone. Rarely active
+  units and bridge samples still need warmup. Existing precomputed unit/platform
+  costs can seed placement without changing simulation state.
+- **Scaling is workload-dependent.** Admission and retirement still have one
+  coordinator; workers still poll their owned actors. Domain indexing reduces
+  scans, but is not an event-driven ready queue. Cheap ticks can be slower than
+  serial execution, and adding bridge vertices increases partitioning cost.
+  The supplied fixed-work benchmark measures 1/2/4 workers and up to 32 domains;
+  it is not a many-core, NUMA, SAGE/GPU, or tracing-throughput speedup claim.
 
 Two intentional semantics should not be mistaken for missing correctness fixes:
 

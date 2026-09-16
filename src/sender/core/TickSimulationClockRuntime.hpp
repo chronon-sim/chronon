@@ -10,15 +10,27 @@ namespace chronon::sender {
 // begin grants endpoint edges; their completion hands pending commands back to
 // commit. Only a fully committed bridge may transfer ownership.
 struct TickSimulation::ClockParallelRuntime {
-    struct alignas(64) Cluster {
+    struct Domain {
         const ClockDomain* clock = nullptr;
         std::atomic<uint64_t> allowed{0};
-        std::vector<const std::atomic<uint64_t>*> bridges;
+        std::atomic<uint64_t> retired{0};
+        std::vector<const std::atomic<uint64_t>*> completions;
+    };
+    struct Dependency {
+        size_t actor;
+        const std::atomic<uint64_t>* progress;
+    };
+    struct alignas(64) Cluster {
+        const ClockDomain* clock = nullptr;
+        Domain* domain = nullptr;
+        uint64_t sample_interval = detail::kDynamicTickSampleInterval;
+        std::vector<Dependency> bridges;
     };
     struct alignas(64) Endpoint {
         size_t cluster = 0;
         const ClockDomain* clock = nullptr;
         uint64_t next = 0;  // Bridge-owner private.
+        SimTime next_time;  // Cached successor, not recomputed on unsuccessful readiness polls.
         std::atomic<uint64_t> prepared{0};
         std::atomic<uint64_t> completed{0};
     };
@@ -31,7 +43,7 @@ struct TickSimulation::ClockParallelRuntime {
         size_t edge_count = 0;
         std::atomic<uint64_t> completed{0};  // Committed merged-edge transactions.
         bool sample = false;
-        uint64_t sample_ns = 0;  // begin + commit CPU work, excluding dependency waits.
+        uint64_t sample_ns = 0;  // begin + commit execution time, excluding dependency waits.
     };
     struct Batch {
         SimTime time;
@@ -39,6 +51,7 @@ struct TickSimulation::ClockParallelRuntime {
     };
 
     std::unique_ptr<Cluster[]> clusters;
+    std::unordered_map<ClockDomainId, Domain> domains;
     std::vector<std::unique_ptr<Bridge>> bridges;
     std::vector<std::vector<size_t>> worker_bridges;
     std::deque<Batch> pending;
