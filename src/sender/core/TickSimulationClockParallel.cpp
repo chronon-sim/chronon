@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include <exception>
+#include <thread>
 
 #include "../../chronon/CpuPause.hpp"
+#include "DynamicWaitPolicy.hpp"
 #include "TickSimulationClockRuntime.hpp"
 
 namespace chronon::sender {
@@ -248,6 +250,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     auto owned_bridges = runtime.worker_bridges[worker];
                     std::vector<size_t> owned_actors, ownership_scratch;
                     uint64_t seen_generation = 0;
+                    uint64_t idle_sweeps = 0;
                     const auto refresh = [&] {
                         refreshDynamicOwnedActors_(worker, owned_actors, ownership_scratch,
                                                    seen_generation);
@@ -301,7 +304,17 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             // circuit, unit sampling and SPSC producer state.
                             serviceEpochFreeMigration_(worker);
                         }
-                        if (!progress) cpuPause();
+                        if (progress) {
+                            idle_sweeps = 0;
+                        } else if (detail::shouldYieldDynamicWaitThread(
+                                       idle_sweeps++, detail::kFloorWaitThreadYieldSpinMask)) {
+                            // A persistent worker must let its peers (including
+                            // the trace backend) run on oversubscribed hosts.
+                            // Keep short waits on the existing CPU-pause path.
+                            std::this_thread::yield();
+                        } else {
+                            cpuPause();
+                        }
                     }
                 } catch (...) {
                     if (!error_set.test_and_set(std::memory_order_relaxed))
