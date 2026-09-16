@@ -31,10 +31,19 @@ depths include 2, 4, and 16 in the combined matrix, and 64 in the circuit test;
 synchronizer chains include 2, 3, and 5 stages. Seeds are fixed in the tests.
 An integrated mismatch prints its configuration and the last 32 state snapshots.
 
-**Requested parallel multi-clock configurations currently exercise the explicit
-serial fallback.** These tests do not establish an epoch-free parallel CDC
-implementation. Recorder concurrency is exercised by real concurrent threads.
-TSan has not been run.
+The initial results below predate epoch-free CDC scheduling. Current tests assert
+actual parallel execution for requested 2/4-worker clock graphs, including text,
+Perfetto and combined recording. `sender_multiclock_epoch_free` additionally
+checks multi-bridge feedback graphs against serial execution, two-record ingress
+rings, segmented runs, termination/resume, and independent same-domain progress
+while another actor is stalled. `sender_clock_trace_budget` covers parallel dense
+bursts, record/byte pressure, lossy accounting and terminal bucket overflow.
+The clock simulation/recorder tests have also passed an instrumented TSan run.
+The parallel multi-bridge trace fixture imports 39,169 events and 7,575 flow edges:
+serial and 2/4-worker runs with lookahead windows 1/32 have identical normalized
+records. The parallel output-failure test injects `EFBIG` while producers share
+workers and use two-record rings; the run exits, close reports the original
+writer error, and resuming the failed simulation is rejected.
 
 ### Trace Processor results
 
@@ -365,7 +374,8 @@ compiler or optimization setting and call it an exact main-branch baseline.
 Clock frequencies and phases are fixed for a run.
 The FIFO is a deterministic digital CDC model, not an analog metastability or
 MTBF model. Only power-of-two FIFO depths and registered synchronous reads are
-implemented. Explicit multi-clock execution is serial with reported fallback.
+implemented. Explicit multi-clock execution supports epoch-free scheduling and
+clock tracing; dynamic migration of clock actors is not yet implemented.
 Legacy observation entry points and YAML clock-domain configuration are not
 automatically migrated; use the C++ clock/CDC and native recorder APIs in the
 guide. Legacy multi-clock observation is rejected rather than mis-timestamped.

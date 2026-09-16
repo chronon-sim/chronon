@@ -179,6 +179,9 @@ def run(args, root):
     if args.recorder_binary:
         subprocess.run([str(args.recorder_binary), str(root / "recorders")], check=True,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if args.epoch_free_binary:
+        subprocess.run([str(args.epoch_free_binary), str(root / "epoch-free")], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     directories = sorted({path.parent for path in root.rglob("reference.tsv")})
     if not directories:
         raise ValueError("no generated reference fixtures found")
@@ -189,7 +192,7 @@ def run(args, root):
     digests = {}
     for directory in directories:
         digests[directory.name] = verify_directory(args.trace_processor, directory, args.check_prefix)
-    for a, b in (("serial", "fallback"), ("serial", "lossy"),
+    for a, b in (("serial", "parallel"), ("serial", "lossy"),
                  ("workers-0", "workers-1"), ("workers-0", "workers-2"), ("workers-0", "workers-3")):
         if a in digests and b in digests and digests[a] != digests[b]:
             raise AssertionError(f"execution/recording configuration changed semantics: {a}, {b}")
@@ -215,6 +218,7 @@ def main():
     parser.add_argument("--directory", type=Path)
     parser.add_argument("--multiclock-binary", type=Path)
     parser.add_argument("--recorder-binary", type=Path)
+    parser.add_argument("--epoch-free-binary", type=Path)
     parser.add_argument("--check-prefix", action="store_true")
     args = parser.parse_args()
     if args.directory:

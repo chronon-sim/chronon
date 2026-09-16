@@ -50,6 +50,8 @@ public:
     /// Quiet streams must also advance, or finish when permanently done.
     void advance(uint64_t next_cycle);
     void finish();
+    /// Scheduler actor boundary: publish non-lossy gap metadata before progress.
+    void endEdge();
 
 private:
     friend class ClockTraceRecorder;
@@ -70,6 +72,8 @@ private:
     uint64_t ordinal_ = 0;
     uint64_t dropped_ = 0;
     uint64_t peak_ = 0;
+    bool parallel_ = false;
+    ClockRecord dropped_run_{};  // value = count; phase high bit marks gap metadata.
 };
 
 class ClockTraceRecorder {
@@ -94,6 +98,8 @@ public:
         uint64_t native_buffer_peak_bytes = 0;
         uint64_t native_buffer_peak_records = 0;
         uint64_t first_output_ns = 0;  // Host time since native writer open().
+        uint64_t allocated_staging_bytes = 0;
+        uint64_t peak_staging_records = 0;
     };
 
     explicit ClockTraceRecorder(Config config);
@@ -102,10 +108,23 @@ public:
     ClockTraceRecorder& operator=(const ClockTraceRecorder&) = delete;
     void defineEvent(ClockEventKind kind, std::string name);
     ClockTraceStream* addStream(const ClockDomain& domain, uint32_t unit_id, std::string unit_name);
+    /// Independent actor, same logical unit/track. Stable nonzero producer_order
+    /// breaks commit ties (CDC uses FIFO ID + 1), never a host worker identity.
+    ClockTraceStream* addProducerStream(ClockTraceStream* unit, uint64_t producer_order);
     /// Serial coordinator mode requires begin/endClockBatch around all producers.
     /// All records must belong to that exact batch time; do not advance/finish
     /// individual streams. Leave disabled for independent worker streams.
     void start(bool serial_coordinator = false);
+    /// Scheduler-owned, nonblocking observation credits. Compact staging for
+    /// admitted ns buckets lets the backend drain EVERY ingress stream without
+    /// waiting for simulation progress, including several actors on one worker.
+    void startParallel(size_t lookahead_batches);
+    bool parallelActive() const noexcept;
+    /// Single scheduler coordinator only; false means retry after backend drain.
+    bool tryAdmitClockBatch(const SimTime& time);
+    /// All records below this bound have been published (units AND CDC commits).
+    /// Does not wait for the backend; quiet actors need no per-stream advance.
+    void publishClockProgress(uint64_t exclusive_ns);
     void beginClockBatch(const SimTime& time);
     void endClockBatch();
     /// Coordinator-only alternative to per-stream advance: ALL producers must

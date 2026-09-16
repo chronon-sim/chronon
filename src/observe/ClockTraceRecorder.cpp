@@ -14,6 +14,7 @@
 #include <iostream>
 #include <map>
 #include <thread>
+#include <tuple>
 
 #include "detail/ClockEventBuffer.hpp"
 
@@ -28,7 +29,8 @@ ClockTraceStream::ClockTraceStream(size_t capacity, bool lossless, bool perfetto
       clock_(std::move(clock)) {}
 
 void ClockTraceStream::advance(uint64_t next_cycle) {
-    if (coordinator_) throw std::logic_error("coordinated streams use recorder progress");
+    if (coordinator_ || parallel_)
+        throw std::logic_error("coordinated streams use recorder progress");
     if (finished_.load(std::memory_order_relaxed) || next_cycle < minimum_cycle_)
         throw std::logic_error("invalid clock stream progress after finish or backwards");
     const auto ns = perfetto_ ? clock_.edge(next_cycle).floorNanoseconds() : 0;
@@ -44,8 +46,25 @@ void ClockTraceStream::advance(uint64_t next_cycle) {
 }
 
 void ClockTraceStream::finish() {
-    if (coordinator_) throw std::logic_error("coordinated streams finish with recorder close");
+    if (coordinator_ || parallel_)
+        throw std::logic_error("coordinated streams finish with recorder close");
     finished_.store(true, std::memory_order_release);
+}
+
+void ClockTraceStream::endEdge() {
+    if (!dropped_run_.value) return;
+    const auto head = head_.load(std::memory_order_relaxed);
+    auto tail = tail_.load(std::memory_order_acquire);
+    while (head - tail == ring_.size()) {
+        if (failed_->load(std::memory_order_acquire))
+            throw std::runtime_error("clock trace backend failed or closed");
+        std::this_thread::yield();
+        tail = tail_.load(std::memory_order_acquire);
+    }
+    ring_[head & (ring_.size() - 1)] = dropped_run_;
+    dropped_run_.value = 0;
+    peak_ = std::max(peak_, head - tail + 1);
+    head_.store(head + 1, std::memory_order_release);
 }
 
 void ClockTraceStream::record(uint64_t cycle, ClockEventKind kind, uint64_t transaction,
@@ -54,13 +73,35 @@ void ClockTraceStream::record(uint64_t cycle, ClockEventKind kind, uint64_t tran
         throw std::logic_error("clock record violates stream progress or finish");
     if (ordinal_ == UINT64_MAX) throw std::overflow_error("clock trace stream ordinal overflow");
     const auto ordinal = ordinal_++;
-    const auto head = head_.load(std::memory_order_relaxed);
+    if (dropped_run_.value &&
+        (dropped_run_.local_cycle != cycle ||
+         (static_cast<uint8_t>(dropped_run_.phase) & 127) != static_cast<uint8_t>(phase)))
+        endEdge();
+    auto head = head_.load(std::memory_order_relaxed);
     auto tail = tail_.load(std::memory_order_acquire);
+    if (dropped_run_.value && head - tail != ring_.size()) {
+        endEdge();
+        head = head_.load(std::memory_order_relaxed);
+        tail = tail_.load(std::memory_order_acquire);
+    }
     while (head - tail == ring_.size()) {
         if (failed_->load(std::memory_order_acquire))
             throw std::runtime_error("clock trace backend failed or closed");
         if (!lossless_) {
             ++dropped_;
+            if (parallel_) {
+                if (!dropped_run_.value) {
+                    dropped_run_ = {
+                        cycle,
+                        0,
+                        0,
+                        ordinal,
+                        0,
+                        kind,
+                        static_cast<ClockEventPhase>(static_cast<uint8_t>(phase) | 128)};
+                }
+                ++dropped_run_.value;
+            }
             return;
         }
         // Host waiting never changes simulated time or acceptance decisions.
@@ -100,6 +141,8 @@ struct ClockTraceRecorder::Impl {
         std::unique_ptr<ClockTraceStream> queue;
         uint32_t sequence = 0;
         uint64_t track = 0;
+        size_t logical_unit = 0;
+        uint64_t producer_order = 0, encoded_ordinal = 0;
     };
     struct TextSink {
         std::ofstream file;
@@ -125,6 +168,104 @@ struct ClockTraceRecorder::Impl {
     size_t pending_records = 0, pending_bytes = 0;
     size_t bucket_records = 0, bucket_bytes = 0, batches = 0;
     std::vector<uint16_t> event_name_bytes;
+
+    // Scheduler publishes slot descriptors; backend alone owns their contents.
+    // Unlike native records, staged records own no strings or payloads. Reserve
+    // each admitted bucket's full capacity so ingress drain never depends on a
+    // different actor getting CPU time. The native writer holds ONE bucket.
+    struct PendingRecord {
+        ClockRecord record;
+        SimTime time;
+        size_t stream;
+    };
+    struct Bucket {
+        uint64_t ns = 0;
+        size_t bytes = 0;
+        std::vector<PendingRecord> records;
+    };
+    std::vector<Bucket> buckets;
+    alignas(64) std::atomic<uint64_t> bucket_head{0};
+    alignas(64) std::atomic<uint64_t> bucket_tail{0};
+    size_t staged_records = 0;
+    size_t bucket_capacity = 0;
+
+    void checkFailure() const {
+        if (failed.load(std::memory_order_acquire)) {
+            if (error) std::rethrow_exception(error);
+            throw std::runtime_error("clock trace backend failed or closed");
+        }
+    }
+
+    void stage(size_t stream_index, const ClockRecord& record) {
+        auto& stream = streams[stream_index];
+        const auto time = stream.domain.edge(record.local_cycle);
+        const auto ns = time.floorNanoseconds();
+        const auto head = bucket_head.load(std::memory_order_acquire);
+        auto first = bucket_tail.load(std::memory_order_relaxed), last = head;
+        while (first < last) {
+            const auto mid = first + (last - first) / 2;
+            if (buckets[mid % buckets.size()].ns < ns)
+                first = mid + 1;
+            else
+                last = mid;
+        }
+        if (first != head && buckets[first % buckets.size()].ns == ns) {
+            auto& bucket = buckets[first % buckets.size()];
+            const auto bytes = stream.queue->record_base_bytes_ + names.at(record.kind).size();
+            if (bucket.records.size() == bucket_capacity ||
+                bytes > detail::ClockEventBuffer::MaxPendingBytes - bucket.bytes)
+                throw std::length_error(
+                    "native clock single-nanosecond bucket exceeds record or 4 MiB byte budget");
+            bucket.records.push_back({record, time, stream_index});
+            bucket.bytes += bytes;
+            stats.peak_staging_records =
+                std::max<uint64_t>(stats.peak_staging_records, ++staged_records);
+            return;
+        }
+        throw std::logic_error("clock event outside admitted observation buckets");
+    }
+
+    void drainBuckets(uint64_t limit, bool stop) {
+        auto tail = bucket_tail.load(std::memory_order_relaxed);
+        const auto head = bucket_head.load(std::memory_order_acquire);
+        while (tail != head) {
+            auto& bucket = buckets[tail % buckets.size()];
+            if (!stop && bucket.ns >= limit) break;
+            std::sort(bucket.records.begin(), bucket.records.end(),
+                      [&](const auto& a, const auto& b) {
+                          if (a.time != b.time) return a.time < b.time;
+                          const auto& sa = streams[a.stream];
+                          const auto& sb = streams[b.stream];
+                          return std::tuple{static_cast<uint8_t>(a.record.phase) & 127,
+                                            std::string_view(sa.unit_name), sa.producer_order,
+                                            a.record.ordinal} <
+                                 std::tuple{static_cast<uint8_t>(b.record.phase) & 127,
+                                            std::string_view(sb.unit_name), sb.producer_order,
+                                            b.record.ordinal};
+                      });
+            for (auto& pending : bucket.records) {
+                auto& stream = streams[pending.stream];
+                auto& ordinal = streams[stream.logical_unit].encoded_ordinal;
+                if (static_cast<uint8_t>(pending.record.phase) & 128) {
+                    if (pending.record.value > UINT64_MAX - ordinal)
+                        throw std::overflow_error("clock unit ordinal overflow");
+                    ordinal += pending.record.value;
+                    continue;
+                }
+                if (ordinal == UINT64_MAX) throw std::overflow_error("clock unit ordinal overflow");
+                pending.record.ordinal = ordinal++;
+                encode(stream, pending.record);
+            }
+            // One closed bucket fits the native record/metadata budgets. No
+            // later bucket enters the writer until this one has been emitted.
+            if (config.perfetto)
+                writer.advanceClockWatermark(bucket.ns == UINT64_MAX ? UINT64_MAX : bucket.ns + 1);
+            staged_records -= bucket.records.size();
+            bucket.records.clear();
+            bucket.bytes = 0;
+            bucket_tail.store(++tail, std::memory_order_release);
+        }
+    }
 
     void writeManifest() {
         std::ofstream file(config.output_dir / "clock-manifest.json");
@@ -153,7 +294,8 @@ struct ClockTraceRecorder::Impl {
             file << "\n    {\"unit_id\":" << stream.unit_id
                  << ",\"unit\":" << std::quoted(stream.unit_name)
                  << ",\"domain_id\":" << stream.domain.id() << ",\"sequence\":" << stream.sequence
-                 << ",\"track\":" << stream.track << '}';
+                 << ",\"track\":" << stream.track << ",\"producer_order\":" << stream.producer_order
+                 << '}';
         }
         file << "\n  ],\n  \"events\":{";
         first = true;
@@ -204,7 +346,9 @@ struct ClockTraceRecorder::Impl {
                 uint64_t limit = UINT64_MAX;
                 // Read progress BEFORE the heads. Acquiring a promise then the
                 // heads includes every record whose publication preceded it.
-                if (config.perfetto && !stop) {
+                if (!buckets.empty() && !stop) {
+                    limit = watermark.load(std::memory_order_acquire);
+                } else if (config.perfetto && !stop) {
                     for (const auto& stream : streams) {
                         const auto& queue = *stream.queue;
                         if (!queue.finished_.load(std::memory_order_acquire))
@@ -227,14 +371,21 @@ struct ClockTraceRecorder::Impl {
                         const auto end =
                             tail + std::min<uint64_t>(heads[index] - tail, config.drain_batch);
                         for (; tail != end; ++tail) {
-                            encode(stream, queue.ring_[tail & (queue.ring_.size() - 1)]);
+                            const auto& record = queue.ring_[tail & (queue.ring_.size() - 1)];
+                            if (buckets.empty())
+                                encode(stream, record);
+                            else
+                                stage(index, record);
                             any = true;
                         }
                         queue.tail_.store(tail, std::memory_order_release);
                         remaining |= tail != heads[index];
                     }
                 } while (remaining);
-                if (config.perfetto) {
+                if (!buckets.empty()) {
+                    drainBuckets(limit, stop);
+                    acknowledged.store(limit, std::memory_order_release);
+                } else if (config.perfetto) {
                     writer.advanceClockWatermark(limit);
                     acknowledged.store(limit, std::memory_order_release);
                     for (auto& stream : streams)
@@ -321,27 +472,121 @@ ClockTraceStream* ClockTraceRecorder::addStream(const ClockDomain& domain, uint3
         new ClockTraceStream(impl_->config.stream_capacity, impl_->config.lossless,
                              impl_->config.perfetto, domain, &impl_->failed));
     auto* result = queue.get();
-    impl_->streams.push_back({domain, unit_id, std::move(unit_name), std::move(queue)});
+    const auto index = impl_->streams.size();
+    impl_->streams.push_back(
+        {domain, unit_id, std::move(unit_name), std::move(queue), 0, 0, index});
     impl_->stats.allocated_buffer_bytes += bytes;
     return result;
 }
 
+ClockTraceStream* ClockTraceRecorder::addProducerStream(ClockTraceStream* unit,
+                                                        uint64_t producer_order) {
+    if (impl_->started) throw std::logic_error("clock streams must be declared before start");
+    if (!enabled()) return nullptr;
+    const auto found = std::find_if(impl_->streams.begin(), impl_->streams.end(),
+                                    [&](const auto& stream) { return stream.queue.get() == unit; });
+    if (found == impl_->streams.end() || !producer_order || found->producer_order)
+        throw std::invalid_argument("producer stream requires a primary unit and nonzero order");
+    const auto logical = found->logical_unit;
+    for (const auto& stream : impl_->streams)
+        if (stream.logical_unit == logical && stream.producer_order == producer_order)
+            throw std::invalid_argument("duplicate clock producer order");
+    const auto bytes = impl_->config.stream_capacity * sizeof(ClockRecord);
+    if (impl_->stats.allocated_buffer_bytes + bytes > 256 * 1024 * 1024)
+        throw std::invalid_argument("clock trace ingress budget exceeds 256 MiB");
+    auto queue = std::unique_ptr<ClockTraceStream>(
+        new ClockTraceStream(impl_->config.stream_capacity, impl_->config.lossless,
+                             impl_->config.perfetto, found->domain, &impl_->failed));
+    auto* result = queue.get();
+    // Copy metadata before push_back can invalidate found.
+    Impl::Stream stream{found->domain, found->unit_id, found->unit_name, std::move(queue), 0, 0,
+                        logical,       producer_order};
+    impl_->streams.push_back(std::move(stream));
+    impl_->stats.allocated_buffer_bytes += bytes;
+    return result;
+}
+
+void ClockTraceRecorder::startParallel(size_t lookahead_batches) {
+    auto& p = *impl_;
+    if (p.started || !lookahead_batches) throw std::logic_error("invalid parallel clock start");
+    if (!enabled()) return start();
+    const auto records = std::min(
+        p.config.perfetto_options.clock_buffer_records,
+        detail::ClockEventBuffer::MaxPendingBytes / detail::ClockEventBuffer::BaseRecordBytes);
+    if (records < 2)
+        throw std::invalid_argument("parallel clock bucket needs at least two records");
+    const auto slot_bytes = records * sizeof(Impl::PendingRecord);
+    const auto available = 256 * 1024 * 1024 - p.stats.allocated_buffer_bytes;
+    const auto max_slots = available / slot_bytes;
+    if (!max_slots)
+        throw std::invalid_argument("parallel clock ingress/staging budget exceeds 256 MiB");
+    const auto slots = std::min(lookahead_batches, max_slots - 1) + 1;
+    p.buckets.resize(slots);
+    p.bucket_capacity = records;
+    for (auto& bucket : p.buckets) bucket.records.reserve(records);
+    p.stats.allocated_staging_bytes = slots * slot_bytes;
+    start();
+}
+
+bool ClockTraceRecorder::parallelActive() const noexcept {
+    return impl_->started && !impl_->buckets.empty() && !impl_->closed;
+}
+
+bool ClockTraceRecorder::tryAdmitClockBatch(const SimTime& time) {
+    auto& p = *impl_;
+    if (!parallelActive()) throw std::logic_error("clock admission requires parallel recording");
+    p.checkFailure();
+    const auto ns = time.floorNanoseconds();
+    if (ns < p.watermark.load(std::memory_order_relaxed))
+        throw std::logic_error("clock admission precedes published progress");
+    const auto head = p.bucket_head.load(std::memory_order_relaxed);
+    const auto tail = p.bucket_tail.load(std::memory_order_acquire);
+    // Termination may discard unused simulation grants. Their empty observation
+    // slots remain reserved and can be reused after resetTermination().
+    if (tail != head && ns <= p.buckets[(head - 1) % p.buckets.size()].ns) {
+        for (auto n = tail; n != head; ++n)
+            if (p.buckets[n % p.buckets.size()].ns == ns) return true;
+        throw std::logic_error("clock observation admissions must be ordered");
+    }
+    if (head - tail == p.buckets.size()) return false;
+    if (head == UINT64_MAX) throw std::overflow_error("clock observation admission overflow");
+    p.buckets[head % p.buckets.size()].ns = ns;
+    p.bucket_head.store(head + 1, std::memory_order_release);
+    return true;
+}
+
+void ClockTraceRecorder::publishClockProgress(uint64_t exclusive_ns) {
+    auto& p = *impl_;
+    if (!parallelActive()) throw std::logic_error("clock progress requires parallel recording");
+    p.checkFailure();
+    if (exclusive_ns < p.watermark.load(std::memory_order_relaxed))
+        throw std::logic_error("clock recorder watermark cannot move backwards");
+    p.watermark.store(exclusive_ns, std::memory_order_release);
+}
+
 void ClockTraceRecorder::start(bool serial_coordinator) {
     if (impl_->started) throw std::logic_error("clock recorder cannot be restarted");
+    if (impl_->buckets.empty() &&
+        std::any_of(impl_->streams.begin(), impl_->streams.end(),
+                    [](const auto& stream) { return stream.producer_order != 0; }))
+        throw std::logic_error("additional clock producers require startParallel");
     if (!enabled()) {
         impl_->started = true;
         return;
     }
     const auto& config = impl_->config;
     impl_->coordinated = serial_coordinator && config.perfetto;
-    if (impl_->coordinated) {
-        impl_->event_name_bytes.resize(1u << 16);
-        for (const auto& [kind, name] : impl_->names)
-            impl_->event_name_bytes[static_cast<uint16_t>(kind)] = name.size();
+    if (impl_->coordinated || !impl_->buckets.empty()) {
+        if (impl_->coordinated) {
+            impl_->event_name_bytes.resize(1u << 16);
+            for (const auto& [kind, name] : impl_->names)
+                impl_->event_name_bytes[static_cast<uint16_t>(kind)] = name.size();
+        }
         size_t base = detail::ClockEventBuffer::BaseRecordBytes + ClockCategory.size();
         for (auto name : ClockAnnotations) base += name.size();
         for (auto& stream : impl_->streams) {
-            stream.queue->coordinator_ = this;
+            if (impl_->coordinated) stream.queue->coordinator_ = this;
+            stream.queue->parallel_ = !impl_->buckets.empty();
             stream.queue->record_base_bytes_ = base + stream.unit_name.size();
         }
     }
@@ -362,7 +607,9 @@ void ClockTraceRecorder::start(bool serial_coordinator) {
         if (config.perfetto) {
             auto [entry, inserted] = domains.try_emplace(stream.domain.id(), 0);
             if (inserted) entry->second = impl_->writer.addTrack("domain-" + stream.domain.name());
-            stream.track = impl_->writer.addTrack(stream.unit_name, entry->second);
+            stream.track = stream.producer_order
+                               ? impl_->streams[stream.logical_unit].track
+                               : impl_->writer.addTrack(stream.unit_name, entry->second);
         }
         if (config.text && !impl_->text.contains(stream.domain.id())) {
             auto& sink = impl_->text[stream.domain.id()];
@@ -454,6 +701,15 @@ void ClockTraceRecorder::endClockBatch() {
 
 void ClockTraceRecorder::close() {
     if (!impl_->started || impl_->closed) return;
+    // All producers have stopped. Flush any gap metadata left by an interrupted
+    // actor before taking the backend's final queue snapshot.
+    try {
+        if (!impl_->failed.load(std::memory_order_acquire))
+            for (auto& stream : impl_->streams) stream.queue->endEdge();
+    } catch (...) {
+        // Backend failure while flushing metadata: still join below, then
+        // rethrow the original backend error rather than leaving a live thread.
+    }
     impl_->stopping.store(true, std::memory_order_release);
     if (impl_->worker.joinable()) impl_->worker.join();
     impl_->failed.store(true, std::memory_order_release);
@@ -473,6 +729,8 @@ void ClockTraceRecorder::close() {
                << ",\"dropped_events\":" << impl_->stats.dropped
                << ",\"allocated_ingress_bytes\":" << impl_->stats.allocated_buffer_bytes
                << ",\"peak_ingress_bytes_upper_bound\":" << impl_->stats.peak_buffer_bytes
+               << ",\"allocated_staging_bytes\":" << impl_->stats.allocated_staging_bytes
+               << ",\"peak_staging_records\":" << impl_->stats.peak_staging_records
                << ",\"native_buffer_peak_bytes_upper_bound\":"
                << impl_->stats.native_buffer_peak_bytes
                << ",\"native_buffer_peak_records\":" << impl_->stats.native_buffer_peak_records

@@ -59,6 +59,7 @@ Result run(const std::filesystem::path& output, size_t units, size_t per_edge,
         sim.configureClockTrace(trace);
     }
     sim.initialize();
+    assert(sim.useParallelExecution() == (reverse && units > 1));
     assert(sim.runClockEvents(64) == 64);
     // Resume across multiple API calls, including a partially filled ns bucket.
     assert(sim.runClockEvents(3) == 3);
@@ -104,12 +105,27 @@ int main(int argc, char** argv) {
     // each bucket individually fits. Publication must work mid-tick.
     run(root / "burst", 64, 80, 65536, true);
     run(root / "record-pressure", 32, 2, 128);
+    run(root / "parallel-record-pressure", 32, 2, 128, false, 3, true);
+    run(root / "parallel-burst", 64, 80, 65536, true, 3, true);
+    run(root / "parallel-lossy", 128, 1, 65536, false, 3, true, true);
     for (const auto& [events, capacity] : {std::pair{3u, 2u}, std::pair{8000u, 65536u}}) {
         bool rejected = false;
         try {
             run(root / ("single-bucket-overflow-" + std::to_string(capacity)), 1, events, capacity);
         } catch (const std::exception& e) {
             rejected = std::string(e.what()).find("single-nanosecond bucket") != std::string::npos;
+        }
+        assert(rejected);
+    }
+    // Both peers can be blocked publishing when the backend discovers overflow.
+    // Failure must release all workers, including the admission coordinator.
+    for (const auto& [events, capacity] : {std::pair{3u, 2u}, std::pair{8000u, 65536u}}) {
+        bool rejected = false;
+        try {
+            run(root / ("parallel-overflow-" + std::to_string(capacity)), 2, events, capacity,
+                false, 3, true);
+        } catch (const std::exception&) {
+            rejected = true;
         }
         assert(rejected);
     }

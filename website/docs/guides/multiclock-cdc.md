@@ -58,26 +58,19 @@ sampling/commit handshake. No simulation state rollback is used.
 The clock runtime uses static cluster/bridge placement; runtime migration is not
 currently performed, even if `enable_dynamic_rebalance` is set. Disabled parallel
 or lookahead settings, a single cluster, and unproven ordinary-port transport
-headroom retain explicit sequential fallback reasons. Enabled `configureClockTrace`
-recording also selects the serial path: its shared stream and memory-reservation
-protocol is not yet connected to independent bridge workers. The default
+headroom retain explicit sequential fallback reasons. `configureClockTrace`
+supports epoch-free execution with text, Perfetto, or both sinks; enabling it
+does not select a different simulation execution mode. The default
 single-clock paths are unchanged. This infrastructure does not choose or calibrate
 SAGE/GPU clock parameters.
 
 ## Known limitations and follow-up work
 
-The initial epoch-free CDC implementation has the following capability and
-performance gaps:
+The clock-tracing fallback from the initial epoch-free CDC implementation has
+been removed. Unit and bridge actors now have independent producer streams,
+bridge-aware progress publication, and bounded asynchronous observation credits
+(see below). The following capability and performance gaps remain:
 
-- **Clock tracing still forces sequential execution.** This applies to enabled
-  `configureClockTrace` recording, including text-only recording, not to all
-  observation APIs. Unit evaluation and CDC bridge commits currently emit into
-  the same per-unit single-producer stream; independent bridge workers cannot
-  safely share that stream. Parallel support needs logically owned producer
-  streams, progress accounting that includes bridge commits, and nonblocking
-  watermark/backpressure handling that preserves bounded memory. Blocking a
-  worker until other actors on that same worker advance could deadlock. These
-  recorder changes do not require a simulation-wide clock-domain barrier.
 - **Dynamic placement is not implemented for clock actors.**
   `enable_dynamic_rebalance` does not migrate clusters or bridges in explicit
   clock mode. The worker task lists are static. A follow-up must connect them to
@@ -462,9 +455,13 @@ cross-domain order. Guard expensive observation-only argument calculations with
 `if (clockTraceStream())`.
 
 Each unit has a bounded SPSC record stream. Separate streams can be written by
-separate workers, including workers in the same domain. One backend drains
-batches without a global time heap or per-event global lock. Text is formatted
-and written immediately in batches; native Perfetto records use bounded open
+separate workers, including workers in the same domain. In epoch-free mode each
+CDC bridge also has two private commit streams, associated with the endpoints'
+existing unit identities and tracks. The unit stream records evaluation events
+(including consume); bridge streams record commit events. Logical producer
+ownership is independent of host worker placement. One backend drains batches
+without a per-event global lock. Serial text is formatted and written immediately
+in batches; native Perfetto records use bounded open
 nanosecond buckets, closed by explicit producer progress. Exactly one text sink
 exists per domain:
 
@@ -478,7 +475,9 @@ clock-stats.json
 ```
 
 The manifest records run identity, exact periods/phases, unit/domain/sequence/
-track mappings and event names. Text rows contain local cycle, unit ID, event,
+track mappings and event names. Multiple epoch-free producer streams share one
+unit/track; `producer_order` is zero for evaluation and FIFO ID + 1 for commits.
+Text rows contain local cycle, unit ID, event,
 evaluation/commit phase, transaction ID, FIFO ID, value and stream ordinal.
 Only per-stream order is guaranteed; different streams in one domain need not
 be cycle-sorted. There are no per-worker text shards and no global order across
@@ -487,12 +486,19 @@ consume are separate events on the appropriate units' domain tracks.
 
 On a full observation ring, lossless recording blocks/yields the **host** until
 space exists; no simulated edge is added. Lossy recording drops the record and
-counts the drop. Metadata is not placed in a lossy queue. `clock-stats.json`
-reports total retained/dropped events and ingress memory. Close/join only after
+counts the drop. In epoch-free mode, contiguous dropped records produce compact,
+non-lossy gap metadata at actor boundaries. Publishing that metadata can wait for
+the backend to drain ingress, but never waits for another simulation actor. This
+preserves the original logical-unit ordinal of every retained event, even when
+unit and bridge records interleave. Metadata is not placed in a lossy queue.
+`clock-stats.json` reports total retained/dropped events and ingress memory,
+plus `allocated_staging_bytes` and `peak_staging_records` for parallel recording.
+Close/join only after
 all producer threads have stopped. Native Perfetto packet prefixes become available
 during execution; `close()` / `closeClockTrace()` finishes the tail. Backend failures unblock waiting producers
 and are surfaced as errors. Static metadata plus ring capacity are fixed before
-running; ring allocation is capped at 256 MiB across streams.
+running; combined ring and parallel compact-record staging allocation is capped
+at 256 MiB across streams (separate from the native encoder's storage).
 
 The ingress peak is the sum of per-stream high-water marks, a conservative bound
 on simultaneous queued bytes. It excludes bounded text/Perfetto encoder batches
@@ -512,6 +518,36 @@ drops accepted events. In particular, all events in one open ns bucket must fit;
 reduce publication batch size or increase the record bound for dense models.
 
 ### Progress publication and bounded streaming
+
+The epoch-free scheduler reserves observation credits **before admitting** a new
+physical-time batch. Credits cover a bounded rolling window of nanosecond buckets,
+with room reserved for each bucket's full compact-record capacity. The default
+window is at most `max_lookahead_cycles + 1` buckets, reduced if necessary to fit
+the shared 256 MiB ingress/staging allocation budget. A bucket may contain many
+physical instants. These credits are observation resources, not execution epochs.
+When exhausted, only new admission pauses; workers continue all already-admitted
+unit/bridge tasks. There is no per-tick, per-nanosecond, or whole-window execution
+barrier while credits are available.
+
+As batches retire, the scheduler publishes a **nonblocking** watermark using the
+next unretired physical instant. Retirement includes all unit publications and
+CDC commits, including quiet/sleeping endpoints. The backend can always drain
+every admitted actor's ring into its reserved compact storage, without needing
+another actor on the same worker to run first. It releases closed buckets
+individually and returns credits as they drain, not as a synchronized epoch.
+Backend failure releases waiting producers and is checked by the coordinator.
+
+Both parallel sinks merge a closed bucket by exact time, evaluation/commit phase,
+unit name, FIFO producer order and producer-local ordinal. The backend reconstructs
+canonical per-unit ordinals (including lossy gaps), preserving the serial text
+and Perfetto identities. The native writer receives only one closed bucket at a
+time, retaining its existing record and 4 MiB metadata bounds. Parallel text-only
+recording uses the same bucket limits and ordering. Compact gap metadata also
+counts against these limits. A genuinely oversized single bucket fails explicitly;
+many individually valid dense buckets do not overflow the native buffer simply
+because independent actors are running ahead. No temporary files or whole-run
+sorting are used. Termination settlement publishes the completed boundary and
+unused observation credits remain reusable on resume; close drains the tail.
 
 `PerfettoTraceWriter::advanceClockWatermark(W)` promises that **all streams** have
 submitted every event with `floor(physical_time / 1 ns) < W`, and will never submit

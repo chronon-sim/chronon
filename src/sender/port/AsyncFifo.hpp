@@ -237,6 +237,8 @@ public:
     virtual uint32_t id() const noexcept = 0;
     virtual Unit* writeOwner() const noexcept = 0;
     virtual Unit* readOwner() const noexcept = 0;
+    virtual void setClockTraceStreams(observe::ClockTraceStream* write,
+                                      observe::ClockTraceStream* read) noexcept = 0;
     virtual void begin(std::span<const ClockEdge> edges) = 0;
     virtual void commit() = 0;
     virtual bool drained() const noexcept = 0;
@@ -319,6 +321,11 @@ public:
     uint32_t id() const noexcept override { return id_; }
     Unit* writeOwner() const noexcept override { return write_.owner(); }
     Unit* readOwner() const noexcept override { return read_.owner(); }
+    void setClockTraceStreams(observe::ClockTraceStream* write,
+                              observe::ClockTraceStream* read) noexcept override {
+        write_trace_ = write;
+        read_trace_ = read;
+    }
     void begin(std::span<const ClockEdge> edges) override {
         bool w = false, r = false;
         for (const auto& edge : edges) {
@@ -335,11 +342,11 @@ public:
         circuit_.beginEdges(w, r);
     }
     void commit() override {
-        const auto delta = circuit_.commit(read_.owner()->clockTraceStream() != nullptr);
+        const auto delta = circuit_.commit(commitTrace_(read_.owner()) != nullptr);
         if (delta.wrote)
             record_(write_.owner(), write_cycle_, observe::ClockEventKind::Write,
                     delta.write_transaction);
-        if (read_edge_ && read_.owner()->clockTraceStream()) {
+        if (read_edge_ && commitTrace_(read_.owner())) {
             for (auto n = delta.visible_begin; n != delta.visible_end;
                  n = (n + 1) & circuit_.pointerMask()) {
                 record_(read_.owner(), read_cycle_, observe::ClockEventKind::Visible,
@@ -374,10 +381,16 @@ public:
 private:
     friend class AsyncWritePort<T>;
     friend class AsyncReadPort<T>;
+    observe::ClockTraceStream* commitTrace_(Unit* unit) const noexcept {
+        auto* stream = unit == write_.owner() ? write_trace_ : read_trace_;
+        return stream ? stream : unit->clockTraceStream();
+    }
     void record_(Unit* unit, uint64_t cycle, observe::ClockEventKind kind, uint64_t transaction,
                  uint64_t value = 0,
                  observe::ClockEventPhase phase = observe::ClockEventPhase::Commit) {
-        if (auto* stream = unit->clockTraceStream()) {
+        auto* stream = phase == observe::ClockEventPhase::Commit ? commitTrace_(unit)
+                                                                 : unit->clockTraceStream();
+        if (stream) {
             stream->record(cycle, kind, transaction, value, id_, phase);
         }
     }
@@ -387,6 +400,8 @@ private:
     AsyncFifoCircuit<T> circuit_;
     uint64_t write_cycle_ = 0, read_cycle_ = 0;
     bool read_edge_ = false;
+    observe::ClockTraceStream* write_trace_ = nullptr;
+    observe::ClockTraceStream* read_trace_ = nullptr;
 };
 
 }  // namespace chronon::sender

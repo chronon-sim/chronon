@@ -2,8 +2,11 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -19,6 +22,7 @@ struct Recorded : TickableUnit {
     void record(uint64_t a, uint64_t b = 0, uint64_t c = 0) {
         worker = std::this_thread::get_id();
         events.insert(events.end(), {localCycle(), a, b, c});
+        clockEvent(ClockEventKind::User, 0, a);
     }
 };
 
@@ -92,7 +96,9 @@ struct Forward : Recorded {
 using Digest = std::vector<std::vector<uint64_t>>;
 
 Digest runGraph(size_t threads, uint64_t whz, uint64_t rhz, uint64_t phase, size_t depth, bool lazy,
-                bool segmented, uint32_t window, bool dynamic) {
+                bool segmented, uint32_t window, bool dynamic,
+                const std::filesystem::path& output = {}, unsigned trace_mode = 3,
+                std::vector<std::string>* trace_records = nullptr) {
     TickSimulationConfig config;
     config.num_threads = threads;
     config.enable_parallel = threads > 1;
@@ -112,6 +118,17 @@ Digest runGraph(size_t threads, uint64_t whz, uint64_t rhz, uint64_t phase, size
     auto* first = sim.connectAsyncFifo(1, w->out, m->in, {depth, 2});
     auto* second = sim.connectAsyncFifo(2, m->out, c->in, {4, 3});
     auto* ack = sim.connectAsyncFifo(3, c->out, a->ack, {2, 2});
+    if (!output.empty()) {
+        ClockTraceRecorder::Config trace;
+        trace.output_dir = output;
+        trace.text = trace_mode & 1;
+        trace.perfetto = trace_mode & 2;
+        trace.stream_capacity = 2;
+        trace.drain_batch = 1;
+        trace.reverse_drain = threads > 1;
+        trace.perfetto_options.clock_buffer_records = 128;
+        sim.configureClockTrace(trace);
+    }
     sim.initialize();
     assert(sim.useParallelExecution() == (threads > 1));
     if (segmented) {
@@ -126,6 +143,46 @@ Digest runGraph(size_t threads, uint64_t whz, uint64_t rhz, uint64_t phase, size
     if (threads > 1) {
         assert(a->worker == w->worker);  // Same-cycle ordinary dependency.
         assert(a->worker != m->worker || a->worker != c->worker || a->worker != b->worker);
+    }
+    sim.closeClockTrace();
+    if (!output.empty()) {
+        const auto stats = sim.clockTraceRecorder()->stats();
+        assert(!stats.dropped && stats.events > 0);
+        assert(stats.native_buffer_peak_records <= 128);
+        assert(stats.allocated_buffer_bytes + stats.allocated_staging_bytes <= 256 * 1024 * 1024);
+        if (threads > 1) assert(stats.allocated_staging_bytes && stats.peak_staging_records);
+    }
+    if (trace_records) {
+        const std::array<Recorded*, 5> units{a, b, w, m, c};
+        for (const auto& entry : std::filesystem::directory_iterator(output)) {
+            if (!entry.path().filename().string().starts_with("text-domain-")) continue;
+            std::ifstream file(entry.path());
+            std::string line;
+            while (std::getline(file, line)) {
+                if (line.starts_with('#')) continue;
+                std::istringstream row(line);
+                uint64_t cycle, id, phase_, transaction, fifo, value, ordinal;
+                std::string kind;
+                row >> cycle >> id >> kind >> phase_ >> transaction >> fifo >> value >> ordinal;
+                assert(row);
+                const auto unit = std::find_if(units.begin(), units.end(),
+                                               [&](auto* u) { return u->id() == id; });
+                assert(unit != units.end());
+                std::ostringstream normalized;
+                normalized << (*unit)->clockDomain().edge(cycle).floorNanoseconds() << '\t'
+                           << (*unit)->fullPath() << '\t' << cycle << '\t' << kind << '\t' << phase_
+                           << '\t' << transaction << '\t' << fifo << '\t' << value << '\t'
+                           << ordinal;
+                trace_records->push_back(normalized.str());
+            }
+        }
+        std::sort(trace_records->begin(), trace_records->end());
+        if (trace_mode & 2) {
+            std::ofstream reference(output / "reference.tsv");
+            reference
+                << "ts\tunit\tlocal_cycle\tevent\tphase\ttransaction_id\tfifo_id\tvalue\tordinal\n";
+            for (const auto& row : *trace_records) reference << row << '\n';
+        }
     }
     const auto state = [](const auto* fifo) {
         auto s = fifo->diagnostics();
@@ -150,7 +207,10 @@ struct Runner : TickableUnit {
     std::atomic<uint64_t>& progress;
     Runner(std::string name, std::atomic<uint64_t>& progress)
         : TickableUnit(std::move(name)), progress(progress) {}
-    void tick() override { progress.store(localCycle() + 1, std::memory_order_release); }
+    void tick() override {
+        clockEvent(ClockEventKind::User, 0, localCycle());
+        progress.store(localCycle() + 1, std::memory_order_release);
+    }
 };
 struct StalledWriter : TickableUnit {
     AsyncWritePort<uint64_t> out{this, "out"};
@@ -178,7 +238,7 @@ struct Reader : TickableUnit {
     }
 };
 
-void noDomainBarrier() {
+void noDomainBarrier(const std::filesystem::path& output = {}, unsigned mode = 3) {
     std::atomic<uint64_t> independent{0}, other{0};
     TickSimulationConfig config;
     config.num_threads = 4;
@@ -190,10 +250,21 @@ void noDomainBarrier() {
     auto* free = sim.createUnitInDomain<Runner>(1, "independent", independent);
     sim.createUnitInDomain<Runner>(2, "other", other);
     sim.connectAsyncFifo(1, w->out, r->in);
+    if (!output.empty()) {
+        ClockTraceRecorder::Config trace;
+        trace.output_dir = output;
+        trace.text = mode & 1;
+        trace.perfetto = mode & 2;
+        trace.stream_capacity = 2;
+        trace.drain_batch = 1;
+        trace.perfetto_options.clock_buffer_records = 64;
+        sim.configureClockTrace(trace);
+    }
     sim.initialize();
     assert(sim.useParallelExecution());
     assert(sim.assignedThread(w) != sim.assignedThread(free));
     assert(sim.runClockEvents(100) == 100);
+    sim.closeClockTrace();
 }
 
 struct Stopper : Recorded {
@@ -205,7 +276,7 @@ struct Stopper : Recorded {
     }
 };
 
-void terminationAndResume() {
+void terminationAndResume(const std::filesystem::path& output = {}) {
     TickSimulationConfig config;
     config.num_threads = 4;
     config.max_lookahead_cycles = 16;
@@ -215,6 +286,14 @@ void terminationAndResume() {
     auto* a = sim.createUnitInDomain<Stopper>(1, "a", 3);
     auto* b = sim.createUnitInDomain<Stopper>(1, "b", 3);
     sim.createUnitInDomain<Stopper>(2, "c", UINT64_MAX);
+    if (!output.empty()) {
+        ClockTraceRecorder::Config trace;
+        trace.output_dir = output;
+        trace.stream_capacity = 2;
+        trace.drain_batch = 1;
+        trace.perfetto_options.clock_buffer_records = 16;
+        sim.configureClockTrace(trace);
+    }
     sim.initialize();
     const auto count = sim.runClockEvents(1000);
     assert(count < 1000 && count == sim.schedulerSteps());
@@ -231,6 +310,7 @@ void terminationAndResume() {
     assert(sim.runClockEvents(23) == 23);
     assert(!sim.wasTerminationRequested());
     assert(sim.schedulerSteps() == count + 23);
+    sim.closeClockTrace();
 }
 
 struct Throws : TickableUnit {
@@ -263,7 +343,9 @@ void exceptionStopsPeers() {
     assert(caught);
 }
 
-int main() {
+int main(int argc, char** argv) {
+    const std::filesystem::path root = argc > 1 ? argv[1] : "out/clock-parallel";
+    std::filesystem::remove_all(root);
     for (const auto& [w, r, phase] : {std::tuple{1'000'000'000ULL, 1'000'000'000ULL, 0ULL},
                                       std::tuple{914'000'000ULL, 1'326'000'000ULL, 137ULL},
                                       std::tuple{2'000'000'000ULL, 500'000'000ULL, 1ULL},
@@ -283,6 +365,25 @@ int main() {
     noDomainBarrier();
     terminationAndResume();
     exceptionStopsPeers();
+    for (unsigned mode : {1u, 2u, 3u}) {
+        noDomainBarrier(root / ("independent-" + std::to_string(mode)), mode);
+        std::vector<std::string> reference;
+        const auto expected = runGraph(1, 3'000'000'000ULL, 4'000'000'000ULL, 125, 4, true, false,
+                                       32, false, root / ("serial-" + std::to_string(mode)), mode,
+                                       mode & 1 ? &reference : nullptr);
+        for (size_t threads : {2, 4}) {
+            for (uint32_t window : {1, 32}) {
+                std::vector<std::string> actual;
+                const auto output = root / ("graph-" + std::to_string(mode) + "-" +
+                                            std::to_string(threads) + "-" + std::to_string(window));
+                assert(runGraph(threads, 3'000'000'000ULL, 4'000'000'000ULL, 125, 4, true, true,
+                                window, true, output, mode,
+                                mode & 1 ? &actual : nullptr) == expected);
+                assert(actual == reference);
+            }
+        }
+    }
+    for (size_t i = 0; i < 8; ++i) terminationAndResume(root / ("stop-" + std::to_string(i)));
     std::cout << "multiclock epoch-free: differential graphs, local progress, stop/resume and "
                  "exception propagation passed\n";
 }

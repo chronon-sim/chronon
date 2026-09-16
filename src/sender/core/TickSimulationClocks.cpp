@@ -135,7 +135,12 @@ void TickSimulation::initializeClockRuntime_() {
     }
     clock_calendar_ = std::make_unique<ClockCalendar>(clocks);
     if (shouldUseParallelExecution_()) initializeClockParallel_();
-    if (clock_trace_) clock_trace_->start(true);
+    if (clock_trace_) {
+        if (shouldUseParallelExecution_())
+            clock_trace_->startParallel(config_.max_lookahead_cycles);
+        else
+            clock_trace_->start(true);
+    }
     if (config_.enable_parallel && !shouldUseParallelExecution_())
         std::clog << "[chronon] " << parallel_fallback_reason_ << '\n';
 }
@@ -245,6 +250,7 @@ void TickSimulation::configureClockTrace(observe::ClockTraceRecorder::Config con
 void TickSimulation::closeClockTrace() {
     if (!clock_trace_) return;
     for (auto* unit : unit_ptrs_) unit->clock_trace_stream_ = nullptr;
+    for (auto& fifo : cdc_) fifo->setClockTraceStreams(nullptr, nullptr);
     clock_trace_->close();
 }
 

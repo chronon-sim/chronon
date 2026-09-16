@@ -31,6 +31,7 @@ struct TickSimulation::ClockParallelRuntime {
         std::array<Endpoint, 2> endpoints;
         std::array<ClockEdge, 2> edges;
         std::array<bool, 2> participating{};
+        std::array<observe::ClockTraceStream*, 2> trace{};
         size_t edge_count = 0;
     };
     struct Batch {
@@ -55,12 +56,6 @@ void TickSimulation::selectClockExecutionMode_() {
     if (!config_.enable_lookahead) return fallback("enable_lookahead=false");
     if (!config_.enable_epoch_free_lookahead) return fallback("enable_epoch_free_lookahead=false");
     if (!config_.max_lookahead_cycles) return fallback("max_lookahead_cycles=0");
-    // The recorder's serial reservation protocol is not a multi-producer
-    // protocol. Keep its existing bounded-memory contract until clock actors
-    // have independent recording streams and asynchronous watermarks.
-    if (clock_trace_ && clock_trace_->enabled())
-        return fallback("clock tracing currently requires serial clock scheduling");
-
     unit_costs_ = has_precomputed_costs_ && precomputed_unit_costs_.size() == unit_ptrs_.size()
                       ? precomputed_unit_costs_
                       : std::vector<double>(unit_ptrs_.size(), 1.0);
@@ -96,6 +91,15 @@ void TickSimulation::initializeClockParallel_() {
         auto bridge = std::make_unique<ClockParallelRuntime::Bridge>();
         bridge->circuit = fifo.get();
         const std::array<Unit*, 2> owners{fifo->writeOwner(), fifo->readOwner()};
+        if (clock_trace_ && clock_trace_->enabled()) {
+            // Stable logical producers survive host placement changes. Units
+            // record evaluate events; only this bridge writes its commit streams.
+            const auto producer = uint64_t{fifo->id()} + 1;
+            bridge->trace = {
+                clock_trace_->addProducerStream(owners[0]->clockTraceStream(), producer),
+                clock_trace_->addProducerStream(owners[1]->clockTraceStream(), producer)};
+            fifo->setClockTraceStreams(bridge->trace[0], bridge->trace[1]);
+        }
         for (size_t side = 0; side < owners.size(); ++side) {
             auto& endpoint = bridge->endpoints[side];
             endpoint.cluster = cluster_of.at(owners[side]);
@@ -124,6 +128,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
     std::exception_ptr error;
     std::atomic_flag error_set = ATOMIC_FLAG_INIT;
     const auto token = stop_source_->get_token();
+    auto* trace = clock_trace_ && clock_trace_->parallelActive() ? clock_trace_.get() : nullptr;
 
     // Only worker zero manipulates the calendar. It grants a rolling bounded
     // window, never waits for a whole window, and retires individual completed
@@ -158,10 +163,15 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             runtime.pending.pop_front();
             progress = true;
         }
+        // Retirement observes both unit and bridge completion with acquire.
+        // Publish without waiting: actors sharing this worker must keep running
+        // while the backend drains its bounded observation window.
+        if (trace) trace->publishClockProgress(clock_calendar_->nextTime().floorNanoseconds());
         if (!settling) {
             while (runtime.pending.size() < config_.max_lookahead_cycles &&
                    scheduled < max_batches && !calendar.empty() &&
                    within_limit(calendar.nextTime()) && !token.stop_requested()) {
+                if (trace && !trace->tryAdmitClockBatch(calendar.nextTime())) break;
                 if (scheduled >= UINT64_MAX - (current_cycle_ - completed))
                     throw std::overflow_error("scheduler progress overflow");
                 const auto edges = calendar.pop();  // Validates representable successor edges.
@@ -176,7 +186,10 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                 progress = true;
             }
         }
-        if (runtime.pending.empty()) done.store(true, std::memory_order_release);
+        if (runtime.pending.empty() &&
+            (settling || scheduled == max_batches || calendar.empty() ||
+             !within_limit(calendar.nextTime()) || token.stop_requested()))
+            done.store(true, std::memory_order_release);
         return progress;
     };
 
@@ -193,6 +206,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             for (size_t side = 0; side < 2; ++side) {
                 auto& endpoint = bridge.endpoints[side];
                 if (bridge.participating[side]) {
+                    if (trace && bridge.trace[side]) bridge.trace[side]->endEdge();
                     ++endpoint.next;
                     endpoint.completed.store(endpoint.next, std::memory_order_release);
                 }
@@ -250,6 +264,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                                 unit->clock_edge_executing_ = true;
                                 executeUnitCycle_(unit, cycle);
                                 unit->clock_edge_executing_ = false;
+                                if (auto* stream = unit->clockTraceStream()) stream->endEdge();
                             }
                             published.store(cycle + 1, std::memory_order_release);
                             progress = true;
