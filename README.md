@@ -34,6 +34,60 @@ make -j$(nproc)
 ctest --output-on-failure
 ```
 
+## Use Chronon from another project
+
+Chronon supports `add_subdirectory`, CPM, and an installed CMake package. All
+three expose `chronon::core` and `chronon::observe`.
+
+With [CPM.cmake](https://github.com/cpm-cmake/CPM.cmake) loaded in the parent project:
+
+```cmake
+CPMAddPackage(
+    NAME chronon
+    GITHUB_REPOSITORY chronon-sim/chronon
+    GIT_TAG main # Pin a release tag or full commit for reproducible builds.
+    OPTIONS "CHRONON_BUILD_TESTS OFF" "CHRONON_BUILD_BENCHMARKS OFF"
+)
+target_link_libraries(my_sim PRIVATE chronon::core)
+```
+
+Set `CPM_SOURCE_CACHE` to an absolute shared cache directory to reuse downloads
+across build trees. Use `CPM_chronon_SOURCE` to develop against a local checkout;
+CPM applies this override before its download/cache lookup:
+
+```bash
+cmake -S . -B build -DCPM_SOURCE_CACHE="$HOME/.cache/CPM"
+cmake -S . -B build -DCPM_chronon_SOURCE=/absolute/path/to/chronon
+```
+
+Chronon reuses the parent's CPM instance and compatible dependencies already
+registered with CPM, including a pre-downloaded Perfetto SDK. Nested CPM
+consumers are supported. Use the dependency versions specified by Chronon's
+CMakeLists when preloading dependencies; arbitrary version combinations are
+not a compatibility guarantee.
+
+For installation, build and install Chronon before configuring the consumer:
+
+```bash
+cmake -S . -B build-install -DCMAKE_BUILD_TYPE=Release -DCHRONON_INSTALL=ON
+cmake --build build-install -j
+cmake --install build-install --prefix /absolute/path/to/chronon-install
+```
+
+```cmake
+find_package(chronon CONFIG REQUIRED)
+target_link_libraries(my_sim PRIVATE chronon::core)
+```
+
+Configure the consumer with `-DCMAKE_PREFIX_PATH=/absolute/path/to/chronon-install`.
+Installation honors `CMAKE_INSTALL_LIBDIR`, `CMAKE_INSTALL_INCLUDEDIR`, and
+`CMAKE_INSTALL_BINDIR` from GNUInstallDirs. Keep these paths relative for
+`--prefix` and relocation support. For a custom library directory that CMake
+does not search automatically, set `chronon_DIR` to
+`<prefix>/<libdir>/cmake/chronon` and `stdexec_DIR` to
+`<prefix>/<libdir>/cmake/stdexec`. System dependencies (yaml-cpp, fmt, zlib and
+threads) must also be available to the consumer.
+
 ## Basic Usage
 
 ```cpp

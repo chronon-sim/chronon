@@ -113,10 +113,33 @@ if(CHRONON_INSTALL)
     add_test(NAME installed_consumer
         COMMAND ${CMAKE_COMMAND}
             -DCHRONON_BUILD_DIR=${CMAKE_BINARY_DIR}
+            -DINSTALL_LIBDIR=${CMAKE_INSTALL_LIBDIR}
             -DCONSUMER_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/install
             -DWORK_DIR=${PROJECT_BINARY_DIR}/out/install-consumer
             -DCXX=${CMAKE_CXX_COMPILER}
             -DCONFIG=$<CONFIG>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/install/run.cmake)
     set_tests_properties(installed_consumer PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+
+    include(FetchContent)
+    set(package_dependency_cache "${CMAKE_CURRENT_BINARY_DIR}/package-dependencies.cmake")
+    file(WRITE "${package_dependency_cache}" "# Local dependency sources for package tests.\n")
+    foreach(dependency stdexec perfetto icm rapids-cmake)
+        FetchContent_GetProperties(${dependency} SOURCE_DIR dependency_source)
+        string(TOUPPER "${dependency}" dependency_upper)
+        file(APPEND "${package_dependency_cache}"
+            "set(FETCHCONTENT_SOURCE_DIR_${dependency_upper} \"${dependency_source}\" CACHE PATH \"\" FORCE)\n")
+    endforeach()
+    add_test(NAME cpm_consumers
+        COMMAND ${CMAKE_COMMAND}
+            -DCHRONON_SOURCE=${chronon_SOURCE_DIR}
+            -DCHRONON_BUILD_DIR=${CMAKE_BINARY_DIR}
+            -DCONSUMER_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/package
+            -DWORK_DIR=${PROJECT_BINARY_DIR}/out/cpm-consumers
+            -DCPM_MODULE=${CPM_DOWNLOAD_LOCATION}
+            -DSTDEXEC_BUILD=${stdexec_BINARY_DIR}
+            -DDEPENDENCY_CACHE=${package_dependency_cache}
+            -DCXX=${CMAKE_CXX_COMPILER}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/package/run.cmake)
+    set_tests_properties(cpm_consumers PROPERTIES TIMEOUT 1200 RUN_SERIAL TRUE)
 endif()
