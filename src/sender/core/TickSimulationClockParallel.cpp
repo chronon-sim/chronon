@@ -308,6 +308,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                 try {
                     auto& scratch = worker_run_scratch_[worker];
                     InvocationPredecessorCache cache(scratch.predecessor, thread_progress_count_);
+                    uint64_t* const predecessor_cycles = cache.data();
                     auto& owned_clusters = scratch.owned_clusters;
                     auto& owned_bridges = scratch.owned_bridges;
                     auto& owned_actors = scratch.owned_actors;
@@ -406,7 +407,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             }
                             BlockedClusterInfo blocker;
                             if (!ready) continue;
-                            if (!clusterCanAdvance_(c, cycle, blocker, cache.data())) {
+                            if (!clusterCanAdvance_(c, cycle, blocker, predecessor_cycles)) {
                                 if (profile) ++profile->dependency_waits;
                                 if (sample_wait)
                                     blocked(c, blocker.pred_cluster, state.clock->edge(cycle));
