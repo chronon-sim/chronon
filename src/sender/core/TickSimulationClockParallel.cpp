@@ -169,7 +169,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             clock_time_ = batch.time;
             ++current_cycle_;
             ++completed;
-            runtime.pending_head = (runtime.pending_head + 1) % runtime.pending.size();
+            if (++runtime.pending_head == runtime.pending.size()) runtime.pending_head = 0;
             --runtime.pending_size;
             progress = true;
         }
@@ -351,11 +351,18 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                         };
                         SchedulerTimelineTrace::TimePoint wait_begin{};
                         if (sample_wait) wait_begin = SchedulerTimelineTrace::Clock::now();
+                        // Reuse the single-clock stable-sweep protocol. Only
+                        // this worker can relinquish its actors, in service()
+                        // AFTER the entire sweep. A concurrent peer handoff can
+                        // only add an actor; refresh acquires it on the next sweep.
+                        const bool stable_sweep =
+                            !dynamic || migration_request_.state.load(std::memory_order_acquire) ==
+                                            static_cast<uint8_t>(MigrationRequestState::None);
                         if (dynamic && seen_generation != cluster_assignment_generation_.load(
                                                               std::memory_order_acquire))
                             refresh();
                         for (const auto index : owned_bridges) {
-                            if (dynamic &&
+                            if (dynamic && !stable_sweep &&
                                 cluster_runtime_owner_[clusters_.numClusters() + index].load(
                                     std::memory_order_acquire) != worker)
                                 continue;
@@ -363,7 +370,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             progress = bridge_step(index, blocked, profile) || progress;
                         }
                         for (const auto c : owned_clusters) {
-                            if (dynamic &&
+                            if (dynamic && !stable_sweep &&
                                 cluster_runtime_owner_[c].load(std::memory_order_acquire) != worker)
                                 continue;
                             if (profile) ++profile->cluster_polls;

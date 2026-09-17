@@ -69,7 +69,10 @@ struct TickSimulation::ClockParallelRuntime {
     std::vector<Batch> pending;
     size_t pending_head = 0, pending_size = 0;
     uint64_t coordinator_sweep = 0;
-    Batch& pendingAt(size_t index) { return pending[(pending_head + index) % pending.size()]; }
+    Batch& pendingAt(size_t index) {
+        const auto slot = pending_head + index;
+        return pending[slot < pending.size() ? slot : slot - pending.size()];
+    }
     // Migration heuristics use reference-clock cycles of retired physical time,
     // never incomparable actor-local cycles or calendar batch counts.
     std::atomic<uint64_t> rebalance_cycle{0};
