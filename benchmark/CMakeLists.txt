@@ -6,12 +6,17 @@ target_link_libraries(chronon_scheduler_invocation_benchmark PRIVATE chronon::co
 target_compile_definitions(chronon_scheduler_invocation_benchmark PRIVATE CHRONON_BENCH_SCRATCH=1)
 add_executable(chronon_placement_scoring_benchmark placement_scoring_benchmark.cpp)
 target_link_libraries(chronon_placement_scoring_benchmark PRIVATE chronon::core chronon_compile_options)
+# Count allocations in separate executables: a shared atomic counter changes
+# allocator contention and must not be enabled in throughput measurements.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8
    AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT BUILD_SHARED_LIBS)
-    target_compile_definitions(chronon_scheduler_invocation_benchmark PRIVATE CHRONON_COUNT_CLOCK_ALLOCATIONS=1)
-    target_link_options(chronon_scheduler_invocation_benchmark PRIVATE "-Wl,--wrap=_Znwm" "-Wl,--wrap=_Znam")
-    target_compile_definitions(chronon_placement_scoring_benchmark PRIVATE CHRONON_COUNT_CLOCK_ALLOCATIONS=1)
-    target_link_options(chronon_placement_scoring_benchmark PRIVATE "-Wl,--wrap=_Znwm" "-Wl,--wrap=_Znam")
+    foreach(kind scheduler_invocation placement_scoring)
+        add_executable(chronon_${kind}_allocations ${kind}_benchmark.cpp)
+        target_link_libraries(chronon_${kind}_allocations PRIVATE chronon::core chronon_compile_options)
+        target_compile_definitions(chronon_${kind}_allocations PRIVATE
+            CHRONON_BENCH_SCRATCH=1 CHRONON_COUNT_CLOCK_ALLOCATIONS=1)
+        target_link_options(chronon_${kind}_allocations PRIVATE "-Wl,--wrap=_Znwm" "-Wl,--wrap=_Znam")
+    endforeach()
 endif()
 
 add_executable(chronon_multiclock_benchmark multiclock_benchmark.cpp)

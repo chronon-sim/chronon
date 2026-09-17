@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 
+#include "BenchmarkThreadAffinity.hpp"
 #include "ClockAllocationCount.hpp"
 #include "SchedulerInvocationModel.hpp"
 
@@ -48,6 +49,7 @@ int main(int argc, char** argv) {
     config.max_lookahead_cycles = 32;
     config.epoch_size = interval ? interval : 32;
     TickSimulation sim(config);
+    pinBenchmarkWorkers(threads);
     const auto units = invocationModel(sim, clock, pairs, work, skew);
     const auto init_alloc = clockAllocations();
     const auto init_begin = std::chrono::steady_clock::now();
@@ -61,6 +63,8 @@ int main(int argc, char** argv) {
     if (advance(128) != 128) return 3;
     const auto start = clock ? sim.schedulerSteps() : sim.currentCycle();
     uint64_t predicates = 0;
+    rusage before{};
+    getrusage(RUSAGE_SELF, &before);
     const auto run_alloc = clockAllocations();
     const auto begin = std::chrono::steady_clock::now();
     const auto completed = interval ? sim.runUntil(
@@ -85,17 +89,23 @@ int main(int argc, char** argv) {
     }
     rusage usage{};
     getrusage(RUSAGE_SELF, &usage);
+    const auto cpuSeconds = [](const rusage& r) {
+        return r.ru_utime.tv_sec + r.ru_utime.tv_usec / 1e6 + r.ru_stime.tv_sec +
+               r.ru_stime.tv_usec / 1e6;
+    };
     size_t retained = 0;
 #ifdef CHRONON_BENCH_SCRATCH
     retained = sender::SchedulerScratchTestAccess::bytes(sim);
 #endif
     std::cout << "init_s,run_s,init_allocations,run_allocations,worker_scratch_bytes,rss_kib,"
-                 "predicates,parallel,ticks,sent,received,checksum,digest,overflow\n"
+                 "run_cpu_s,voluntary_switches,involuntary_switches,predicates,parallel,ticks,sent,"
+                 "received,checksum,digest,overflow\n"
               << std::setprecision(12)
               << std::chrono::duration<double>(init_end - init_begin).count() << ','
               << std::chrono::duration<double>(end - begin).count() << ',' << init_allocations
               << ',' << allocations << ',' << retained << ',' << usage.ru_maxrss << ','
-              << predicates << ',' << sim.useParallelExecution() << ',' << ticks << ',' << sent
-              << ',' << received << ',' << checksum << ',' << digest << ','
-              << sim.totalTransportOverflowEvents() << '\n';
+              << cpuSeconds(usage) - cpuSeconds(before) << ',' << usage.ru_nvcsw - before.ru_nvcsw
+              << ',' << usage.ru_nivcsw - before.ru_nivcsw << ',' << predicates << ','
+              << sim.useParallelExecution() << ',' << ticks << ',' << sent << ',' << received << ','
+              << checksum << ',' << digest << ',' << sim.totalTransportOverflowEvents() << '\n';
 }

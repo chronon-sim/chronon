@@ -14,6 +14,13 @@ incremental evaluation on the same generated graph:
 ./build/benchmark/chronon_placement_scoring_benchmark incremental 128 8 8 10
 ```
 
+Timing executables leave allocation counters disabled. On supported Linux static
+builds, the matching `chronon_placement_scoring_allocations` and
+`chronon_scheduler_invocation_allocations` executables enable counters for a
+separate allocation-only run; their timing must not be used as throughput data.
+Pass `--count-allocations` to the baseline builder to produce the latter baseline
+counter executable.
+
 Check `valid` and `selection` before comparing the separately reported preparation
 and scoring time/allocation counts. Include preparation in total planning cost.
 `retained_bytes` includes the prepared snapshot and its vector capacities.
@@ -43,7 +50,15 @@ python3 benchmark/build_baseline_invocation.py /path/to/baseline/build
 
 Run fresh processes in interleaved, shuffled order with the same physical CPU
 affinity and no competing builds/tests. Report repeated medians and ranges for
-each scenario independently. The C++ allocation wrappers count scalar/array
+each scenario independently. An optional Linux control,
+`CHRONON_BENCH_PIN_WORKERS=1`, assigns each existing pool thread to a distinct CPU
+from that mask before model construction and timing, and pins the caller to the
+last allowed CPU (the first for sequential runs). Use the same setting on both
+revisions and choose distinct physical cores. Keep ordinary-mask measurements
+separate: the OS may otherwise place mutually waiting workers on the same CPU.
+`run_cpu_s` and voluntary/involuntary context switches help identify that noise.
+
+The C++ allocation wrappers count scalar/array
 `new` in statically linked code; they exclude aligned allocation, `malloc` and
 shared-library internals. `worker_scratch_bytes` measures retained worker vector
 capacity plus the worker scratch objects in the candidate (zero in the baseline);
