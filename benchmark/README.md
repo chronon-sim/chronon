@@ -57,6 +57,10 @@ last allowed CPU (the first for sequential runs). Use the same setting on both
 revisions and choose distinct physical cores. Keep ordinary-mask measurements
 separate: the OS may otherwise place mutually waiting workers on the same CPU.
 `run_cpu_s` and voluntary/involuntary context switches help identify that noise.
+With pinning enabled, `CHRONON_BENCH_WARM_CPUS=1` adds a 150 ms CPU warmup
+on each selected core before the identical model warmup. These temporary threads
+join before the measured run. Apply it to both revisions and report this control;
+it changes neither model work nor predicate cadence.
 
 The C++ allocation wrappers count scalar/array
 `new` in statically linked code; they exclude aligned allocation, `malloc` and

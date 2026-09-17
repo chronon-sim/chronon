@@ -49,13 +49,14 @@ int main(int argc, char** argv) {
     config.max_lookahead_cycles = 32;
     config.epoch_size = interval ? interval : 32;
     TickSimulation sim(config);
-    pinBenchmarkWorkers(threads);
+    const auto worker_cpus = pinBenchmarkWorkers(threads);
     const auto units = invocationModel(sim, clock, pairs, work, skew);
     const auto init_alloc = clockAllocations();
     const auto init_begin = std::chrono::steady_clock::now();
     sim.initialize();
     const auto init_end = std::chrono::steady_clock::now();
     const auto init_allocations = clockAllocations() - init_alloc;
+    warmBenchmarkCpus(worker_cpus);
     // Warm storage/queues once, with identical calls in baseline and candidate.
     const auto advance = [&](uint64_t count) {
         return clock ? sim.runClockEvents(count) : sim.run(count);
