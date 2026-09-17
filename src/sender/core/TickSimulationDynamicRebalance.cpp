@@ -190,7 +190,6 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     auto* const priority_blocker_ns = scratch.priority_blocker.data();
     auto* const priority_cost_ns = scratch.priority_cost.data();
     auto* const ready_through_cycle = scratch.ready_through.data();
-    std::span<const size_t> owned_view;
     uint64_t seen_generation = 0;
     uint64_t priority_refresh = 0;
     uint64_t wait_sample_sequence = 0;
@@ -202,7 +201,6 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     auto refresh_owned_clusters = [&]() {
         if (!cluster_runtime_owner_) return;
         refreshDynamicOwnedActors_(thread_idx, owned_clusters, refreshed_clusters, seen_generation);
-        owned_view = owned_clusters;
     };
 
     auto all_clusters_done = [&]() {
@@ -217,7 +215,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
 
     auto prioritize_owned_clusters = [&]() {
         if (owned_clusters.size() < 2) return;
-        for (size_t cluster : owned_view) {
+        for (size_t cluster : owned_clusters) {
             priority_blocker_ns[cluster] =
                 dynamic_cluster_blocker_wait_ns_
                     ? dynamic_cluster_blocker_wait_ns_[cluster].load(std::memory_order_relaxed)
@@ -307,7 +305,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
         uint64_t blocked_floor_needed = 0;
         BlockedClusterInfo blocker{};
 
-        for (size_t cluster : owned_view) {
+        for (size_t cluster : owned_clusters) {
             auto& progress = thread_progress_array_[cluster].completed_cycle;
             uint64_t cycle = progress.load(std::memory_order_relaxed);
             if (!stable_sweep &&
@@ -449,7 +447,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
 
         if constexpr (PushPeriodicCounters) {
             auto& obs_mgr = observe::ObservationManager::instance();
-            for (size_t cluster : owned_view) {
+            for (size_t cluster : owned_clusters) {
                 if (!counter_producer || !cluster_runtime_owner_ ||
                     cluster_runtime_owner_[cluster].load(std::memory_order_acquire) != thread_idx) {
                     continue;
@@ -588,7 +586,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
 
             bool any_ready = false;
             bool all_done = local_done ? all_clusters_done() : true;
-            for (size_t cluster : owned_view) {
+            for (size_t cluster : owned_clusters) {
                 uint64_t cycle =
                     thread_progress_array_[cluster].completed_cycle.load(std::memory_order_relaxed);
                 if (cycle < end_cycle) {

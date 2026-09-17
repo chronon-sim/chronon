@@ -246,6 +246,8 @@ bool TickSimulation::executeClockBatch_() {
 uint64_t TickSimulation::runClockEvents(uint64_t max_event_batches) {
     requireClockRun_();
     if (shouldUseParallelExecution_()) return runClockEpochFree_(max_event_batches);
+    // A predicate interval of one needs a single batch, with no counted loop.
+    if (max_event_batches == 1) return executeClockBatch_();
     uint64_t count = 0;
     while (count < max_event_batches && executeClockBatch_()) ++count;
     return count;
