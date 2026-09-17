@@ -178,8 +178,19 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     };
     const size_t num_clusters = dynamic_runtime_cluster_count_;
     auto& scratch = schedulerScratch_().workers[thread_idx];
-    auto& owned_clusters = scratch.owned_clusters;
-    auto& refreshed_clusters = scratch.ownership;
+    // Keep the vector headers invocation-local while borrowing their retained
+    // allocations. Unit callbacks cannot alias these local ownership headers.
+    auto owned_clusters = std::move(scratch.owned_clusters);
+    auto refreshed_clusters = std::move(scratch.ownership);
+    struct RestoreOwnershipStorage {
+        WorkerRunScratch& scratch;
+        std::vector<size_t>& owned;
+        std::vector<size_t>& refreshed;
+        ~RestoreOwnershipStorage() {
+            scratch.owned_clusters.swap(owned);
+            scratch.ownership.swap(refreshed);
+        }
+    } restore_ownership{scratch, owned_clusters, refreshed_clusters};
     owned_clusters.clear();
     refreshed_clusters.clear();
     InvocationPredecessorCache predecessor_cache(scratch.predecessor, thread_progress_count_);
