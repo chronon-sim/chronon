@@ -57,8 +57,8 @@ void TickSimulation::initialize() {
         precomputed_unit_costs_ = std::move(remapped);
     }
 
-    // Tight (delay=0) connections are grouped into indivisible scheduler
-    // clusters so epoch-free workers preserve same-cycle producer order.
+    // Delay-zero connectivity remains distinct from additional scheduler
+    // co-location constraints, which are built after capacities are final.
     has_tight_connections_ = hasTightConnections();
 
     auto& obs_mgr = observe::ObservationManager::instance();
@@ -80,11 +80,15 @@ void TickSimulation::initialize() {
         unit->initialize();
     }
 
+    for (auto* connection : connections_) connection->prepareRegisteredCapacity();
+
     // Unit::initialize() may finalize Port capacities. Discover transparent
     // transports only after those model-visible settings are stable, but
     // before thread assignment chooses physical queue adapters and computes
     // cross-thread headroom dependencies.
     transparent_broadcast_connection_count_ = optimizeTransparentBroadcasts_();
+
+    if (config_.enable_parallel) buildSchedulingClusters_();
 
     selectExecutionMode_();
     initClusterActivityScheduling_();
@@ -277,7 +281,7 @@ void TickSimulation::selectExecutionMode_() {
             assignThreadsDeterministic_();
         }
         parallel_beneficial_ = parallelBeneficialWeighted_();
-    } else if (has_tight_connections_) {
+    } else if (clusters_.numClusters() < unit_ptrs_.size()) {
         buildClusterAffinity();
     } else {
         buildThreadAssignment();
@@ -800,14 +804,6 @@ void TickSimulation::optimizeConnectionQueuesForDynamicRebalance_() {
 void TickSimulation::buildThreadAssignment() {
     size_t num_threads = normalizeThreadCount(config_.num_threads);
     config_.num_threads = num_threads;
-
-    clusters_.cluster_id.resize(unit_ptrs_.size());
-    clusters_.clusters.resize(unit_ptrs_.size());
-    for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-        clusters_.cluster_id[i] = i;
-        clusters_.clusters[i].assign(1, i);
-    }
-    unit_to_cluster_ = clusters_.cluster_id;
 
     // Topology-aware thread assignment minimizes cross-thread edges by
     // weighting adjacency as 1/delay (higher = tighter coupling).

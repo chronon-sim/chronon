@@ -426,8 +426,8 @@ void test_zero_slack_feedback_falls_back_to_sequential() {
     auto* b1 = sim.createUnit<RelayUnit>("b1");
     auto* b2 = sim.createUnit<RelayUnit>("b2");
 
-    // Two tight intra-cluster chains force two size-3 clusters. With two
-    // threads, the bidirectional delay-1/capacity-1 links must cross threads.
+    // Two delay-zero chains and their zero-slack admission feedback form one
+    // indivisible cluster. With no independent work, sequential is appropriate.
     sim.connect(a->local_out, a1->in, 0);
     sim.connect(a1->out, a2->in, 0);
     sim.connect(b->local_out, b1->in, 0);
@@ -442,7 +442,7 @@ void test_zero_slack_feedback_falls_back_to_sequential() {
     sim.run(8);
 
     require(sim.epochFreeRunCount() == 0,
-            "zero-slack feedback cycle should veto epoch-free lookahead");
+            "single feedback cluster should use sequential execution");
     require(a->ticks() == 8 && b->ticks() == 8,
             "sequential fallback did not execute zero-slack feedback units");
 

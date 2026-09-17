@@ -149,17 +149,6 @@ void TickSimulation::assignThreadsFromPrecomputedCosts_() {
 
 void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
                                                      double partition_sync_cost_ns) {
-    if (dep_graph_.graph()) {
-        clusters_ = findTightCouplingClusters(*dep_graph_.graph());
-    } else {
-        clusters_.cluster_id.resize(unit_ptrs_.size());
-        clusters_.clusters.resize(unit_ptrs_.size());
-        for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-            clusters_.cluster_id[i] = i;
-            clusters_.clusters[i].assign(1, i);
-        }
-    }
-    unit_to_cluster_ = clusters_.cluster_id;
     size_t num_clusters = clusters_.numClusters();
 
     std::vector<double> cluster_costs(num_clusters, 0.0);
@@ -348,9 +337,6 @@ bool TickSimulation::parallelBeneficialWeighted_() const {
 void TickSimulation::buildClusterAffinity() {
     if (!dep_graph_.graph()) return;
 
-    clusters_ = findTightCouplingClusters(*dep_graph_.graph());
-    unit_to_cluster_ = clusters_.cluster_id;
-
     cluster_to_thread_.resize(clusters_.numClusters());
     size_t num_threads = normalizeThreadCount(config_.num_threads);
     config_.num_threads = num_threads;
@@ -391,6 +377,10 @@ void TickSimulation::buildClusterAffinity() {
     }
 
     optimizeConnectionQueuesForThreads();
+
+    for (auto* unit : unit_ptrs_) unit->useFastCycleCounter();
+    has_thread_assignment_ = true;
+    buildCrossThreadDependencies();
 
     has_tight_inter_cluster_ = hasTightInterClusterConnections();
 

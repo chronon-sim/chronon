@@ -356,8 +356,8 @@ void verify_transport_headroom(uint64_t cycles, unsigned hw) {
     check(far.epoch_free_runs > 0,
           "transport-clamp keeps epoch-free past configured ring capacity");
 
-    // (1b) A one-entry DFF-style edge is still epoch-free safe. The scheduler
-    //      represents it as a zero-slack reverse dependency.
+    // (1b) Each DFF edge has zero-slack reverse credit. This closed feedback
+    //      graph forms one indivisible cluster, with no independent work left.
     const uint64_t ref_cap1 =
         runOnce(1, 1, /*threads=*/1, /*lookahead=*/false, /*epoch_free=*/false,
                 /*max_lookahead=*/100, cycles, /*out_rate=*/1, /*scheduler_timeline=*/false,
@@ -368,7 +368,8 @@ void verify_transport_headroom(uint64_t cycles, unsigned hw) {
                              /*scheduler_timeline=*/false, /*dynamic_rebalance=*/false,
                              /*edge_capacity=*/1, /*edge_rate=*/1);
     check(cap1.checksum == ref_cap1, "transport-capacity-one epoch-free == ref");
-    check(cap1.epoch_free_runs > 0, "transport-capacity-one keeps epoch-free");
+    check(cap1.epoch_free_runs == 0 && !cap1.parallel,
+          "closed capacity-one feedback uses one sequential cluster");
 
     // (2) Default/unlimited source rate is not provable for bounded registered
     //     headroom, so epoch-free must be vetoed unless the edge declares a rate.

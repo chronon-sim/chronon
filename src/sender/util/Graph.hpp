@@ -12,8 +12,10 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <span>
 #include <stack>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace chronon::sender {
@@ -342,7 +344,7 @@ inline std::vector<std::vector<size_t>> findIndependentSubgraphs(const DirectedG
 /**
  * @brief Tight-coupling cluster assignment from findTightCouplingClusters().
  *
- * Units connected by delay=0 edges share a cluster and must execute on the same thread.
+ * Zero-delay and additional scheduling constraints share an indivisible cluster.
  */
 struct TightCouplingResult {
     std::vector<size_t> cluster_id;
@@ -353,8 +355,10 @@ struct TightCouplingResult {
     const std::vector<size_t>& getCluster(size_t node) const { return clusters[cluster_id[node]]; }
 };
 
-/// Union-Find clustering over zero-weight edges. Time O(E·α(V)), space O(V).
-inline TightCouplingResult findTightCouplingClusters(const DirectedGraph& graph) {
+/// Union-Find over zero-weight edges and explicit co-location constraints.
+/// Constraints do not modify the graph's modeled connection delays.
+inline TightCouplingResult findTightCouplingClusters(
+    const DirectedGraph& graph, std::span<const std::pair<size_t, size_t>> co_location = {}) {
     const size_t n = graph.numNodes();
 
     std::vector<size_t> parent(n);
@@ -393,6 +397,8 @@ inline TightCouplingResult findTightCouplingClusters(const DirectedGraph& graph)
             }
         }
     }
+
+    for (const auto& [source, destination] : co_location) unite(source, destination);
 
     TightCouplingResult result;
     result.cluster_id.resize(n);
