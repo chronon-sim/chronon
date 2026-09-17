@@ -77,7 +77,8 @@ extends one-call and interval-64 cases while preserving check cadence;
 The C++ allocation wrappers count scalar/array
 `new` in statically linked code; they exclude aligned allocation, `malloc` and
 shared-library internals. `worker_scratch_bytes` measures retained worker vector
-capacity plus the worker scratch objects in the candidate (zero in the baseline);
+capacity plus the worker scratch objects in the candidate allocation executable
+(zero in the baseline and in both timing executables);
 `rss_kib` is process peak RSS, not a precise scratch measurement. These probes do
 not establish universal downstream speedups.
 

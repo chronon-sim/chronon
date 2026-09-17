@@ -80,12 +80,13 @@ void TickSimulation::installMultiProducerProgress_() {
 
 void TickSimulation::freeThreadProgressArray() {
     // Topology/progress replacement happens with all worker tasks joined.
-    scheduler_scratch_.reset();
     if (thread_progress_array_) {
+        auto* storage = &schedulerScratch_();
+        std::destroy_at(storage);
         for (size_t i = 0; i < thread_progress_count_; ++i) {
             thread_progress_array_[i].~ThreadProgress();
         }
-        std::free(thread_progress_array_);
+        std::free(storage);
         thread_progress_array_ = nullptr;
         thread_progress_count_ = 0;
     }
@@ -99,11 +100,16 @@ void TickSimulation::initProgressSync() {
     if (num_clusters == 0) return;
 
     freeThreadProgressArray();
-    scheduler_scratch_ = std::make_unique<SchedulerScratch>();
-    scheduler_scratch_->workers.resize(num_threads);
+    if (num_clusters > (SIZE_MAX - kSchedulerScratchStorageBytes) / sizeof(ThreadProgress))
+        throw std::bad_array_new_length();
+    void* mem =
+        std::aligned_alloc(alignof(ThreadProgress),
+                           kSchedulerScratchStorageBytes + num_clusters * sizeof(ThreadProgress));
+    if (!mem) throw std::bad_alloc();
+    std::construct_at(static_cast<SchedulerScratch*>(mem));
+    thread_progress_array_ = reinterpret_cast<ThreadProgress*>(static_cast<std::byte*>(mem) +
+                                                               kSchedulerScratchStorageBytes);
     thread_progress_count_ = num_clusters;
-    void* mem = std::aligned_alloc(64, num_clusters * sizeof(ThreadProgress));
-    thread_progress_array_ = static_cast<ThreadProgress*>(mem);
     for (size_t i = 0; i < num_clusters; ++i) {
         new (&thread_progress_array_[i]) ThreadProgress();
         uint64_t cycle = 0;
@@ -116,6 +122,7 @@ void TickSimulation::initProgressSync() {
         thread_progress_array_[i].completed_cycle.store(cycle, std::memory_order_relaxed);
     }
 
+    schedulerScratch_().workers.resize(num_threads);
     thread_resolved_deps_.resize(num_clusters);
     for (size_t c = 0; c < num_clusters; ++c) {
         thread_resolved_deps_[c].clear();
@@ -323,7 +330,7 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     // This cache spans the worker invocation (the entire run in EpochFree mode),
     // allowing all locally-owned clusters to reuse acquired predecessor progress.
     InvocationPredecessorCache predecessor_cache(
-        scheduler_scratch_->workers[thread_idx].predecessor, thread_progress_count_);
+        schedulerScratch_().workers[thread_idx].predecessor, thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;

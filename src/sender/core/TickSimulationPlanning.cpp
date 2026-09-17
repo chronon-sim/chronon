@@ -64,7 +64,7 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
 
     const size_t num_threads = thread_units_.size();
     const size_t num_clusters = dynamic_runtime_cluster_count_;
-    auto& planning = scheduler_scratch_->planning;
+    auto& planning = schedulerScratch_().planning;
     if (!planning) planning = std::make_shared<PlanningScratch>();
     auto& scratch = *planning;
     auto& input = scratch.input;

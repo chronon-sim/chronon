@@ -3,7 +3,6 @@
 
 add_executable(chronon_scheduler_invocation_benchmark scheduler_invocation_benchmark.cpp)
 target_link_libraries(chronon_scheduler_invocation_benchmark PRIVATE chronon::core chronon_compile_options)
-target_compile_definitions(chronon_scheduler_invocation_benchmark PRIVATE CHRONON_BENCH_SCRATCH=1)
 add_executable(chronon_placement_scoring_benchmark placement_scoring_benchmark.cpp)
 target_link_libraries(chronon_placement_scoring_benchmark PRIVATE chronon::core chronon_compile_options)
 # Count allocations in separate executables: a shared atomic counter changes

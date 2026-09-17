@@ -9,16 +9,45 @@ namespace chronon::sender {
 struct SchedulerScratchTestAccess {
     static std::vector<const void*> storage(const TickSimulation& sim) {
         std::vector<const void*> result;
-        if (!sim.scheduler_scratch_) return result;
-        for (const auto& worker : sim.scheduler_scratch_->workers) {
+        if (!sim.thread_progress_array_) return result;
+        for (const auto& worker : sim.schedulerScratch_().workers) {
             result.push_back(worker.predecessor.observed_cycles.data());
             result.push_back(worker.ready_through.data());
         }
         return result;
     }
+    static void assertOwnershipLists(const TickSimulation& sim) {
+        if (!sim.cluster_runtime_owner_) return;
+        std::vector<size_t> seen_clusters(sim.clusters_.numClusters());
+        std::vector<size_t> seen_units(sim.unit_ptrs_.size());
+        for (size_t worker = 0; worker < sim.thread_units_.size(); ++worker) {
+            for (const size_t cluster : sim.thread_clusters_[worker]) {
+                assert(sim.cluster_runtime_owner_[cluster].load() == worker);
+                assert(++seen_clusters[cluster] == 1);
+            }
+            for (const size_t unit : sim.thread_units_[worker]) {
+                assert(sim.cluster_runtime_owner_[sim.unit_to_cluster_[unit]].load() == worker);
+                assert(++seen_units[unit] == 1);
+            }
+        }
+        assert(
+            std::all_of(seen_clusters.begin(), seen_clusters.end(), [](auto n) { return n == 1; }));
+        assert(std::all_of(seen_units.begin(), seen_units.end(), [](auto n) { return n == 1; }));
+        if (sim.clock_parallel_) {
+            std::vector<size_t> seen(sim.clock_parallel_->bridges.size());
+            for (size_t worker = 0; worker < sim.clock_parallel_->worker_bridges.size(); ++worker)
+                for (const size_t bridge : sim.clock_parallel_->worker_bridges[worker]) {
+                    assert(
+                        sim.cluster_runtime_owner_[sim.clusters_.numClusters() + bridge].load() ==
+                        worker);
+                    assert(++seen[bridge] == 1);
+                }
+            assert(std::all_of(seen.begin(), seen.end(), [](auto n) { return n == 1; }));
+        }
+    }
     static void poison(TickSimulation& sim) {
-        if (!sim.scheduler_scratch_) return;
-        for (auto& worker : sim.scheduler_scratch_->workers) {
+        if (!sim.thread_progress_array_) return;
+        for (auto& worker : sim.schedulerScratch_().workers) {
             std::fill(worker.predecessor.observed_cycles.begin(),
                       worker.predecessor.observed_cycles.end(), UINT64_MAX);
             std::fill(worker.ready_through.begin(), worker.ready_through.end(), UINT64_MAX);
@@ -53,6 +82,7 @@ static std::vector<uint64_t> exercise(bool clock, bool dynamic, size_t workers, 
         return clock ? sim.runClockEvents(count) : sim.run(count);
     };
     assert(advance(128) == 128);
+    Scratch::assertOwnershipLists(sim);
     const auto storage = Scratch::storage(sim);
     if (dynamic && workers > 1) {
         const auto actor = clock ? Migration::bridge(sim, 0) : Migration::cluster(sim, units[0]);
@@ -69,10 +99,12 @@ static std::vector<uint64_t> exercise(bool clock, bool dynamic, size_t workers, 
     assert(completed == 128);
     assert(predicate_calls == (128 + interval - 1) / interval);
     assert(storage == Scratch::storage(sim));
+    Scratch::assertOwnershipLists(sim);
     if (dynamic && workers > 1) Migration::assertIdle(sim);
     assert(sim.totalTransportOverflowEvents() == 0);
     // Continue with a fresh limit after the poisoned predicate boundary.
     assert(advance(19) == 19);
+    Scratch::assertOwnershipLists(sim);
     return invocationState(units);
 }
 

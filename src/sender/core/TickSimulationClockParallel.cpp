@@ -306,7 +306,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         auto work =
             stdexec::bulk(stdexec::just(), stdexec::par, thread_units_.size(), [&](size_t worker) {
                 try {
-                    auto& scratch = scheduler_scratch_->workers[worker];
+                    auto& scratch = schedulerScratch_().workers[worker];
                     InvocationPredecessorCache cache(scratch.predecessor, thread_progress_count_);
                     uint64_t* const predecessor_cycles = cache.data();
                     auto& owned_clusters = scratch.owned_clusters;

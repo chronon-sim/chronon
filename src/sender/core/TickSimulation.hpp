@@ -39,10 +39,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -672,7 +674,20 @@ private:
     struct SchedulerScratch {
         std::vector<WorkerRunScratch> workers;
         std::shared_ptr<PlanningScratch> planning;
+        uint64_t assignment_lists_generation = 0;
     };
+    // Coallocate cold scratch immediately before the cache-line-aligned progress
+    // array. Its lifetime already ends after joined workers on topology reset or
+    // destruction. Sequential simulations keep their original object layout and
+    // constructor/destructor, and allocate neither progress nor scratch storage.
+    static constexpr size_t kSchedulerScratchStorageBytes =
+        ((sizeof(SchedulerScratch) + alignof(ThreadProgress) - 1) / alignof(ThreadProgress)) *
+        alignof(ThreadProgress);
+    static_assert(alignof(SchedulerScratch) <= alignof(ThreadProgress));
+    SchedulerScratch& schedulerScratch_() const noexcept {
+        return *std::launder(reinterpret_cast<SchedulerScratch*>(
+            reinterpret_cast<std::byte*>(thread_progress_array_) - kSchedulerScratchStorageBytes));
+    }
     friend struct SchedulerScratchTestAccess;
 
     /// Return a predecessor-progress lower bound sufficient for `needed` when
@@ -953,11 +968,6 @@ private:
 
     uint64_t cycles_since_last_actual_rebalance_ = 0;
     uint64_t rebalance_count_ = 0;
-
-    // One cold pointer fits in the existing tail padding on the measured ABI,
-    // preserving both hot-field offsets and the original simulation object size.
-    // Sequential execution allocates no scheduler scratch.
-    std::unique_ptr<SchedulerScratch> scheduler_scratch_;
 };
 
 }  // namespace chronon::sender
