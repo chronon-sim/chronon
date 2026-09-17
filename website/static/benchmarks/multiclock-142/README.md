@@ -4,6 +4,29 @@
 Baseline runtime: 000ebb3 (7c0766d with the common benchmark/diagnostic harness).
 Source: https://github.com/chronon-sim/chronon
 
+## Reconstructing the archived sources
+
+The original source commits are historical identifiers and need not be present
+in a fresh clone after rebasing. Both trees can be reconstructed using the
+patches alongside this README:
+
+1. Fetch public ancestor `7c0766d14ee9ed10323e75b4d82d1aa6a71e650a` from
+   `https://github.com/chronon-sim/chronon.git`.
+2. Apply `baseline-harness.patch` to that ancestor for the baseline.
+3. Apply `candidate-runtime.patch` on top of the baseline for the candidate.
+
+| Version | Original commit | Reconstructed Git tree |
+| --- | --- | --- |
+| Baseline | `000ebb383ed9a75f6a495a339797b6c6df8a6a8c` | `301c12587628e51b8c50443ebdda2544dc640f72` |
+| Candidate | `9a9bd5bcb916cfd7fe4797ef04077b752d6b5993` | `4ec37e3b74c7d70af5e20fb758ba63f4c1ae7890` |
+
+These patches and the unchanged measurement archive are covered by `SHA256SUMS`.
+The report's Reproduce section contains fetch, worktree, patch, build and runner
+commands. The two source patches are separate downloads, not additions to the
+original measurement archive.
+
+## Measurement contents
+
 Each measurement directory has raw.csv, runs.jsonl (exact invocation and result),
 summary.json (min/median/max and resources), and metadata.json (seed, CPU topology,
 affinity, binary SHA-256 and available CMake caches). Intermediate experiments

@@ -53,8 +53,8 @@ trace modes additionally require identical event counts and zero drops.
    FIFO lists, deduplicated in stable FIFO-ID order. Empty FIFOs still receive
    every endpoint edge, including synchronizer/flag transitions. Custom bridges
    retain every-batch callbacks unless they explicitly opt in.
-2. **Calendar/retirement (`71eb725`).** Pending batches use a bounded ring whose
-   edge storage is reserved at initialization and reused. Dense calendar indices
+2. **Calendar/retirement (`71eb725`).** Pending batches use a reusable bounded
+   ring. Dense calendar indices
    resolve domain references for pending edges. Each coordinator sweep caches a
    conservative acquired completion frontier per visited domain. The canonical
    retirement calendar remains distinct from admission: unused grants are still
@@ -71,6 +71,12 @@ trace modes additionally require identical event counts and zero drops.
    after its entire sweep; targets acquire a refreshed actor list on a later
    sweep. Migration fences remain checked, and every executed tick publishes
    progress. Ring indexing also avoids integer division.
+
+After the measured revision, review fixes cap scheduler workers using the grouped
+actor count and grow pending storage only as batches are admitted. A large
+`max_lookahead_cycles` no longer preallocates the entire window at initialization;
+edge storage grows with participating domains and is retained across runs. The
+archived measurements below describe the original revisions, before these fixes.
 
 A cached-readiness prototype did not improve the matrix consistently and was
 removed. A CDC endpoint consumes one prepared edge per tick, leaving little
@@ -290,18 +296,37 @@ Validation logs and fixture import digests are included in the archive.
 Use a fresh output directory on each run and choose masks from your host's
 physical-core topology. Do not copy this host's CPU numbers without checking.
 
+The original benchmark commits were rewritten during rebase. The checked-in
+[baseline harness patch](/benchmarks/multiclock-142/baseline-harness.patch) and
+[candidate patch](/benchmarks/multiclock-142/candidate-runtime.patch) reconstruct
+their exact source trees from the public ancestor `7c0766d14ee9ed10323e75b4d82d1aa6a71e650a`.
+The following builds both archived versions; it does not substitute the current
+PR head for the historical candidate. See the artifact README for full source
+and tree hashes. Run these commands from a checkout containing this report.
+
 ```bash
-git worktree add --detach /tmp/chronon-142-baseline 000ebb3
+artifacts="$PWD/website/static/benchmarks/multiclock-142"
+(cd "$artifacts" && sha256sum -c SHA256SUMS)
+base_revision=7c0766d14ee9ed10323e75b4d82d1aa6a71e650a
+git fetch https://github.com/chronon-sim/chronon.git "$base_revision"
+git worktree add --detach /tmp/chronon-142-baseline "$base_revision"
+git -C /tmp/chronon-142-baseline apply "$artifacts/baseline-harness.patch"
+git worktree add --detach /tmp/chronon-142-candidate "$base_revision"
+git -C /tmp/chronon-142-candidate apply "$artifacts/baseline-harness.patch"
+git -C /tmp/chronon-142-candidate apply "$artifacts/candidate-runtime.patch"
+
 cmake -S /tmp/chronon-142-baseline -B /tmp/chronon-142-baseline/build \
   -DCMAKE_BUILD_TYPE=Release -DCHRONON_BUILD_BENCHMARKS=ON
 cmake --build /tmp/chronon-142-baseline/build --target chronon_multiclock_benchmark -j8
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DCHRONON_BUILD_BENCHMARKS=ON
-cmake --build build-release --target chronon_multiclock_benchmark -j8
+cmake -S /tmp/chronon-142-candidate -B /tmp/chronon-142-candidate/build \
+  -DCMAKE_BUILD_TYPE=Release -DCHRONON_BUILD_BENCHMARKS=ON
+cmake --build /tmp/chronon-142-candidate/build --target chronon_multiclock_benchmark -j8
 
-python3 scripts/run_multiclock_benchmark.py \
-  --binary build-release/benchmark/chronon_multiclock_benchmark \
+python3 /tmp/chronon-142-candidate/scripts/run_multiclock_benchmark.py \
+  --binary /tmp/chronon-142-candidate/build/benchmark/chronon_multiclock_benchmark \
   --baseline-binary /tmp/chronon-142-baseline/build/benchmark/chronon_multiclock_benchmark \
-  --baseline-revision 000ebb3 --scaling --extended --steps 20000 \
+  --baseline-revision 000ebb383ed9a75f6a495a339797b6c6df8a6a8c \
+  --scaling --extended --steps 20000 \
   --repetitions 5 --threads 1,2,4,8 --cpus 0,2,4,6,8,10,12,14 \
   --output-dir out/multiclock-142-repro
 ```

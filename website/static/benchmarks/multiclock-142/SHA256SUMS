@@ -1,1 +1,3 @@
 09ea624c14ba5588054f18d1b6cb5dc1a7cb8e01a7ed3723b7f03f59a37039c6  measurements.tar.gz
+8a2145a79e0e7ddbeabbc4dc429428a2f4194b2de008b5e41b942489b810e0f7  baseline-harness.patch
+de6b19242c223226da6be56ba07fa7daab8bc29268f9b8c229fc5bac2dc8ef7e  candidate-runtime.patch

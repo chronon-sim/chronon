@@ -1,0 +1,1130 @@
+diff --git a/benchmark/CMakeLists.txt b/benchmark/CMakeLists.txt
+index 2692f1545d1ab6e7aba270d93fa1be34567cc855..f9fd4cf85d4470be9351f1286c9bc574d8d44ab3 100644
+--- a/benchmark/CMakeLists.txt
++++ b/benchmark/CMakeLists.txt
+@@ -3,6 +3,11 @@
+ 
+ add_executable(chronon_multiclock_benchmark multiclock_benchmark.cpp)
+ target_link_libraries(chronon_multiclock_benchmark PRIVATE chronon::core chronon_compile_options)
++if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8
++   AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT BUILD_SHARED_LIBS)
++    target_compile_definitions(chronon_multiclock_benchmark PRIVATE CHRONON_COUNT_CLOCK_ALLOCATIONS=1)
++    target_link_options(chronon_multiclock_benchmark PRIVATE "-Wl,--wrap=_Znwm" "-Wl,--wrap=_Znam")
++endif()
+ add_executable(chronon_single_clock_regression_benchmark single_clock_regression.cpp)
+ target_link_libraries(chronon_single_clock_regression_benchmark PRIVATE chronon::core chronon_compile_options)
+ add_executable(chronon_trace_output_benchmark trace_output_benchmark.cpp)
+@@ -117,6 +122,14 @@ if(CHRONON_BUILD_TESTS)
+     add_test(NAME benchmark_multiclock_scaling_smoke
+         COMMAND chronon_multiclock_benchmark scaling 2000 2 4 4 8 1 4)
+     set_tests_properties(benchmark_multiclock_scaling_smoke PROPERTIES PROCESSORS 2 TIMEOUT 30)
++    add_test(NAME benchmark_multiclock_shared_segmented
++        COMMAND chronon_multiclock_benchmark scaling 2000 4 4 4 0 1 1
++            --lanes 8 --segment 137 --clocks coincident --profile 1)
++    add_test(NAME benchmark_multiclock_feedback
++        COMMAND chronon_multiclock_benchmark scaling 2000 4 8 8 8 0 1
++            --topology ring --activity 4 --clocks coprime)
++    set_tests_properties(benchmark_multiclock_shared_segmented benchmark_multiclock_feedback
++        PROPERTIES PROCESSORS 4 TIMEOUT 30)
+     add_test(NAME benchmark_direct_spsc_smoke
+         COMMAND chronon_direct_spsc_benchmark 10000 1)
+     set_tests_properties(benchmark_direct_spsc_smoke PROPERTIES RUN_SERIAL TRUE)
+diff --git a/benchmark/ClockAllocationCount.hpp b/benchmark/ClockAllocationCount.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b1deaf9c062ea4e596f0cc207a3f802bf22fea0
+--- /dev/null
++++ b/benchmark/ClockAllocationCount.hpp
+@@ -0,0 +1,23 @@
++// SPDX-License-Identifier: MPL-2.0
++#pragma once
++#include <atomic>
++#include <cstddef>
++
++// Linker wrappers count C++ scalar/array allocations in the statically linked
++// executable, not malloc, aligned new, shared-library internals, or peak live bytes.
++namespace chronon::benchmark {
++inline std::atomic<uint64_t> clock_allocations{0};
++inline uint64_t clockAllocations() { return clock_allocations.load(std::memory_order_relaxed); }
++}  // namespace chronon::benchmark
++#ifdef CHRONON_COUNT_CLOCK_ALLOCATIONS
++extern "C" void* __real__Znwm(std::size_t);
++extern "C" void* __real__Znam(std::size_t);
++extern "C" void* __wrap__Znwm(std::size_t size) {
++    chronon::benchmark::clock_allocations.fetch_add(1, std::memory_order_relaxed);
++    return __real__Znwm(size);
++}
++extern "C" void* __wrap__Znam(std::size_t size) {
++    chronon::benchmark::clock_allocations.fetch_add(1, std::memory_order_relaxed);
++    return __real__Znam(size);
++}
++#endif
+diff --git a/benchmark/MulticlockScaling.hpp b/benchmark/MulticlockScaling.hpp
+index 0f86fe0e635fea1c8de8ecaf05867578a26fde4e..0f2c70a89eb8a48862d9712fc3de7fea4359c8de 100644
+--- a/benchmark/MulticlockScaling.hpp
++++ b/benchmark/MulticlockScaling.hpp
+@@ -7,43 +7,72 @@
+ #include <iomanip>
+ #include <iostream>
+ 
++#include "ClockAllocationCount.hpp"
+ #include "chronon/Chronon.hpp"
+ 
+ namespace chronon::benchmark {
+ 
+ struct ClockWork : TickableUnit {
+-    AsyncWritePort<uint64_t> out{this, "out"};
+-    AsyncReadPort<uint64_t> in{this, "in"};
+-    uint64_t count = 0, checksum = 0, work_digest = 1;
+-    unsigned work;
+-    bool producer;
+-    ClockWork(std::string name, unsigned work, bool producer)
+-        : TickableUnit(std::move(name)), work(work), producer(producer) {}
++    struct Output {
++        AsyncWritePort<uint64_t> port;
++        uint64_t count = 0;
++        Output(ClockWork* owner, size_t lane) : port(owner, "out" + std::to_string(lane)) {}
++    };
++    struct Input {
++        AsyncReadPort<uint64_t> port;
++        uint64_t count = 0, checksum = 0;
++        Input(ClockWork* owner, size_t lane) : port(owner, "in" + std::to_string(lane)) {}
++    };
++    std::vector<std::unique_ptr<Output>> outputs;
++    std::vector<std::unique_ptr<Input>> inputs;
++    uint64_t work_digest = 1;
++    unsigned work, activity;
++    ClockWork(std::string name, unsigned work, unsigned activity)
++        : TickableUnit(std::move(name)), work(work), activity(activity) {}
++    auto& output() {
++        outputs.push_back(std::make_unique<Output>(this, outputs.size()));
++        return outputs.back()->port;
++    }
++    auto& input() {
++        inputs.push_back(std::make_unique<Input>(this, inputs.size()));
++        return inputs.back()->port;
++    }
+     void tick() override {
+         for (unsigned i = 0; i < work; ++i) {
+             work_digest = work_digest * 6364136223846793005ULL + i + 1;
+             asm volatile("" : "+r"(work_digest));
+         }
+-        if (producer) {
+-            if (out.send({count + 1, count + 1})) ++count;
+-        } else {
+-            if (auto packet = in.take()) {
+-                if (packet->data != count + 1) throw std::runtime_error("FIFO order mismatch");
+-                ++count;
+-                checksum += packet->data;
++        for (auto& in : inputs) {
++            if (auto packet = in->port.take()) {
++                if (packet->data != in->count + 1) throw std::runtime_error("FIFO order mismatch");
++                ++in->count;
++                in->checksum += packet->data;
+             }
+-            in.requestRead();
++            if (localCycle() % activity == 0) in->port.requestRead();
+         }
++        if (localCycle() % activity == 0)
++            for (auto& out : outputs)
++                if (out->port.send({out->count + 1, out->count + 1})) ++out->count;
+     }
+ };
+ 
++inline double clockCpuSeconds() {
++    rusage usage{};
++    getrusage(RUSAGE_SELF, &usage);
++    return usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6 + usage.ru_stime.tv_sec +
++           usage.ru_stime.tv_usec / 1e6;
++}
++
+ // Reuse the clock benchmark executable and its CSV runner. Fixed hardware work
+ // and full end-state digests make serial/static/dynamic and before/after runs
+ // comparable; initialization is reported separately from simulation throughput.
+ inline int runClockScaling(int argc, char** argv) {
+-    if (argc != 9) {
++    if (argc < 9) {
+         std::cerr << "usage: multiclock_benchmark scaling STEPS THREADS PAIRS DOMAINS WORK "
+-                     "DYNAMIC SKEW\n";
++                     "DYNAMIC SKEW [--lanes N --topology pairs|fanin|ring "
++                     "--clocks staggered|coincident|coprime --activity N --segment N "
++                     "--trace off|text|perfetto|both --output DIR --lossy 0|1 "
++                     "--trace-capacity N --profile 0|1]\n";
+         return 2;
+     }
+     const auto steps = std::stoull(argv[2]);
+@@ -56,40 +85,137 @@ inline int runClockScaling(int argc, char** argv) {
+     if (!steps || steps > 1'000'000'000 || !threads || threads > 64 || !pairs || pairs > 512 ||
+         domains < 2 || domains > 2 * pairs || work > 100'000 || dynamic > 1 || !skew || skew > 64)
+         throw std::invalid_argument("scaling arguments outside supported bounds");
++    size_t lanes = 1, activity = 1, segment = steps, trace_capacity = 4096;
++    std::string topology = "pairs", clocks = "staggered", trace_mode = "off", output;
++    bool lossy = false, profile = false;
++    for (int i = 9; i < argc; i += 2) {
++        if (i + 1 == argc) throw std::invalid_argument("option needs a value");
++        const std::string key = argv[i], value = argv[i + 1];
++        if (key == "--lanes")
++            lanes = std::stoull(value);
++        else if (key == "--activity")
++            activity = std::stoull(value);
++        else if (key == "--segment")
++            segment = std::stoull(value);
++        else if (key == "--topology")
++            topology = value;
++        else if (key == "--clocks")
++            clocks = value;
++        else if (key == "--trace")
++            trace_mode = value;
++        else if (key == "--output")
++            output = value;
++        else if (key == "--lossy" && (value == "0" || value == "1"))
++            lossy = value == "1";
++        else if (key == "--profile" && (value == "0" || value == "1"))
++            profile = value == "1";
++        else if (key == "--trace-capacity")
++            trace_capacity = std::stoull(value);
++        else
++            throw std::invalid_argument("unknown scaling option: " + key);
++    }
++    if (!lanes || lanes > 64 || !activity || activity > 1024 || !segment ||
++        (topology != "pairs" && topology != "fanin" && topology != "ring") ||
++        (clocks != "staggered" && clocks != "coincident" && clocks != "coprime") ||
++        (trace_mode != "off" && trace_mode != "text" && trace_mode != "perfetto" &&
++         trace_mode != "both"))
++        throw std::invalid_argument("invalid scaling options");
++    const auto wall_begin = std::chrono::steady_clock::now();
++    const auto cpu_begin = clockCpuSeconds();
+     TickSimulationConfig config;
+     config.num_threads = threads;
+     config.enable_parallel = threads > 1;
+     config.enable_dynamic_rebalance = dynamic;
+     config.max_lookahead_cycles = 32;
++    config.profile_clock_scheduler = profile;
+     TickSimulation sim(config);
+     for (size_t d = 0; d < domains; ++d)
+-        sim.addClockDomain(ClockDomain::fromHz(d + 1, "clock" + std::to_string(d),
+-                                               250'000'000ULL << (d % 4), 1,
+-                                               SimTime::picoseconds(d * 37)));
+-    std::vector<ClockWork*> producers, consumers;
++        sim.addClockDomain(ClockDomain::fromHz(
++            d + 1, "clock" + std::to_string(d),
++            clocks == "coprime" ? 914'000'000 + 37'000'000 * d : 250'000'000ULL << (d % 4), 1,
++            SimTime::picoseconds(clocks == "coincident" ? 0 : d * 37)));
++    std::vector<ClockWork*> producers, consumers, nodes;
+     for (size_t p = 0; p < pairs; ++p) {
+         const unsigned cost = static_cast<unsigned>(work * (p == 0 ? skew : 1));
+-        auto* producer = sim.createUnitInDomain<ClockWork>(
+-            (p * 2) % domains + 1, "producer" + std::to_string(p), cost, true);
+-        auto* consumer = sim.createUnitInDomain<ClockWork>(
+-            (p * 2 + 1) % domains + 1, "consumer" + std::to_string(p), cost, false);
+-        sim.connectAsyncFifo(p + 1, producer->out, consumer->in, {16, 2});
+-        producers.push_back(producer);
+-        consumers.push_back(consumer);
++        producers.push_back(sim.createUnitInDomain<ClockWork>(
++            (p * 2) % domains + 1, "producer" + std::to_string(p), cost, activity));
++        consumers.push_back(sim.createUnitInDomain<ClockWork>(
++            (p * 2 + 1) % domains + 1, "consumer" + std::to_string(p), cost, activity));
++        nodes.push_back(producers.back());
++        nodes.push_back(consumers.back());
++    }
++    std::vector<AsyncFifo<uint64_t>*> fifos;
++    const auto connect = [&](ClockWork* source, ClockWork* sink) {
++        for (size_t lane = 0; lane < lanes; ++lane)
++            fifos.push_back(
++                sim.connectAsyncFifo(fifos.size() + 1, source->output(), sink->input(), {16, 2}));
++    };
++    if (topology == "ring") {
++        for (size_t n = 0; n < nodes.size(); ++n) connect(nodes[n], nodes[(n + 1) % nodes.size()]);
++    } else {
++        for (size_t p = 0; p < pairs; ++p)
++            connect(producers[p], consumers[topology == "fanin" ? 0 : p]);
++    }
++    if (trace_mode != "off") {
++        if (output.empty()) throw std::invalid_argument("trace requires --output");
++        ClockTraceRecorder::Config trace;
++        trace.output_dir = output;
++        trace.run_id = "multiclock-scaling";
++        trace.text = trace_mode != "perfetto";
++        trace.perfetto = trace_mode != "text";
++        trace.lossless = !lossy;
++        trace.stream_capacity = trace_capacity;
++        trace.drain_batch = std::min<size_t>(256, trace_capacity);
++        sim.configureClockTrace(trace);
+     }
+     const auto begin = std::chrono::steady_clock::now();
++    const auto allocations_begin = clockAllocations();
++    const auto init_cpu_begin = clockCpuSeconds();
+     sim.initialize();
+     const auto initialized = std::chrono::steady_clock::now();
+-    if (sim.runClockEvents(steps) != steps) throw std::runtime_error("short scaling run");
++    const auto init_cpu_end = clockCpuSeconds();
++    const auto allocations_initialized = clockAllocations();
++    for (uint64_t done = 0; done < steps;) {
++        const auto count = std::min<uint64_t>(segment, steps - done);
++        if (sim.runClockEvents(count) != count) throw std::runtime_error("short scaling run");
++        done += count;
++    }
+     const auto end = std::chrono::steady_clock::now();
++    const auto run_cpu_end = clockCpuSeconds();
++    const auto allocations_end = clockAllocations();
++    sim.closeClockTrace();
++    const auto closed = std::chrono::steady_clock::now();
++    const auto cpu_end = clockCpuSeconds();
++    ClockTraceRecorder::Stats stats;
++    if (sim.clockTraceRecorder()) stats = sim.clockTraceRecorder()->stats();
+     uint64_t ticks = 0, sent = 0, received = 0, checksum = 0, digest = 0;
+     for (size_t p = 0; p < pairs; ++p) {
+         ticks += producers[p]->localCycle() + consumers[p]->localCycle();
+-        sent += producers[p]->count;
+-        received += consumers[p]->count;
+-        checksum += consumers[p]->checksum;
++
+         digest ^= (p + 1) * (producers[p]->work_digest + 31 * consumers[p]->work_digest);
+     }
++    uint64_t fifo_digest = 0, lane_digest = 0;
++    for (const auto* node : nodes) {
++        for (const auto& out : node->outputs) {
++            sent += out->count;
++            lane_digest = lane_digest * 31 + out->count;
++        }
++        for (const auto& in : node->inputs) {
++            received += in->count;
++            checksum += in->checksum;
++            lane_digest = lane_digest * 31 + in->count;
++            lane_digest = lane_digest * 31 + in->checksum;
++        }
++    }
++    for (const auto* fifo : fifos) {
++        const auto state = fifo->diagnostics();
++        for (const uint64_t value :
++             {state.write_binary, state.read_binary, state.write_gray, state.read_gray,
++              state.write_sync, state.read_sync, uint64_t(state.full), uint64_t(state.empty),
++              uint64_t(state.output_valid), uint64_t(state.ram_occupancy), state.writes,
++              state.reads})
++            fifo_digest = fifo_digest * 31 + value;
++    }
+     rusage usage{};
+     getrusage(RUSAGE_SELF, &usage);
+     const double cpu = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6 +
+@@ -97,15 +223,70 @@ inline int runClockScaling(int argc, char** argv) {
+     std::cout
+         << std::setprecision(12)
+         << "mode,steps,threads,pairs,domains,work,dynamic,skew,init_s,run_s,wall_s,cpu_s,"
+-           "maxrss_kib,unit_ticks,sent,received,checksum,work_digest,migrations,parallel,overflow\n"
+-        << "scaling," << steps << ',' << threads << ',' << pairs << ',' << domains << ',' << work
+-        << ',' << dynamic << ',' << skew << ','
+-        << std::chrono::duration<double>(initialized - begin).count() << ','
+-        << std::chrono::duration<double>(end - initialized).count() << ','
+-        << std::chrono::duration<double>(end - begin).count() << ',' << cpu << ','
+-        << usage.ru_maxrss << ',' << ticks << ',' << sent << ',' << received << ',' << checksum
+-        << ',' << digest << ',' << sim.rebalanceCount() << ',' << sim.useParallelExecution() << ','
+-        << sim.totalTransportOverflowEvents() << '\n';
++           "maxrss_kib,unit_ticks,sent,received,checksum,work_digest,migrations,parallel,overflow,"
++           "lanes,bridges,topology,clocks,activity,segment,trace,lossy,profile,lane_digest,fifo_"
++           "digest,"
++           "init_cpu_s,run_cpu_s,total_cpu_s,close_s,total_s,init_allocations,run_allocations,"
++           "partition_ns,"
++           "events,dropped,producer_stalls,producer_stall_ns,admission_retries,progress_stalls,"
++           "progress_stall_ns,"
++           "allocated_ingress_bytes,peak_ingress_bytes,allocated_staging_bytes,peak_staging_"
++           "records,"
++           "native_buffer_peak_bytes,file_bytes";
++    const std::array<std::pair<const char*, uint64_t sender::ClockSchedulerProfile::*>, 16> fields{
++        {{"sweeps", &sender::ClockSchedulerProfile::sweeps},
++         {"idle_sweeps", &sender::ClockSchedulerProfile::idle_sweeps},
++         {"retirement_ns", &sender::ClockSchedulerProfile::retirement_ns},
++         {"admission_ns", &sender::ClockSchedulerProfile::admission_ns},
++         {"actor_ns", &sender::ClockSchedulerProfile::actor_ns},
++         {"tick_ns", &sender::ClockSchedulerProfile::tick_ns},
++         {"bridge_ns", &sender::ClockSchedulerProfile::bridge_ns},
++         {"wait_ns", &sender::ClockSchedulerProfile::wait_ns},
++         {"cluster_polls", &sender::ClockSchedulerProfile::cluster_polls},
++         {"bridge_polls", &sender::ClockSchedulerProfile::bridge_polls},
++         {"cluster_ticks", &sender::ClockSchedulerProfile::cluster_ticks},
++         {"bridge_commits", &sender::ClockSchedulerProfile::bridge_commits},
++         {"allowance_waits", &sender::ClockSchedulerProfile::allowance_waits},
++         {"dependency_waits", &sender::ClockSchedulerProfile::dependency_waits},
++         {"completion_loads", &sender::ClockSchedulerProfile::completion_loads},
++         {"coordinator_sweeps", &sender::ClockSchedulerProfile::sweeps}}};
++    for (const auto& [name, field] : fields) {
++        (void)field;
++        std::cout << ",sample_" << name;
++    }
++    std::cout << '\n'
++              << "scaling," << steps << ',' << threads << ',' << pairs << ',' << domains << ','
++              << work << ',' << dynamic << ',' << skew << ','
++              << std::chrono::duration<double>(initialized - begin).count() << ','
++              << std::chrono::duration<double>(end - initialized).count() << ','
++              << std::chrono::duration<double>(end - begin).count() << ',' << cpu << ','
++              << usage.ru_maxrss << ',' << ticks << ',' << sent << ',' << received << ','
++              << checksum << ',' << digest << ',' << sim.rebalanceCount() << ','
++              << sim.useParallelExecution() << ',' << sim.totalTransportOverflowEvents() << ','
++              << lanes << ',' << fifos.size() << ',' << topology << ',' << clocks << ',' << activity
++              << ',' << segment << ',' << trace_mode << ',' << lossy << ',' << profile << ','
++              << lane_digest << ',' << fifo_digest << ',' << init_cpu_end - init_cpu_begin << ','
++              << run_cpu_end - init_cpu_end << ',' << cpu_end - cpu_begin << ','
++              << std::chrono::duration<double>(closed - end).count() << ','
++              << std::chrono::duration<double>(closed - wall_begin).count() << ','
++              << allocations_initialized - allocations_begin << ','
++              << allocations_end - allocations_initialized << ',' << sim.clockPartitionTimeNs()
++              << ',' << stats.events << ',' << stats.dropped << ',' << stats.producer_stalls << ','
++              << stats.producer_stall_ns << ',' << stats.admission_retries << ','
++              << stats.progress_stalls << ',' << stats.progress_stall_ns << ','
++              << stats.allocated_buffer_bytes << ',' << stats.peak_buffer_bytes << ','
++              << stats.allocated_staging_bytes << ',' << stats.peak_staging_records << ','
++              << stats.native_buffer_peak_bytes << ',' << stats.file_bytes;
++    for (const auto& [name, field] : fields) {
++        uint64_t total = 0;
++        if (std::string_view(name) == "coordinator_sweeps") {
++            if (!sim.clockSchedulerProfile().empty()) total = sim.clockSchedulerProfile()[0].sweeps;
++        } else {
++            for (const auto& sample : sim.clockSchedulerProfile()) total += sample.*field;
++        }
++        std::cout << ',' << total;
++    }
++    std::cout << '\n';
+     return 0;
+ }
+ 
+diff --git a/scripts/run_multiclock_benchmark.py b/scripts/run_multiclock_benchmark.py
+index 0cc39ac06b9e314f65d9d1e9417ea3212b8ad902..ce8cfbd71524865d4202f4ebb7a846b1fbc57c35 100644
+--- a/scripts/run_multiclock_benchmark.py
++++ b/scripts/run_multiclock_benchmark.py
+@@ -17,76 +17,186 @@ def execute(binary, arguments, cpus):
+     command = [str(binary), *map(str, arguments)]
+     if cpus:
+         command = ["taskset", "-c", cpus, *command]
+-    result = subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++    if result.returncode:
++        raise RuntimeError(f"benchmark failed ({result.returncode}): {command}\n{result.stderr}")
+     rows = list(csv.DictReader(io.StringIO(result.stdout)))
+     if len(rows) != 1:
+         raise ValueError(f"unexpected benchmark output: {result.stdout}")
+     return rows[0]
+ 
+ 
++def host_topology(cpus):
++    def capture(command):
++        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++        return result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
++    rows = capture(["lscpu", "-p=CPU,CORE,SOCKET,NODE"])
++    allowed = set(os.sched_getaffinity(0))
++    selected = set()
++    for part in cpus.split(","):
++        if not part:
++            continue
++        bounds = list(map(int, part.split("-")))
++        selected.update(range(bounds[0], bounds[-1] + 1))
++    if not selected or not selected <= allowed:
++        raise ValueError("--cpus must select CPUs in this process's permitted affinity")
++    processors = []
++    for row in rows.splitlines():
++        if row.startswith("#"):
++            continue
++        cpu, core, socket, node = row.split(",")
++        if int(cpu) in selected:
++            frequency = Path(f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq")
++            processors.append(dict(cpu=int(cpu), core=int(core), socket=int(socket), node=node,
++                                   max_khz=frequency.read_text().strip() if frequency.exists() else None))
++    return dict(lscpu=capture(["lscpu", "--json"]), selected_processors=processors,
++                allowed_cpus=sorted(allowed), selected_logical_cpus=len(selected),
++                selected_physical_cores=len({(p["socket"], p["core"]) for p in processors}),
++                selected_numa_nodes=sorted({p["node"] for p in processors}),
++                affinity="process mask inherited by workers and recorder; no per-thread pinning",
++                compiler=capture(["c++", "--version"]),
++                git_revision=capture(["git", "rev-parse", "HEAD"]),
++                git_status=capture(["git", "status", "--short"]))
++
++
++def default_cpus():
++    # Prefer distinct cores. On hybrid hosts disclose their frequency/topology;
++    # lscpu's global threads-per-core is not true of every selected core.
++    chosen, cores = [], set()
++    for cpu in sorted(os.sched_getaffinity(0)):
++        root = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
++        key = tuple((root / name).read_text().strip() for name in ("physical_package_id", "core_id"))
++        if key not in cores:
++            cores.add(key)
++            chosen.append(cpu)
++        if len(chosen) == 8:
++            break
++    return ",".join(map(str, chosen))
++
++
+ def scaling(args):
+     """Same hardware work, independent serial oracle, interleaved host variants."""
+-    scenarios = [(f"p{pairs}-d{domains}-w{work}-s{skew}", pairs, domains, work, skew)
++    scenarios = [(f"p{pairs}-d{domains}-w{work}-s{skew}", pairs, domains, work, skew, [])
+                  for pairs, domains, work, skew in
+                  ((4, 2, 0, 1), (32, 2, 0, 1), (32, 8, 0, 1), (32, 32, 0, 1),
+                   (4, 2, 4000, 1), (16, 8, 4000, 1), (16, 8, 4000, 16))]
++    if args.extended:
++        scenarios += [
++            ("shared-8", 4, 2, 0, 1, ["--lanes", 8]),
++            ("shared-coincident", 4, 2, 0, 1, ["--lanes", 8, "--clocks", "coincident"]),
++            ("sparse-64", 64, 64, 0, 1, ["--activity", 16]),
++            ("fanin-coprime", 16, 8, 0, 1, ["--topology", "fanin", "--clocks", "coprime"]),
++            ("feedback", 8, 8, 8, 1, ["--topology", "ring", "--activity", 4]),
++            ("segmented-shared", 4, 4, 0, 1, ["--lanes", 8, "--segment", 137]),
++        ]
++    if args.scenarios:
++        selected = set(args.scenarios.split(","))
++        scenarios = [s for s in scenarios if s[0] in selected]
++        if {s[0] for s in scenarios} != selected:
++            raise ValueError("unknown --scenarios name (extended scenarios need --extended)")
+     variants = [("candidate", args.binary)]
+     if args.baseline_binary:
+         variants.insert(0, ("baseline", args.baseline_binary))
+-    threads = sorted(set(map(int, args.threads.split(","))))
++    topology = host_topology(args.cpus)
++    threads = sorted(set(map(int, args.threads.split(",")))) if args.threads else [
++        t for t in (1, 2, 4, 8) if t <= max(1, topology["selected_physical_cores"])]
+     if not threads or threads[0] != 1 or any(t < 1 or t > 64 for t in threads):
+         raise ValueError("--threads must include 1 and contain values in [1,64]")
+-    jobs = [(scenario, variant, binary, count, dynamic)
++    modes = args.trace_modes.split(",")
++    if any(m not in ("off", "text", "perfetto", "both") for m in modes):
++        raise ValueError("unknown --trace-modes")
++    jobs = [(scenario, variant, binary, count, dynamic, mode)
+             for scenario in scenarios for variant, binary in variants for count in threads
+-            for dynamic in ([0] if count == 1 else [0, 1])]
++            for dynamic in ([0] if count == 1 else [0, 1]) for mode in modes]
++    metadata = dict(platform=platform.platform(), cpus=args.cpus, topology=topology, seed=9141326,
++                    steps=args.steps, repetitions=args.repetitions, baseline_revision=args.baseline_revision,
++                    threads=threads, trace_modes=modes, profile=args.profile, lossy=args.lossy,
++                    worker_capacity=[dict(workers=t,
++                        exceeds_selected_cores=t > topology["selected_physical_cores"],
++                        exceeds_selected_logical_cpus=t > topology["selected_logical_cpus"],
++                        workers_plus_recorder_exceeds_cores=t + (m != "off") > topology["selected_physical_cores"],
++                        trace=m) for t in threads for m in modes],
++                    binaries={v: dict(path=str(binary.resolve()), sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
++                                     cmake_cache=(binary.parent.parent / "CMakeCache.txt").read_text()
++                                     if (binary.parent.parent / "CMakeCache.txt").exists() else None)
++                              for v, binary in variants},
++                    method="fresh processes; shuffled scenarios/variants; no warmup or speculative ticks; all variants checked against serial state; min/median/max; no fsync",
++                    diagnostics="one sweep in 64, worker-staggered; sampled actor_ns includes useful tick/bridge time; instrumentation perturbs timing; separate throughput runs",
++                    allocation_scope="wrapped scalar/array C++ new only; excludes aligned new, malloc and shared-library internals")
++    (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+     rng = random.Random(9141326)
+-    rows, expected = [], {}
+-    for repetition in range(args.repetitions):
+-        rng.shuffle(jobs)
+-        for (name, pairs, domains, work, skew), variant, binary, count, dynamic in jobs:
+-            row = execute(binary, ["scaling", args.steps, count, pairs, domains, work, dynamic, skew], args.cpus)
+-            state = tuple(row[key] for key in
+-                          ("steps", "unit_ticks", "sent", "received", "checksum", "work_digest"))
+-            if expected.setdefault(name, state) != state or int(row["overflow"]):
+-                raise AssertionError(f"hardware results differ: {name} {variant} T{count} dynamic={dynamic}")
+-            if int(row["parallel"]) != (count > 1):
+-                raise AssertionError("benchmark silently fell back from requested parallel mode")
+-            row.update(scenario=name, variant=variant, repetition=repetition)
+-            rows.append(row)
+-        print(f"scaling repetition {repetition + 1}/{args.repetitions} passed", flush=True)
++    rows, expected, serial_states = [], {}, {}
++    with (args.output_dir / "runs.jsonl").open("w") as raw:
++        for repetition in range(args.repetitions):
++            rng.shuffle(jobs)
++            for (name, pairs, domains, work, skew, options), variant, binary, count, dynamic, mode in jobs:
++                arguments = ["scaling", args.steps, count, pairs, domains, work, dynamic, skew, *options]
++                if mode != "off":
++                    arguments += ["--trace", mode, "--output", args.output_dir / f"trace-{name}-{variant}-t{count}-d{dynamic}-{mode}-{repetition}",
++                                  "--lossy", int(args.lossy), "--trace-capacity", args.trace_capacity]
++                if args.profile:
++                    arguments += ["--profile", 1]
++                row = execute(binary, arguments, args.cpus)
++                # FIFO/lane state is checked where both binaries expose it, with
++                # backward compatibility for the original scaling executable.
++                keys = ["steps", "unit_ticks", "sent", "received", "checksum", "work_digest"]
++                state = tuple(row[key] for key in keys)
++                if expected.setdefault(name, state) != state or int(row["overflow"]):
++                    raise AssertionError(f"hardware results differ: {name} {variant} T{count} dynamic={dynamic}")
++                if "fifo_digest" in row:
++                    detailed = (row["fifo_digest"], row["lane_digest"])
++                    if expected.setdefault((name, "fifo"), detailed) != detailed:
++                        raise AssertionError(f"FIFO/lane state differs: {name}")
++                if count == 1:
++                    serial_states[name] = state
++                if int(row["parallel"]) != (count > 1):
++                    raise AssertionError("benchmark silently fell back from requested parallel mode")
++                if not args.lossy and int(row.get("dropped", 0)):
++                    raise AssertionError("lossless recording dropped events")
++                row.update(scenario=name, variant=variant, repetition=repetition, trace=mode)
++                rows.append(row)
++                raw.write(json.dumps(dict(command=[str(binary), *map(str, arguments)], affinity=args.cpus, result=row)) + "\n")
++                raw.flush()
++            print(f"scaling repetition {repetition + 1}/{args.repetitions} passed", flush=True)
++    assert set(serial_states) == {s[0] for s in scenarios}
++    columns = list(dict.fromkeys(key for row in rows for key in row))
+     with (args.output_dir / "raw.csv").open("w") as file:
+-        writer = csv.DictWriter(file, list(rows[0]))
++        writer = csv.DictWriter(file, columns)
+         writer.writeheader()
+         writer.writerows(rows)
+     summary = []
+-    for scenario, variant, _, count, dynamic in sorted(jobs, key=lambda j: (j[0][0], j[1], j[3], j[4])):
++    for scenario, variant, _, count, dynamic, mode in sorted(jobs, key=lambda j: (j[0][0], j[1], j[3], j[4], j[5])):
+         name = scenario[0]
+-        selected = [r for r in rows if (r["scenario"], r["variant"], int(r["threads"]), int(r["dynamic"])) ==
+-                    (name, variant, count, dynamic)]
++        selected = [r for r in rows if (r["scenario"], r["variant"], int(r["threads"]), int(r["dynamic"]), r["trace"]) ==
++                    (name, variant, count, dynamic, mode)]
+         wall = [float(r["run_s"]) for r in selected]
+         median = statistics.median(wall)
+         serial = statistics.median(float(r["run_s"]) for r in rows
+-                                   if r["scenario"] == name and r["variant"] == variant and int(r["threads"]) == 1)
+-        item = dict(scenario=name, variant=variant, threads=count, dynamic=dynamic,
++                                   if r["scenario"] == name and r["variant"] == variant and int(r["threads"]) == 1 and r["trace"] == mode)
++        item = dict(scenario=name, variant=variant, threads=count, dynamic=dynamic, trace=mode,
+                     run_s=median, run_min_s=min(wall), run_max_s=max(wall), serial_speedup=serial / median,
+-                    init_s=statistics.median(float(r["init_s"]) for r in selected),
+-                    cpu_s=statistics.median(float(r["cpu_s"]) for r in selected),
+-                    unit_ticks_per_s=int(selected[0]["unit_ticks"]) / median,
+-                    migrations_median=statistics.median(int(r["migrations"]) for r in selected),
+-                    maxrss_kib=max(int(r["maxrss_kib"]) for r in selected))
++                    unit_ticks_per_s=int(selected[0]["unit_ticks"]) / median)
++        for field in ("init_s", "wall_s", "total_s", "close_s", "init_cpu_s", "run_cpu_s", "total_cpu_s",
++                      "cpu_s", "migrations", "init_allocations", "run_allocations", "partition_ns", "events", "dropped",
++                      "producer_stalls", "producer_stall_ns", "admission_retries", "progress_stalls", "progress_stall_ns"):
++            if field in selected[0]:
++                item[field] = statistics.median(float(r[field]) for r in selected)
++        for field in ("maxrss_kib", "allocated_ingress_bytes", "peak_ingress_bytes", "allocated_staging_bytes",
++                      "peak_staging_records", "native_buffer_peak_bytes", "file_bytes"):
++            if field in selected[0]:
++                item[field] = max(int(r[field]) for r in selected)
++        for field in selected[0]:
++            if field.startswith("sample_"):
++                item[field] = statistics.median(int(r[field]) for r in selected)
++        if "events" in item:
++            item["events_per_s"] = item["events"] / (median + item["close_s"])
+         if args.baseline_binary:
+             baseline = statistics.median(float(r["run_s"]) for r in rows
+-                                         if (r["scenario"], r["variant"], int(r["threads"]), int(r["dynamic"])) ==
+-                                         (name, "baseline", count, dynamic))
++                                         if (r["scenario"], r["variant"], int(r["threads"]), int(r["dynamic"]), r["trace"]) ==
++                                         (name, "baseline", count, dynamic, mode))
+             item["baseline_speedup"] = baseline / median
+         summary.append(item)
+     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+-    metadata = dict(platform=platform.platform(), cpus=args.cpus, seed=9141326, steps=args.steps,
+-                    repetitions=args.repetitions, baseline_revision=args.baseline_revision,
+-                    binaries={v: dict(path=str(b.resolve()), sha256=hashlib.sha256(b.read_bytes()).hexdigest())
+-                              for v, b in variants},
+-                    method="fresh processes, shuffled scenarios/variants, fixed hardware work; initialization separate; serial digest checked")
+-    (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+     for item in summary:
+         print(json.dumps(item))
+ 
+@@ -97,13 +207,19 @@ def main():
+     parser.add_argument("--output-dir", type=Path, required=True)
+     parser.add_argument("--steps", type=int)
+     parser.add_argument("--repetitions", type=int, default=5)
+-    parser.add_argument("--cpus", default=",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))
++    parser.add_argument("--cpus", default=default_cpus())
+     parser.add_argument("--baseline-single", type=Path)
+     parser.add_argument("--candidate-single", type=Path)
+     parser.add_argument("--baseline-revision", default="unspecified")
+     parser.add_argument("--scaling", action="store_true", help="measure serial/static/dynamic scheduling across graph sizes and costs")
+     parser.add_argument("--baseline-binary", type=Path, help="interleave a prior scaling-capable executable")
+-    parser.add_argument("--threads", default="1,2,4")
++    parser.add_argument("--threads", help="comma-separated workers; default 1,2,4,8 up to selected physical cores")
++    parser.add_argument("--extended", action="store_true", help="add shared lanes, sparse domains, fan-in, feedback and segmentation")
++    parser.add_argument("--scenarios", help="optional comma-separated scaling scenario names")
++    parser.add_argument("--trace-modes", default="off")
++    parser.add_argument("--lossy", action="store_true")
++    parser.add_argument("--trace-capacity", type=int, default=4096)
++    parser.add_argument("--profile", action="store_true", help="separate diagnostic run with sparse component timing")
+     args = parser.parse_args()
+     if args.steps is None:
+         args.steps = 20_000 if args.scaling else 500_000
+diff --git a/src/observe/ClockTraceRecorder.cpp b/src/observe/ClockTraceRecorder.cpp
+index 60cb5a44a4b489fedbd8e21347bfb925e6bf7a33..fc310ef5e032766257b6699b899d62607b4c4cef 100644
+--- a/src/observe/ClockTraceRecorder.cpp
++++ b/src/observe/ClockTraceRecorder.cpp
+@@ -20,6 +20,28 @@
+ #include "detail/ClockEventBuffer.hpp"
+ 
+ namespace chronon::observe {
++namespace {
++// Read host time only on the slow path; stream counters follow producer ownership.
++class ClockTraceStall {
++public:
++    ClockTraceStall(bool stalled, uint64_t& count, uint64_t& ns) : ns_(stalled ? &ns : nullptr) {
++        if (ns_) {
++            ++count;
++            start_ = std::chrono::steady_clock::now();
++        }
++    }
++    ~ClockTraceStall() {
++        if (ns_)
++            *ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
++                        std::chrono::steady_clock::now() - start_)
++                        .count();
++    }
++
++private:
++    uint64_t* ns_;
++    std::chrono::steady_clock::time_point start_;
++};
++}  // namespace
+ 
+ ClockTraceStream::ClockTraceStream(size_t capacity, bool lossless, bool perfetto, ClockDomain clock,
+                                    std::atomic<bool>* failed)
+@@ -37,6 +59,8 @@ void ClockTraceStream::advance(uint64_t next_cycle) {
+     const auto ns = perfetto_ ? clock_.edge(next_cycle).floorNanoseconds() : 0;
+     minimum_cycle_ = next_cycle;
+     watermark_.store(ns, std::memory_order_release);
++    ClockTraceStall stall(perfetto_ && acknowledged_.load(std::memory_order_acquire) < ns, stalls_,
++                          stall_ns_);
+     while (perfetto_ && acknowledged_.load(std::memory_order_acquire) < ns) {
+         if (failed_->load(std::memory_order_acquire))
+             throw std::runtime_error("clock trace backend failed or closed");
+@@ -56,11 +80,14 @@ void ClockTraceStream::endEdge() {
+     if (!dropped_run_.value) return;
+     const auto head = head_.load(std::memory_order_relaxed);
+     auto tail = tail_.load(std::memory_order_acquire);
+-    while (head - tail == ring_.size()) {
+-        if (failed_->load(std::memory_order_acquire))
+-            throw std::runtime_error("clock trace backend failed or closed");
+-        std::this_thread::yield();
+-        tail = tail_.load(std::memory_order_acquire);
++    {
++        ClockTraceStall stall(head - tail == ring_.size(), stalls_, stall_ns_);
++        while (head - tail == ring_.size()) {
++            if (failed_->load(std::memory_order_acquire))
++                throw std::runtime_error("clock trace backend failed or closed");
++            std::this_thread::yield();
++            tail = tail_.load(std::memory_order_acquire);
++        }
+     }
+     ring_[head & (ring_.size() - 1)] = dropped_run_;
+     dropped_run_.value = 0;
+@@ -85,32 +112,35 @@ void ClockTraceStream::record(uint64_t cycle, ClockEventKind kind, uint64_t tran
+         head = head_.load(std::memory_order_relaxed);
+         tail = tail_.load(std::memory_order_acquire);
+     }
+-    while (head - tail == ring_.size()) {
+-        if (failed_->load(std::memory_order_acquire))
+-            throw std::runtime_error("clock trace backend failed or closed");
+-        if (!lossless_) {
+-            ++dropped_;
+-            if (parallel_) {
+-                if (!dropped_run_.value) {
+-                    dropped_run_ = {
+-                        cycle,
+-                        0,
+-                        0,
+-                        ordinal,
+-                        0,
+-                        kind,
+-                        static_cast<ClockEventPhase>(static_cast<uint8_t>(phase) | 128)};
++    {
++        ClockTraceStall stall(lossless_ && head - tail == ring_.size(), stalls_, stall_ns_);
++        while (head - tail == ring_.size()) {
++            if (failed_->load(std::memory_order_acquire))
++                throw std::runtime_error("clock trace backend failed or closed");
++            if (!lossless_) {
++                ++dropped_;
++                if (parallel_) {
++                    if (!dropped_run_.value) {
++                        dropped_run_ = {
++                            cycle,
++                            0,
++                            0,
++                            ordinal,
++                            0,
++                            kind,
++                            static_cast<ClockEventPhase>(static_cast<uint8_t>(phase) | 128)};
++                    }
++                    ++dropped_run_.value;
+                 }
+-                ++dropped_run_.value;
++                return;
+             }
+-            return;
++            // Host waiting never changes simulated time or acceptance decisions.
++            std::this_thread::yield();
++            tail = tail_.load(std::memory_order_acquire);
+         }
+-        // Host waiting never changes simulated time or acceptance decisions.
+-        std::this_thread::yield();
+-        tail = tail_.load(std::memory_order_acquire);
++        if (failed_->load(std::memory_order_acquire))
++            throw std::runtime_error("clock trace backend failed or closed");
+     }
+-    if (failed_->load(std::memory_order_acquire))
+-        throw std::runtime_error("clock trace backend failed or closed");
+     if (coordinator_) coordinator_->reserveClockRecord(record_base_bytes_, kind);
+     ring_[head & (ring_.size() - 1)] = {cycle, transaction, value, ordinal, fifo, kind, phase};
+     peak_ = std::max(peak_, head - tail + 1);
+@@ -558,7 +588,10 @@ bool ClockTraceRecorder::tryAdmitClockBatch(const SimTime& time) {
+             if (p.buckets[n % p.buckets.size()].ns == ns) return true;
+         throw std::logic_error("clock observation admissions must be ordered");
+     }
+-    if (head - tail == p.buckets.size()) return false;
++    if (head - tail == p.buckets.size()) {
++        ++p.stats.admission_retries;
++        return false;
++    }
+     if (head == UINT64_MAX) throw std::overflow_error("clock observation admission overflow");
+     p.buckets[head % p.buckets.size()].ns = ns;
+     p.bucket_head.store(head + 1, std::memory_order_release);
+@@ -649,6 +682,8 @@ void ClockTraceRecorder::advance(uint64_t exclusive_ns) {
+     if (exclusive_ns < impl_->watermark.load(std::memory_order_relaxed))
+         throw std::invalid_argument("clock recorder watermark cannot move backwards");
+     impl_->watermark.store(exclusive_ns, std::memory_order_release);
++    ClockTraceStall stall(impl_->acknowledged.load(std::memory_order_acquire) < exclusive_ns,
++                          impl_->stats.progress_stalls, impl_->stats.progress_stall_ns);
+     while (impl_->acknowledged.load(std::memory_order_acquire) < exclusive_ns) {
+         if (impl_->failed.load(std::memory_order_acquire))
+             throw std::runtime_error("clock trace backend failed or closed");
+@@ -726,6 +761,8 @@ void ClockTraceRecorder::close() {
+     impl_->closed = true;
+     for (const auto& stream : impl_->streams) {
+         impl_->stats.dropped += stream.queue->dropped_;
++        impl_->stats.producer_stalls += stream.queue->stalls_;
++        impl_->stats.producer_stall_ns += stream.queue->stall_ns_;
+         impl_->stats.peak_buffer_bytes += stream.queue->peak_ * sizeof(ClockRecord);
+     }
+     if (impl_->error) std::rethrow_exception(impl_->error);
+@@ -736,6 +773,11 @@ void ClockTraceRecorder::close() {
+         std::ofstream report(impl_->config.output_dir / "clock-stats.json");
+         report.exceptions(std::ios::badbit | std::ios::failbit);
+         report << "{\"events\":" << impl_->stats.events
++               << ",\"producer_stalls\":" << impl_->stats.producer_stalls
++               << ",\"producer_stall_ns\":" << impl_->stats.producer_stall_ns
++               << ",\"admission_retries\":" << impl_->stats.admission_retries
++               << ",\"progress_stalls\":" << impl_->stats.progress_stalls
++               << ",\"progress_stall_ns\":" << impl_->stats.progress_stall_ns
+                << ",\"dropped_events\":" << impl_->stats.dropped
+                << ",\"allocated_ingress_bytes\":" << impl_->stats.allocated_buffer_bytes
+                << ",\"peak_ingress_bytes_upper_bound\":" << impl_->stats.peak_buffer_bytes
+diff --git a/src/observe/ClockTraceRecorder.hpp b/src/observe/ClockTraceRecorder.hpp
+index 01ca1154d56e0d6da2a17b07ac77b3411f14f5fc..1d5f0a1da4936c714a1e4445366e1fbf37623846 100644
+--- a/src/observe/ClockTraceRecorder.hpp
++++ b/src/observe/ClockTraceRecorder.hpp
+@@ -72,6 +72,7 @@ private:
+     uint64_t ordinal_ = 0;
+     uint64_t dropped_ = 0;
+     uint64_t peak_ = 0;
++    uint64_t stalls_ = 0, stall_ns_ = 0;
+     bool parallel_ = false;
+     ClockRecord dropped_run_{};  // value = count; phase high bit marks gap metadata.
+ };
+@@ -92,6 +93,9 @@ public:
+     struct Stats {
+         uint64_t events = 0;
+         uint64_t dropped = 0;
++        uint64_t producer_stalls = 0, producer_stall_ns = 0;
++        uint64_t admission_retries = 0;
++        uint64_t progress_stalls = 0, progress_stall_ns = 0;
+         uint64_t allocated_buffer_bytes = 0;
+         uint64_t peak_buffer_bytes = 0;  // Sum of per-stream high water marks (upper bound).
+         uint64_t file_bytes = 0;
+diff --git a/src/sender/core/ClockSchedulerProfile.hpp b/src/sender/core/ClockSchedulerProfile.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4d611051a3d3d4805328daa67a45a48479b3349
+--- /dev/null
++++ b/src/sender/core/ClockSchedulerProfile.hpp
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: MPL-2.0
++#pragma once
++
++#include <chrono>
++#include <cstdint>
++
++namespace chronon::sender {
++
++/// Opt-in host diagnostics, accumulated by one worker and read only between runs.
++/// Timings/counts sample one sweep in 64; actor_ns includes tick_ns and bridge_ns.
++/// They describe sampled wall time, not CPU time or a sum of independent costs.
++struct alignas(64) ClockSchedulerProfile {
++    uint64_t sweeps = 0, idle_sweeps = 0;
++    uint64_t retirement_ns = 0, admission_ns = 0, actor_ns = 0;
++    uint64_t tick_ns = 0, bridge_ns = 0, wait_ns = 0;
++    uint64_t cluster_polls = 0, bridge_polls = 0, cluster_ticks = 0, bridge_commits = 0;
++    uint64_t allowance_waits = 0, dependency_waits = 0, completion_loads = 0;
++};
++
++namespace detail {
++// Same steady clock used by scheduler sampling. Disabled scopes read no clock.
++class ClockProfileScope {
++public:
++    explicit ClockProfileScope(uint64_t* total) : total_(total) {
++        if (total_) begin_ = std::chrono::steady_clock::now();
++    }
++    ~ClockProfileScope() { finish(); }
++    void finish() {
++        if (!total_) return;
++        *total_ += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                             std::chrono::steady_clock::now() - begin_)
++                                             .count());
++        total_ = nullptr;
++    }
++
++private:
++    uint64_t* total_;
++    std::chrono::steady_clock::time_point begin_;
++};
++}  // namespace detail
++}  // namespace chronon::sender
+diff --git a/src/sender/core/TickSimulation.hpp b/src/sender/core/TickSimulation.hpp
+index 0dd6e047402cec81cb6242510ab0a1f05411fa45..cbd639dacb724312b464ed2bdb15efd2c5e6dfb3 100644
+--- a/src/sender/core/TickSimulation.hpp
++++ b/src/sender/core/TickSimulation.hpp
+@@ -22,6 +22,7 @@
+ #include "../schedule/SchedulerTimelineTrace.hpp"
+ #include "../schedule/SimulatedAnnealingPartitioner.hpp"
+ #include "../schedule/WeightedPartitioner.hpp"
++#include "ClockSchedulerProfile.hpp"
+ #include "TerminationRequest.hpp"
+ #include "TickSimulationConfig.hpp"
+ #include "TickSimulationCycleUtils.hpp"
+@@ -189,6 +190,12 @@ public:
+ 
+     void initialize();
+ 
++    /// Host-only, between run calls. Empty unless profile_clock_scheduler is enabled.
++    const std::vector<ClockSchedulerProfile>& clockSchedulerProfile() const noexcept {
++        return clock_scheduler_profile_;
++    }
++    uint64_t clockPartitionTimeNs() const noexcept { return clock_partition_time_ns_; }
++
+     /// Static configuration only. ID 0 is the legacy default clock; UINT32_MAX is reserved.
+     const ClockDomain& addClockDomain(ClockDomain domain);
+     const ClockDomain& clockDomain(ClockDomainId id) const;
+@@ -720,6 +727,8 @@ private:
+     std::deque<ClockDomain> clock_domains_;
+     bool clock_mode_ = false;
+     bool clock_failed_ = false;
++    std::vector<ClockSchedulerProfile> clock_scheduler_profile_;
++    uint64_t clock_partition_time_ns_ = 0;
+     SimTime clock_time_;
+     struct ClockRuntime {
+         const ClockDomain* clock = nullptr;
+diff --git a/src/sender/core/TickSimulationClockParallel.cpp b/src/sender/core/TickSimulationClockParallel.cpp
+index ef7de8c1ff21b724845dc7459f0c28e7d6c16fba..52d615d005e5bb96f16f046baa73f114590ecf8b 100644
+--- a/src/sender/core/TickSimulationClockParallel.cpp
++++ b/src/sender/core/TickSimulationClockParallel.cpp
+@@ -26,6 +26,8 @@ void TickSimulation::selectClockExecutionMode_() {
+                       : std::vector<double>(unit_ptrs_.size(), 1.0);
+     const size_t workers = std::min(config_.num_threads, unit_ptrs_.size() + cdc_.size());
+     platform_metrics_ = has_precomputed_costs_ ? precomputed_platform_metrics_ : PlatformMetrics{};
++    detail::ClockProfileScope partition_profile(
++        config_.profile_clock_scheduler ? &clock_partition_time_ns_ : nullptr);
+     applyClusteredThreadAssignment_(workers, has_precomputed_costs_
+                                                  ? platform_metrics_.atomic_roundtrip_ns
+                                                  : config_.initial_partition_sync_cost_ns);
+@@ -116,13 +118,15 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+     // Only worker zero manipulates the calendar. It grants a rolling bounded
+     // window, never waits for a whole window, and retires individual completed
+     // physical instants. Workers gate on local dependencies inside that window.
+-    const auto coordinate = [&](bool settling) {
++    const auto coordinate = [&](bool settling, ClockSchedulerProfile* profile) {
++        detail::ClockProfileScope retirement(profile ? &profile->retirement_ns : nullptr);
+         bool progress = false;
+         while (!runtime.pending.empty()) {
+             const auto& batch = runtime.pending.front();
+             bool ready = true;
+             for (const auto& edge : batch.edges) {
+                 for (const auto* progress : runtime.domains.at(edge.domain->id()).completions) {
++                    if (profile) ++profile->completion_loads;
+                     if (progress->load(std::memory_order_acquire) <= edge.cycle) {
+                         ready = false;
+                         break;
+@@ -152,6 +156,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+         // Publish without waiting: actors sharing this worker must keep running
+         // while the backend drains its bounded observation window.
+         if (trace) trace->publishClockProgress(clock_calendar_->nextTime().floorNanoseconds());
++        retirement.finish();
++        detail::ClockProfileScope admission(profile ? &profile->admission_ns : nullptr);
+         if (!settling) {
+             while (runtime.pending.size() < config_.max_lookahead_cycles &&
+                    scheduled < max_batches && !calendar.empty() &&
+@@ -176,7 +182,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+         return progress;
+     };
+ 
+-    const auto bridge_step = [&](size_t index, auto&& blocked) {
++    const auto bridge_step = [&](size_t index, auto&& blocked, ClockSchedulerProfile* profile) {
+         auto& bridge = *runtime.bridges[index];
+         const size_t actor = clusters_.numClusters() + index;
+         const uint64_t cycle = dynamic ? bridge.completed.load(std::memory_order_relaxed) : 0;
+@@ -192,7 +198,11 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+             }
+             SchedulerTimelineTrace::TimePoint begin{};
+             if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
+-            bridge.circuit->commit();
++            {
++                detail::ClockProfileScope commit_profile(profile ? &profile->bridge_ns : nullptr);
++                bridge.circuit->commit();
++            }
++            if (profile) ++profile->bridge_commits;
+             for (size_t side = 0; side < 2; ++side) {
+                 auto& endpoint = bridge.endpoints[side];
+                 if (bridge.participating[side]) {
+@@ -240,7 +250,10 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+                                        cycle, dynamic_cluster_last_tick_sample_cycle_[actor]);
+         SchedulerTimelineTrace::TimePoint begin{};
+         if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
+-        bridge.circuit->begin(std::span(bridge.edges.data(), bridge.edge_count));
++        {
++            detail::ClockProfileScope begin_profile(profile ? &profile->bridge_ns : nullptr);
++            bridge.circuit->begin(std::span(bridge.edges.data(), bridge.edge_count));
++        }
+         if (bridge.sample) {
+             dynamic_cluster_last_tick_sample_cycle_[actor] = cycle;
+             bridge.sample_ns =
+@@ -267,6 +280,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+                     uint64_t seen_generation = 0;
+                     uint64_t idle_sweeps = 0;
+                     uint64_t wait_sequence = 0;
++                    uint64_t profile_sequence = worker;
+                     const auto refresh = [&] {
+                         refreshDynamicOwnedActors_(worker, owned_actors, ownership_scratch,
+                                                    seen_generation);
+@@ -282,7 +296,14 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+                     while (!failed.load(std::memory_order_acquire) &&
+                            !done.load(std::memory_order_acquire) &&
+                            (settling || !token.stop_requested())) {
+-                        bool progress = worker == 0 && coordinate(settling);
++                        auto* profile =
++                            config_.profile_clock_scheduler && (profile_sequence++ & 63) == 0
++                                ? &clock_scheduler_profile_[worker]
++                                : nullptr;
++                        if (profile) ++profile->sweeps;
++                        bool progress = worker == 0 && coordinate(settling, profile);
++                        detail::ClockProfileScope actors_profile(profile ? &profile->actor_ns
++                                                                         : nullptr);
+                         const bool sample_wait =
+                             dynamic && !settling && (wait_sequence++ & 63) == 0;
+                         BlockedClusterInfo wait_blocker;
+@@ -305,23 +326,27 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+                                 cluster_runtime_owner_[clusters_.numClusters() + index].load(
+                                     std::memory_order_acquire) != worker)
+                                 continue;
+-                            progress = bridge_step(index, blocked) || progress;
++                            if (profile) ++profile->bridge_polls;
++                            progress = bridge_step(index, blocked, profile) || progress;
+                         }
+                         for (const auto c : owned_clusters) {
+                             if (dynamic &&
+                                 cluster_runtime_owner_[c].load(std::memory_order_acquire) != worker)
+                                 continue;
++                            if (profile) ++profile->cluster_polls;
+                             auto& state = runtime.clusters[c];
+                             auto& published = thread_progress_array_[c].completed_cycle;
+                             const auto cycle = published.load(std::memory_order_relaxed);
+                             if (dynamic && dynamicMigrationBlocksCluster_(c, cycle)) continue;
+                             if (cycle >= state.domain->allowed.load(std::memory_order_acquire)) {
++                                if (profile) ++profile->allowance_waits;
+                                 if (sample_wait) blocked(c, SIZE_MAX, state.clock->edge(cycle));
+                                 continue;
+                             }
+                             bool ready = true;
+                             for (const auto& bridge : state.bridges) {
+                                 if (bridge.progress->load(std::memory_order_acquire) <= cycle) {
++                                    if (profile) ++profile->dependency_waits;
+                                     ready = false;
+                                     if (sample_wait)
+                                         blocked(c, bridge.actor, state.clock->edge(cycle));
+@@ -331,15 +356,23 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+                             BlockedClusterInfo blocker;
+                             if (!ready) continue;
+                             if (!clusterCanAdvance_(c, cycle, blocker, cache.data())) {
++                                if (profile) ++profile->dependency_waits;
+                                 if (sample_wait)
+                                     blocked(c, blocker.pred_cluster, state.clock->edge(cycle));
+                                 continue;
+                             }
+-                            executeClusterOneCycle_(worker, c, cycle, false, dynamic,
+-                                                    state.sample_interval);
++                            {
++                                detail::ClockProfileScope ticks_profile(profile ? &profile->tick_ns
++                                                                                : nullptr);
++                                executeClusterOneCycle_(worker, c, cycle, false, dynamic,
++                                                        state.sample_interval);
++                            }
++                            if (profile) ++profile->cluster_ticks;
+                             published.store(cycle + 1, std::memory_order_release);
+                             progress = true;
+                         }
++                        actors_profile.finish();
++                        if (profile && !progress) ++profile->idle_sweeps;
+                         if (sample_wait && !progress) {
+                             const auto elapsed =
+                                 std::chrono::duration_cast<std::chrono::nanoseconds>(
+@@ -356,6 +389,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+                             // circuit, unit sampling and SPSC producer state.
+                             serviceEpochFreeMigration_(worker);
+                         }
++                        detail::ClockProfileScope wait_profile(
++                            profile && !progress ? &profile->wait_ns : nullptr);
+                         if (progress) {
+                             idle_sweeps = 0;
+                         } else if (detail::shouldYieldDynamicWaitThread(
+diff --git a/src/sender/core/TickSimulationClocks.cpp b/src/sender/core/TickSimulationClocks.cpp
+index db337b6ced58e12e9207e6c130465fde1bd2bf9d..c894d7705f97a1433c0e15b2ffa9742d009c1101 100644
+--- a/src/sender/core/TickSimulationClocks.cpp
++++ b/src/sender/core/TickSimulationClocks.cpp
+@@ -119,6 +119,8 @@ void TickSimulation::prepareClockTopology_() {
+ }
+ 
+ void TickSimulation::initializeClockRuntime_() {
++    if (config_.profile_clock_scheduler)
++        clock_scheduler_profile_.resize(shouldUseParallelExecution_() ? thread_units_.size() : 1);
+     for (auto* unit : unit_ptrs_) {
+         auto& runtime = clock_runtime_[unit->clockDomainId()];
+         runtime.clock = &unit->clockDomain();
+@@ -160,10 +162,21 @@ bool TickSimulation::executeClockBatch_() {
+     if (clock_calendar_->empty() || wasTerminationRequested()) return false;
+     if (current_cycle_ == UINT64_MAX) throw std::overflow_error("scheduler progress overflow");
+     try {
++        auto* profile = config_.profile_clock_scheduler && (current_cycle_ & 63) == 0
++                            ? &clock_scheduler_profile_[0]
++                            : nullptr;
++        if (profile) ++profile->sweeps;
++        detail::ClockProfileScope calendar_profile(profile ? &profile->admission_ns : nullptr);
+         const auto edges = clock_calendar_->pop();
++        calendar_profile.finish();
++        detail::ClockProfileScope actors_profile(profile ? &profile->actor_ns : nullptr);
+         if (clock_trace_ && clock_trace_->needsProgress())
+             clock_trace_->beginClockBatch(edges.front().time);
+-        for (auto& fifo : cdc_) fifo->begin(edges);
++        {
++            detail::ClockProfileScope bridge_profile(profile ? &profile->bridge_ns : nullptr);
++            for (auto& fifo : cdc_) fifo->begin(edges);
++        }
++        detail::ClockProfileScope ticks_profile(profile ? &profile->tick_ns : nullptr);
+         for (const auto& edge : edges) {
+             auto& runtime = clock_runtime_.at(edge.domain->id());
+             for (auto* unit : runtime.units) {
+@@ -172,8 +185,14 @@ bool TickSimulation::executeClockBatch_() {
+                 unit->clock_edge_executing_ = false;
+             }
+         }
++        ticks_profile.finish();
+         // Every CDC component sampled before ANY participating domain committed.
+-        for (auto& fifo : cdc_) fifo->commit();
++        {
++            detail::ClockProfileScope bridge_profile(profile ? &profile->bridge_ns : nullptr);
++            for (auto& fifo : cdc_) fifo->commit();
++            if (profile) profile->bridge_commits += cdc_.size();
++        }
++        actors_profile.finish();
+         for (const auto& edge : edges)
+             clock_runtime_.at(edge.domain->id()).next_cycle = edge.cycle + 1;
+         clock_time_ = edges.front().time;
+diff --git a/src/sender/core/TickSimulationConfig.hpp b/src/sender/core/TickSimulationConfig.hpp
+index 56ea35a3691cbd74bf04aa292521fba95cb21412..6ad5399d59938b9efc0dfd57abca548dc1fddcf3 100644
+--- a/src/sender/core/TickSimulationConfig.hpp
++++ b/src/sender/core/TickSimulationConfig.hpp
+@@ -61,6 +61,9 @@ struct TickSimulationConfig {
+ 
+     uint64_t tick_frequency_hz = 1'000'000'000;  ///< 1 GHz default.
+ 
++    /// Sample multi-clock scheduler components every 64 sweeps (no speculative ticks).
++    bool profile_clock_scheduler = false;
++
+     bool trace_execution = false;
+     SchedulerTimelineTraceConfig timeline_trace;
+ 
