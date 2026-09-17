@@ -15,6 +15,7 @@ std::filesystem::path fixture_root;
 bool export_fixtures = false;
 
 struct LaneUnit : TickableUnit {
+    using TickableUnit::requestTermination;
     OutPort<int> order_out{this, "order_out"};
     InPort<int> order_in{this, "order_in"};
     std::vector<std::unique_ptr<AsyncWritePort<uint64_t>>> outputs;
@@ -135,7 +136,7 @@ struct Result {
 };
 
 Result run(size_t workers, bool dynamic, bool segmented, bool coincident, bool custom, bool tracing,
-           bool migrating = false, bool clustered = false) {
+           bool migrating = false, bool clustered = false, bool stop_resume = false) {
     TickSimulationConfig config;
     config.num_threads = workers;
     config.enable_parallel = workers > 1;
@@ -189,14 +190,25 @@ Result run(size_t workers, bool dynamic, bool segmented, bool coincident, bool c
                             ? sender::ClockScalingTestAccess::sharedActor(sim, clustered ? 9 : 8)
                             : SIZE_MAX;
     size_t requests = 0;
-    if (migrating) {
+    if (migrating || stop_resume) {
         w->callback = [&] {
-            if (requests < 3 && w->localCycle() >= 11 + 47 * requests &&
+            if (stop_resume && w->localCycle() == 9)
+                w->requestTermination(TerminationReason::Completed, 0, "grouped stop");
+            if (migrating && requests < 3 && w->localCycle() >= 11 + 47 * requests &&
                 Access::request(sim, shared))
                 ++requests;
         };
     }
-    if (segmented) {
+    if (stop_resume) {
+        const auto done = sim.runClockEvents(370);
+        assert(done > 0 && done < 370);
+        assert(sim.wasTerminationRequested());
+        assert(sim.terminationRequest().settled_time == sim.lastCommittedTime());
+        // Every participating lane has committed at the reported boundary.
+        for (const auto* fifo : fifos) (void)fifo->diagnostics();
+        sim.resetTermination();
+        assert(sim.runClockEvents(370 - done) == 370 - done);
+    } else if (segmented) {
         for (unsigned i = 0; i < 10; ++i) assert(sim.runClockEvents(37) == 37);
     } else {
         assert(sim.runClockEvents(370) == 370);
@@ -272,6 +284,7 @@ int main(int argc, char** argv) {
     for (bool coincident : {false, true}) {
         const auto reference = run(1, false, false, coincident, false, true);
         assert(run(1, false, true, coincident, true, true) == reference);
+        assert(run(4, true, false, coincident, false, true, false, false, true) == reference);
         for (size_t workers : {2, 4, 8})
             for (bool dynamic : {false, true})
                 assert(run(workers, dynamic, true, coincident, false, true, dynamic) == reference);
