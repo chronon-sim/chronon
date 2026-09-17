@@ -62,6 +62,18 @@ on each selected core before the identical model warmup. These temporary threads
 join before the measured run. Apply it to both revisions and report this control;
 it changes neither model work nor predicate cadence.
 
+The comparison runner records the binary hashes, exact case matrix, raw results
+and per-case medians/ranges, and rejects mismatched state or predicate counts:
+
+```sh
+python3 benchmark/run_scheduler_comparison.py /path/to/baseline/build ./build ./comparison \
+  --repeats 21 --pin-workers --warm-cpus --cpus 0,2,4,6,8,10,12,14
+```
+
+Choose physical CPUs available on the measurement host. `--long-focus --scale 10`
+extends one-call and interval-64 cases while preserving check cadence;
+`--allocations --repeats 3` selects the separate counting executables.
+
 The C++ allocation wrappers count scalar/array
 `new` in statically linked code; they exclude aligned allocation, `malloc` and
 shared-library internals. `worker_scratch_bytes` measures retained worker vector
