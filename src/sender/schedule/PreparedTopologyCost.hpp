@@ -226,9 +226,10 @@ private:
         out.objective = out.max_active = out.cross_pressure = out.max_incoming_pressure = 0.0;
         out.heavy_colocation_penalty = out.idle_thread_penalty = 0.0;
         out.active_threads = 0;
-        out.active.assign(input_->num_threads, 0.0);
-        out.incoming_pressure.assign(input_->num_threads, 0.0);
-        out.heavy_count.assign(input_->num_threads, 0);
+        const size_t threads = input_->num_units ? input_->num_threads : 0;
+        out.active.assign(threads, 0.0);
+        out.incoming_pressure.assign(threads, 0.0);
+        out.heavy_count.assign(threads, 0);
     }
     void finish(ObjectiveSummary& out, double total) const {
         const size_t threads = input_->num_threads;

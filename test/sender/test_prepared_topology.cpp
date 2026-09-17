@@ -61,6 +61,11 @@ static void close(const ObjectiveSummary& a, const ObjectiveSummary& b, double e
 int main() {
     std::mt19937_64 random(143);
     PreparedTopologyCost prepared;
+    PartitionInput empty{};
+    empty.num_threads = 2;
+    const std::vector<size_t> no_assignment;
+    prepared.prepare(empty, no_assignment);
+    equal(summarize(empty, no_assignment, 2), prepared.baseline());
     for (size_t sample = 0; sample < 300; ++sample) {
         PartitionInput input;
         input.num_units = 1 + random() % 40;
@@ -78,6 +83,8 @@ int main() {
                                               static_cast<uint32_t>(random() % 5),
                                               (random() % 100) / 37.0});
         }
+        if (sample % 19 == 0)
+            for (auto& cost : input.unit_cost_ns) cost *= (sample % 2 ? 1e-12 : 1e12);
         if (sample % 17 == 0) input.unit_cost_ns.resize(input.num_units / 2);
         std::vector<uint64_t> floor(input.num_threads), dep(input.num_threads),
             ready(input.num_threads);
@@ -88,6 +95,9 @@ int main() {
         prepared.prepare(input, assignment, waits, sample);
         assert(prepared.generation() == sample);
         equal(summarize(input, assignment, input.num_threads), prepared.baseline());
+        MoveBreakdown best_full, best_fast;
+        size_t full_unit = SIZE_MAX, fast_unit = SIZE_MAX, full_target = SIZE_MAX,
+               fast_target = SIZE_MAX;
         for (size_t u = 0; u < input.num_units; ++u) {
             for (size_t target = 0; target < input.num_threads; ++target) {
                 auto candidate = assignment;
@@ -105,9 +115,23 @@ int main() {
                 equal(scoreMove(input, assignment, u, target, waits, gain, churn),
                       prepared.scoreFull(u, target, gain, churn));
                 const auto full = prepared.scoreFull(u, target, gain, churn);
-                const auto delta = prepared.scoreMove(u, target, gain, churn);
+                auto delta = prepared.scoreMove(u, target, gain, churn);
                 assert(full.valid == delta.valid);
                 close(full.score, delta.score, prepared.roundoff());
+                if (full.valid && (full.score > best_full.score ||
+                                   (full.score == best_full.score && u < full_unit))) {
+                    best_full = full;
+                    full_unit = u;
+                    full_target = target;
+                }
+                if (delta.valid && delta.score >= best_fast.score - prepared.roundoff())
+                    delta = prepared.scoreFull(u, target, gain, churn);
+                if (delta.valid && (delta.score > best_fast.score ||
+                                    (delta.score == best_fast.score && u < fast_unit))) {
+                    best_fast = delta;
+                    fast_unit = u;
+                    fast_target = target;
+                }
                 if (std::isfinite(full.score)) {
                     const double threshold =
                         full.score + churn -
@@ -122,6 +146,8 @@ int main() {
                 }
             }
         }
+        assert(full_unit == fast_unit && full_target == fast_target);
+        equal(best_full, best_fast);
         assert(improveInitialPlacement(input, assignment, input.num_threads) ==
                improvePreparedPlacement(input, assignment, input.num_threads));
         // Rebinding changes both sampled costs and owners, even if dimensions

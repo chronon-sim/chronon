@@ -649,9 +649,7 @@ private:
         std::vector<uint64_t> priority_blocker, ready_through;
         std::vector<double> priority_cost;
     };
-    std::vector<WorkerRunScratch> worker_run_scratch_;
     struct PlanningScratch;
-    std::shared_ptr<PlanningScratch> planning_scratch_;
     friend struct SchedulerScratchTestAccess;
 
     /// Return a predecessor-progress lower bound sufficient for `needed` when
@@ -932,6 +930,10 @@ private:
 
     uint64_t cycles_since_last_actual_rebalance_ = 0;
     uint64_t rebalance_count_ = 0;
+
+    // Append scratch so existing hot fields keep their offsets and alignment.
+    std::vector<WorkerRunScratch> worker_run_scratch_;
+    std::shared_ptr<PlanningScratch> planning_scratch_;
 };
 
 }  // namespace chronon::sender

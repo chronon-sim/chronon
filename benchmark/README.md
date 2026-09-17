@@ -1,5 +1,55 @@
 # Chronon benchmarks
 
+## Scheduler planning and repeated calls
+
+Configure Release with `-DCHRONON_BUILD_BENCHMARKS=ON` and build
+`chronon_placement_scoring_benchmark` and `chronon_scheduler_invocation_benchmark`.
+The first compares the retained full oracle, prepared full evaluation and
+incremental evaluation on the same generated graph:
+
+```sh
+# MODE UNITS THREADS SKEW PASSES
+./build/benchmark/chronon_placement_scoring_benchmark oracle 128 8 8 10
+./build/benchmark/chronon_placement_scoring_benchmark prepared 128 8 8 10
+./build/benchmark/chronon_placement_scoring_benchmark incremental 128 8 8 10
+```
+
+Check `valid` and `selection` before comparing the separately reported preparation
+and scoring time/allocation counts. Include preparation in total planning cost.
+`retained_bytes` includes the prepared snapshot and its vector capacities.
+
+The invocation probe fixes the graph, work, FIFO settings and check cadence:
+
+```sh
+# CLOCK THREADS PAIRS WORK SKEW DYNAMIC INTERVAL STEPS
+taskset -c 0,2,4,6 ./build/benchmark/chronon_scheduler_invocation_benchmark 1 4 4 64 1 0 1 20000
+```
+
+`CLOCK=0` uses ordinary delayed ports; `CLOCK=1` uses 250/500 MHz domains with
+0/37 ps phases and depth-16, two-stage async FIFOs. Interval zero selects one
+run call; a positive interval is the actual `runUntil` predicate cadence.
+An identical 128-step warmup precedes the measurement. Output separates
+initialization/run timing and allocations, reports predicate calls, and includes
+ticks, transactions, checksum, work digest, overflow and actual parallel mode.
+Compare all state columns against both the baseline and sequential execution.
+
+Build the baseline with the same Release flags, GCC/Clang and dependencies, using
+the Unix Makefiles generator and `CHRONON_BUILD_BENCHMARKS=ON`, then link this same
+probe source against its headers and libraries:
+
+```sh
+python3 benchmark/build_baseline_invocation.py /path/to/baseline/build
+```
+
+Run fresh processes in interleaved, shuffled order with the same physical CPU
+affinity and no competing builds/tests. Report repeated medians and ranges for
+each scenario independently. The C++ allocation wrappers count scalar/array
+`new` in statically linked code; they exclude aligned allocation, `malloc` and
+shared-library internals. `worker_scratch_bytes` measures retained worker vector
+capacity plus the worker scratch objects in the candidate (zero in the baseline);
+`rss_kib` is process peak RSS, not a precise scratch measurement. These probes do
+not establish universal downstream speedups.
+
 The small queue benchmarks in this directory isolate individual transport hot
 paths. `chronon_representative_workload_benchmark` complements them with a full
 `TickSimulation`: variable-cost units execute real memory-dependent work while
