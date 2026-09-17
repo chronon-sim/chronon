@@ -612,6 +612,7 @@ private:
     friend struct EpochFreeDifferentialTestAccess;
     /// Test-only source-owner migration commit validation.
     friend struct DynamicMigrationTestAccess;
+    friend struct ClockScalingTestAccess;
     /// Test-only transparent-broadcast fusion selection inspection.
     friend struct TransparentBroadcastFusionTestAccess;
 
@@ -738,6 +739,7 @@ private:
     struct ClockRuntime {
         const ClockDomain* clock = nullptr;
         std::vector<TickableUnit*> units;
+        std::vector<size_t> cdc;
         uint64_t next_cycle = 0;
     };
     std::map<ClockDomainId, ClockRuntime> clock_runtime_;
@@ -747,6 +749,8 @@ private:
     std::shared_ptr<ClockParallelRuntime> clock_parallel_;
     std::vector<size_t> clock_bridge_owners_;
     std::vector<std::unique_ptr<CdcComponent>> cdc_;
+    std::vector<size_t> clock_always_cdc_, clock_active_cdc_;
+    std::vector<uint8_t> clock_cdc_seen_;
     std::unique_ptr<observe::ClockTraceRecorder> clock_trace_;
     uint64_t current_cycle_;
     bool initialized_;

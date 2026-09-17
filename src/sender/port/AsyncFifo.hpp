@@ -239,6 +239,10 @@ public:
     virtual Unit* readOwner() const noexcept = 0;
     virtual void setClockTraceStreams(observe::ClockTraceStream* write,
                                       observe::ClockTraceStream* read) noexcept = 0;
+    /// Opt in only if begin/commit on unrelated-domain batches have no callback,
+    /// hardware, wakeup or trace effects. Other bridge implementations retain
+    /// the conservative every-batch serial contract.
+    virtual bool endpointEdgesOnly() const noexcept { return false; }
     virtual void begin(std::span<const ClockEdge> edges) = 0;
     virtual void commit() = 0;
     virtual bool drained() const noexcept = 0;
@@ -326,6 +330,7 @@ public:
         write_trace_ = write;
         read_trace_ = read;
     }
+    bool endpointEdgesOnly() const noexcept override { return true; }
     void begin(std::span<const ClockEdge> edges) override {
         bool w = false, r = false;
         for (const auto& edge : edges) {

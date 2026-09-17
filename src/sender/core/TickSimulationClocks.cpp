@@ -130,6 +130,19 @@ void TickSimulation::initializeClockRuntime_() {
                 clock_trace_->addStream(unit->clockDomain(), unit->id(), unit->fullPath());
         }
     }
+    clock_active_cdc_.reserve(cdc_.size());
+    clock_cdc_seen_.resize(cdc_.size());
+    for (size_t f = 0; f < cdc_.size(); ++f) {
+        const auto& fifo = *cdc_[f];
+        if (!fifo.endpointEdgesOnly()) {
+            clock_always_cdc_.push_back(f);
+            continue;
+        }
+        const auto write = fifo.writeOwner()->clockDomainId();
+        const auto read = fifo.readOwner()->clockDomainId();
+        clock_runtime_.at(write).cdc.push_back(f);
+        if (read != write) clock_runtime_.at(read).cdc.push_back(f);
+    }
     std::vector<const ClockDomain*> clocks;
     for (const auto& [id, runtime] : clock_runtime_) {
         (void)id;
@@ -172,9 +185,30 @@ bool TickSimulation::executeClockBatch_() {
         detail::ClockProfileScope actors_profile(profile ? &profile->actor_ns : nullptr);
         if (clock_trace_ && clock_trace_->needsProgress())
             clock_trace_->beginClockBatch(edges.front().time);
+        // Most phased calendars select one domain. Borrow its sorted list;
+        // coincident edges union the lists in preallocated scratch, then restore
+        // stable FIFO-ID order. Never skip an empty lane's synchronizer edges.
+        std::span<const size_t> active;
+        if (edges.size() == 1 && clock_always_cdc_.empty()) {
+            active = clock_runtime_.at(edges.front().domain->id()).cdc;
+        } else {
+            clock_active_cdc_.clear();
+            const auto append = [&](size_t f) {
+                if (!clock_cdc_seen_[f]) {
+                    clock_cdc_seen_[f] = 1;
+                    clock_active_cdc_.push_back(f);
+                }
+            };
+            for (const auto f : clock_always_cdc_) append(f);
+            for (const auto& edge : edges)
+                for (const auto f : clock_runtime_.at(edge.domain->id()).cdc) append(f);
+            std::sort(clock_active_cdc_.begin(), clock_active_cdc_.end());
+            for (const auto f : clock_active_cdc_) clock_cdc_seen_[f] = 0;
+            active = clock_active_cdc_;
+        }
         {
             detail::ClockProfileScope bridge_profile(profile ? &profile->bridge_ns : nullptr);
-            for (auto& fifo : cdc_) fifo->begin(edges);
+            for (const auto f : active) cdc_[f]->begin(edges);
         }
         detail::ClockProfileScope ticks_profile(profile ? &profile->tick_ns : nullptr);
         for (const auto& edge : edges) {
@@ -189,8 +223,8 @@ bool TickSimulation::executeClockBatch_() {
         // Every CDC component sampled before ANY participating domain committed.
         {
             detail::ClockProfileScope bridge_profile(profile ? &profile->bridge_ns : nullptr);
-            for (auto& fifo : cdc_) fifo->commit();
-            if (profile) profile->bridge_commits += cdc_.size();
+            for (const auto f : active) cdc_[f]->commit();
+            if (profile) profile->bridge_commits += active.size();
         }
         actors_profile.finish();
         for (const auto& edge : edges)
