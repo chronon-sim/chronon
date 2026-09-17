@@ -318,8 +318,10 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     // the first sweep and after assignment-generation changes.
                     std::span<const size_t> cluster_view = thread_clusters_[worker];
                     std::span<const size_t> bridge_view = runtime.worker_bridges[worker];
-                    owned_actors.clear();
-                    ownership_scratch.clear();
+                    if (dynamic) {
+                        owned_actors.clear();
+                        ownership_scratch.clear();
+                    }
                     uint64_t seen_generation = 0;
                     uint64_t idle_sweeps = 0;
                     uint64_t wait_sequence = 0;

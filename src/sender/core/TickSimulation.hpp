@@ -644,19 +644,12 @@ private:
     // Small graphs need no heap-backed predecessor cache. The invocation owns
     // these slots on its stack so task stealing cannot bounce a retained cache
     // line between cores. Large graphs reuse their simulation-owned vector.
-    struct InvocationPredecessorCache {
+    struct alignas(64) InvocationPredecessorCache {
         static constexpr size_t kInlineSlots = 16;
         std::array<uint64_t, kInlineSlots> local;
         uint64_t* cycles;
-        InvocationPredecessorCache(WorkerPredecessorCycleCache& retained, size_t clusters) {
-            if (clusters < kInlineSlots) {
-                cycles = local.data();
-                std::fill_n(cycles, clusters + 1, 0);
-            } else {
-                retained.reset(clusters);
-                cycles = retained.data();
-            }
-        }
+        [[gnu::noinline]] InvocationPredecessorCache(WorkerPredecessorCycleCache& retained,
+                                                     size_t clusters);
         uint64_t* data() noexcept { return cycles; }
     };
 
@@ -676,7 +669,7 @@ private:
         std::shared_ptr<PlanningScratch> planning;
         uint64_t assignment_lists_generation = 0;
     };
-    // Coallocate cold scratch immediately before the cache-line-aligned progress
+    // Coallocate cold scratch after the cache-line-aligned progress
     // array. Its lifetime already ends after joined workers on topology reset or
     // destruction. Sequential simulations keep their original object layout and
     // constructor/destructor, and allocate neither progress nor scratch storage.
@@ -686,7 +679,8 @@ private:
     static_assert(alignof(SchedulerScratch) <= alignof(ThreadProgress));
     SchedulerScratch& schedulerScratch_() const noexcept {
         return *std::launder(reinterpret_cast<SchedulerScratch*>(
-            reinterpret_cast<std::byte*>(thread_progress_array_) - kSchedulerScratchStorageBytes));
+            reinterpret_cast<std::byte*>(thread_progress_array_) +
+            thread_progress_count_ * sizeof(ThreadProgress)));
     }
     friend struct SchedulerScratchTestAccess;
 

@@ -78,6 +78,19 @@ void TickSimulation::installMultiProducerProgress_() {
 // Progress-sync allocation
 // ---------------------------------------------------------------------------
 
+// Keep vector growth and small-buffer setup out of the worker's scheduling loop.
+// This also keeps register allocation independent of the cache initialization paths.
+TickSimulation::InvocationPredecessorCache::InvocationPredecessorCache(
+    WorkerPredecessorCycleCache& retained, size_t clusters) {
+    if (clusters < kInlineSlots) {
+        cycles = local.data();
+        std::fill_n(cycles, clusters + 1, 0);
+    } else {
+        retained.reset(clusters);
+        cycles = retained.data();
+    }
+}
+
 void TickSimulation::freeThreadProgressArray() {
     // Topology/progress replacement happens with all worker tasks joined.
     if (thread_progress_array_) {
@@ -86,7 +99,7 @@ void TickSimulation::freeThreadProgressArray() {
         for (size_t i = 0; i < thread_progress_count_; ++i) {
             thread_progress_array_[i].~ThreadProgress();
         }
-        std::free(storage);
+        std::free(thread_progress_array_);
         thread_progress_array_ = nullptr;
         thread_progress_count_ = 0;
     }
@@ -106,9 +119,9 @@ void TickSimulation::initProgressSync() {
         std::aligned_alloc(alignof(ThreadProgress),
                            kSchedulerScratchStorageBytes + num_clusters * sizeof(ThreadProgress));
     if (!mem) throw std::bad_alloc();
-    std::construct_at(static_cast<SchedulerScratch*>(mem));
-    thread_progress_array_ = reinterpret_cast<ThreadProgress*>(static_cast<std::byte*>(mem) +
-                                                               kSchedulerScratchStorageBytes);
+    std::construct_at(reinterpret_cast<SchedulerScratch*>(static_cast<std::byte*>(mem) +
+                                                          num_clusters * sizeof(ThreadProgress)));
+    thread_progress_array_ = static_cast<ThreadProgress*>(mem);
     thread_progress_count_ = num_clusters;
     for (size_t i = 0; i < num_clusters; ++i) {
         new (&thread_progress_array_[i]) ThreadProgress();
