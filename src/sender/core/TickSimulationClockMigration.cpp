@@ -13,12 +13,27 @@ double edgeRate(const ClockDomain& clock, uint64_t reference_hz) {
 }  // namespace
 
 void TickSimulation::addClockPartitionActors_(
-    PartitionInput& input, const std::unordered_map<Unit*, size_t>& unit_indices) const {
+    PartitionInput& input, const std::unordered_map<Unit*, size_t>& unit_indices) {
     const auto rate = [&](const ClockDomain& clock) {
         return edgeRate(clock, config_.tick_frequency_hz);
     };
     const size_t clusters = clusters_.numClusters();
-    input.num_units += cdc_.size();
+    // Stable FIFO-ID traversal gives stable group identities. Matching clock
+    // pairs alone is insufficient: that would add unrelated endpoint waits.
+    clock_bridge_groups_.clear();
+    std::map<std::array<size_t, 5>, size_t> group_index;
+    for (size_t f = 0; f < cdc_.size(); ++f) {
+        const auto* fifo = cdc_[f].get();
+        const std::array<size_t, 5> key{unit_to_cluster_[unit_indices.at(fifo->writeOwner())],
+                                        unit_to_cluster_[unit_indices.at(fifo->readOwner())],
+                                        fifo->writeOwner()->clockDomainId(),
+                                        fifo->readOwner()->clockDomainId(),
+                                        fifo->endpointEdgesOnly() ? SIZE_MAX : f};
+        const auto [it, inserted] = group_index.emplace(key, clock_bridge_groups_.size());
+        if (inserted) clock_bridge_groups_.emplace_back();
+        clock_bridge_groups_[it->second].push_back(f);
+    }
+    input.num_units += clock_bridge_groups_.size();
     input.unit_cost_ns.resize(input.num_units);
     input.adjacency.resize(input.num_units);
     for (size_t c = 0; c < clusters; ++c) {
@@ -26,16 +41,18 @@ void TickSimulation::addClockPartitionActors_(
         input.unit_cost_ns[c] *= rate(clock);
         for (auto& edge : input.adjacency[c]) edge.activity_rate = rate(clock);
     }
-    for (size_t b = 0; b < cdc_.size(); ++b) {
+    for (size_t b = 0; b < clock_bridge_groups_.size(); ++b) {
         const size_t actor = clusters + b;
-        for (auto* unit : {cdc_[b]->writeOwner(), cdc_[b]->readOwner()}) {
+        const auto& lanes = clock_bridge_groups_[b];
+        const auto* fifo = cdc_[lanes.front()].get();
+        for (auto* unit : {fifo->writeOwner(), fifo->readOwner()}) {
             const size_t endpoint = unit_to_cluster_[unit_indices.at(unit)];
             const double frequency = rate(unit->clockDomain());
             // No speculative simulation warmup: use the existing uniform-cost
             // prior for each endpoint until live bridge samples become ready.
-            input.unit_cost_ns[actor] += frequency;
-            input.adjacency[actor].push_back({endpoint, 1, 1, frequency});
-            input.adjacency[endpoint].push_back({actor, 1, 1, frequency});
+            input.unit_cost_ns[actor] += frequency * lanes.size();
+            input.adjacency[actor].push_back({endpoint, lanes.size(), 1, frequency});
+            input.adjacency[endpoint].push_back({actor, lanes.size(), 1, frequency});
         }
     }
 }
@@ -123,8 +140,11 @@ void TickSimulation::initializeClockMigration_() {
             runtime.actor_rates[actor] += endpoint_rate;
             // Endpoint-specific begin/commit handshakes, not a zero-delay edge
             // merging two hardware domains into one scheduling cluster.
-            dynamic_rebalance_adjacency_[actor].push_back({endpoint.cluster, 1, 1, endpoint_rate});
-            dynamic_rebalance_adjacency_[endpoint.cluster].push_back({actor, 1, 1, endpoint_rate});
+            const auto lanes = runtime.bridges[b]->lanes.size();
+            dynamic_rebalance_adjacency_[actor].push_back(
+                {endpoint.cluster, lanes, 1, endpoint_rate});
+            dynamic_rebalance_adjacency_[endpoint.cluster].push_back(
+                {actor, lanes, 1, endpoint_rate});
         }
     }
     const uint64_t start = clockRebalanceCycle_(clock_calendar_->nextTime());
@@ -148,7 +168,8 @@ TickSimulation::DynamicRuntimeCostEstimate TickSimulation::dynamicClockActorCost
             samples ? std::max(0.001, static_cast<double>(cluster_sample_time_ns_[actor].load(
                                           std::memory_order_relaxed)) /
                                           static_cast<double>(samples))
-                    : 1.0;
+                    : static_cast<double>(
+                          clock_parallel_->bridges[actor - clusters_.numClusters()]->lanes.size());
     }
     estimate.cost *= clock_parallel_->actor_rates.at(actor);
     return estimate;

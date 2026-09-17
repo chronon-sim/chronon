@@ -36,12 +36,15 @@ struct TickSimulation::ClockParallelRuntime {
         std::atomic<uint64_t> prepared{0};
         std::atomic<uint64_t> completed{0};
     };
-    struct Bridge {
+    struct Lane {
         CdcComponent* circuit = nullptr;
+        std::array<observe::ClockTraceStream*, 2> trace{};
+    };
+    struct Bridge {
+        std::vector<Lane> lanes;
         std::array<Endpoint, 2> endpoints;
         std::array<ClockEdge, 2> edges;
         std::array<bool, 2> participating{};
-        std::array<observe::ClockTraceStream*, 2> trace{};
         size_t edge_count = 0;
         std::atomic<uint64_t> completed{0};  // Committed merged-edge transactions.
         bool sample = false;

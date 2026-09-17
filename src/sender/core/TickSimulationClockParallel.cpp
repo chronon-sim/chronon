@@ -59,24 +59,30 @@ void TickSimulation::initializeClockParallel_() {
             cluster_of.emplace(unit, c);
         }
     }
-    for (auto& fifo : cdc_) {
+    for (const auto& group : clock_bridge_groups_) {
         auto bridge = std::make_unique<ClockParallelRuntime::Bridge>();
-        bridge->circuit = fifo.get();
-        const std::array<Unit*, 2> owners{fifo->writeOwner(), fifo->readOwner()};
-        if (clock_trace_ && clock_trace_->enabled()) {
-            // Stable logical producers survive host placement changes. Units
-            // record evaluate events; only this bridge writes its commit streams.
-            const auto producer = uint64_t{fifo->id()} + 1;
-            bridge->trace[0] =
-                clock_trace_->addProducerStream(owners[0]->clockTraceStream(), producer);
-            // A self-loop has one logical unit and one bridge producer. Share
-            // its stream to preserve the FIFO's write/read commit event order.
-            bridge->trace[1] =
-                owners[0] == owners[1]
-                    ? bridge->trace[0]
-                    : clock_trace_->addProducerStream(owners[1]->clockTraceStream(), producer);
-            fifo->setClockTraceStreams(bridge->trace[0], bridge->trace[1]);
+        bridge->lanes.reserve(group.size());
+        for (const auto f : group) {
+            auto& fifo = cdc_[f];
+            ClockParallelRuntime::Lane lane;
+            lane.circuit = fifo.get();
+            const std::array<Unit*, 2> owners{fifo->writeOwner(), fifo->readOwner()};
+            if (clock_trace_ && clock_trace_->enabled()) {
+                // Scheduling groups do not merge logical producers, lane IDs,
+                // ordinals, event budgets or FIFO circuit state.
+                const auto producer = uint64_t{fifo->id()} + 1;
+                lane.trace[0] =
+                    clock_trace_->addProducerStream(owners[0]->clockTraceStream(), producer);
+                lane.trace[1] =
+                    owners[0] == owners[1]
+                        ? lane.trace[0]
+                        : clock_trace_->addProducerStream(owners[1]->clockTraceStream(), producer);
+                fifo->setClockTraceStreams(lane.trace[0], lane.trace[1]);
+            }
+            bridge->lanes.push_back(lane);
         }
+        const auto* first = bridge->lanes.front().circuit;
+        const std::array<Unit*, 2> owners{first->writeOwner(), first->readOwner()};
         for (size_t side = 0; side < owners.size(); ++side) {
             auto& endpoint = bridge->endpoints[side];
             endpoint.cluster = cluster_of.at(owners[side]);
@@ -220,13 +226,17 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
             {
                 detail::ClockProfileScope commit_profile(profile ? &profile->bridge_ns : nullptr);
-                bridge.circuit->commit();
+                // Commit EVERY lane before publishing completion or allowing
+                // this actor to transfer to another owner at the sweep boundary.
+                for (auto& lane : bridge.lanes) lane.circuit->commit();
             }
             if (profile) ++profile->bridge_commits;
             for (size_t side = 0; side < 2; ++side) {
                 auto& endpoint = bridge.endpoints[side];
                 if (bridge.participating[side]) {
-                    if (trace && bridge.trace[side]) bridge.trace[side]->endEdge();
+                    if (trace)
+                        for (auto& lane : bridge.lanes)
+                            if (lane.trace[side]) lane.trace[side]->endEdge();
                     ++endpoint.next;
                     endpoint.next_time = endpoint.clock->edge(endpoint.next);
                     endpoint.completed.store(endpoint.next, std::memory_order_release);
@@ -272,7 +282,10 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
         {
             detail::ClockProfileScope begin_profile(profile ? &profile->bridge_ns : nullptr);
-            bridge.circuit->begin(std::span(bridge.edges.data(), bridge.edge_count));
+            // All lanes snapshot old state before either endpoint cluster is
+            // released. Coincident edges cannot observe another lane's commit.
+            for (auto& lane : bridge.lanes)
+                lane.circuit->begin(std::span(bridge.edges.data(), bridge.edge_count));
         }
         if (bridge.sample) {
             dynamic_cluster_last_tick_sample_cycle_[actor] = cycle;

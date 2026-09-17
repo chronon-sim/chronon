@@ -53,6 +53,7 @@ if(CHRONON_TRACE_PROCESSOR)
             --multiclock-binary $<TARGET_FILE:sender_test_multiclock>
             --recorder-binary $<TARGET_FILE:test_clock_trace>
             --epoch-free-binary $<TARGET_FILE:sender_test_multiclock_epoch_free>
+            --scaling-binary $<TARGET_FILE:sender_test_multiclock_scaling>
             --check-prefix)
     set_tests_properties(multiclock_trace_processor PROPERTIES TIMEOUT 180)
 endif()

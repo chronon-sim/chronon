@@ -409,7 +409,7 @@ private:
     void selectClockExecutionMode_();
     void initializeClockParallel_();
     void addClockPartitionActors_(PartitionInput& input,
-                                  const std::unordered_map<Unit*, size_t>& unit_indices) const;
+                                  const std::unordered_map<Unit*, size_t>& unit_indices);
     uint64_t runClockEpochFree_(uint64_t max_batches, std::optional<SimTime> limit = {},
                                 bool inclusive = false);
     bool executeClockBatch_();
@@ -748,6 +748,7 @@ private:
     // The out-of-line runtime owns bridge tasks and their progress atomics.
     std::shared_ptr<ClockParallelRuntime> clock_parallel_;
     std::vector<size_t> clock_bridge_owners_;
+    std::vector<std::vector<size_t>> clock_bridge_groups_;
     std::vector<std::unique_ptr<CdcComponent>> cdc_;
     std::vector<size_t> clock_always_cdc_, clock_active_cdc_;
     std::vector<uint8_t> clock_cdc_seen_;

@@ -182,6 +182,9 @@ def run(args, root):
     if args.epoch_free_binary:
         subprocess.run([str(args.epoch_free_binary), str(root / "epoch-free")], check=True,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if args.scaling_binary:
+        subprocess.run([str(args.scaling_binary), str(root / "scaling")], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     directories = sorted({path.parent for path in root.rglob("reference.tsv")})
     if not directories:
         raise ValueError("no generated reference fixtures found")
@@ -219,6 +222,7 @@ def main():
     parser.add_argument("--multiclock-binary", type=Path)
     parser.add_argument("--recorder-binary", type=Path)
     parser.add_argument("--epoch-free-binary", type=Path)
+    parser.add_argument("--scaling-binary", type=Path)
     parser.add_argument("--check-prefix", action="store_true")
     args = parser.parse_args()
     if args.directory:
