@@ -130,7 +130,10 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
     // Only worker zero manipulates the calendar. It grants a rolling bounded
     // window, never waits for a whole window, and retires individual completed
     // physical instants. Workers gate on local dependencies inside that window.
-    const auto coordinate = [&](bool settling, ClockSchedulerProfile* profile) {
+    // Keep calendar admission/retirement out of the actor polling loop. Inlining
+    // this large coordinator increases its register pressure and instruction footprint.
+    const auto coordinate = [&](bool settling,
+                                ClockSchedulerProfile* profile) __attribute__((noinline)) {
         detail::ClockProfileScope retirement(profile ? &profile->retirement_ns : nullptr);
         bool progress = false;
         if (++runtime.coordinator_sweep == 0) {
