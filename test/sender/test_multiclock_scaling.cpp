@@ -90,10 +90,9 @@ struct ClockScalingTestAccess {
         std::vector<const void*> result;
         if (sim.clock_parallel_) {
             const auto& runtime = *sim.clock_parallel_;
-            assert(runtime.pending.size() == sim.config_.max_lookahead_cycles);
+            assert(runtime.pending.size() <= sim.config_.max_lookahead_cycles);
             assert(runtime.pending_size == 0);
             for (const auto& batch : runtime.pending) {
-                assert(batch.edges.capacity() >= runtime.indexed_domains.size());
                 result.push_back(batch.edges.data());
             }
         }
@@ -185,7 +184,7 @@ Result run(size_t workers, bool dynamic, bool segmented, bool coincident, bool c
     }
     sim.initialize();
     assert(sim.useParallelExecution() == (workers > 1));
-    const auto storage = sender::ClockScalingTestAccess::pendingStorage(sim);
+    assert(sender::ClockScalingTestAccess::pendingStorage(sim).empty());
     const auto shared = workers > 1
                             ? sender::ClockScalingTestAccess::sharedActor(sim, clustered ? 9 : 8)
                             : SIZE_MAX;
@@ -221,7 +220,7 @@ Result run(size_t workers, bool dynamic, bool segmented, bool coincident, bool c
     }
     if (probe) assert(probe->begins == sim.schedulerSteps() && probe->commits == probe->begins);
     assert(!sim.totalTransportOverflowEvents());
-    assert(storage == sender::ClockScalingTestAccess::pendingStorage(sim));
+    (void)sender::ClockScalingTestAccess::pendingStorage(sim);
     Result result;
     for (auto* unit : {w, r, w2, r2}) result.state.push_back(unit->events);
     for (const auto* fifo : fifos) {
@@ -334,7 +333,68 @@ Result runWorkerLimit(size_t workers, TickSimulationConfig::PartitionSolverType 
     return result;
 }
 
+Result runPendingWindow(size_t workers, uint32_t lookahead, bool dynamic) {
+    TickSimulationConfig config;
+    config.num_threads = workers;
+    config.enable_parallel = workers > 1;
+    config.enable_dynamic_rebalance = dynamic;
+    config.rebalance_check_interval_cycles = UINT64_MAX;
+    config.max_lookahead_cycles = lookahead;
+    TickSimulation sim(config);
+    sim.addClockDomain(ClockDomain::fromHz(1, "write", 1'000'000'000));
+    sim.addClockDomain(ClockDomain::fromHz(2, "read", 1'000'000'000));
+    auto* w = sim.createUnitInDomain<LaneUnit>(1, "writer");
+    auto* r = sim.createUnitInDomain<LaneUnit>(2, "reader");
+    auto& fifo = *sim.connectAsyncFifo(1, w->output(), r->input(), {4, 2});
+    sim.initialize();
+    assert(sim.useParallelExecution() == (workers > 1));
+    const auto storage = [&] { return sender::ClockScalingTestAccess::pendingStorage(sim); };
+    assert(storage().empty());
+    assert(sim.runClockEvents(0) == 0);
+    assert(sim.runUntilTime(SimTime{}) == 0);
+    assert(storage().empty());
+    // Time/domain-limited runs pass UINT64_MAX as their batch budget. They
+    // must still allocate only for the one batch actually admitted here.
+    assert(sim.runUntilTime(SimTime::nanoseconds(1)) == 1);
+    assert(storage().size() == (workers > 1 ? 1 : 0));
+    const auto first = storage();
+    assert(sim.runDomainCycles(1, 1) == 1);
+    assert(storage() == first);
+    // The one-event segment leaves a nonzero ring head before the longer
+    // segment grows a wrapped ring. Small windows also wrap while retiring.
+    for (uint64_t count : {3, 1, 17, 3}) assert(sim.runClockEvents(count) == count);
+    const auto warmed = storage();
+    assert(warmed.size() <= std::min(uint32_t{17}, lookahead));
+    assert(sim.runClockEvents(17) == 17);
+    assert(storage() == warmed);
+    w->callback = [&] {
+        if (w->localCycle() == 45)
+            w->requestTermination(TerminationReason::Completed, 0, "grown window stop");
+    };
+    const auto done = sim.runClockEvents(50);
+    assert(done > 0 && done < 50 && sim.wasTerminationRequested());
+    assert(sim.terminationRequest().settled_time == sim.lastCommittedTime());
+    sim.resetTermination();
+    assert(sim.runClockEvents(50 - done) == 50 - done);
+    assert(!sim.totalTransportOverflowEvents());
+    Result result;
+    result.state = {w->events, r->events};
+    const auto state = fifo.diagnostics();
+    result.state.push_back({state.write_binary, state.read_binary, state.write_sync,
+                            state.read_sync, state.full, state.empty, state.output_valid,
+                            state.ram_occupancy, state.writes, state.reads});
+    return result;
+}
+
 int main(int argc, char** argv) {
+    // Run the moderate limit first so the pre-fix regression fails without
+    // attempting the unbounded allocation exercised by UINT32_MAX.
+    for (uint32_t lookahead : {8192u, UINT32_MAX, 7u, 1u}) {
+        const auto reference = runPendingWindow(1, lookahead, false);
+        for (size_t workers : {2, 4})
+            for (bool dynamic : {false, true})
+                assert(runPendingWindow(workers, lookahead, dynamic) == reference);
+    }
     using Solver = TickSimulationConfig::PartitionSolverType;
     for (bool clustered : {false, true}) {
         const auto reference = runWorkerLimit(1, Solver::Weighted, false, clustered);

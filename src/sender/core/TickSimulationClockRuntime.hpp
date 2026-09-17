@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MPL-2.0
 #pragma once
 
+#include <algorithm>
+
 #include "TickSimulation.hpp"
 
 namespace chronon::sender {
@@ -63,8 +65,9 @@ struct TickSimulation::ClockParallelRuntime {
     std::unordered_map<ClockDomainId, Domain> domains;
     std::vector<std::unique_ptr<Bridge>> bridges;
     std::vector<std::vector<size_t>> worker_bridges;
-    // Bounded reusable ring: only the coordinator accesses slots. Pop does not
-    // free edge storage. Dense references avoid hardware-ID lookup at retirement.
+    // Reusable ring grows on admission, bounded by the configured lookahead.
+    // Only the coordinator accesses slots; pop retains their edge storage.
+    // Dense references avoid hardware-ID lookup at retirement.
     std::vector<Domain*> indexed_domains;
     std::vector<Batch> pending;
     size_t pending_head = 0, pending_size = 0;
@@ -72,6 +75,18 @@ struct TickSimulation::ClockParallelRuntime {
     Batch& pendingAt(size_t index) {
         const auto slot = pending_head + index;
         return pending[slot < pending.size() ? slot : slot - pending.size()];
+    }
+    Batch& appendPending(size_t limit) {
+        if (pending_size == pending.size()) {
+            // Preserve logical order when growing a wrapped ring. Moving Batch
+            // objects retains each slot's edge allocation for subsequent runs.
+            std::rotate(pending.begin(), pending.begin() + pending_head, pending.end());
+            pending_head = 0;
+            const size_t growth =
+                std::min(limit - pending.size(), std::max(size_t{1}, pending.size()));
+            pending.resize(pending.size() + growth);
+        }
+        return pendingAt(pending_size++);
     }
     // Migration heuristics use reference-clock cycles of retired physical time,
     // never incomparable actor-local cycles or calendar batch counts.

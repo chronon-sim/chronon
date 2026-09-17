@@ -101,8 +101,6 @@ void TickSimulation::initializeClockParallel_() {
         domain.serial = &serial;
         runtime.indexed_domains.push_back(&domain);
     }
-    runtime.pending.resize(config_.max_lookahead_cycles);
-    for (auto& batch : runtime.pending) batch.edges.reserve(runtime.indexed_domains.size());
     if (config_.enable_dynamic_rebalance) initializeClockMigration_();
 }
 
@@ -116,6 +114,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
     ++epoch_free_run_count_;
     auto& runtime = *clock_parallel_;
     auto calendar = *clock_calendar_;
+    const size_t window_limit = std::min<uint64_t>(config_.max_lookahead_cycles, max_batches);
     uint64_t scheduled = 0, completed = 0;
     std::atomic<bool> done{false}, failed{false};
     std::exception_ptr error;
@@ -183,16 +182,17 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         retirement.finish();
         detail::ClockProfileScope admission(profile ? &profile->admission_ns : nullptr);
         if (!settling) {
-            while (runtime.pending_size < runtime.pending.size() && scheduled < max_batches &&
+            while (runtime.pending_size < window_limit && scheduled < max_batches &&
                    !calendar.empty() && within_limit(calendar.nextTime()) &&
                    !token.stop_requested()) {
                 if (trace && !trace->tryAdmitClockBatch(calendar.nextTime())) break;
                 if (scheduled >= UINT64_MAX - (current_cycle_ - completed))
                     throw std::overflow_error("scheduler progress overflow");
                 const auto edges = calendar.pop();  // Validates representable successor edges.
-                auto& batch = runtime.pendingAt(runtime.pending_size++);
+                auto& batch = runtime.appendPending(window_limit);
                 batch.time = edges.front().time;
                 batch.edges.clear();
+                batch.edges.reserve(edges.size());
                 for (const auto& edge : edges) {
                     auto* domain = runtime.indexed_domains[edge.calendar_index];
                     batch.edges.push_back({domain, edge.cycle});
