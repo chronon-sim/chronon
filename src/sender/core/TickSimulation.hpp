@@ -22,6 +22,7 @@
 #include "../schedule/SchedulerTimelineTrace.hpp"
 #include "../schedule/SimulatedAnnealingPartitioner.hpp"
 #include "../schedule/WeightedPartitioner.hpp"
+#include "ClockSchedulerProfile.hpp"
 #include "TerminationRequest.hpp"
 #include "TickSimulationConfig.hpp"
 #include "TickSimulationCycleUtils.hpp"
@@ -188,6 +189,12 @@ public:
     }
 
     void initialize();
+
+    /// Host-only, between run calls. Empty unless profile_clock_scheduler is enabled.
+    const std::vector<ClockSchedulerProfile>& clockSchedulerProfile() const noexcept {
+        return clock_scheduler_profile_;
+    }
+    uint64_t clockPartitionTimeNs() const noexcept { return clock_partition_time_ns_; }
 
     /// Static configuration only. ID 0 is the legacy default clock; UINT32_MAX is reserved.
     const ClockDomain& addClockDomain(ClockDomain domain);
@@ -725,6 +732,8 @@ private:
     std::deque<ClockDomain> clock_domains_;
     bool clock_mode_ = false;
     bool clock_failed_ = false;
+    std::vector<ClockSchedulerProfile> clock_scheduler_profile_;
+    uint64_t clock_partition_time_ns_ = 0;
     SimTime clock_time_;
     struct ClockRuntime {
         const ClockDomain* clock = nullptr;

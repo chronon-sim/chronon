@@ -119,6 +119,8 @@ void TickSimulation::prepareClockTopology_() {
 }
 
 void TickSimulation::initializeClockRuntime_() {
+    if (config_.profile_clock_scheduler)
+        clock_scheduler_profile_.resize(shouldUseParallelExecution_() ? thread_units_.size() : 1);
     for (auto* unit : unit_ptrs_) {
         auto& runtime = clock_runtime_[unit->clockDomainId()];
         runtime.clock = &unit->clockDomain();
@@ -160,10 +162,21 @@ bool TickSimulation::executeClockBatch_() {
     if (clock_calendar_->empty() || wasTerminationRequested()) return false;
     if (current_cycle_ == UINT64_MAX) throw std::overflow_error("scheduler progress overflow");
     try {
+        auto* profile = config_.profile_clock_scheduler && (current_cycle_ & 63) == 0
+                            ? &clock_scheduler_profile_[0]
+                            : nullptr;
+        if (profile) ++profile->sweeps;
+        detail::ClockProfileScope calendar_profile(profile ? &profile->admission_ns : nullptr);
         const auto edges = clock_calendar_->pop();
+        calendar_profile.finish();
+        detail::ClockProfileScope actors_profile(profile ? &profile->actor_ns : nullptr);
         if (clock_trace_ && clock_trace_->needsProgress())
             clock_trace_->beginClockBatch(edges.front().time);
-        for (auto& fifo : cdc_) fifo->begin(edges);
+        {
+            detail::ClockProfileScope bridge_profile(profile ? &profile->bridge_ns : nullptr);
+            for (auto& fifo : cdc_) fifo->begin(edges);
+        }
+        detail::ClockProfileScope ticks_profile(profile ? &profile->tick_ns : nullptr);
         for (const auto& edge : edges) {
             auto& runtime = clock_runtime_.at(edge.domain->id());
             for (auto* unit : runtime.units) {
@@ -172,8 +185,14 @@ bool TickSimulation::executeClockBatch_() {
                 unit->clock_edge_executing_ = false;
             }
         }
+        ticks_profile.finish();
         // Every CDC component sampled before ANY participating domain committed.
-        for (auto& fifo : cdc_) fifo->commit();
+        {
+            detail::ClockProfileScope bridge_profile(profile ? &profile->bridge_ns : nullptr);
+            for (auto& fifo : cdc_) fifo->commit();
+            if (profile) profile->bridge_commits += cdc_.size();
+        }
+        actors_profile.finish();
         for (const auto& edge : edges)
             clock_runtime_.at(edge.domain->id()).next_cycle = edge.cycle + 1;
         clock_time_ = edges.front().time;

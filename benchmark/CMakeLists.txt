@@ -3,6 +3,11 @@
 
 add_executable(chronon_multiclock_benchmark multiclock_benchmark.cpp)
 target_link_libraries(chronon_multiclock_benchmark PRIVATE chronon::core chronon_compile_options)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8
+   AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(chronon_multiclock_benchmark PRIVATE CHRONON_COUNT_CLOCK_ALLOCATIONS=1)
+    target_link_options(chronon_multiclock_benchmark PRIVATE "-Wl,--wrap=_Znwm" "-Wl,--wrap=_Znam")
+endif()
 add_executable(chronon_single_clock_regression_benchmark single_clock_regression.cpp)
 target_link_libraries(chronon_single_clock_regression_benchmark PRIVATE chronon::core chronon_compile_options)
 add_executable(chronon_trace_output_benchmark trace_output_benchmark.cpp)
@@ -117,6 +122,14 @@ if(CHRONON_BUILD_TESTS)
     add_test(NAME benchmark_multiclock_scaling_smoke
         COMMAND chronon_multiclock_benchmark scaling 2000 2 4 4 8 1 4)
     set_tests_properties(benchmark_multiclock_scaling_smoke PROPERTIES PROCESSORS 2 TIMEOUT 30)
+    add_test(NAME benchmark_multiclock_shared_segmented
+        COMMAND chronon_multiclock_benchmark scaling 2000 4 4 4 0 1 1
+            --lanes 8 --segment 137 --clocks coincident --profile 1)
+    add_test(NAME benchmark_multiclock_feedback
+        COMMAND chronon_multiclock_benchmark scaling 2000 4 8 8 8 0 1
+            --topology ring --activity 4 --clocks coprime)
+    set_tests_properties(benchmark_multiclock_shared_segmented benchmark_multiclock_feedback
+        PROPERTIES PROCESSORS 4 TIMEOUT 30)
     add_test(NAME benchmark_direct_spsc_smoke
         COMMAND chronon_direct_spsc_benchmark 10000 1)
     set_tests_properties(benchmark_direct_spsc_smoke PROPERTIES RUN_SERIAL TRUE)

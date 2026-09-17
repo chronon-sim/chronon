@@ -72,6 +72,7 @@ private:
     uint64_t ordinal_ = 0;
     uint64_t dropped_ = 0;
     uint64_t peak_ = 0;
+    uint64_t stalls_ = 0, stall_ns_ = 0;
     bool parallel_ = false;
     ClockRecord dropped_run_{};  // value = count; phase high bit marks gap metadata.
 };
@@ -92,6 +93,9 @@ public:
     struct Stats {
         uint64_t events = 0;
         uint64_t dropped = 0;
+        uint64_t producer_stalls = 0, producer_stall_ns = 0;
+        uint64_t admission_retries = 0;
+        uint64_t progress_stalls = 0, progress_stall_ns = 0;
         uint64_t allocated_buffer_bytes = 0;
         uint64_t peak_buffer_bytes = 0;  // Sum of per-stream high water marks (upper bound).
         uint64_t file_bytes = 0;

@@ -20,6 +20,28 @@
 #include "detail/ClockEventBuffer.hpp"
 
 namespace chronon::observe {
+namespace {
+// Read host time only on the slow path; stream counters follow producer ownership.
+class ClockTraceStall {
+public:
+    ClockTraceStall(bool stalled, uint64_t& count, uint64_t& ns) : ns_(stalled ? &ns : nullptr) {
+        if (ns_) {
+            ++count;
+            start_ = std::chrono::steady_clock::now();
+        }
+    }
+    ~ClockTraceStall() {
+        if (ns_)
+            *ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start_)
+                        .count();
+    }
+
+private:
+    uint64_t* ns_;
+    std::chrono::steady_clock::time_point start_;
+};
+}  // namespace
 
 ClockTraceStream::ClockTraceStream(size_t capacity, bool lossless, bool perfetto, ClockDomain clock,
                                    std::atomic<bool>* failed)
@@ -37,6 +59,8 @@ void ClockTraceStream::advance(uint64_t next_cycle) {
     const auto ns = perfetto_ ? clock_.edge(next_cycle).floorNanoseconds() : 0;
     minimum_cycle_ = next_cycle;
     watermark_.store(ns, std::memory_order_release);
+    ClockTraceStall stall(perfetto_ && acknowledged_.load(std::memory_order_acquire) < ns, stalls_,
+                          stall_ns_);
     while (perfetto_ && acknowledged_.load(std::memory_order_acquire) < ns) {
         if (failed_->load(std::memory_order_acquire))
             throw std::runtime_error("clock trace backend failed or closed");
@@ -56,11 +80,14 @@ void ClockTraceStream::endEdge() {
     if (!dropped_run_.value) return;
     const auto head = head_.load(std::memory_order_relaxed);
     auto tail = tail_.load(std::memory_order_acquire);
-    while (head - tail == ring_.size()) {
-        if (failed_->load(std::memory_order_acquire))
-            throw std::runtime_error("clock trace backend failed or closed");
-        std::this_thread::yield();
-        tail = tail_.load(std::memory_order_acquire);
+    {
+        ClockTraceStall stall(head - tail == ring_.size(), stalls_, stall_ns_);
+        while (head - tail == ring_.size()) {
+            if (failed_->load(std::memory_order_acquire))
+                throw std::runtime_error("clock trace backend failed or closed");
+            std::this_thread::yield();
+            tail = tail_.load(std::memory_order_acquire);
+        }
     }
     ring_[head & (ring_.size() - 1)] = dropped_run_;
     dropped_run_.value = 0;
@@ -85,32 +112,35 @@ void ClockTraceStream::record(uint64_t cycle, ClockEventKind kind, uint64_t tran
         head = head_.load(std::memory_order_relaxed);
         tail = tail_.load(std::memory_order_acquire);
     }
-    while (head - tail == ring_.size()) {
+    {
+        ClockTraceStall stall(lossless_ && head - tail == ring_.size(), stalls_, stall_ns_);
+        while (head - tail == ring_.size()) {
+            if (failed_->load(std::memory_order_acquire))
+                throw std::runtime_error("clock trace backend failed or closed");
+            if (!lossless_) {
+                ++dropped_;
+                if (parallel_) {
+                    if (!dropped_run_.value) {
+                        dropped_run_ = {
+                            cycle,
+                            0,
+                            0,
+                            ordinal,
+                            0,
+                            kind,
+                            static_cast<ClockEventPhase>(static_cast<uint8_t>(phase) | 128)};
+                    }
+                    ++dropped_run_.value;
+                }
+                return;
+            }
+            // Host waiting never changes simulated time or acceptance decisions.
+            std::this_thread::yield();
+            tail = tail_.load(std::memory_order_acquire);
+        }
         if (failed_->load(std::memory_order_acquire))
             throw std::runtime_error("clock trace backend failed or closed");
-        if (!lossless_) {
-            ++dropped_;
-            if (parallel_) {
-                if (!dropped_run_.value) {
-                    dropped_run_ = {
-                        cycle,
-                        0,
-                        0,
-                        ordinal,
-                        0,
-                        kind,
-                        static_cast<ClockEventPhase>(static_cast<uint8_t>(phase) | 128)};
-                }
-                ++dropped_run_.value;
-            }
-            return;
-        }
-        // Host waiting never changes simulated time or acceptance decisions.
-        std::this_thread::yield();
-        tail = tail_.load(std::memory_order_acquire);
     }
-    if (failed_->load(std::memory_order_acquire))
-        throw std::runtime_error("clock trace backend failed or closed");
     if (coordinator_) coordinator_->reserveClockRecord(record_base_bytes_, kind);
     ring_[head & (ring_.size() - 1)] = {cycle, transaction, value, ordinal, fifo, kind, phase};
     peak_ = std::max(peak_, head - tail + 1);
@@ -558,7 +588,10 @@ bool ClockTraceRecorder::tryAdmitClockBatch(const SimTime& time) {
             if (p.buckets[n % p.buckets.size()].ns == ns) return true;
         throw std::logic_error("clock observation admissions must be ordered");
     }
-    if (head - tail == p.buckets.size()) return false;
+    if (head - tail == p.buckets.size()) {
+        ++p.stats.admission_retries;
+        return false;
+    }
     if (head == UINT64_MAX) throw std::overflow_error("clock observation admission overflow");
     p.buckets[head % p.buckets.size()].ns = ns;
     p.bucket_head.store(head + 1, std::memory_order_release);
@@ -649,6 +682,8 @@ void ClockTraceRecorder::advance(uint64_t exclusive_ns) {
     if (exclusive_ns < impl_->watermark.load(std::memory_order_relaxed))
         throw std::invalid_argument("clock recorder watermark cannot move backwards");
     impl_->watermark.store(exclusive_ns, std::memory_order_release);
+    ClockTraceStall stall(impl_->acknowledged.load(std::memory_order_acquire) < exclusive_ns,
+                          impl_->stats.progress_stalls, impl_->stats.progress_stall_ns);
     while (impl_->acknowledged.load(std::memory_order_acquire) < exclusive_ns) {
         if (impl_->failed.load(std::memory_order_acquire))
             throw std::runtime_error("clock trace backend failed or closed");
@@ -726,6 +761,8 @@ void ClockTraceRecorder::close() {
     impl_->closed = true;
     for (const auto& stream : impl_->streams) {
         impl_->stats.dropped += stream.queue->dropped_;
+        impl_->stats.producer_stalls += stream.queue->stalls_;
+        impl_->stats.producer_stall_ns += stream.queue->stall_ns_;
         impl_->stats.peak_buffer_bytes += stream.queue->peak_ * sizeof(ClockRecord);
     }
     if (impl_->error) std::rethrow_exception(impl_->error);
@@ -736,6 +773,11 @@ void ClockTraceRecorder::close() {
         std::ofstream report(impl_->config.output_dir / "clock-stats.json");
         report.exceptions(std::ios::badbit | std::ios::failbit);
         report << "{\"events\":" << impl_->stats.events
+               << ",\"producer_stalls\":" << impl_->stats.producer_stalls
+               << ",\"producer_stall_ns\":" << impl_->stats.producer_stall_ns
+               << ",\"admission_retries\":" << impl_->stats.admission_retries
+               << ",\"progress_stalls\":" << impl_->stats.progress_stalls
+               << ",\"progress_stall_ns\":" << impl_->stats.progress_stall_ns
                << ",\"dropped_events\":" << impl_->stats.dropped
                << ",\"allocated_ingress_bytes\":" << impl_->stats.allocated_buffer_bytes
                << ",\"peak_ingress_bytes_upper_bound\":" << impl_->stats.peak_buffer_bytes
