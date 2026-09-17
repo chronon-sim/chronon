@@ -142,6 +142,50 @@ void testFullDevice() {
     }
 }
 
+struct ClockProducer : chronon::sender::TickableUnit {
+    explicit ClockProducer(std::string name) : TickableUnit(std::move(name)) {}
+    void tick() override {
+        for (size_t i = 0; i < 8; ++i) clockEvent(ClockEventKind::User, 0, localCycle());
+    }
+};
+
+void testParallelClock(const std::filesystem::path& root) {
+    chronon::sender::TickSimulationConfig config;
+    config.num_threads = 2;
+    config.max_lookahead_cycles = 16;
+    chronon::sender::TickSimulation sim(config);
+    sim.addClockDomain(chronon::ClockDomain::fromHz(1, "clock", 1'000'000'000));
+    for (size_t i = 0; i < 4; ++i)
+        sim.createUnitInDomain<ClockProducer>(1, "unit-" + std::to_string(i));
+    ClockTraceRecorder::Config trace;
+    trace.output_dir = root / "parallel";
+    trace.text = false;
+    trace.stream_capacity = 2;
+    trace.drain_batch = 1;
+    trace.perfetto_options.clock_buffer_records = 64;
+    sim.configureClockTrace(trace);
+    sim.initialize();
+    CHECK(sim.useParallelExecution());
+    {
+        FileSizeLimit limit(1);
+        bool failed = false;
+        try {
+            sim.runClockEvents(100'000);
+        } catch (const std::runtime_error&) {
+            failed = true;
+        }
+        CHECK(failed);  // Includes producers waiting on two-record ingress rings.
+        expectFailure([&] { sim.closeClockTrace(); }, trace.output_dir / "timeline.pftrace");
+    }
+    bool rejected = false;
+    try {
+        sim.runClockEvents(1);
+    } catch (const std::logic_error&) {
+        rejected = true;
+    }
+    CHECK(rejected);
+}
+
 void testBackend(const std::filesystem::path& root, bool reorder, bool pressure) {
     auto& threads = ThreadContextManager::instance();
     threads.setQueueCapacity(4096);
@@ -292,6 +336,8 @@ int main(int argc, char** argv) {
         testWriter(root, mode == "compressed");
     } else if (mode == "full_device") {
         testFullDevice();
+    } else if (mode == "parallel_clock") {
+        testParallelClock(root);
     } else if (mode == "immediate" || mode == "async" || mode == "final_flush") {
         testBackend(root, mode != "immediate", mode != "final_flush");
     } else if (mode == "manager_stop" || mode == "manager_shutdown") {

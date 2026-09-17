@@ -39,10 +39,106 @@ the scheduler chooses edges; each FIFO implements its own pointer synchronizers,
 registered full/empty flags, RAM and output register. An ordinary delayed queue
 is not a CDC circuit.
 
-The initial implementation executes explicitly configured clock-domain graphs
-serially. Requests for parallel execution have a visible fallback reason. The
-existing default single-clock sequential and epoch-free paths remain available.
-This infrastructure does not choose or calibrate SAGE/GPU clock parameters.
+Explicit clock-domain graphs support epoch-free parallel execution. Same-domain
+zero-delay connections form indivisible clusters; each CDC FIFO is an independent
+bridge task with its own two-endpoint edge calendar. A bridge snapshots old state,
+publishes edge readiness to its endpoint clusters, then commits when those
+clusters publish completion. Other units in either domain need not wait for that
+bridge. The circuit's synchronizers, finite storage and full/empty rules are
+unchanged; CDC is not approximated by a constant-delay ordinary connection.
+
+Persistent workers run for the entire run call, without per-edge or per-epoch
+barriers. A coordinator admits a rolling window of at most
+`max_lookahead_cycles` **physical-time batches**, retires completed instants, and
+refills available space without waiting for the whole window. Ordinary port
+dependencies still compare local edges within one domain; bridge tasks compare
+exact physical edge times. Only the bridge's two endpoints participate in its
+sampling/commit handshake. No simulation state rollback is used.
+
+Initial placement reuses the configured Weighted/SA solver and epoch-free
+topology refinement. Its graph contains both real clusters and CDC bridge actors:
+unit costs are multiplied by their domain edge rate, and endpoint-specific
+begin/commit handshake edges carry the corresponding rate. Without precomputed
+costs, bridges use a uniform cost prior per endpoint, not a bridge-count placement
+pass. No speculative model ticks are executed to profile initialization.
+
+Admission publishes once per participating domain; retirement checks only that
+domain's indexed cluster and bridge-endpoint completions. This is an index over
+progress, not a domain execution barrier. Bridge successor timestamps are cached
+until commit, avoiding repeated rational edge construction during polling.
+
+With `enable_dynamic_rebalance`, the clock runtime reuses the epoch-free
+one-actor migration planner, owner/generation publication, gain thresholds and
+cooldown policy. Ordinary zero-delay clusters remain indivisible; a CDC bridge
+is also a migratable actor. Only the losing owner publishes a handoff, after its
+complete sweep: clusters transfer after a completed tick, and bridges transfer
+only after commit, never between begin and commit. The receiving worker acquires
+the existing circuit, queues, sampling state and logical trace producers; no
+whole-domain fence, queue reconstruction, or simulation rollback is introduced.
+
+Sparse active/inactive unit timing is weighted by the domain's edge rate. Bridge
+timing charges begin and commit work, excluding time waiting for endpoints, and
+accounts for coincident edges. The planner's compute and handshake costs use a
+common reference-clock basis. Unit sampling uses the existing sparse sampler
+with `ceil(256 * domain_hz / tick_frequency_hz)` local edges between samples
+(at least one). Four-sample confidence and local active/inactive accounting are
+unchanged, so slow domains no longer require 1024 local edges merely to become
+measurable. Bridge sampling remains every 256 merged transactions.
+Sampled unsuccessful worker sweeps reuse the existing wait counters and scorer;
+dependency waits are credited only at the exact physical retirement frontier.
+Later runahead waits are not treated as critical-path loss. These are sparse
+heuristic samples, not exhaustive wall-time accounting.
+
+In clock mode, `rebalance_check_interval_cycles`
+and `rebalance_cooldown_cycles` mean **cycles at `tick_frequency_hz` of retired
+physical time**, not domain-local cycles or calendar batches. Ownership and
+sampling history survive segmented run calls; an unfinished migration request
+is canceled after workers join at a run/stop boundary, before stop settlement.
+Already committed migrations remain in effect. `rebalanceCount()` reports actual
+handoffs and `assignedThread(unit)` reflects the joined runtime placement.
+
+Disabled parallel or lookahead settings, a single cluster, and unproven
+ordinary-port transport headroom retain explicit sequential fallback reasons. `configureClockTrace`
+supports epoch-free execution with text, Perfetto, or both sinks; enabling it
+does not select a different simulation execution mode. The default
+single-clock paths are unchanged. This infrastructure does not choose or calibrate
+SAGE/GPU clock parameters.
+
+## Known limitations and follow-up work
+
+The clock-tracing fallback from the initial epoch-free CDC implementation has
+been removed. Unit and bridge actors now have independent producer streams,
+bridge-aware progress publication, and bounded asynchronous observation credits
+(see below). Placement/profiling and the first scaling characterization are also
+implemented; measured benefits and regressions are recorded in
+[Multi-clock validation and performance](./multiclock-validation.md#epoch-free-placement-and-scaling).
+The following performance limits remain:
+
+- **Dynamic placement is heuristic, not a speedup guarantee.** Initial uniform
+  cost priors cannot predict an expensive unit. Short skewed runs may end before
+  enough migration checks correct that placement; measured regressions are
+  included, not hidden by reporting balanced workloads alone. Rarely active
+  units and bridge samples still need warmup. Existing precomputed unit/platform
+  costs can seed placement without changing simulation state.
+- **Scaling is workload-dependent.** Admission and retirement still have one
+  coordinator; workers still poll their owned actors. Domain indexing reduces
+  scans, but is not an event-driven ready queue. Cheap ticks can be slower than
+  serial execution, and adding bridge vertices increases partitioning cost.
+  The supplied fixed-work benchmark measures 1/2/4 workers and up to 32 domains;
+  it is not a many-core, NUMA, SAGE/GPU, or tracing-throughput speedup claim.
+
+Two intentional semantics should not be mistaken for missing correctness fixes:
+
+- **Termination permits bounded runahead, without rollback.** The request time
+  and the settled stop boundary are recorded separately as `physical_time` and
+  `settled_time`. The latter can vary with host scheduling. State at the request
+  instant is not promised; all work through the reported settled boundary is
+  complete. See the termination contract below.
+- **One CDC FIFO bridge processes its two endpoints in physical-time order.**
+  This is the expected per-circuit ordering, including old-state sampling at
+  coincident edges, not a whole-domain synchronization requirement. Exploiting
+  synchronizer latency to let the two sides run farther apart is an optional
+  future optimization, not required to fix parallel execution of the graph.
 
 ## Configure and run
 
@@ -128,7 +224,7 @@ of representable physical time. Check `maxEdgeIndex()` for the actual configured
 clock; do not assume every phase has the default clock's horizon. The tests check
 a million consecutive calendar batches and direct mappings at edge `10^12`.
 
-For `D` active domains, `K` coincident edges, `U` units on those edges and `F`
+For serial execution with `D` active domains, `K` coincident edges, `U` units on those edges and `F`
 FIFOs, a batch costs `O(K log D + U + F*K + active synchronizer registers)`.
 Tracing additionally visits newly visible entries, at most the FIFO depth per
 read edge. Calendar memory is `O(D)`; FIFO storage is `O(depth + stages)` packets
@@ -154,15 +250,36 @@ their cycle limit is ambiguous. Use `runClockEvents(N)`, `runUntilTime(t)`, or
 after the entire coincident batch, and do not manufacture a termination request
 when their budget runs out. `runUntil(predicate, N)` uses a batch budget in this
 mode and retains the configured predicate polling interval. For an exact stopping
-edge, request termination from a unit.
+edge without earlier termination, use a physical-time/domain-cycle run limit.
 
 Termination records include a domain ID, local edge number, and exact physical
 time. An external request uses the last completed physical instant, scheduler
 progress and domain sentinel `UINT32_MAX`. Simultaneous unit requests have a
 deterministic winner: domain ID, then the domain's canonical zero-delay topological
-order, with `fullPath()` as the tie-break. All units and CDC commits at that
-instant finish before stopping. Resume after a normal stop with
+order, with `fullPath()` as the tie-break.
+
+In serial mode all units and CDC commits at the request instant finish before
+stopping. In epoch-free mode independent clusters may already have started later
+edges. A termination request freezes admission; workers join and the scheduler
+settles all units and bridges through the latest already-started edge (including
+bridge snapshots). Unstarted work beyond that boundary is discarded. This is
+bounded by the admitted lookahead window, and never exceeds the caller's run
+limit. Earlier requests discovered during settlement win over later requests;
+requests at the same instant use the canonical ordering above.
+
+After return, `terminationRequest().physical_time` is the request time,
+`terminationRequest().settled_time` and `lastCommittedTime()` record the settled
+stop boundary, `domainCycleCount(id)` is
+that domain's completed edge count at the boundary, and the return value counts
+all completed batches including settlement. The stop boundary can depend on
+worker progress and can be later than the request time; arbitrary model state
+is not rolled back. Read termination details after the run returns. Resume with
 `resetTermination()`. A failed evaluation or time overflow cannot be resumed.
+
+If an external stop is already pending when a clock run API is called, the call
+reports the existing `lastCommittedTime()` as `settled_time` without advancing
+any unit or bridge. This also applies to zero-length runs and already-drained
+`drainCdc()` calls. Resetting termination clears the reported stop boundary.
 
 ## Coincident edges and pipeline registers
 
@@ -172,6 +289,12 @@ At each physical instant:
 2. Units on participating domains evaluate their local interfaces.
 3. Every CDC circuit commits RAM operations, pointer flops, synchronizer flops,
    flag flops and its read output register from the captured state.
+
+These are per-circuit ordering requirements, not a global barrier between
+independent circuits. The current parallel bridge task processes its two clocks
+in physical-time order; it does not yet exploit synchronizer depth to run the
+two sides of one FIFO independently ahead of each other. Parallel speedup depends
+on available independent cluster/bridge work and tick cost.
 
 Thus a pointer newly committed at time `t` cannot be sampled by another domain
 at that same `t`, regardless of host execution order. This is a deterministic
@@ -377,9 +500,13 @@ cross-domain order. Guard expensive observation-only argument calculations with
 `if (clockTraceStream())`.
 
 Each unit has a bounded SPSC record stream. Separate streams can be written by
-separate workers, including workers in the same domain. One backend drains
-batches without a global time heap or per-event global lock. Text is formatted
-and written immediately in batches; native Perfetto records use bounded open
+separate workers, including workers in the same domain. In epoch-free mode each
+CDC bridge also has two private commit streams, associated with the endpoints'
+existing unit identities and tracks. The unit stream records evaluation events
+(including consume); bridge streams record commit events. Logical producer
+ownership is independent of host worker placement. One backend drains batches
+without a per-event global lock. Serial text is formatted and written immediately
+in batches; native Perfetto records use bounded open
 nanosecond buckets, closed by explicit producer progress. Exactly one text sink
 exists per domain:
 
@@ -393,7 +520,9 @@ clock-stats.json
 ```
 
 The manifest records run identity, exact periods/phases, unit/domain/sequence/
-track mappings and event names. Text rows contain local cycle, unit ID, event,
+track mappings and event names. Multiple epoch-free producer streams share one
+unit/track; `producer_order` is zero for evaluation and FIFO ID + 1 for commits.
+Text rows contain local cycle, unit ID, event,
 evaluation/commit phase, transaction ID, FIFO ID, value and stream ordinal.
 Only per-stream order is guaranteed; different streams in one domain need not
 be cycle-sorted. There are no per-worker text shards and no global order across
@@ -402,12 +531,23 @@ consume are separate events on the appropriate units' domain tracks.
 
 On a full observation ring, lossless recording blocks/yields the **host** until
 space exists; no simulated edge is added. Lossy recording drops the record and
-counts the drop. Metadata is not placed in a lossy queue. `clock-stats.json`
-reports total retained/dropped events and ingress memory. Close/join only after
+counts the drop. In epoch-free mode, contiguous dropped records produce compact,
+non-lossy gap metadata at actor boundaries. Publishing that metadata can wait for
+the backend to drain ingress, but never waits for another simulation actor. This
+preserves the original logical-unit ordinal of every retained event, even when
+unit and bridge records interleave. Metadata is not placed in a lossy queue.
+`clock-stats.json` reports total retained/dropped events and ingress memory,
+plus `allocated_staging_bytes` and `peak_staging_records` for parallel recording.
+Close/join only after
 all producer threads have stopped. Native Perfetto packet prefixes become available
 during execution; `close()` / `closeClockTrace()` finishes the tail. Backend failures unblock waiting producers
 and are surfaced as errors. Static metadata plus ring capacity are fixed before
-running; ring allocation is capped at 256 MiB across streams.
+running; combined ring and parallel compact-record staging allocation is capped
+at 256 MiB across streams (separate from the native encoder's storage).
+Parallel staging uses two contiguous arrays, for records and bucket descriptors;
+both count toward this cap and `allocated_staging_bytes`. There is no per-bucket
+heap allocation. These are requested storage bytes, not a process RSS limit:
+allocator bookkeeping/page rounding and other recorder/encoder state are separate.
 
 The ingress peak is the sum of per-stream high-water marks, a conservative bound
 on simultaneous queued bytes. It excludes bounded text/Perfetto encoder batches
@@ -427,6 +567,36 @@ drops accepted events. In particular, all events in one open ns bucket must fit;
 reduce publication batch size or increase the record bound for dense models.
 
 ### Progress publication and bounded streaming
+
+The epoch-free scheduler reserves observation credits **before admitting** a new
+physical-time batch. Credits cover a bounded rolling window of nanosecond buckets,
+with room reserved for each bucket's full compact-record capacity. The default
+window is at most `max_lookahead_cycles + 1` buckets, reduced if necessary to fit
+the shared 256 MiB ingress/staging allocation budget. A bucket may contain many
+physical instants. These credits are observation resources, not execution epochs.
+When exhausted, only new admission pauses; workers continue all already-admitted
+unit/bridge tasks. There is no per-tick, per-nanosecond, or whole-window execution
+barrier while credits are available.
+
+As batches retire, the scheduler publishes a **nonblocking** watermark using the
+next unretired physical instant. Retirement includes all unit publications and
+CDC commits, including quiet/sleeping endpoints. The backend can always drain
+every admitted actor's ring into its reserved compact storage, without needing
+another actor on the same worker to run first. It releases closed buckets
+individually and returns credits as they drain, not as a synchronized epoch.
+Backend failure releases waiting producers and is checked by the coordinator.
+
+Both parallel sinks merge a closed bucket by exact time, evaluation/commit phase,
+unit name, FIFO producer order and producer-local ordinal. The backend reconstructs
+canonical per-unit ordinals (including lossy gaps), preserving the serial text
+and Perfetto identities. The native writer receives only one closed bucket at a
+time, retaining its existing record and 4 MiB metadata bounds. Parallel text-only
+recording uses the same bucket limits and ordering. Compact gap metadata also
+counts against these limits. A genuinely oversized single bucket fails explicitly;
+many individually valid dense buckets do not overflow the native buffer simply
+because independent actors are running ahead. No temporary files or whole-run
+sorting are used. Termination settlement publishes the completed boundary and
+unused observation credits remain reusable on resume; close drains the tail.
 
 `PerfettoTraceWriter::advanceClockWatermark(W)` promises that **all streams** have
 submitted every event with `floor(physical_time / 1 ns) < W`, and will never submit

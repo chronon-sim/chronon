@@ -98,7 +98,9 @@ void runCase(uint64_t whz, uint64_t rhz, uint64_t phase, size_t depth, size_t st
         sim.configureClockTrace(recording);
     }
     sim.initialize();
-    assert(!sim.useParallelExecution() && !sim.parallelFallbackReason().empty());
+    const bool parallel = threads > 1;
+    assert(sim.useParallelExecution() == parallel);
+    assert(sim.parallelFallbackReason().empty() == parallel);
     assert(sim.epochFreeRunCount() == 0);
     ref::Fifo oracle(depth, stages, !trace.empty());
     uint64_t wc = 0, rc = 0;
@@ -148,6 +150,7 @@ void runCase(uint64_t whz, uint64_t rhz, uint64_t phase, size_t depth, size_t st
         assert(sim.domainCycleCount(1) == wc && sim.domainCycleCount(2) == rc);
     }
     sim.closeClockTrace();
+    assert((sim.epochFreeRunCount() > 0) == parallel);
     if (!trace.empty()) {
         const auto stats = sim.clockTraceRecorder()->stats();
         assert(stats.events + stats.dropped == oracle.events.size());
@@ -175,7 +178,9 @@ void runCase(uint64_t whz, uint64_t rhz, uint64_t phase, size_t depth, size_t st
     const auto& termination = sim.terminationRequest();
     assert(termination.clock_domain_id == 2 && termination.physical_time);
     assert(*termination.physical_time == sim.clockDomain(2).edge(termination.cycle));
-    assert(*termination.physical_time == sim.lastCommittedTime());
+    assert(*termination.physical_time <= sim.lastCommittedTime());
+    assert(termination.settled_time == sim.lastCommittedTime());
+    if (!parallel) assert(*termination.physical_time == sim.lastCommittedTime());
     sim.resetTermination();
     writer->stopped = true;
     reader->stop_after = UINT64_MAX;
@@ -277,7 +282,7 @@ int main(int argc, char** argv) {
     if (argc > 1) {
         const std::filesystem::path root(argv[1]);
         runCase(914'000'000, 1'326'000'000, 137, 8, 2, 2, 10000, 1, false, root / "serial");
-        runCase(914'000'000, 1'326'000'000, 137, 8, 2, 2, 10000, 4, true, root / "fallback");
+        runCase(914'000'000, 1'326'000'000, 137, 8, 2, 2, 10000, 4, true, root / "parallel");
         runCase(914'000'000, 1'326'000'000, 137, 8, 2, 2, 10000, 4, true, root / "lossy", true);
         runCase(1'000'000'000, 1'000'000'000, 0, 4, 3, 0, 3000, 1, false, root / "coincident",
                 false, false);

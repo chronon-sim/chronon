@@ -13,11 +13,22 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 # Test executables (prefixed with sender_ to avoid conflicts)
-foreach(clock_test clock_time async_fifo_circuit multiclock clock_trace_budget)
+foreach(clock_test clock_time async_fifo_circuit multiclock multiclock_epoch_free multiclock_migration clock_trace_budget)
     add_executable(sender_test_${clock_test} test_${clock_test}.cpp)
-    target_link_libraries(sender_test_${clock_test} PRIVATE chronon::core)
+    target_link_libraries(sender_test_${clock_test} PRIVATE chronon::core chronon_compile_options)
     add_test(NAME sender_${clock_test} COMMAND sender_test_${clock_test})
+    add_dependencies(regress sender_test_${clock_test})
 endforeach()
+# These tests create up to four persistent workers plus a trace backend. Account
+# for that in CTest's job budget on small CI runners; do not trim the matrix.
+set_tests_properties(sender_multiclock sender_multiclock_epoch_free sender_multiclock_migration
+    PROPERTIES PROCESSORS 4)
+if(CHRONON_ENABLE_ASAN OR CHRONON_ENABLE_TSAN OR CHRONON_ENABLE_COVERAGE)
+    set_tests_properties(sender_multiclock_epoch_free PROPERTIES TIMEOUT 600)
+else()
+    set_tests_properties(sender_multiclock_epoch_free PROPERTIES TIMEOUT 300)
+endif()
+set_tests_properties(sender_multiclock_migration PROPERTIES TIMEOUT 45)
 
 set(CHRONON_TRACE_PROCESSOR "" CACHE FILEPATH "Optional real Perfetto Trace Processor for multiclock acceptance")
 if(CHRONON_TRACE_PROCESSOR)
@@ -27,6 +38,7 @@ if(CHRONON_TRACE_PROCESSOR)
             --trace-processor ${CHRONON_TRACE_PROCESSOR}
             --multiclock-binary $<TARGET_FILE:sender_test_multiclock>
             --recorder-binary $<TARGET_FILE:test_clock_trace>
+            --epoch-free-binary $<TARGET_FILE:sender_test_multiclock_epoch_free>
             --check-prefix)
     set_tests_properties(multiclock_trace_processor PROPERTIES TIMEOUT 180)
 endif()
@@ -48,8 +60,10 @@ target_link_libraries(sender_test_factory_parameter_allocation_failure
 include(CheckLinkerFlag)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(CHRONON_TEST_NEW_SYMBOL _Znwm)
+    set(CHRONON_TEST_NEW_ARRAY_SYMBOL _Znam)
 else()
     set(CHRONON_TEST_NEW_SYMBOL _Znwj)
+    set(CHRONON_TEST_NEW_ARRAY_SYMBOL _Znaj)
 endif()
 check_linker_flag(CXX "LINKER:--wrap=${CHRONON_TEST_NEW_SYMBOL}" CHRONON_TEST_HAS_WRAP_NEW)
 if(CHRONON_TEST_HAS_WRAP_NEW)
@@ -58,6 +72,21 @@ if(CHRONON_TEST_HAS_WRAP_NEW)
     target_compile_definitions(sender_test_factory_parameter_allocation_failure PRIVATE
         CHRONON_TEST_WRAP_NEW=__wrap_${CHRONON_TEST_NEW_SYMBOL}
         CHRONON_TEST_REAL_NEW=__real_${CHRONON_TEST_NEW_SYMBOL})
+endif()
+# Count actual staging allocation requests independently of recorder statistics.
+# Preserve the sanitizer's allocators, just as the allocation-failure test does.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CHRONON_TEST_HAS_WRAP_NEW AND NOT BUILD_SHARED_LIBS)
+    check_linker_flag(CXX "LINKER:--wrap=${CHRONON_TEST_NEW_ARRAY_SYMBOL}" CHRONON_TEST_HAS_WRAP_NEW_ARRAY)
+    if(CHRONON_TEST_HAS_WRAP_NEW_ARRAY)
+        target_link_options(sender_test_clock_trace_budget PRIVATE
+            "LINKER:--wrap=${CHRONON_TEST_NEW_SYMBOL}"
+            "LINKER:--wrap=${CHRONON_TEST_NEW_ARRAY_SYMBOL}")
+        target_compile_definitions(sender_test_clock_trace_budget PRIVATE
+            CHRONON_TEST_WRAP_NEW=__wrap_${CHRONON_TEST_NEW_SYMBOL}
+            CHRONON_TEST_REAL_NEW=__real_${CHRONON_TEST_NEW_SYMBOL}
+            CHRONON_TEST_WRAP_NEW_ARRAY=__wrap_${CHRONON_TEST_NEW_ARRAY_SYMBOL}
+            CHRONON_TEST_REAL_NEW_ARRAY=__real_${CHRONON_TEST_NEW_ARRAY_SYMBOL})
+    endif()
 endif()
 add_test(NAME sender_factory_parameters_allocation_failure
     COMMAND sender_test_factory_parameter_allocation_failure)

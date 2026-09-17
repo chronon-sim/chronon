@@ -31,10 +31,33 @@ depths include 2, 4, and 16 in the combined matrix, and 64 in the circuit test;
 synchronizer chains include 2, 3, and 5 stages. Seeds are fixed in the tests.
 An integrated mismatch prints its configuration and the last 32 state snapshots.
 
-**Requested parallel multi-clock configurations currently exercise the explicit
-serial fallback.** These tests do not establish an epoch-free parallel CDC
-implementation. Recorder concurrency is exercised by real concurrent threads.
-TSan has not been run.
+The initial results below predate epoch-free CDC scheduling. Current tests assert
+actual parallel execution for requested 2/4-worker clock graphs, including text,
+Perfetto and combined recording. `sender_multiclock_epoch_free` additionally
+checks multi-bridge feedback graphs against serial execution, two-record ingress
+rings, segmented runs, termination/resume, and independent same-domain progress
+while another actor is stalled. Its parallel trace fixtures force eight live
+handoffs per run, moving both ordinary clusters and all three bridges, including
+a request while a bridge is between begin and commit. Text events, native events
+and flows must remain identical to serial execution. `sender_multiclock_migration`
+also tests autonomous measured-load migration, planner-selected bridge migration,
+physical-time cost/cooldown normalization, source-only safe-point publication,
+and cancellation of pending requests on stop, resume and exceptions.
+`sender_clock_trace_budget` covers parallel dense
+bursts, record/byte pressure, lossy accounting and terminal bucket overflow.
+The placement/profiling follow-up passes the full Release suite (123 tests),
+Debug with `-Werror` (4 targeted tests), and an instrumented TSan subset (9 tests,
+including clock migration/recording, partitioning, and the shared single-clock
+rebalance/equivalence paths). New cases check frequency-weighted edge aggregation
+in both partitioners, bridge placement costs, exact-time critical-wait attribution,
+and comparable sampling warmup for 100 MHz and 2 GHz domains.
+The autonomous migration test
+also passes 20 consecutive Release runs.
+The parallel multi-bridge trace fixture imports 39,169 events and 7,575 flow edges:
+serial and 2/4-worker runs with lookahead windows 1/32 have identical normalized
+records. The parallel output-failure test injects `EFBIG` while producers share
+workers and use two-record rings; the run exits, close reports the original
+writer error, and resuming the failed simulation is rejected.
 
 ### Trace Processor results
 
@@ -93,6 +116,99 @@ A permanently empty stream explicitly finishes. A sleeping stream test publishes
 progress without any event, unblocking its peer; late and post-finish records are
 rejected. The integrated scheduler publishes after 64 completed edge batches and
 the existing reverse-drain, lossy, phase and prefix-recovery matrix remains active.
+
+## Epoch-free placement and scaling
+
+Measured on 2026-09-16, Intel Core i9-14900K, Linux 6.1, GCC 12.2 Release,
+pinned to logical CPUs `20,21,22,23` (four distinct cores). Three fresh-process
+repetitions interleave baseline/candidate, serial/static/dynamic and all graph
+shapes with seed `9141326`. Builds and regression tests finished before these
+runs; host frequency and unrelated system activity were not controlled.
+The baseline is runtime commit `b3bef22`, built with the **same new scaling
+workload source** and build configuration as the candidate.
+
+The existing `chronon_multiclock_benchmark` now accepts a `scaling` mode; the
+existing Python runner adds matrix orchestration, serial digest checks and
+before/after summaries. This does not introduce a second profiling framework.
+Each independent pair has two units and one depth-16, two-stage CDC FIFO.
+Domains repeat 250/500/1000/2000 MHz, with `37 * domain_index` ps phase offsets.
+`work` is the number of deterministic integer-mixing iterations **per tick**;
+skew 16 makes both units in pair zero 16 times more expensive. All runs use
+lookahead 32, tracing off, default SA placement and default rebalance settings,
+without precomputed cost hints. Event budgets and hardware work are identical
+across host execution variants of each scenario, not across different graphs.
+
+The following medians use 20,000 physical-time batches. Times cover the run call,
+including live profiling/migration where enabled, but **exclude initialization**.
+The last column is old/new four-worker static run time; above 1 means faster.
+
+| Pairs / domains | Work / skew | Serial ms | Static 2T ms | Static 4T ms | Dynamic 4T ms | Static 4T vs baseline |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 4 / 2 | 0 / 1 | 3.422 | 11.826 | 9.730 | 41.245 | 1.11x |
+| 32 / 2 | 0 / 1 | 16.137 | 41.097 | 24.068 | 38.675 | 2.18x |
+| 32 / 8 | 0 / 1 | 10.064 | 19.572 | 13.906 | 15.916 | 1.44x |
+| 32 / 32 | 0 / 1 | 9.217 | 9.973 | 8.682 | 8.938 | 1.45x |
+| 4 / 2 | 4000 / 1 | 513.228 | 266.297 | 136.941 | 138.329 | 1.01x |
+| 16 / 8 | 4000 / 1 | 515.746 | 266.765 | 156.718 | 153.600 | 1.44x |
+| 16 / 8 | 4000 / 16 | 707.271 | 458.415 | 328.140 | 313.696 | 0.76x |
+
+Important limits shown by the measurements:
+
+- Balanced heavy ticks scale: the 16-pair case reaches 1.93x/3.29x serial
+  throughput at 2T/4T static, and 3.36x with 4T dynamic. The 4-pair case reaches
+  3.75x static, but was already nearly that fast before this change.
+- Cheap ticks are usually still faster serially. Dynamic migration can make
+  them worse: the 4-pair light case ranged from 11.022 to 102.085 ms (median
+  41.245 ms), versus a 12.597 ms baseline dynamic median. Sparse wall-time
+  costs, migration choices and locality make this regime variable; this is not
+  presented as a reliable dynamic speedup or a completed tuning problem.
+- The skewed short run regresses against the previous placement: four-worker
+  static is 31% slower, dynamic 25% slower. It has only about 2,666 reference
+  cycles, allowing one default migration check. A uniform cost prior cannot
+  predict the expensive pair, and one handoff cannot generally repair it.
+- Initial partitioning is more expensive when bridge actors join the graph.
+  Four-worker initialization for 16 pairs rises from about 0.74 to 4.50 ms;
+  for 32 pairs it rises from 2.75 to 13.20–16.65 ms. For 32 domains, the run-only
+  gain does **not** offset initialization in this short run. Report end-to-end
+  time as well as throughput when choosing a configuration.
+
+Repeating the **entire matrix** at 80,000 batches (another 210 checked runs)
+retains 3.29x static scaling for the balanced 16-pair case; dynamic reaches
+3.60x (573.607 ms versus 2,062.839 ms serial and 791.648 ms baseline dynamic).
+The skewed case improves from 1,312.776 ms static to 1,055.637 ms dynamic with
+five median handoffs, but still trails the 1,000.835 ms baseline dynamic result
+by 5.5%. Cheap-tick results remain variable: for 32 pairs/eight domains,
+four-worker static spans 56.076–127.827 ms (median 113.120 ms), versus an
+81.329 ms baseline median; dynamic has a 64.788 ms median. These longer runs
+support separating warmup from throughput, not a universal regression-free claim.
+
+Every variant/repetition checks FIFO packet order, unit-tick and packet totals,
+payload checksum and deterministic work digest against the serial result;
+transport overflows must be zero and parallel fallback is rejected. The runner
+records raw CSV, median/min/max run times, initialization, process CPU time,
+RSS, migration counts, binary SHA-256 and invocation metadata. RSS is a process
+high-water value, not an isolated scheduler-allocation measurement. Generated
+raw artifacts are local measurement outputs, not checked-in golden data.
+
+Reproduce the matrix (choose CPUs available on the target host):
+
+```bash
+python3 scripts/run_multiclock_benchmark.py --scaling \
+  --binary build-release/benchmark/chronon_multiclock_benchmark \
+  --threads 1,2,4 --steps 20000 --repetitions 3 --cpus 20,21,22,23 \
+  --output-dir out/multiclock-scaling
+```
+
+For before/after runs, compile the same scaling harness against the older
+runtime in a separate worktree, then add `--baseline-binary PATH` and
+`--baseline-revision REV`. Use a fresh output directory for each run. Increase
+`--steps` to distinguish profiling/migration warmup from longer-run throughput;
+do not compare executables with different modeled work.
+
+The coordinator remains single-owner and workers still poll actor lists.
+These microbenchmarks do not establish many-core/NUMA scaling, application-level
+GPU/SAGE speedup, or parallel tracing throughput. Existing trace correctness
+and memory-pressure tests are independent evidence, not timing claims.
 
 ## Measured performance
 
@@ -365,7 +481,11 @@ compiler or optimization setting and call it an exact main-branch baseline.
 Clock frequencies and phases are fixed for a run.
 The FIFO is a deterministic digital CDC model, not an analog metastability or
 MTBF model. Only power-of-two FIFO depths and registered synchronous reads are
-implemented. Explicit multi-clock execution is serial with reported fallback.
+implemented. Explicit multi-clock execution supports epoch-free scheduling,
+clock tracing and dynamic cluster/bridge migration. Migration profitability and
+large-graph scheduling scalability still require representative benchmarks;
+clock-specific critical-wait attribution and frequency-aware initial placement
+remain follow-up work.
 Legacy observation entry points and YAML clock-domain configuration are not
 automatically migrated; use the C++ clock/CDC and native recorder APIs in the
 guide. Legacy multi-clock observation is rejected rather than mis-timestamped.

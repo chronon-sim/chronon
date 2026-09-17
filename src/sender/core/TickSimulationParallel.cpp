@@ -128,7 +128,7 @@ void TickSimulation::initProgressSync() {
         // num_clusters is its reserved cache slot; blocker diagnostics map it
         // back to SIZE_MAX because it is not a real predecessor cluster.
         // A zero window disables epoch-free execution before progress setup.
-        if (config_.max_lookahead_cycles > 0) {
+        if (!clock_mode_ && config_.max_lookahead_cycles > 0) {
             thread_resolved_deps_[c].push_back(
                 {&lookahead_floor_, config_.max_lookahead_cycles, /*pred_id=*/num_clusters});
         }
@@ -166,7 +166,7 @@ void TickSimulation::initProgressSync() {
             observe_ctx_, num_clusters, num_threads);
     }
 
-    if (config_.enable_dynamic_rebalance) {
+    if (!clock_mode_ && config_.enable_dynamic_rebalance) {
         initDynamicMigrationRuntime_();
     }
 }
@@ -668,10 +668,19 @@ std::string TickSimulation::formatBlockerDetail_(const BlockedClusterInfo& block
 }
 
 void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, uint64_t cycle,
-                                             bool trace_units, bool sample_unit_activity) {
+                                             bool trace_units, bool sample_unit_activity,
+                                             uint64_t sample_interval) {
     auto* const* units = cluster_unit_ptrs_[cluster].data();
     const size_t num_units = cluster_unit_ptrs_[cluster].size();
 
+    const auto execute = [&](TickableUnit* unit) {
+        if (!clock_mode_) return executeUnitCycle_(unit, cycle);
+        unit->clock_edge_executing_ = true;
+        const bool active = executeUnitCycle_(unit, cycle);
+        unit->clock_edge_executing_ = false;
+        if (auto* stream = unit->clockTraceStream()) stream->endEdge();
+        return active;
+    };
     auto unit_index = [&](size_t offset) {
         return cluster < clusters_.clusters.size() && offset < clusters_.clusters[cluster].size()
                    ? clusters_.clusters[cluster][offset]
@@ -681,7 +690,7 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
         if (unit >= dynamic_runtime_unit_count_) return;
         if (active) ++dynamic_unit_active_ticks_since_checkpoint_[unit];
         const uint64_t last = dynamic_unit_last_activity_checkpoint_cycle_[unit];
-        if (!detail::shouldSampleDynamicTick(cycle, last)) return;
+        if (!detail::shouldSampleDynamicTick(cycle, last, sample_interval)) return;
         const uint64_t window_cycles =
             last == detail::kNoDynamicTickSample ? cycle + 1 : cycle - last;
         dynamic_unit_observed_active_ticks_[unit].fetch_add(
@@ -694,7 +703,7 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
         if (unit >= dynamic_runtime_unit_count_) return;
         auto& last = active ? dynamic_unit_last_active_sample_cycle_[unit]
                             : dynamic_unit_last_inactive_sample_cycle_[unit];
-        if (!detail::shouldSampleDynamicTick(cycle, last)) return;
+        if (!detail::shouldSampleDynamicTick(cycle, last, sample_interval)) return;
         recordDynamicUnitTickSample_(unit, elapsed_ns, active);
         last = cycle;
     };
@@ -717,7 +726,7 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
             cpu_points[0] = threadTraceCpuPoint_();
         }
         for (size_t u = 0; u < num_units; ++u) {
-            points[u].active = executeUnitCycle_(units[u], cycle);
+            points[u].active = execute(units[u]);
             points[u + 1].time = SchedulerTimelineTrace::Clock::now();
             if (cpu_points) {
                 cpu_points[u + 1] = threadTraceCpuPoint_();
@@ -742,7 +751,7 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
     } else {
         for (size_t u = 0; u < num_units; ++u) {
             if (!sample_unit_activity) {
-                executeUnitCycle_(units[u], cycle);
+                execute(units[u]);
                 continue;
             }
 
@@ -751,9 +760,9 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
             bool time_sample = false;
             if (unit < dynamic_runtime_unit_count_) {
                 const bool active_due = detail::shouldSampleDynamicTick(
-                    cycle, dynamic_unit_last_active_sample_cycle_[unit]);
+                    cycle, dynamic_unit_last_active_sample_cycle_[unit], sample_interval);
                 const bool inactive_due = detail::shouldSampleDynamicTick(
-                    cycle, dynamic_unit_last_inactive_sample_cycle_[unit]);
+                    cycle, dynamic_unit_last_inactive_sample_cycle_[unit], sample_interval);
                 if (active_due || inactive_due) {
                     expected_active = units[u]->shouldRunTickAt(cycle);
                     time_sample = expected_active ? active_due : inactive_due;
@@ -761,7 +770,7 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
             }
             SchedulerTimelineTrace::TimePoint begin{};
             if (time_sample) begin = SchedulerTimelineTrace::Clock::now();
-            const bool active = executeUnitCycle_(units[u], cycle);
+            const bool active = execute(units[u]);
             if (time_sample && active == expected_active) {
                 const auto end = SchedulerTimelineTrace::Clock::now();
                 const uint64_t elapsed_ns = static_cast<uint64_t>(

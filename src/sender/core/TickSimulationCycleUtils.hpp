@@ -17,10 +17,13 @@ inline constexpr uint64_t kDynamicClusterBurstCycles = 4;
 /// accepted samples. The runtime additionally requires every cluster member
 /// to execute at the sampled cycle, so periodic and externally woken units
 /// cannot be measured through permanently idle phases.
-inline constexpr bool shouldSampleDynamicTick(uint64_t cycle, uint64_t last_sample) noexcept {
-    if (cycle < kDynamicTickSampleInterval - 1) return false;
+/// interval must be positive; explicit clocks convert the reference cadence
+/// to whole local edges before entering the hot loop.
+inline constexpr bool shouldSampleDynamicTick(
+    uint64_t cycle, uint64_t last_sample, uint64_t interval = kDynamicTickSampleInterval) noexcept {
+    if (cycle < interval - 1) return false;
     if (last_sample == kNoDynamicTickSample) return true;
-    return cycle >= last_sample && cycle - last_sample >= kDynamicTickSampleInterval;
+    return cycle >= last_sample && cycle - last_sample >= interval;
 }
 
 inline uint64_t nextPeriodicCycle(uint64_t cycle, uint64_t period) noexcept {

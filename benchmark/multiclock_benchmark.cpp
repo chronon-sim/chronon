@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <iostream>
 
+#include "MulticlockScaling.hpp"
 #include "chronon/Chronon.hpp"
 
 using namespace chronon;
@@ -35,6 +36,8 @@ struct Empty : TickableUnit {
     void tick() override { value = value * 6364136223846793005ULL + 1442695040888963407ULL; }
 };
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string_view(argv[1]) == "scaling")
+        return chronon::benchmark::runClockScaling(argc, argv);
     if (argc < 3) {
         std::cerr << "usage: multiclock_benchmark off|text|perfetto|both|single|calendar STEPS "
                      "[new-output-dir]\n";

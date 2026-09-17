@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "TickSimulation.hpp"
+#include "TickSimulationClockRuntime.hpp"
 
 namespace chronon::sender {
 
@@ -39,8 +40,28 @@ void TickSimulation::clearDynamicMigrationRequest_() {
                                    std::memory_order_release);
 }
 
+void TickSimulation::refreshDynamicOwnedActors_(size_t worker, std::vector<size_t>& owned,
+                                                std::vector<size_t>& scratch,
+                                                uint64_t& seen_generation) const {
+    scratch.reserve(dynamic_runtime_cluster_count_);
+    for (;;) {
+        const uint64_t before = cluster_assignment_generation_.load(std::memory_order_acquire);
+        scratch.clear();
+        for (size_t c = 0; c < dynamic_runtime_cluster_count_; ++c)
+            if (cluster_runtime_owner_[c].load(std::memory_order_acquire) == worker)
+                scratch.push_back(c);
+        const uint64_t after = cluster_assignment_generation_.load(std::memory_order_acquire);
+        if (before == after) {
+            owned.swap(scratch);
+            seen_generation = after;
+            return;
+        }
+    }
+}
+
 void TickSimulation::initDynamicMigrationRuntime_() {
-    const size_t num_clusters = clusters_.numClusters();
+    const size_t num_clusters =
+        clusters_.numClusters() + (clock_parallel_ ? clock_parallel_->bridges.size() : 0);
     if (num_clusters == 0 || thread_units_.empty()) return;
     const size_t num_threads = thread_units_.size();
     const size_t num_units = unit_ptrs_.size();
@@ -96,6 +117,7 @@ void TickSimulation::initDynamicMigrationRuntime_() {
     }
 
     for (size_t c = 0; c < num_clusters && c < clusters_.clusters.size(); ++c) {
+        if (clock_mode_) dynamic_cluster_unit_sampling_[c] = 1;
         for (size_t unit_idx : clusters_.clusters[c]) {
             if (unit_idx < unit_ptrs_.size() && (unit_ptrs_[unit_idx]->tickInterval() > 1 ||
                                                  unit_ptrs_[unit_idx]->usesActivityScheduling())) {
@@ -230,11 +252,11 @@ void TickSimulation::rebuildThreadUnitsFromClusterOwners_() {
     thread_units_.assign(num_threads, {});
     thread_clusters_.assign(num_threads, {});
 
-    if (cluster_to_thread_.size() < dynamic_runtime_cluster_count_) {
-        cluster_to_thread_.resize(dynamic_runtime_cluster_count_, 0);
+    if (cluster_to_thread_.size() < clusters_.numClusters()) {
+        cluster_to_thread_.resize(clusters_.numClusters(), 0);
     }
 
-    for (size_t c = 0; c < dynamic_runtime_cluster_count_; ++c) {
+    for (size_t c = 0; c < clusters_.numClusters(); ++c) {
         size_t owner = cluster_runtime_owner_[c].load(std::memory_order_acquire);
         if (owner >= num_threads) owner = 0;
         cluster_to_thread_[c] = owner;
@@ -300,7 +322,7 @@ bool TickSimulation::forceEpochFreeMigrationAtBoundary_(Unit* unit, size_t targe
     // ownership refresh uses acquire loads.
     cluster_runtime_owner_[cluster].store(target_thread, std::memory_order_release);
     if (cluster < dynamic_cluster_last_migration_cycle_.size()) {
-        dynamic_cluster_last_migration_cycle_[cluster] = current_cycle_;
+        dynamic_cluster_last_migration_cycle_[cluster] = dynamicMigrationCycle_();
         dynamic_cluster_last_source_thread_[cluster] = source;
         dynamic_cluster_last_target_thread_[cluster] = target_thread;
     }

@@ -243,10 +243,7 @@ void TickSimulation::selectExecutionMode_() {
     parallel_fallback_reason_.clear();
 
     if (clock_mode_) {
-        parallel_fallback_reason_ =
-            "static multi-clock/CDC graph uses physical-time serial scheduling; epoch-free CDC "
-            "unsupported";
-        optimizeAllQueuesForSingleThread();
+        selectClockExecutionMode_();
         return;
     }
 

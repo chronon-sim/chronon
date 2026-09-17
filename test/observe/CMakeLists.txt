@@ -39,7 +39,7 @@ if(UNIX)
     target_link_libraries(test_trace_output_failure
         PRIVATE chronon::core chronon_compile_options ZLIB::ZLIB)
     add_dependencies(regress test_trace_output_failure)
-    foreach(mode raw compressed immediate async final_flush manager_stop manager_shutdown app app_crash)
+    foreach(mode raw compressed immediate async final_flush manager_stop manager_shutdown app app_crash parallel_clock)
         add_test(NAME trace_output_failure_${mode}_test COMMAND test_trace_output_failure ${mode})
         set_tests_properties(trace_output_failure_${mode}_test PROPERTIES TIMEOUT 45)
     endforeach()

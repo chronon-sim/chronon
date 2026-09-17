@@ -114,6 +114,9 @@ target_link_libraries(chronon_representative_workload_benchmark PRIVATE
 target_compile_features(chronon_representative_workload_benchmark PRIVATE cxx_std_20)
 
 if(CHRONON_BUILD_TESTS)
+    add_test(NAME benchmark_multiclock_scaling_smoke
+        COMMAND chronon_multiclock_benchmark scaling 2000 2 4 4 8 1 4)
+    set_tests_properties(benchmark_multiclock_scaling_smoke PROPERTIES PROCESSORS 2 TIMEOUT 30)
     add_test(NAME benchmark_direct_spsc_smoke
         COMMAND chronon_direct_spsc_benchmark 10000 1)
     set_tests_properties(benchmark_direct_spsc_smoke PROPERTIES RUN_SERIAL TRUE)

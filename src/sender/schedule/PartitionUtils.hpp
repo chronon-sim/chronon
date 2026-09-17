@@ -30,6 +30,7 @@ struct PartitionInput {
         size_t neighbor;
         size_t num_connections;
         uint32_t min_delay;
+        double activity_rate = 1.0;  ///< Edges per reference-clock cycle in explicit clock mode.
     };
     std::vector<std::vector<EdgeInfo>> adjacency;
 };
@@ -84,8 +85,9 @@ inline void computeThreadTimes(const PartitionInput& input, const std::vector<si
             size_t dst_thread = assignment[edge.neighbor];
             if (src_thread != dst_thread) {
                 double df = delayFactor(edge.min_delay);
-                thread_times[dst_thread] +=
-                    input.sync_cost_ns * static_cast<double>(edge.num_connections) * df;
+                thread_times[dst_thread] += input.sync_cost_ns *
+                                            static_cast<double>(edge.num_connections) * df *
+                                            edge.activity_rate;
             }
         }
     }

@@ -93,7 +93,8 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     std::vector<uint8_t> cluster_cost_ready(num_clusters, 0);
 
     for (size_t c = 0; c < num_clusters; ++c) {
-        const auto estimate = dynamicClusterRuntimeCost_(c);
+        const auto estimate =
+            clock_mode_ ? dynamicClockActorCost_(c) : dynamicClusterRuntimeCost_(c);
         cluster_cost[c] = estimate.cost;
         cluster_cost_ready[c] = estimate.ready ? 1 : 0;
 
@@ -280,13 +281,14 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
         return false;
     }
 
-    const uint64_t progress =
-        thread_progress_array_[cluster].completed_cycle.load(std::memory_order_acquire);
+    const uint64_t progress = dynamicActorProgress_(cluster);
     const uint64_t fence = saturatingCycleAdd(progress, 1);
 
     std::string names;
     if (cluster < clusters_.clusters.size()) {
         names = buildUnitNameList_(clusters_.clusters[cluster]);
+    } else if (clock_mode_) {
+        names = "CDC bridge " + std::to_string(cluster - clusters_.numClusters());
     }
     std::string rebalance_detail =
         "rebalance=" + std::to_string(rebalance_count_ + 1) + " C" + std::to_string(cluster) + "(" +
@@ -378,9 +380,9 @@ void TickSimulation::serviceEpochFreeMigration_(size_t worker_thread) {
     // source execution remains in flight.
     if (worker_thread != source) return;
 
-    const uint64_t progress =
-        thread_progress_array_[cluster].completed_cycle.load(std::memory_order_acquire);
+    const uint64_t progress = dynamicActorProgress_(cluster);
     if (progress < fence) return;
+    if (clock_mode_ && !clockActorCanMigrate_(cluster)) return;
 
     uint8_t expected = quiescing;
     if (!migration_request_.state.compare_exchange_strong(
@@ -389,10 +391,11 @@ void TickSimulation::serviceEpochFreeMigration_(size_t worker_thread) {
         return;
     }
 
+    const uint64_t migration_cycle = clock_mode_ ? dynamicMigrationCycle_() : fence;
     cluster_runtime_owner_[cluster].store(target, std::memory_order_release);
     cluster_migration_pending_[cluster].store(0, std::memory_order_release);
     if (cluster < dynamic_cluster_last_migration_cycle_.size()) {
-        dynamic_cluster_last_migration_cycle_[cluster] = fence;
+        dynamic_cluster_last_migration_cycle_[cluster] = migration_cycle;
         dynamic_cluster_last_source_thread_[cluster] = source;
         dynamic_cluster_last_target_thread_[cluster] = target;
     }
@@ -400,7 +403,7 @@ void TickSimulation::serviceEpochFreeMigration_(size_t worker_thread) {
 
     const uint64_t delay =
         std::max(config_.rebalance_check_interval_cycles, config_.rebalance_cooldown_cycles);
-    const uint64_t next_check = saturatingCycleAdd(fence, delay);
+    const uint64_t next_check = saturatingCycleAdd(migration_cycle, delay);
     uint64_t old_next = next_dynamic_rebalance_check_cycle_.load(std::memory_order_relaxed);
     while (next_check > old_next &&
            !next_dynamic_rebalance_check_cycle_.compare_exchange_weak(
@@ -433,9 +436,13 @@ void TickSimulation::serviceEpochFreeMigration_(size_t worker_thread) {
                 }
             }
         }
-        cluster_sample_time_ns_[c].store(0, std::memory_order_relaxed);
-        cluster_sample_count_[c].store(0, std::memory_order_relaxed);
-        cluster_active_sample_count_[c].store(0, std::memory_order_relaxed);
+        // Clock bridges retain their sparse cumulative estimate, just as the
+        // clock units retain per-unit samples. They have no unit_costs_ slot.
+        if (c < clusters_.numClusters()) {
+            cluster_sample_time_ns_[c].store(0, std::memory_order_relaxed);
+            cluster_sample_count_[c].store(0, std::memory_order_relaxed);
+            cluster_active_sample_count_[c].store(0, std::memory_order_relaxed);
+        }
         dynamic_cluster_blocked_wait_ns_[c].store(0, std::memory_order_relaxed);
         dynamic_cluster_blocker_wait_ns_[c].store(0, std::memory_order_relaxed);
     }
@@ -454,7 +461,7 @@ void TickSimulation::serviceEpochFreeMigration_(size_t worker_thread) {
         observe::log_info<"Dynamic rebalance committed: {}">(observe_ctx_,
                                                              last_rebalance_detail_.c_str());
     }
-    recordDynamicSchedulerMarker_("Chronon epoch-free rebalance committed", fence,
+    recordDynamicSchedulerMarker_("Chronon epoch-free rebalance committed", migration_cycle,
                                   last_rebalance_detail_);
     clearDynamicMigrationRequest_();
 }
@@ -503,24 +510,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
 
     auto refresh_owned_clusters = [&]() {
         if (!cluster_runtime_owner_) return;
-        refreshed_clusters.reserve(num_clusters);
-        for (;;) {
-            const uint64_t generation_before =
-                cluster_assignment_generation_.load(std::memory_order_acquire);
-            refreshed_clusters.clear();
-            for (size_t cluster = 0; cluster < num_clusters; ++cluster) {
-                if (cluster_runtime_owner_[cluster].load(std::memory_order_acquire) == thread_idx) {
-                    refreshed_clusters.push_back(cluster);
-                }
-            }
-            const uint64_t generation_after =
-                cluster_assignment_generation_.load(std::memory_order_acquire);
-            if (generation_before == generation_after) {
-                owned_clusters.swap(refreshed_clusters);
-                seen_generation = generation_after;
-                return;
-            }
-        }
+        refreshDynamicOwnedActors_(thread_idx, owned_clusters, refreshed_clusters, seen_generation);
     };
 
     auto all_clusters_done = [&]() {
