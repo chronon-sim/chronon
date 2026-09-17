@@ -201,7 +201,14 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
         cluster_input.adjacency[key.u].push_back({key.v, info.first, info.second});
     }
 
-    if (clock_mode_) addClockPartitionActors_(cluster_input, unit_ptr_to_idx);
+    if (clock_mode_) {
+        addClockPartitionActors_(cluster_input, unit_ptr_to_idx);
+        // Endpoint clustering and CDC grouping can leave far fewer actors than
+        // units plus FIFOs. Cap runtime workers as well as the partition solver
+        // so workers without any possible actor do not poll the clock frontier.
+        num_threads = std::min(num_threads, cluster_input.num_units);
+        cluster_input.num_threads = num_threads;
+    }
     auto result = runPartitionSolver_(cluster_input);
     if (config_.enable_lookahead && config_.enable_epoch_free_lookahead && num_threads > 1) {
         auto improved = epoch_free_cost::improveInitialPlacement(

@@ -273,7 +273,76 @@ Result run(size_t workers, bool dynamic, bool segmented, bool coincident, bool c
     return result;
 }
 
+Result runWorkerLimit(size_t workers, TickSimulationConfig::PartitionSolverType solver,
+                      bool dynamic, bool clustered) {
+    TickSimulationConfig config;
+    config.num_threads = workers;
+    config.enable_parallel = workers > 1;
+    config.enable_dynamic_rebalance = dynamic;
+    config.partition_solver = solver;
+    config.initial_partition_sync_cost_ns = 0;
+    config.rebalance_check_interval_cycles = UINT64_MAX;
+    config.profile_clock_scheduler = true;
+    TickSimulation sim(config);
+    sim.addClockDomain(ClockDomain::fromHz(1, "write", 1'000'000'000));
+    sim.addClockDomain(ClockDomain::fromHz(2, "read", 500'000'000, 1, SimTime::picoseconds(137)));
+    auto* w = sim.createUnitInDomain<LaneUnit>(1, "writer");
+    auto* r = sim.createUnitInDomain<LaneUnit>(2, "reader");
+    auto* w2 = clustered ? sim.createUnitInDomain<LaneUnit>(1, "writer2") : w;
+    auto* r2 = clustered ? sim.createUnitInDomain<LaneUnit>(2, "reader2") : r;
+    if (clustered) {
+        sim.connect(w->order_out, w2->order_in, 0);
+        sim.connect(r->order_out, r2->order_in, 0);
+    }
+    std::vector<AsyncFifo<uint64_t>*> fifos;
+    for (size_t lane = 0; lane < 32; ++lane) {
+        auto* source = lane % 2 ? w2 : w;
+        auto* destination = lane % 2 ? r2 : r;
+        fifos.push_back(sim.connectAsyncFifo(lane + 1, source->output(), destination->input(),
+                                             {2ULL << (lane % 3), 2 + lane % 3}));
+    }
+    sim.initialize();
+    assert(sim.useParallelExecution() == (workers > 1));
+    // Two endpoint clusters and one shared bridge actor, regardless of the
+    // number of FIFO lanes or units inside either endpoint cluster.
+    const size_t active_workers = std::min(workers, size_t{3});
+    assert(sim.clockSchedulerProfile().size() == active_workers);
+    size_t requests = 0;
+    if (dynamic) {
+        w->callback = [&] {
+            if (requests < 2 && w->localCycle() >= 11 + 47 * requests &&
+                Access::request(sim, Access::bridge(sim, 0)))
+                ++requests;
+        };
+    }
+    assert(sim.runClockEvents(37) == 37);
+    assert(sim.runClockEvents(173) == 173);
+    assert(sim.epochFreeRunCount() == (workers > 1 ? 2 : 0));
+    assert(!sim.totalTransportOverflowEvents());
+    if (dynamic) {
+        assert(requests == 2 && sim.rebalanceCount() == 2);
+        Access::assertIdle(sim);
+    }
+    Result result;
+    for (const auto* unit : {w, r, w2, r2}) result.state.push_back(unit->events);
+    for (const auto* fifo : fifos) {
+        const auto state = fifo->diagnostics();
+        result.state.push_back({state.write_binary, state.read_binary, state.write_sync,
+                                state.read_sync, state.full, state.empty, state.output_valid,
+                                state.ram_occupancy, state.writes, state.reads});
+    }
+    return result;
+}
+
 int main(int argc, char** argv) {
+    using Solver = TickSimulationConfig::PartitionSolverType;
+    for (bool clustered : {false, true}) {
+        const auto reference = runWorkerLimit(1, Solver::Weighted, false, clustered);
+        for (auto solver : {Solver::Weighted, Solver::SA})
+            for (size_t workers : {2, 32})
+                for (bool dynamic : {false, true})
+                    assert(runWorkerLimit(workers, solver, dynamic, clustered) == reference);
+    }
     export_fixtures = argc > 1;
     fixture_root =
         export_fixtures
