@@ -66,7 +66,87 @@ public:
     uint64_t generation() const noexcept { return generation_; }
     const ObjectiveSummary& baseline() const noexcept { return baseline_; }
 
-    void resetAssignment() { evaluateFull(baseline_); }
+    void resetAssignment() {
+        evaluateFull(baseline_);
+        total_active_ = 0.0;
+        safe_incremental_ = input_->num_threads > 0;
+        positive_count_.assign(input_->num_threads, 0);
+        for (size_t u = 0; u < input_->num_units; ++u) {
+            const size_t owner = (*assignment_)[u];
+            if (owner >= input_->num_threads || cost(u) < 0.0 || !std::isfinite(cost(u))) {
+                safe_incremental_ = false;
+                continue;
+            }
+            total_active_ += cost(u);
+            if (cost(u) > 0.0) ++positive_count_[owner];
+        }
+        for (const auto& edge : edges_)
+            if (edge.pressure < 0.0 || !std::isfinite(edge.pressure)) safe_incremental_ = false;
+        // Conservative error envelope for nonnegative accumulation and worker
+        // reductions. Near any decision boundary use the ordered full path.
+        roundoff_ = 128.0 * std::numeric_limits<double>::epsilon() *
+                    (input_->num_units + edges_.size() + pairs_.size() + input_->num_threads + 1) *
+                    std::max({1.0, total_active_, baseline_.objective, baseline_.cross_pressure});
+        if (!std::isfinite(roundoff_)) safe_incremental_ = false;
+    }
+    double roundoff() const noexcept { return roundoff_; }
+
+    void evaluateMove(ObjectiveSummary& out, size_t moved, size_t target) const {
+        const size_t source = (*assignment_)[moved];
+        if (!safe_incremental_ || target >= input_->num_threads || target == source) {
+            evaluateFull(out, moved, target);
+            return;
+        }
+        out = baseline_;  // Worker-sized storage only; capacities are retained.
+        out.active[source] -= cost(moved);
+        out.active[target] += cost(moved);
+        const size_t remaining = positive_count_[source] - (cost(moved) > 0.0 ? 1 : 0);
+        if (remaining == 0)
+            out.active[source] = 0.0;
+        else if (out.active[source] <= roundoff_) {
+            evaluateFull(out, moved, target);
+            return;
+        }
+        const auto update = [&](const Edge& edge) {
+            if (edge.from == edge.to) return;
+            const size_t old_from = (*assignment_)[edge.from], old_to = (*assignment_)[edge.to];
+            const size_t new_from = edge.from == moved ? target : old_from;
+            const size_t new_to = edge.to == moved ? target : old_to;
+            if (old_from != old_to) {
+                out.cross_pressure -= edge.pressure;
+                out.incoming_pressure[old_to] -= edge.pressure;
+            }
+            if (new_from != new_to) {
+                out.cross_pressure += edge.pressure;
+                out.incoming_pressure[new_to] += edge.pressure;
+            }
+        };
+        for (size_t index : outgoing_[moved]) update(edges_[index]);
+        for (size_t index : incoming_[moved])
+            if (edges_[index].from != moved) update(edges_[index]);
+        if (std::find(heavy_.begin(), heavy_.end(), moved) != heavy_.end()) {
+            --out.heavy_count[source];
+            ++out.heavy_count[target];
+            for (const auto& pair : pairs_) {
+                if (pair.a != moved && pair.b != moved) continue;
+                const size_t other = (*assignment_)[pair.a == moved ? pair.b : pair.a];
+                if (other == source) out.heavy_colocation_penalty -= pair.weight;
+                if (other == target) out.heavy_colocation_penalty += pair.weight;
+            }
+        }
+        finish(out, total_active_);
+    }
+
+    MoveBreakdown scoreMove(size_t cluster, size_t target, double min_gain, double churn) {
+        if (cluster >= input_->num_units || target >= input_->num_threads ||
+            (*assignment_)[cluster] == target)
+            return {};
+        evaluateMove(candidate_, cluster, target);
+        bool uncertain = false;
+        const auto result =
+            scoreCandidate(cluster, target, min_gain, churn, candidate_, &uncertain);
+        return uncertain ? scoreFull(cluster, target, min_gain, churn) : result;
+    }
 
     // Preserve the full oracle's summation order while caching the graph-only
     // terms. A candidate overrides one owner without copying the assignment.
@@ -173,12 +253,13 @@ private:
         return pressure;
     }
     MoveBreakdown scoreCandidate(size_t cluster, size_t target, double min_gain, double churn,
-                                 const ObjectiveSummary& candidate) const {
+                                 const ObjectiveSummary& candidate,
+                                 bool* uncertain = nullptr) const {
         const size_t source = (*assignment_)[cluster];
-        return scoreSummaries(cost(cluster), cluster, source, target, input_->num_threads, waits_,
-                              min_gain, churn, baseline_, candidate,
-                              localCross(cluster, source) - localCross(cluster, target),
-                              avg_dep_wait_);
+        return scoreSummaries(
+            cost(cluster), cluster, source, target, input_->num_threads, waits_, min_gain, churn,
+            baseline_, candidate, localCross(cluster, source) - localCross(cluster, target),
+            avg_dep_wait_, roundoff_ * std::max(1.0, std::abs(min_gain)), uncertain);
     }
 
     const PartitionInput* input_ = nullptr;
@@ -186,6 +267,9 @@ private:
     RuntimeWaits waits_;
     uint64_t generation_ = 0;
     double avg_dep_wait_ = 0.0;
+    double total_active_ = 0.0, roundoff_ = 0.0;
+    bool safe_incremental_ = false;
+    std::vector<size_t> positive_count_;
     std::vector<Edge> edges_;
     std::vector<std::vector<size_t>> incoming_, outgoing_;
     std::vector<double> incident_, effective_;
@@ -208,13 +292,24 @@ inline std::vector<size_t> improvePreparedPlacement(const PartitionInput& input,
         for (size_t u = 0; u < input.num_units; ++u) {
             for (size_t target = 0; target < num_threads; ++target) {
                 if (target == assignment[u] || prepared.splitsZeroDelay(u, target)) continue;
-                prepared.evaluateFull(candidate, u, target);
+                prepared.evaluateMove(candidate, u, target);
+                const double error = prepared.roundoff();
+                if (std::abs(candidate.max_active - best.max_active - 0.01) <= error ||
+                    std::abs(candidate.max_incoming_pressure - best.max_incoming_pressure + 0.01) <=
+                        error ||
+                    std::abs(candidate.cross_pressure - best.cross_pressure + 0.01) <= error ||
+                    std::abs(candidate.objective - best_objective + 0.01) <= error)
+                    prepared.evaluateFull(candidate, u, target);
                 if (candidate.active_threads < best.active_threads) continue;
                 if (candidate.max_active > best.max_active + 0.01 &&
                     candidate.max_incoming_pressure >= best.max_incoming_pressure - 0.01 &&
                     candidate.cross_pressure >= best.cross_pressure - 0.01)
                     continue;
                 if (candidate.objective < best_objective - 0.01) {
+                    // Keep the incumbent exact, so subsequent near ties use the
+                    // same deterministic comparisons as the original search.
+                    prepared.evaluateFull(candidate, u, target);
+                    if (candidate.objective >= best_objective - 0.01) continue;
                     best_objective = candidate.objective;
                     best_unit = u;
                     best_target = target;

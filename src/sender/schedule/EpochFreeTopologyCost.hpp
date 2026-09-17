@@ -344,7 +344,16 @@ inline MoveBreakdown scoreSummaries(double cluster_cost, size_t cluster, size_t 
                                     const RuntimeWaits& waits, double min_gain_fraction,
                                     double churn_penalty, const ObjectiveSummary& old_summary,
                                     const ObjectiveSummary& new_summary,
-                                    double local_topology_delta, double avg_dep_wait) {
+                                    double local_topology_delta, double avg_dep_wait,
+                                    double roundoff = 0.0, bool* uncertain = nullptr) {
+    const auto gt = [&](double a, double b) {
+        if (uncertain && std::abs(a - b) <= roundoff) *uncertain = true;
+        return a > b;
+    };
+    const auto ge = [&](double a, double b) {
+        if (uncertain && std::abs(a - b) <= roundoff) *uncertain = true;
+        return a >= b;
+    };
     MoveBreakdown out;
     const double target_floor = waitAt(waits.thread_floor_wait_ns, target_thread);
     const double target_dep = waitAt(waits.thread_dep_wait_ns, target_thread);
@@ -380,7 +389,7 @@ inline MoveBreakdown scoreSummaries(double cluster_cost, size_t cluster, size_t 
                              std::max(0.0, new_summary.incoming_pressure[target_thread] -
                                                old_summary.incoming_pressure[target_thread]) *
                                  0.20;
-    if (out.topology_delta > 0.0) {
+    if (gt(out.topology_delta, 0.0)) {
         out.target_dep_penalty = std::max(0.0, out.target_dep_penalty - out.topology_delta * 0.50);
     }
     const size_t old_heavy = old_summary.heavy_count[target_thread];
@@ -397,7 +406,7 @@ inline MoveBreakdown scoreSummaries(double cluster_cost, size_t cluster, size_t 
     out.target_heavy_after = new_summary.heavy_count[target_thread];
 
     const bool strong_dep_relief =
-        out.topology_delta > std::max(cluster_cost * 0.20, old_summary.objective * 0.02) ||
+        gt(out.topology_delta, std::max(cluster_cost * 0.20, old_summary.objective * 0.02)) ||
         out.measured_dep_bonus > cluster_cost * 0.25;
     const bool stacks_heavy =
         out.target_heavy_after > out.target_heavy_before && out.target_heavy_before > 0;
@@ -405,15 +414,15 @@ inline MoveBreakdown scoreSummaries(double cluster_cost, size_t cluster, size_t 
     const bool relieves_source_balance = source_active_before > avg_active * 1.15 &&
                                          target_active_before < source_active_before &&
                                          out.target_active_after <= source_active_before &&
-                                         new_summary.max_active <= old_summary.max_active * 1.02;
-    const bool relieves_active =
-        out.active_gain > std::max(cluster_cost * 0.05, old_summary.max_active * min_gain_fraction);
+                                         ge(old_summary.max_active * 1.02, new_summary.max_active);
+    const bool relieves_active = gt(
+        out.active_gain, std::max(cluster_cost * 0.05, old_summary.max_active * min_gain_fraction));
     const bool active_or_balance_relief = relieves_active || relieves_source_balance;
     const bool relieves_critical_blocker =
         active_or_balance_relief && avg_dep_wait > 0.0 && blocker_wait > avg_dep_wait * 0.50;
     if (stacks_heavy && !(strong_dep_relief || active_or_balance_relief)) return out;
     if (target_over_budget && !(strong_dep_relief || active_or_balance_relief)) return out;
-    if (out.active_gain < -std::max(0.01, old_summary.max_active * min_gain_fraction * 0.50) &&
+    if (gt(-std::max(0.01, old_summary.max_active * min_gain_fraction * 0.50), out.active_gain) &&
         !strong_dep_relief) {
         return out;
     }
@@ -433,16 +442,16 @@ inline MoveBreakdown scoreSummaries(double cluster_cost, size_t cluster, size_t 
                 out.target_dep_penalty - out.active_stack_penalty - out.churn_penalty;
 
     const double min_score = std::max(0.01, min_gain_fraction * old_summary.objective * 0.25);
-    if (new_summary.max_active > old_summary.max_active * (1.0 + min_gain_fraction * 0.5) &&
-        out.topology_delta <= 0.0) {
+    if (gt(new_summary.max_active, old_summary.max_active * (1.0 + min_gain_fraction * 0.5)) &&
+        ge(0.0, out.topology_delta)) {
         return out;
     }
-    if (dep_ratio > 0.50 && out.topology_delta <= 0.0 && !relieves_critical_blocker) return out;
-    if (relieves_source_balance && out.score >= -cluster_cost * 0.25) {
+    if (dep_ratio > 0.50 && ge(0.0, out.topology_delta) && !relieves_critical_blocker) return out;
+    if (relieves_source_balance && ge(out.score, -cluster_cost * 0.25)) {
         out.valid = true;
         return out;
     }
-    out.valid = out.score >= min_score;
+    out.valid = ge(out.score, min_score);
     return out;
 }
 

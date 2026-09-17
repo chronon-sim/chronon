@@ -42,6 +42,22 @@ static void equal(const MoveBreakdown& a, const MoveBreakdown& b) {
     assert(a.target_heavy_after == b.target_heavy_after);
 }
 
+static void close(double a, double b, double error) { assert(a == b || std::abs(a - b) <= error); }
+static void close(const ObjectiveSummary& a, const ObjectiveSummary& b, double error) {
+    close(a.objective, b.objective, error);
+    close(a.max_active, b.max_active, error);
+    close(a.cross_pressure, b.cross_pressure, error);
+    close(a.max_incoming_pressure, b.max_incoming_pressure, error);
+    close(a.heavy_colocation_penalty, b.heavy_colocation_penalty, error);
+    close(a.idle_thread_penalty, b.idle_thread_penalty, error);
+    assert(a.active_threads == b.active_threads);
+    assert(a.heavy_count == b.heavy_count);
+    for (size_t t = 0; t < a.active.size(); ++t) {
+        close(a.active[t], b.active[t], error);
+        close(a.incoming_pressure[t], b.incoming_pressure[t], error);
+    }
+}
+
 int main() {
     std::mt19937_64 random(143);
     PreparedTopologyCost prepared;
@@ -79,12 +95,31 @@ int main() {
                 ObjectiveSummary summary;
                 prepared.evaluateFull(summary, u, target);
                 equal(summarize(input, candidate, input.num_threads), summary);
+                ObjectiveSummary incremental;
+                prepared.evaluateMove(incremental, u, target);
+                close(summary, incremental, prepared.roundoff());
                 assert(prepared.splitsZeroDelay(u, target) ==
                        moveWouldSplitZeroDelay(input, assignment, u, target));
                 const double gain = sample % 4 ? 0.05 : 0.0;
                 const double churn = sample % 9 ? 0.0 : 10.0;
                 equal(scoreMove(input, assignment, u, target, waits, gain, churn),
                       prepared.scoreFull(u, target, gain, churn));
+                const auto full = prepared.scoreFull(u, target, gain, churn);
+                const auto delta = prepared.scoreMove(u, target, gain, churn);
+                assert(full.valid == delta.valid);
+                close(full.score, delta.score, prepared.roundoff());
+                if (std::isfinite(full.score)) {
+                    const double threshold =
+                        full.score + churn -
+                        std::max(0.01, gain * prepared.baseline().objective * 0.25);
+                    for (double penalty : {std::nextafter(threshold, -INFINITY), threshold,
+                                           std::nextafter(threshold, INFINITY)}) {
+                        const auto exact = prepared.scoreFull(u, target, gain, penalty);
+                        const auto fast = prepared.scoreMove(u, target, gain, penalty);
+                        assert(exact.valid == fast.valid);
+                        close(exact.score, fast.score, prepared.roundoff());
+                    }
+                }
             }
         }
         assert(improveInitialPlacement(input, assignment, input.num_threads) ==

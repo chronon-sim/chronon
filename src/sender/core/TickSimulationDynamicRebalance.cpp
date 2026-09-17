@@ -207,7 +207,11 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                 const double churn =
                     last_cycle == kNoMigrationCycle ? 0.0 : std::max(0.001, cluster_cost[c] * 0.05);
                 auto breakdown =
-                    prepared.scoreFull(c, candidate_target, config_.rebalance_min_gain, churn);
+                    prepared.scoreMove(c, candidate_target, config_.rebalance_min_gain, churn);
+                if (!breakdown.valid) continue;
+                if (breakdown.score >= best_breakdown.score - prepared.roundoff())
+                    breakdown =
+                        prepared.scoreFull(c, candidate_target, config_.rebalance_min_gain, churn);
                 if (!breakdown.valid) continue;
                 if (breakdown.score > best_breakdown.score ||
                     (breakdown.score == best_breakdown.score && c < cluster)) {
