@@ -70,6 +70,11 @@ public:
     }
 
 private:
+    // Only ClockDomain's exact reduction may bypass the public normalization.
+    struct Reduced {};
+    SimTime(uint64_t numerator, uint64_t denominator, Reduced)
+        : numerator_(numerator), denominator_(denominator) {}
+    friend class ClockDomain;
     uint64_t numerator_ = 0;
     uint64_t denominator_ = 1;
 };
@@ -96,6 +101,16 @@ public:
                                              (denominator_ / period.denominator()));
         phase_ticks_ = clock_detail::narrow(clock_detail::Wide(phase.numerator()) *
                                             (denominator_ / phase.denominator()));
+        uint64_t reduction_denominator = denominator_;
+        for (;;) {
+            const auto factor = std::gcd(period_ticks_, reduction_denominator);
+            // Every numerator is n*period_ticks + phase_ticks. A factor shared
+            // with the period but coprime to the phase can never reduce it.
+            if (factor == 1 || std::gcd(phase_ticks_, factor) != 1) break;
+            reduction_denominator /= factor;
+        }
+        if (reduction_denominator <= UINT32_MAX)
+            reduction_denominator_ = static_cast<uint32_t>(reduction_denominator);
     }
     static ClockDomain fromHz(ClockDomainId id, std::string name, uint64_t hz_numerator,
                               uint64_t hz_denominator = 1, SimTime phase = {}) {
@@ -110,8 +125,11 @@ public:
     SimTime phase() const noexcept { return phase_; }
     uint64_t maxEdgeIndex() const noexcept { return (UINT64_MAX - phase_ticks_) / period_ticks_; }
     SimTime edge(uint64_t n) const {
-        return {clock_detail::narrow(clock_detail::Wide(n) * period_ticks_ + phase_ticks_),
-                denominator_};
+        const auto ticks =
+            clock_detail::narrow(clock_detail::Wide(n) * period_ticks_ + phase_ticks_);
+        const uint64_t reduction = reduction_denominator_ ? reduction_denominator_ : denominator_;
+        const auto divisor = reduction == 1 ? 1 : std::gcd(ticks, reduction);
+        return {ticks / divisor, denominator_ / divisor, SimTime::Reduced{}};
     }
     /// First n >= 0 with E(n) >= t. O(1) double-width integer arithmetic.
     uint64_t edgeAtOrAfter(SimTime t) const { return query_(t, false); }
@@ -131,6 +149,9 @@ private:
         return static_cast<uint64_t>(index);
     }
     ClockDomainId id_;
+    // Fits beside the ID without enlarging the clock on supported 64-bit ABIs.
+    // Zero retains the full-denominator path for unusually large residuals.
+    uint32_t reduction_denominator_ = 0;
     std::string name_;
     SimTime period_, phase_;
     uint64_t denominator_, period_ticks_, phase_ticks_;
