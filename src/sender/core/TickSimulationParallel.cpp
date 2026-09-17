@@ -135,7 +135,6 @@ void TickSimulation::initProgressSync() {
         thread_progress_array_[i].completed_cycle.store(cycle, std::memory_order_relaxed);
     }
 
-    schedulerScratch_().workers.resize(num_threads);
     thread_resolved_deps_.resize(num_clusters);
     for (size_t c = 0; c < num_clusters; ++c) {
         thread_resolved_deps_[c].clear();
@@ -193,6 +192,9 @@ void TickSimulation::initProgressSync() {
     if (!clock_mode_ && config_.enable_dynamic_rebalance) {
         initDynamicMigrationRuntime_();
     }
+    // Allocate cold worker metadata after the dependency tables, preserving
+    // locality of the progress and dependency storage used by the hot loop.
+    schedulerScratch_().workers.resize(num_threads);
 }
 
 bool TickSimulation::allMultiProducerPortsHaveProgress_() const noexcept {
