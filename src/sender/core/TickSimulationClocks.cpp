@@ -57,9 +57,9 @@ void TickSimulation::prepareClockTopology_() {
         throw std::logic_error(
             "scheduler wall-time tracing for multiclock is unsupported; use configureClockTrace");
     }
-    std::set<std::string> names;
+    std::map<std::string, TickableUnit*> names;
     for (auto* unit : unit_ptrs_) {
-        if (!names.insert(unit->fullPath()).second) {
+        if (!names.emplace(unit->fullPath(), unit).second) {
             throw std::invalid_argument("multiclock units require unique fullPath identities");
         }
         for (auto* port : unit->ports()) port->appendOutgoingConnections(connections_);
@@ -88,26 +88,37 @@ void TickSimulation::prepareClockTopology_() {
 
     // Canonical Kahn order for same-domain zero-delay combinational paths.
     // Registered edges and CDC do not constrain evaluation order at one instant.
-    std::map<Unit*, size_t> incoming;
-    std::map<Unit*, std::vector<Unit*>> outgoing;
-    std::map<std::string, TickableUnit*> ready;
-    for (auto* unit : unit_ptrs_) incoming[unit] = 0;
-    for (auto* connection : connections_) {
-        if (!connection->delay()) {
-            ++incoming[connection->destination()];
-            outgoing[connection->source()].push_back(connection->destination());
-        }
-    }
-    for (auto* unit : unit_ptrs_)
-        if (!incoming[unit]) ready.emplace(unit->fullPath(), unit);
     std::vector<TickableUnit*> order;
-    while (!ready.empty()) {
-        auto* unit = ready.begin()->second;
-        ready.erase(ready.begin());
-        order.push_back(unit);
-        for (auto* successor : outgoing[unit]) {
-            if (--incoming[successor] == 0)
-                ready.emplace(successor->fullPath(), static_cast<TickableUnit*>(successor));
+    order.reserve(unit_ptrs_.size());
+    if (std::none_of(connections_.begin(), connections_.end(),
+                     [](const auto* connection) { return connection->delay() == 0; })) {
+        // With no same-instant dependency, Kahn's ready queue is simply the
+        // already-validated name order. Avoid rebuilding per-unit maps.
+        for (const auto& [name, unit] : names) {
+            (void)name;
+            order.push_back(unit);
+        }
+    } else {
+        std::map<Unit*, size_t> incoming;
+        std::map<Unit*, std::vector<Unit*>> outgoing;
+        std::map<std::string, TickableUnit*> ready;
+        for (auto* unit : unit_ptrs_) incoming[unit] = 0;
+        for (auto* connection : connections_) {
+            if (!connection->delay()) {
+                ++incoming[connection->destination()];
+                outgoing[connection->source()].push_back(connection->destination());
+            }
+        }
+        for (auto* unit : unit_ptrs_)
+            if (!incoming[unit]) ready.emplace(unit->fullPath(), unit);
+        while (!ready.empty()) {
+            auto* unit = ready.begin()->second;
+            ready.erase(ready.begin());
+            order.push_back(unit);
+            for (auto* successor : outgoing[unit]) {
+                if (--incoming[successor] == 0)
+                    ready.emplace(successor->fullPath(), static_cast<TickableUnit*>(successor));
+            }
         }
     }
     if (order.size() != unit_ptrs_.size())

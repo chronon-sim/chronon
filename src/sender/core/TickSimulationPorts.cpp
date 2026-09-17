@@ -22,6 +22,15 @@ size_t TickSimulation::optimizeTransparentBroadcasts_() {
     }
     if (connections_.empty()) return 0;
 
+    constexpr size_t kMinimumFanout = 4;
+    constexpr size_t kHeadroomCycles = 512;
+    transparent_broadcast_fusion_connection_count_ = 0;
+    if (std::none_of(connections_.begin(), connections_.end(), [](const auto* connection) {
+            return connection->transparentBroadcastEligible(kHeadroomCycles);
+        })) {
+        return 0;
+    }
+
     // Optimize whole connected Port components, never isolated edges. This
     // guarantees that an InPort cannot end up merging a shared lane with a
     // conventional queue and that fallback remains all-or-nothing.
@@ -62,10 +71,7 @@ size_t TickSimulation::optimizeTransparentBroadcasts_() {
         components[find_root(node)].push_back(connection);
     }
 
-    constexpr size_t kMinimumFanout = 4;
-    constexpr size_t kHeadroomCycles = 512;
     size_t optimized_connections = 0;
-    transparent_broadcast_fusion_connection_count_ = 0;
 
     const char* fusion_value = std::getenv("CHRONON_EXPERIMENTAL_TRANSPARENT_BROADCAST_FUSION");
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION

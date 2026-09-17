@@ -7,6 +7,14 @@
 
 namespace chronon::sender {
 struct SchedulerScratchTestAccess {
+    static void assertInitializedGraph(const TickSimulation& sim) {
+        const std::vector<Unit*> units(sim.unit_ptrs_.begin(), sim.unit_ptrs_.end());
+        DependencyGraph oracle;
+        oracle.build(units, sim.connections_);
+        assert(sim.dependencyGraph().units() == units);
+        assert(sim.dependencyGraph().distances() == oracle.distances());
+        assert(sim.dependencyGraph().graph()->numEdges() == oracle.graph()->numEdges());
+    }
     static std::vector<const void*> storage(const TickSimulation& sim) {
         std::vector<const void*> result;
         if (!sim.thread_progress_array_) return result;
@@ -80,6 +88,7 @@ static std::vector<uint64_t> exercise(bool clock, bool dynamic, size_t workers, 
     TickSimulation sim(config);
     const auto units = invocationModel(sim, clock, pairs, 8, 4);
     sim.initialize();
+    Scratch::assertInitializedGraph(sim);
     assert(sim.useParallelExecution() == (workers > 1));
     const auto advance = [&](uint64_t count) {
         return clock ? sim.runClockEvents(count) : sim.run(count);
@@ -112,6 +121,17 @@ static std::vector<uint64_t> exercise(bool clock, bool dynamic, size_t workers, 
 }
 
 int main() {
+    // A one-unit ordinary graph retains its original index order.
+    {
+        TickSimulationConfig config;
+        config.enable_parallel = false;
+        config.num_threads = 1;
+        TickSimulation sim(config);
+        auto* unit = sim.createUnit<InvocationUnit>("only", false, false, 0);
+        sim.initialize();
+        Scratch::assertInitializedGraph(sim);
+        assert(sim.dependencyGraph().lookahead(unit, unit) == 0);
+    }
     for (bool clock : {false, true}) {
         for (size_t pairs : {4, 12}) {
             const auto serial = exercise(clock, false, 1, 1, pairs);

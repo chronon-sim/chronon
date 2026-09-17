@@ -50,7 +50,8 @@ uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
 // ---------------------------------------------------------------------------
 
 void TickSimulation::installMultiProducerProgress_() {
-    if (!thread_progress_array_ || thread_progress_count_ == 0) return;
+    if (multi_producer_ports_.empty() || !thread_progress_array_ || thread_progress_count_ == 0)
+        return;
 
     std::unordered_map<Unit*, size_t> unit_to_cluster;
     for (size_t i = 0; i < unit_ptrs_.size(); ++i) {

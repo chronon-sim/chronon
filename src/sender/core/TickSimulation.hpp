@@ -476,7 +476,7 @@ private:
         }
     }
 
-    void buildDependencyGraph();
+    void buildDependencyGraph(bool calculate_lookahead = true);
     void validateNoZeroDelayCycles_() const;
 
     /**
@@ -485,9 +485,9 @@ private:
      * same-cycle producers tick before consumers; creation order is the
      * tie-breaker. Result is stable for a given graph but not fully canonical
      * (Tarjan traversal order plus builder ids).
-     * Must be followed by buildDependencyGraph() to rebuild graph indices.
+     * Returns whether graph indices changed and need rebuilding.
      */
-    void reorderUnitsTopologically_();
+    bool reorderUnitsTopologically_();
 
     bool hasTightConnections() const;
 

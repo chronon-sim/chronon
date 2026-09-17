@@ -34,14 +34,16 @@ void TickSimulation::initialize() {
 
     if (clock_mode_) prepareClockTopology_();
 
-    buildDependencyGraph();
+    buildDependencyGraph(false);
     validateNoZeroDelayCycles_();
 
     // Topologically reorder unit_ptrs_ so zero-delay producers tick before
     // same-cycle consumers in the per-cycle loop. Full-graph SCC condensation
     // handles registered feedback; creation order is a tie-break only.
-    if (!clock_mode_) reorderUnitsTopologically_();
-    buildDependencyGraph();
+    if (!clock_mode_ && reorderUnitsTopologically_())
+        buildDependencyGraph();
+    else
+        dep_graph_.recomputeLookahead();
 
     // Remap pre-computed costs to the new index order.
     // setPrecomputedUnitCosts() stores costs in creation order (by unit
@@ -424,20 +426,23 @@ uint64_t TickSimulation::runEpochFree(uint64_t num_cycles) {
 // Dependency analysis and topological ordering
 // ---------------------------------------------------------------------------
 
-void TickSimulation::buildDependencyGraph() {
+void TickSimulation::buildDependencyGraph(bool calculate_lookahead) {
     std::vector<Unit*> unit_as_base;
     unit_as_base.reserve(unit_ptrs_.size());
     for (auto* unit : unit_ptrs_) {
         unit_as_base.push_back(static_cast<Unit*>(unit));
     }
 
-    dep_graph_.build(unit_as_base, connections_);
+    if (calculate_lookahead)
+        dep_graph_.build(unit_as_base, connections_);
+    else
+        dep_graph_.buildTopology_(unit_as_base, connections_);
 }
 
-void TickSimulation::reorderUnitsTopologically_() {
+bool TickSimulation::reorderUnitsTopologically_() {
     const auto* graph = dep_graph_.graph();
     if (!graph || graph->numNodes() <= 1) {
-        return;
+        return false;
     }
 
     const size_t n = graph->numNodes();
@@ -502,7 +507,9 @@ void TickSimulation::reorderUnitsTopologically_() {
         }
     }
 
+    if (new_order == unit_ptrs_) return false;
     unit_ptrs_ = std::move(new_order);
+    return true;
 }
 
 bool TickSimulation::hasTightConnections() const {
