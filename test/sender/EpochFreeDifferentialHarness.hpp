@@ -29,6 +29,15 @@ namespace chronon::sender {
  * branch, lock, or callback to the production scheduler hot path.
  */
 struct EpochFreeDifferentialTestAccess {
+    static size_t clusterOf(const TickSimulation& simulation, const Unit* unit) {
+        for (size_t i = 0; i < simulation.unit_ptrs_.size(); ++i) {
+            if (simulation.unit_ptrs_[i] == unit && i < simulation.unit_to_cluster_.size()) {
+                return simulation.unit_to_cluster_[i];
+            }
+        }
+        return SIZE_MAX;
+    }
+
     static bool migrateAtRunBoundary(TickSimulation& simulation, Unit* unit, size_t target_thread) {
         return simulation.forceEpochFreeMigrationAtBoundary_(unit, target_thread);
     }

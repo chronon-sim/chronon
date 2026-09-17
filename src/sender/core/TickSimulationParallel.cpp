@@ -201,7 +201,7 @@ bool TickSimulation::crossThreadHeadroomFits_(uint64_t max_lookahead) const noex
 
 bool TickSimulation::crossThreadHeadroomAllowsEpochFree_() const noexcept {
     if (has_zero_delay_cross_thread_cycle_) return false;
-    for (const ConnectionBase* c : connections_) {
+    for (const ConnectionBase* c : cross_cluster_connections_) {
         if (c->crossThreadHeadroom() == 0) return false;
     }
     return true;
@@ -209,31 +209,23 @@ bool TickSimulation::crossThreadHeadroomAllowsEpochFree_() const noexcept {
 
 size_t TickSimulation::prepareEpochFreeHeadroom_() {
     if (!config_.enable_epoch_free_lookahead) return 0;
-    std::unordered_map<void*, std::vector<ConnectionBase*>> by_port;
+    // Provision physical storage even for internal edges: a same-cycle burst
+    // may exceed the default ring before the consumer's tick runs. A bounded
+    // edge never grows its architectural capacity; failure only constrains
+    // eligibility when the connection actually crosses a cluster boundary.
     for (auto* conn : connections_) {
-        by_port[conn->destPortPtr()].push_back(conn);
+        if (conn->crossThreadHeadroom() == 0)
+            (void)conn->ensureEpochFreeHeadroom(config_.max_lookahead_cycles);
     }
-
     size_t unproven_count = 0;
-    for (auto& [port, conns] : by_port) {
-        (void)port;
-        bool unsafe = false;
-        for (auto* conn : conns) {
-            if (conn->crossThreadHeadroom() == 0 &&
-                !conn->ensureEpochFreeHeadroom(config_.max_lookahead_cycles)) {
-                unsafe = true;
-                break;
-            }
-        }
-        if (!unsafe) continue;
-        unproven_count += conns.size();
-    }
+    for (const auto* conn : cross_cluster_connections_)
+        unproven_count += conn->crossThreadHeadroom() == 0;
     return unproven_count;
 }
 
 size_t TickSimulation::crossThreadHeadroomLimit_() const noexcept {
     size_t limit = std::numeric_limits<size_t>::max();
-    for (const ConnectionBase* c : connections_) {
+    for (const ConnectionBase* c : cross_cluster_connections_) {
         limit = std::min(limit, c->crossThreadHeadroom());
     }
     return limit;

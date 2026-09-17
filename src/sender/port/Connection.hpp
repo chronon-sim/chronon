@@ -28,6 +28,7 @@
 #include "MessageQueue.hpp"
 #include "SharedBroadcastTransport.hpp"
 #include "detail/ConnectionAdmissionState.hpp"
+#include "detail/ConnectionHeadroom.hpp"
 
 namespace chronon::sender {
 
@@ -116,6 +117,14 @@ public:
     virtual void configureRegisteredEdge(std::optional<size_t> capacity,
                                          std::optional<size_t> rate) = 0;
 
+    /// Finalize destination capacity after Unit::initialize(), before planning
+    /// clusters or selecting adapters (including other edges of a fan-in).
+    virtual void prepareRegisteredCapacity() {}
+
+    /// Placement-independent admission headroom. Zero requires one atomic
+    /// cluster; SIZE_MAX leaves only physical transport constraints to check.
+    virtual size_t modelHeadroom() const noexcept { return SIZE_MAX; }
+
     /// Try to grow physical lock-free buffers enough for epoch-free run-ahead
     /// when the model-visible registered edge is unbounded. A finite declared
     /// edge capacity is semantic backpressure and must not be bypassed by
@@ -181,7 +190,7 @@ public:
      * which transfer() stops accepting (the ring, or the InPort capacity if
      * smaller), `rate` is the source's per-cycle send cap, and `delay` accounts
      * for not-yet-due entries the consumer cannot drain. Returns SIZE_MAX for
-     * connections with no bounded cross-thread ring (same-thread / unbounded)
+     * connections with neither bounded admission nor bounded transport
      * and 0 when no finite capacity dependency is provably safe. Used to gate
      * the epoch-free lookahead path, which removes the per-epoch drain.
      */
@@ -609,66 +618,36 @@ public:
         return !dependency_only_transport_ && thread_queue_id_ != SIZE_MAX;
     }
 
+    void prepareRegisteredCapacity() override {
+        if (!dependency_only_transport_ && registered_capacity_)
+            to_->setCapacity(*registered_capacity_);
+    }
+
+    size_t modelHeadroom() const noexcept override {
+        if (dependency_only_transport_) return dependency_only_headroom_;
+        const size_t capacity = edgeAdmissionCapacity_();
+        if (capacity == InPort<T>::UNLIMITED_CAPACITY) return SIZE_MAX;
+        return detail::connectionHeadroom(capacity, capacity, effectiveHeadroomRate_(), delay_,
+                                          true);
+    }
+
     size_t crossThreadHeadroom() const noexcept override {
         if (dependency_only_transport_) return dependency_only_headroom_;
-        // Identify the bounded cross-thread buffer this connection fills:
-        //   MPSC (thread_queue_id_ set) -> the per-connection direct lane,
-        //   SPSC (lock-free ring)       -> the InPort's lock-free queue (finite
-        //                                  even for an unlimited-capacity port),
-        //   same-thread / unbounded     -> no ring to overflow (SIZE_MAX).
-        const bool dff_style = isDFFStyleEdge_();
         size_t ring_usable;
         bool cycle_strict_admission = false;
         if (thread_queue_id_ != SIZE_MAX) {
             ring_usable = mpscLogicalHeadroomCapacity_();
-            // A bounded MPSC lane publishes receiver pops into the same
-            // simulated-cycle admission ledger as SPSC. Its reverse scheduler
-            // dependency must therefore keep the producer one cycle closer to
-            // the consumer than a transport-only, unbounded lane.
             cycle_strict_admission = edgeAdmissionCapacity_() != InPort<T>::UNLIMITED_CAPACITY;
         } else if (to_->usesLockFreeQueue()) {
             ring_usable = spscLogicalHeadroomCapacity_();
             cycle_strict_admission = true;
         } else {
-            if (dff_style) {
-                // Same-thread DFF-style edges have no physical ring, but they
-                // still need a logical dependency so a separate producer cluster
-                // cannot run arbitrarily far ahead of its consumer. One cycle of
-                // slack lets the event queue represent current output plus next
-                // input without creating a zero-delay dependency cycle.
-                return 2;
-            }
-            return SIZE_MAX;  // single-thread queue drains synchronously each tick
+            // Separate clusters on one worker can advance independently too.
+            // Removing atomics never removes their simulated credit dependency.
+            return modelHeadroom();
         }
-        if (dff_style) {
-            return 1;
-        }
-        const auto rate = effectiveHeadroomRate_();
-        if (!rate.has_value()) return 0;
-        const size_t buffered_cycles = ring_usable / *rate;
-        // The consumer drains only *due* entries (arrive_cycle <= k, i.e.
-        // send_cycle <= k - delay_), so delay_ cycles of not-yet-due entries always
-        // sit buffered. Model-visible SPSC and bounded-MPSC admission is
-        // cycle-strict: a consumer pop at cycle k does not free producer
-        // capacity for another send in cycle k, so its safe run-ahead window is
-        // one cycle smaller than a transport-only unbounded MPSC lane. A
-        // delay-1, capacity-1 DFF-style edge is handled above and remains safe
-        // with headroom=1.
-        if (buffered_cycles < delay_) return 0;
-        if (cycle_strict_admission) {
-            if (buffered_cycles == delay_) return 0;
-            const size_t physical_headroom = buffered_cycles - delay_;
-            // A finite architectural capacity snapshot for producer cycle C
-            // must observe every receiver pop through C-1. More physical ring
-            // slack may prevent overflow, but it cannot make missing simulated
-            // credit deterministic. Reverse-delay 1 (headroom 2) is therefore
-            // the widest safe epoch-free window for a model-bounded edge.
-            if (edgeAdmissionCapacity_() != InPort<T>::UNLIMITED_CAPACITY) {
-                return std::min<size_t>(physical_headroom, 2);
-            }
-            return physical_headroom;
-        }
-        return buffered_cycles - delay_ + 1;
+        return detail::connectionHeadroom(ring_usable, edgeAdmissionCapacity_(),
+                                          effectiveHeadroomRate_(), delay_, cycle_strict_admission);
     }
 
     void setConnId(uint32_t conn_id) noexcept override {

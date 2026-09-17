@@ -22,6 +22,7 @@ add_library(chronon STATIC
     sender/core/TickSimulationClockMigration.cpp
     sender/core/TickSimulationActivity.cpp
     sender/core/TickSimulationPorts.cpp
+    sender/core/TickSimulationClusters.cpp
     sender/core/TickSimulationDependencies.cpp
     sender/core/TickSimulationPartition.cpp
     sender/core/TickSimulationParallel.cpp

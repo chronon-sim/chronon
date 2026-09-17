@@ -325,7 +325,7 @@ hold; otherwise Chronon selects Sequential without changing model results:
 
 - `enable_epoch_free_lookahead` is set and `max_lookahead_cycles > 0`;
 - every MPSC input port has fully-resolved per-connection producer progress;
-- **cross-thread buffer headroom suffices for every connection** (see below);
+- **buffer headroom suffices for every cross-cluster connection** (see below);
 - the dependency/headroom graph contains no zero-slack cluster cycle.
 
 **Cross-thread buffer headroom.** In epoch-free lookahead, a producer can run
@@ -347,9 +347,27 @@ headroom = min(InPort capacity, ring slots) / per_cycle_send_rate - edge_delay
 where `per_cycle_send_rate` is the source `OutPort`'s per-cycle send cap (an
 uncapped source forces a veto), `ring slots` is the usable physical ring
 capacity, and `edge_delay` accounts for not-yet-due entries the consumer cannot
-drain. Same-thread connections drain synchronously and impose no bound. If any
-cross-thread connection cannot expose a safe progress dependency, the
-simulation selects Sequential. To use epoch-free
+drain. Before partitioning, bounded edges with no provable admission headroom
+join their endpoints into the existing indivisible clusters, transitively with
+delay-zero groups. Same-domain zero-slack admission feedback also joins one
+cluster. This is a hard scheduling constraint used by every partitioner;
+connection delays, capacities, rates, and receive order remain unchanged.
+
+Internal edges impose no cross-cluster headroom gate, including when dynamic
+mode uses SPSC/MPSC storage inside a cluster. Physical ring provisioning still
+runs for internal transports so a full producer-tick burst fits before the
+consumer ticks. Separate clusters on the same
+worker still need admission-credit dependencies: they advance independently
+and may migrate separately. Every ordinary bounded edge retains the rule that
+a receiver pop in cycle C becomes producer credit in C+1. The existing scalar
+delay-one DFF admission special case remains distinct from ordinary FIFOs.
+Clusters never span hardware clock domains; CDC bridges retain their own
+sample/commit protocol.
+
+Independent clusters can therefore remain parallel alongside a constrained
+pipeline or feedback group. Sequential remains the fallback when the resulting
+placement has no useful parallelism or a remaining cross-cluster transport
+cannot expose a safe progress dependency. To use epoch-free
 with unlimited-capacity cross-thread edges, give the producing `OutPort` a
 per-cycle send cap and keep `max_lookahead_cycles + edge_delay` within the
 default physical ring, or use an explicit bounded `InPort` capacity large enough
@@ -367,7 +385,7 @@ If no local cluster is ready, the stream spins until one becomes ready. The
 scheduler timeline records that time as `cluster dependency` events and includes
 the blocking predecessor cluster in the event detail.
 
-This keeps delay=0 groups atomic while allowing independent clusters assigned
+This keeps delay=0 and admission-constrained groups atomic while allowing independent clusters assigned
 to the same stream to advance out of order. Dynamic rebalance, when enabled,
 migrates whole clusters at scheduler fence points; it does not split delay=0
 clusters or migrate individual units.
@@ -485,7 +503,7 @@ When `enable_weighted_partitioning = true` (default) and at least 4 units exist,
 
 1. **Cost model selection**: Uses deterministic unit cost `1.0` plus `initial_partition_sync_cost_ns` by default, or caller-supplied measured costs from `setPrecomputedUnitCosts(...)`
 2. **Solver selection**: Runs `partition_solver` (`SA` by default, `Weighted` optional) against the same partition input
-3. **Tight cluster detection**: Groups units with delay=0 connections into clusters (units within a cluster must share a thread)
+3. **Cluster constraints**: Groups delay-zero connections, bounded edges with unproven admission headroom, and same-domain zero-slack admission feedback into indivisible clusters before placement
 4. **Cluster-level graph partitioning**: Treats each cluster as a super-node with aggregated cost and delay-aware edges
 5. **Thread assignment**: Maps cluster assignments back to per-unit thread assignments
 6. **Queue optimization**: Selects optimal queue type per connection based on thread placement

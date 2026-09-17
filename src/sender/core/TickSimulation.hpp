@@ -468,6 +468,11 @@ private:
 
     bool hasTightConnections() const;
 
+    /// Build indivisible same-clock clusters before any placement decisions.
+    /// Includes zero-delay edges, bounded admission constraints and zero-slack
+    /// feedback. All partitioners and migrations use the resulting ownership.
+    void buildSchedulingClusters_();
+
     /**
      * Aggregate connections between unit pairs into a single edge with
      * count and minimum delay. Directed edges only (see implementation
@@ -500,8 +505,8 @@ private:
 
     /**
      * Topology-only cluster-aware placement (no cost profiling). Used as
-     * the legacy path when weighted partitioning is disabled but tight
-     * connections exist.
+     * the legacy path when weighted partitioning is disabled and indivisible
+     * multi-unit clusters exist.
      */
     void buildClusterAffinity();
     bool hasTightInterClusterConnections() const;
@@ -552,15 +557,15 @@ private:
     /// epoch-free instead of changing queue semantics.
     size_t prepareEpochFreeHeadroom_();
 
-    /// Minimum cross-thread queue headroom over all connections. SIZE_MAX means
+    /// Minimum queue headroom over cross-cluster connections. SIZE_MAX means
     /// no bounded cross-thread ring constrains epoch-free run-ahead.
     size_t crossThreadHeadroomLimit_() const noexcept;
 
     /// True when every finite cross-thread queue has a provable capacity
     /// dependency after headroom preparation, and those dependencies do not
-    /// introduce a zero-delay cluster cycle. Zero-slack cycles fall back to
-    /// sequential execution because epoch-free lookahead has no cluster that
-    /// can legally make the first tick.
+    /// introduce a zero-delay cluster cycle. Model admission feedback has
+    /// already been clustered; remaining unsupported transport cycles still
+    /// select sequential execution.
     bool crossThreadHeadroomAllowsEpochFree_() const noexcept;
 
     /// Compatibility helper used by logs/tests.
@@ -761,6 +766,8 @@ private:
 
     /// Pointers only — Connections are owned by their OutPort.
     std::vector<ConnectionBase*> connections_;
+    /// Stable topology boundary, independent of worker placement or migration.
+    std::vector<ConnectionBase*> cross_cluster_connections_;
     size_t transparent_broadcast_fusion_connection_count_ = 0;
 
     /// Flat, deduplicated list of InPorts with at least one MPSC ingress lane.

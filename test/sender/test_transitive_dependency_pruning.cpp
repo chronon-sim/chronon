@@ -180,9 +180,13 @@ ZeroCycleSnapshot buildHeadroomZeroCycleGraph(const char* prune_value) {
 
     auto* ab = sim.connect(a->out, b->in, 1);
     auto* ba = sim.connect(b->out, a->in, 1);
+    sim.initialize();
+
+    // Introduce stronger transport constraints after cluster planning. Normal
+    // bounded feedback now joins one cluster; this white-box rebuild verifies
+    // that pruning still cannot hide a remaining unsupported transport cycle.
     ab->configureRegisteredEdge(/*capacity=*/1, /*rate=*/1);
     ba->configureRegisteredEdge(/*capacity=*/1, /*rate=*/1);
-    sim.initialize();
 
     // Force bounded cross-thread transport. Each edge then contributes a reverse
     // headroom constraint with delay zero, creating a pair-min zero cycle.
