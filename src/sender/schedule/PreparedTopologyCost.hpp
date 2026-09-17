@@ -91,6 +91,19 @@ public:
     }
     double roundoff() const noexcept { return roundoff_; }
 
+    size_t retainedBytes() const noexcept {
+        const auto bytes = [](const auto& values) { return values.capacity() * sizeof(values[0]); };
+        size_t result = sizeof(*this) + bytes(edges_) + bytes(incoming_) + bytes(outgoing_) +
+                        bytes(incident_) + bytes(effective_) + bytes(heavy_) + bytes(pairs_) +
+                        bytes(positive_count_);
+        for (const auto& edges : incoming_) result += bytes(edges);
+        for (const auto& edges : outgoing_) result += bytes(edges);
+        for (const auto* summary : {&baseline_, &candidate_})
+            result += bytes(summary->active) + bytes(summary->incoming_pressure) +
+                      bytes(summary->heavy_count);
+        return result;
+    }
+
     void evaluateMove(ObjectiveSummary& out, size_t moved, size_t target) const {
         const size_t source = (*assignment_)[moved];
         if (!safe_incremental_ || target >= input_->num_threads || target == source) {
