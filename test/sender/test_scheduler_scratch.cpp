@@ -34,7 +34,8 @@ using namespace chronon::benchmark;
 using Scratch = sender::SchedulerScratchTestAccess;
 using Migration = sender::DynamicMigrationTestAccess;
 
-static std::vector<uint64_t> exercise(bool clock, bool dynamic, size_t workers, uint64_t interval) {
+static std::vector<uint64_t> exercise(bool clock, bool dynamic, size_t workers, uint64_t interval,
+                                      size_t pairs) {
     TickSimulationConfig config;
     config.num_threads = workers;
     config.enable_parallel = workers > 1;
@@ -43,7 +44,7 @@ static std::vector<uint64_t> exercise(bool clock, bool dynamic, size_t workers, 
     config.max_lookahead_cycles = 32;
     config.epoch_size = interval;
     TickSimulation sim(config);
-    const auto units = invocationModel(sim, clock, 4, 8, 4);
+    const auto units = invocationModel(sim, clock, pairs, 8, 4);
     sim.initialize();
     assert(sim.useParallelExecution() == (workers > 1));
     const auto advance = [&](uint64_t count) {
@@ -75,10 +76,12 @@ static std::vector<uint64_t> exercise(bool clock, bool dynamic, size_t workers, 
 
 int main() {
     for (bool clock : {false, true}) {
-        const auto serial = exercise(clock, false, 1, 1);
-        for (bool dynamic : {false, true})
-            for (uint64_t interval : {1, 7, 64})
-                assert(exercise(clock, dynamic, 4, interval) == serial);
+        for (size_t pairs : {4, 12}) {
+            const auto serial = exercise(clock, false, 1, 1, pairs);
+            for (bool dynamic : {false, true})
+                for (uint64_t interval : {1, 7, 64})
+                    assert(exercise(clock, dynamic, 4, interval, pairs) == serial);
+        }
     }
     std::cout << "Repeated runs reset scratch and preserve state across migration\n";
 }

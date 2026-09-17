@@ -639,6 +639,25 @@ private:
         std::vector<uint64_t> observed_cycles;
     };
 
+    // Small graphs need no heap-backed predecessor cache. The invocation owns
+    // these slots on its stack so task stealing cannot bounce a retained cache
+    // line between cores. Large graphs reuse their simulation-owned vector.
+    struct InvocationPredecessorCache {
+        static constexpr size_t kInlineSlots = 16;
+        std::array<uint64_t, kInlineSlots> local;
+        uint64_t* cycles;
+        InvocationPredecessorCache(WorkerPredecessorCycleCache& retained, size_t clusters) {
+            if (clusters < kInlineSlots) {
+                cycles = local.data();
+                std::fill_n(cycles, clusters + 1, 0);
+            } else {
+                retained.reset(clusters);
+                cycles = retained.data();
+            }
+        }
+        uint64_t* data() noexcept { return cycles; }
+    };
+
     // Indexed by logical worker, never by an OS thread ID. Bulk task completion
     // joins every access before a subsequent public run call can reuse storage.
     // Only capacities survive: progress/readiness and ownership views are reset

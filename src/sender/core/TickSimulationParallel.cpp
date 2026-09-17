@@ -322,8 +322,8 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     };
     // This cache spans the worker invocation (the entire run in EpochFree mode),
     // allowing all locally-owned clusters to reuse acquired predecessor progress.
-    auto& predecessor_cache = worker_run_scratch_[thread_idx].predecessor;
-    predecessor_cache.reset(thread_progress_count_);
+    InvocationPredecessorCache predecessor_cache(worker_run_scratch_[thread_idx].predecessor,
+                                                 thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;

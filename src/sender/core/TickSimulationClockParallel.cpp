@@ -307,14 +307,16 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             stdexec::bulk(stdexec::just(), stdexec::par, thread_units_.size(), [&](size_t worker) {
                 try {
                     auto& scratch = worker_run_scratch_[worker];
-                    auto& cache = scratch.predecessor;
-                    cache.reset(thread_progress_count_);
+                    InvocationPredecessorCache cache(scratch.predecessor, thread_progress_count_);
                     auto& owned_clusters = scratch.owned_clusters;
                     auto& owned_bridges = scratch.owned_bridges;
                     auto& owned_actors = scratch.owned_actors;
                     auto& ownership_scratch = scratch.ownership;
-                    owned_clusters = thread_clusters_[worker];
-                    owned_bridges = runtime.worker_bridges[worker];
+                    // Static ownership is immutable for this invocation. Borrow
+                    // its lists; dynamic workers rebuild their private views on
+                    // the first sweep and after assignment-generation changes.
+                    std::span<const size_t> cluster_view = thread_clusters_[worker];
+                    std::span<const size_t> bridge_view = runtime.worker_bridges[worker];
                     owned_actors.clear();
                     ownership_scratch.clear();
                     uint64_t seen_generation = 0;
@@ -332,6 +334,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             else
                                 owned_bridges.push_back(actor - clusters_.numClusters());
                         }
+                        cluster_view = owned_clusters;
+                        bridge_view = owned_bridges;
                     };
                     while (!failed.load(std::memory_order_acquire) &&
                            !done.load(std::memory_order_acquire) &&
@@ -368,7 +372,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                         if (dynamic && seen_generation != cluster_assignment_generation_.load(
                                                               std::memory_order_acquire))
                             refresh();
-                        for (const auto index : owned_bridges) {
+                        for (const auto index : bridge_view) {
                             if (dynamic && !stable_sweep &&
                                 cluster_runtime_owner_[clusters_.numClusters() + index].load(
                                     std::memory_order_acquire) != worker)
@@ -376,7 +380,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             if (profile) ++profile->bridge_polls;
                             progress = bridge_step(index, blocked, profile) || progress;
                         }
-                        for (const auto c : owned_clusters) {
+                        for (const auto c : cluster_view) {
                             if (dynamic && !stable_sweep &&
                                 cluster_runtime_owner_[c].load(std::memory_order_acquire) != worker)
                                 continue;
