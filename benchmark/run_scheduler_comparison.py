@@ -13,7 +13,7 @@ import statistics
 import subprocess
 
 STATE_FIELDS = ("predicates", "parallel", "ticks", "sent", "received", "checksum", "digest", "overflow")
-METRICS = ("run_s", "init_s", "run_allocations", "init_allocations", "worker_scratch_bytes",
+METRICS = ("run_s", "init_s", "run_allocations", "init_allocations", "worker_scratch_bytes", "calendar_scratch_bytes",
            "rss_kib", "run_cpu_s", "voluntary_switches", "involuntary_switches")
 
 

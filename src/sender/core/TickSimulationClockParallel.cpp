@@ -113,7 +113,14 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
     if (!within_limit(clock_calendar_->nextTime())) return 0;
     ++epoch_free_run_count_;
     auto& runtime = *clock_parallel_;
-    auto calendar = *clock_calendar_;
+    // Only capacity survives a public call. Restart speculative admission from
+    // committed progress after the previous workers (including settling) joined.
+    auto& saved_calendar = schedulerScratch_().admission_calendar;
+    if (!saved_calendar)
+        saved_calendar = std::make_shared<ClockCalendar>(*clock_calendar_);
+    else
+        *saved_calendar = *clock_calendar_;
+    auto& calendar = *saved_calendar;
     const size_t window_limit = std::min<uint64_t>(config_.max_lookahead_cycles, max_batches);
     uint64_t scheduled = 0, completed = 0;
     std::atomic<bool> done{false}, failed{false};

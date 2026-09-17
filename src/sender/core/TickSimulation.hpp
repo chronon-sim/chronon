@@ -668,6 +668,7 @@ private:
         std::vector<WorkerRunScratch> workers;
         std::shared_ptr<PlanningScratch> planning;
         uint64_t assignment_lists_generation = 0;
+        std::shared_ptr<ClockCalendar> admission_calendar;
     };
     // Coallocate cold scratch after the cache-line-aligned progress
     // array. Its lifetime already ends after joined workers on topology reset or

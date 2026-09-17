@@ -10,6 +10,7 @@ struct SchedulerScratchTestAccess {
     static std::vector<const void*> storage(const TickSimulation& sim) {
         std::vector<const void*> result;
         if (!sim.thread_progress_array_) return result;
+        result.push_back(sim.schedulerScratch_().admission_calendar.get());
         for (const auto& worker : sim.schedulerScratch_().workers) {
             result.push_back(worker.predecessor.observed_cycles.data());
             result.push_back(worker.ready_through.data());
@@ -47,6 +48,8 @@ struct SchedulerScratchTestAccess {
     }
     static void poison(TickSimulation& sim) {
         if (!sim.thread_progress_array_) return;
+        if (auto& calendar = sim.schedulerScratch_().admission_calendar)
+            for (size_t i = 0; i < 11; ++i) (void)calendar->pop();
         for (auto& worker : sim.schedulerScratch_().workers) {
             std::fill(worker.predecessor.observed_cycles.begin(),
                       worker.predecessor.observed_cycles.end(), UINT64_MAX);

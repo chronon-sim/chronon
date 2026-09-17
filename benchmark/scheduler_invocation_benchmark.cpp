@@ -10,8 +10,14 @@
 #include "SchedulerInvocationModel.hpp"
 
 #ifdef CHRONON_BENCH_SCRATCH
+#include "sender/schedule/ClockCalendar.hpp"
 namespace chronon::sender {
 struct SchedulerScratchTestAccess {
+    static size_t calendarBytes(const TickSimulation& sim) {
+        if (!sim.thread_progress_array_) return 0;
+        const auto& calendar = sim.schedulerScratch_().admission_calendar;
+        return calendar ? calendar->retainedBytes() : 0;
+    }
     static size_t bytes(const TickSimulation& sim) {
         if (!sim.thread_progress_array_) return 0;
         size_t result =
@@ -96,13 +102,14 @@ int main(int argc, char** argv) {
         return r.ru_utime.tv_sec + r.ru_utime.tv_usec / 1e6 + r.ru_stime.tv_sec +
                r.ru_stime.tv_usec / 1e6;
     };
-    size_t retained = 0;
+    size_t retained = 0, calendar_retained = 0;
 #ifdef CHRONON_BENCH_SCRATCH
     retained = sender::SchedulerScratchTestAccess::bytes(sim);
+    calendar_retained = sender::SchedulerScratchTestAccess::calendarBytes(sim);
 #endif
     std::cout << "init_s,run_s,init_allocations,run_allocations,worker_scratch_bytes,rss_kib,"
                  "run_cpu_s,voluntary_switches,involuntary_switches,predicates,parallel,ticks,sent,"
-                 "received,checksum,digest,overflow\n"
+                 "received,checksum,digest,overflow,calendar_scratch_bytes\n"
               << std::setprecision(12)
               << std::chrono::duration<double>(init_end - init_begin).count() << ','
               << std::chrono::duration<double>(end - begin).count() << ',' << init_allocations
@@ -110,5 +117,6 @@ int main(int argc, char** argv) {
               << cpuSeconds(usage) - cpuSeconds(before) << ',' << usage.ru_nvcsw - before.ru_nvcsw
               << ',' << usage.ru_nivcsw - before.ru_nivcsw << ',' << predicates << ','
               << sim.useParallelExecution() << ',' << ticks << ',' << sent << ',' << received << ','
-              << checksum << ',' << digest << ',' << sim.totalTransportOverflowEvents() << '\n';
+              << checksum << ',' << digest << ',' << sim.totalTransportOverflowEvents() << ','
+              << calendar_retained << '\n';
 }
