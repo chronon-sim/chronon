@@ -80,13 +80,18 @@ public:
             total_active_ += cost(u);
             if (cost(u) > 0.0) ++positive_count_[owner];
         }
-        for (const auto& edge : edges_)
+        double all_pressure = 0.0, all_pair_weights = 0.0;
+        for (const auto& edge : edges_) {
             if (edge.pressure < 0.0 || !std::isfinite(edge.pressure)) safe_incremental_ = false;
+            all_pressure += std::abs(edge.pressure);
+        }
+        for (const auto& pair : pairs_) all_pair_weights += std::abs(pair.weight);
         // Conservative error envelope for nonnegative accumulation and worker
         // reductions. Near any decision boundary use the ordered full path.
-        roundoff_ = 128.0 * std::numeric_limits<double>::epsilon() *
-                    (input_->num_units + edges_.size() + pairs_.size() + input_->num_threads + 1) *
-                    std::max({1.0, total_active_, baseline_.objective, baseline_.cross_pressure});
+        roundoff_ =
+            128.0 * std::numeric_limits<double>::epsilon() *
+            (input_->num_units + edges_.size() + pairs_.size() + input_->num_threads + 1) *
+            std::max({1.0, total_active_ + all_pressure + all_pair_weights, baseline_.objective});
         if (!std::isfinite(roundoff_)) safe_incremental_ = false;
     }
     double roundoff() const noexcept { return roundoff_; }

@@ -58,7 +58,36 @@ static void close(const ObjectiveSummary& a, const ObjectiveSummary& b, double e
     }
 }
 
+static void newlyExposedPressure() {
+    PartitionInput input{};
+    input.num_units = 5;
+    input.num_threads = 2;
+    input.sync_cost_ns = 1.0;
+    input.unit_cost_ns.assign(5, 1e9);
+    input.adjacency.resize(5);
+    for (size_t u = 0; u < 4; ++u) input.adjacency[u].push_back({4, 1, 1, 100.0});
+    input.adjacency[4].push_back({0, 1, 1, std::ldexp(1.0, 60)});
+    const std::vector<size_t> assignment(5, 0);
+    PreparedTopologyCost prepared;
+    prepared.prepare(input, assignment);
+    assert(prepared.baseline().cross_pressure == 0.0);
+    ObjectiveSummary full, incremental;
+    prepared.evaluateFull(full, 4, 1);
+    prepared.evaluateMove(incremental, 4, 1);
+    // The incoming small edges precede the large outgoing edge in the full
+    // sum, but follow it in the incremental sum. Baseline cross pressure alone
+    // would give an error envelope many orders of magnitude too small.
+    assert(full.cross_pressure != incremental.cross_pressure);
+    close(full, incremental, prepared.roundoff());
+    const auto score = prepared.scoreFull(4, 1, 0.01, 0.0);
+    const double threshold = score.score + input.unit_cost_ns[4] * 0.25;
+    for (double penalty :
+         {std::nextafter(threshold, -INFINITY), threshold, std::nextafter(threshold, INFINITY)})
+        equal(prepared.scoreFull(4, 1, 0.01, penalty), prepared.scoreMove(4, 1, 0.01, penalty));
+}
+
 int main() {
+    newlyExposedPressure();
     std::mt19937_64 random(143);
     PreparedTopologyCost prepared;
     PartitionInput empty{};
