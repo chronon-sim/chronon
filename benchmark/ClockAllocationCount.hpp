@@ -2,6 +2,7 @@
 #pragma once
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 
 // Linker wrappers count C++ scalar/array allocations in the statically linked
 // executable, not malloc, aligned new, shared-library internals, or peak live bytes.

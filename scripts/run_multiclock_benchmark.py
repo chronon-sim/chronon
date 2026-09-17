@@ -11,18 +11,21 @@ import platform
 import random
 import statistics
 import subprocess
+import time
 
 
 def execute(binary, arguments, cpus):
     command = [str(binary), *map(str, arguments)]
     if cpus:
         command = ["taskset", "-c", cpus, *command]
+    started = time.perf_counter()
     result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode:
         raise RuntimeError(f"benchmark failed ({result.returncode}): {command}\n{result.stderr}")
     rows = list(csv.DictReader(io.StringIO(result.stdout)))
     if len(rows) != 1:
         raise ValueError(f"unexpected benchmark output: {result.stdout}")
+    rows[0]["process_wall_s"] = time.perf_counter() - started
     return rows[0]
 
 
@@ -54,6 +57,10 @@ def host_topology(cpus):
                 selected_physical_cores=len({(p["socket"], p["core"]) for p in processors}),
                 selected_numa_nodes=sorted({p["node"] for p in processors}),
                 affinity="process mask inherited by workers and recorder; no per-thread pinning",
+                cgroup=Path("/proc/self/cgroup").read_text(),
+                cpu_quota={str(path): path.read_text().strip() for path in map(Path, (
+                    "/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+                    "/sys/fs/cgroup/cpu/cpu.cfs_period_us")) if path.exists()},
                 compiler=capture(["c++", "--version"]),
                 git_revision=capture(["git", "rev-parse", "HEAD"]),
                 git_status=capture(["git", "status", "--short"]))
@@ -153,6 +160,9 @@ def scaling(args):
                     raise AssertionError("benchmark silently fell back from requested parallel mode")
                 if not args.lossy and int(row.get("dropped", 0)):
                     raise AssertionError("lossless recording dropped events")
+                if mode != "off" and not args.lossy:
+                    if expected.setdefault((name, "events"), row["events"]) != row["events"]:
+                        raise AssertionError(f"lossless event count differs: {name}")
                 row.update(scenario=name, variant=variant, repetition=repetition, trace=mode)
                 rows.append(row)
                 raw.write(json.dumps(dict(command=[str(binary), *map(str, arguments)], affinity=args.cpus, result=row)) + "\n")
@@ -176,7 +186,7 @@ def scaling(args):
         item = dict(scenario=name, variant=variant, threads=count, dynamic=dynamic, trace=mode,
                     run_s=median, run_min_s=min(wall), run_max_s=max(wall), serial_speedup=serial / median,
                     unit_ticks_per_s=int(selected[0]["unit_ticks"]) / median)
-        for field in ("init_s", "wall_s", "total_s", "close_s", "init_cpu_s", "run_cpu_s", "total_cpu_s",
+        for field in ("init_s", "wall_s", "process_wall_s", "total_s", "close_s", "init_cpu_s", "run_cpu_s", "total_cpu_s",
                       "cpu_s", "migrations", "init_allocations", "run_allocations", "partition_ns", "events", "dropped",
                       "producer_stalls", "producer_stall_ns", "admission_retries", "progress_stalls", "progress_stall_ns"):
             if field in selected[0]:

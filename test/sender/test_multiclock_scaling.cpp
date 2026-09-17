@@ -15,6 +15,8 @@ std::filesystem::path fixture_root;
 bool export_fixtures = false;
 
 struct LaneUnit : TickableUnit {
+    OutPort<int> order_out{this, "order_out"};
+    InPort<int> order_in{this, "order_in"};
     std::vector<std::unique_ptr<AsyncWritePort<uint64_t>>> outputs;
     std::vector<std::unique_ptr<AsyncReadPort<uint64_t>>> inputs;
     std::vector<uint64_t> sent, received, events, transaction_prefix;
@@ -96,20 +98,21 @@ struct ClockScalingTestAccess {
         }
         return result;
     }
-    static size_t sharedActor(TickSimulation& sim) {
+    static size_t sharedActor(TickSimulation& sim, size_t lanes) {
         const auto& runtime = *sim.clock_parallel_;
-        assert(runtime.bridges.size() == 4);  // shared, unrelated, reverse, self
+        assert(runtime.bridges.size() ==
+               (lanes == 8 ? 4 : 3));  // shared, reverse, self, optionally unrelated
         for (size_t b = 0; b < runtime.bridges.size(); ++b) {
             const auto& group = *runtime.bridges[b];
-            if (group.lanes.size() != 8) continue;
-            assert(group.lanes.front().circuit->id() == 93);
+            if (group.lanes.size() != lanes) continue;
+            assert(group.lanes.front().circuit->id() == (lanes == 8 ? 93 : 92));
             assert(group.lanes.back().circuit->id() == 100);
             const auto actor = sim.clusters_.numClusters() + b;
             if (sim.config_.enable_dynamic_rebalance) {
                 for (const auto& edge : sim.dynamic_rebalance_adjacency_[actor])
-                    assert(edge.num_connections == 8);
+                    assert(edge.num_connections == lanes);
                 // Unmeasured work prior remains the SUM of all lane costs.
-                assert(std::abs(sim.dynamicClockActorCost_(actor).cost - 12.0) < 1e-9);
+                assert(std::abs(sim.dynamicClockActorCost_(actor).cost - 1.5 * lanes) < 1e-9);
             }
             return actor;
         }
@@ -132,7 +135,7 @@ struct Result {
 };
 
 Result run(size_t workers, bool dynamic, bool segmented, bool coincident, bool custom, bool tracing,
-           bool migrating = false) {
+           bool migrating = false, bool clustered = false) {
     TickSimulationConfig config;
     config.num_threads = workers;
     config.enable_parallel = workers > 1;
@@ -150,6 +153,10 @@ Result run(size_t workers, bool dynamic, bool segmented, bool coincident, bool c
     auto* w2 = sim.createUnitInDomain<LaneUnit>(3, "other_writer");
     auto* r2 = sim.createUnitInDomain<LaneUnit>(97, "other_reader");
     sim.createUnitInDomain<LaneUnit>(4093, "unrelated");
+    if (clustered) {
+        sim.connect(w->order_out, w2->order_in, 0);
+        sim.connect(r->order_out, r2->order_in, 0);
+    }
     std::vector<AsyncFifo<uint64_t>*> fifos;
     const auto connect = [&](LaneUnit* a, LaneUnit* b, size_t depth, size_t stages) {
         // Deliberately insert IDs out of order; runtime order must be stable.
@@ -178,7 +185,9 @@ Result run(size_t workers, bool dynamic, bool segmented, bool coincident, bool c
     sim.initialize();
     assert(sim.useParallelExecution() == (workers > 1));
     const auto storage = sender::ClockScalingTestAccess::pendingStorage(sim);
-    const auto shared = workers > 1 ? sender::ClockScalingTestAccess::sharedActor(sim) : SIZE_MAX;
+    const auto shared = workers > 1
+                            ? sender::ClockScalingTestAccess::sharedActor(sim, clustered ? 9 : 8)
+                            : SIZE_MAX;
     size_t requests = 0;
     if (migrating) {
         w->callback = [&] {
@@ -267,6 +276,8 @@ int main(int argc, char** argv) {
             for (bool dynamic : {false, true})
                 assert(run(workers, dynamic, true, coincident, false, true, dynamic) == reference);
     }
+    const auto clustered = run(1, false, false, true, false, false, false, true);
+    assert(run(4, true, true, true, false, false, true, true) == clustered);
     if (!export_fixtures) std::filesystem::remove(fixture_root);
     std::cout
         << "shared lanes, sparse domains, fallback callbacks, segmentation and migration passed\n";
