@@ -258,15 +258,10 @@ public:
             initialize();
         }
 
-        uint64_t executed = 0;
-        while (executed < max_cycles && !should_stop()) {
-            const uint64_t polling_interval = std::max<uint64_t>(1, config_.epoch_size);
-            uint64_t batch = std::min(polling_interval, max_cycles - executed);
-            const auto step = clock_mode_ ? runClockEvents(batch) : run(batch);
-            executed += step;
-            if (clock_mode_ && (!step || wasTerminationRequested())) break;
-        }
-        return executed;
+        // Clock topology is immutable after initialization. Select the loop
+        // once, retaining every predicate boundary and per-call run limit.
+        return clock_mode_ ? runUntilImpl_<true>(should_stop, max_cycles)
+                           : runUntilImpl_<false>(should_stop, max_cycles);
     }
 
     uint64_t runUntilComplete(uint64_t max_cycles = UINT64_MAX) {
@@ -405,6 +400,25 @@ public:
     void forceStableConnectionQueues() noexcept { force_stable_connection_queues_ = true; }
 
 private:
+    template <bool ClockMode, typename Predicate>
+    uint64_t runUntilImpl_(Predicate& should_stop, uint64_t max_cycles) {
+        uint64_t executed = 0;
+        while (executed < max_cycles && !should_stop()) {
+            const uint64_t polling_interval = std::max<uint64_t>(1, config_.epoch_size);
+            const uint64_t batch = std::min(polling_interval, max_cycles - executed);
+            uint64_t step;
+            if constexpr (ClockMode)
+                step = runClockEvents(batch);
+            else
+                step = run(batch);
+            executed += step;
+            if constexpr (ClockMode) {
+                if (!step || wasTerminationRequested()) break;
+            }
+        }
+        return executed;
+    }
+
     void validateClockOwner_(const Unit* unit) const;
     void prepareClockTopology_();
     void initializeClockRuntime_();
