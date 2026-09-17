@@ -22,7 +22,7 @@
 #include "DynamicWaitPolicy.hpp"
 #include "TickSimulation.hpp"
 #include "TickSimulationCycleUtils.hpp"
-#include "sender/schedule/EpochFreeTopologyCost.hpp"
+#include "sender/schedule/PreparedTopologyCost.hpp"
 #include "sender/schedule/SchedulerTimelineStyle.hpp"
 
 namespace chronon::sender {
@@ -162,6 +162,8 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
 
     epoch_free_cost::RuntimeWaits waits{&thread_floor_wait, &thread_dep_wait, &thread_no_ready_wait,
                                         &cluster_blocked_wait, &cluster_blocker_wait};
+    epoch_free_cost::PreparedTopologyCost prepared;
+    prepared.prepare(input, assignment, waits, planning_generation);
     const uint64_t history_cooldown = std::max(config_.rebalance_cooldown_cycles, interval * 2);
     const uint64_t pingpong_cooldown = std::max(history_cooldown, interval * 4);
     auto last_migration_cycle = [&](size_t c) -> uint64_t {
@@ -205,8 +207,7 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                 const double churn =
                     last_cycle == kNoMigrationCycle ? 0.0 : std::max(0.001, cluster_cost[c] * 0.05);
                 auto breakdown =
-                    epoch_free_cost::scoreMove(input, assignment, c, candidate_target, waits,
-                                               config_.rebalance_min_gain, churn);
+                    prepared.scoreFull(c, candidate_target, config_.rebalance_min_gain, churn);
                 if (!breakdown.valid) continue;
                 if (breakdown.score > best_breakdown.score ||
                     (breakdown.score == best_breakdown.score && c < cluster)) {

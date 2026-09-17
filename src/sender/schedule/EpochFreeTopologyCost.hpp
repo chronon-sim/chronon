@@ -327,34 +327,25 @@ inline std::vector<size_t> improveInitialPlacement(const PartitionInput& input,
     return assignment;
 }
 
-inline MoveBreakdown scoreMove(const PartitionInput& input, const std::vector<size_t>& assignment,
-                               size_t cluster, size_t target_thread, const RuntimeWaits& waits,
-                               double min_gain_fraction, double churn_penalty) {
+inline double averageDependencyWait(const RuntimeWaits& waits) {
+    double total_dep_wait = 0.0;
+    if (waits.thread_dep_wait_ns) {
+        for (uint64_t wait : *waits.thread_dep_wait_ns) total_dep_wait += static_cast<double>(wait);
+    }
+    return waits.thread_dep_wait_ns && !waits.thread_dep_wait_ns->empty()
+               ? total_dep_wait / static_cast<double>(waits.thread_dep_wait_ns->size())
+               : 0.0;
+}
+
+// Shared decision arithmetic; the independent full graph evaluator below remains
+// the numerical oracle for prepared and incremental candidates.
+inline MoveBreakdown scoreSummaries(double cluster_cost, size_t cluster, size_t source_thread,
+                                    size_t target_thread, size_t num_threads,
+                                    const RuntimeWaits& waits, double min_gain_fraction,
+                                    double churn_penalty, const ObjectiveSummary& old_summary,
+                                    const ObjectiveSummary& new_summary,
+                                    double local_topology_delta, double avg_dep_wait) {
     MoveBreakdown out;
-    if (cluster >= input.num_units || cluster >= assignment.size()) return out;
-    const size_t num_threads = input.num_threads;
-    const size_t source_thread = assignment[cluster];
-    if (target_thread >= num_threads || target_thread == source_thread) return out;
-
-    // Runtime adjacency also contains finite-headroom reverse constraints:
-    // headroom=1 is represented with min_delay=0, but it is not a physical
-    // same-cycle connection. Physical delay-zero components were already
-    // coalesced into indivisible scheduler clusters. Let the measured cost
-    // model score moves across these remaining zero-delay edges; the epoch-free
-    // dependency graph continues to enforce their progress constraint.
-    ObjectiveSummary old_summary = summarize(input, assignment, num_threads);
-    std::vector<size_t> candidate = assignment;
-    candidate[cluster] = target_thread;
-    ObjectiveSummary new_summary = summarize(input, candidate, num_threads);
-
-    const double cluster_cost =
-        cluster < input.unit_cost_ns.size() ? input.unit_cost_ns[cluster] : 1.0;
-    const double old_local_cross =
-        crossPressureForCluster(input, assignment, cluster, source_thread);
-    const double new_local_cross =
-        crossPressureForCluster(input, candidate, cluster, target_thread);
-    const double local_topology_delta = old_local_cross - new_local_cross;
-
     const double target_floor = waitAt(waits.thread_floor_wait_ns, target_thread);
     const double target_dep = waitAt(waits.thread_dep_wait_ns, target_thread);
     const double target_no_ready = waitAt(waits.thread_no_ready_wait_ns, target_thread);
@@ -377,14 +368,6 @@ inline MoveBreakdown scoreMove(const PartitionInput& input, const std::vector<si
 
     const double blocker_wait = waitAt(waits.cluster_blocker_wait_ns, cluster);
     const double cluster_wait = waitAt(waits.cluster_blocked_wait_ns, cluster) + blocker_wait;
-    double total_dep_wait = 0.0;
-    if (waits.thread_dep_wait_ns) {
-        for (uint64_t wait : *waits.thread_dep_wait_ns) total_dep_wait += static_cast<double>(wait);
-    }
-    const double avg_dep_wait =
-        waits.thread_dep_wait_ns && !waits.thread_dep_wait_ns->empty()
-            ? total_dep_wait / static_cast<double>(waits.thread_dep_wait_ns->size())
-            : 0.0;
     const double wait_scale = avg_dep_wait > 0.0 ? std::min(3.0, cluster_wait / avg_dep_wait) : 0.0;
 
     out.objective_gain = old_summary.objective - new_summary.objective;
@@ -461,6 +444,39 @@ inline MoveBreakdown scoreMove(const PartitionInput& input, const std::vector<si
     }
     out.valid = out.score >= min_score;
     return out;
+}
+
+inline MoveBreakdown scoreMove(const PartitionInput& input, const std::vector<size_t>& assignment,
+                               size_t cluster, size_t target_thread, const RuntimeWaits& waits,
+                               double min_gain_fraction, double churn_penalty) {
+    MoveBreakdown out;
+    if (cluster >= input.num_units || cluster >= assignment.size()) return out;
+    const size_t num_threads = input.num_threads;
+    const size_t source_thread = assignment[cluster];
+    if (target_thread >= num_threads || target_thread == source_thread) return out;
+
+    // Runtime adjacency also contains finite-headroom reverse constraints:
+    // headroom=1 is represented with min_delay=0, but it is not a physical
+    // same-cycle connection. Physical delay-zero components were already
+    // coalesced into indivisible scheduler clusters. Let the measured cost
+    // model score moves across these remaining zero-delay edges; the epoch-free
+    // dependency graph continues to enforce their progress constraint.
+    ObjectiveSummary old_summary = summarize(input, assignment, num_threads);
+    std::vector<size_t> candidate = assignment;
+    candidate[cluster] = target_thread;
+    ObjectiveSummary new_summary = summarize(input, candidate, num_threads);
+
+    const double cluster_cost =
+        cluster < input.unit_cost_ns.size() ? input.unit_cost_ns[cluster] : 1.0;
+    const double old_local_cross =
+        crossPressureForCluster(input, assignment, cluster, source_thread);
+    const double new_local_cross =
+        crossPressureForCluster(input, candidate, cluster, target_thread);
+    const double local_topology_delta = old_local_cross - new_local_cross;
+
+    return scoreSummaries(cluster_cost, cluster, source_thread, target_thread, num_threads, waits,
+                          min_gain_fraction, churn_penalty, old_summary, new_summary,
+                          local_topology_delta, averageDependencyWait(waits));
 }
 
 }  // namespace chronon::sender::epoch_free_cost
