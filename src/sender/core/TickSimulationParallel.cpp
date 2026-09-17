@@ -79,6 +79,9 @@ void TickSimulation::installMultiProducerProgress_() {
 // ---------------------------------------------------------------------------
 
 void TickSimulation::freeThreadProgressArray() {
+    // Topology/progress replacement happens with all worker tasks joined.
+    worker_run_scratch_.clear();
+    planning_scratch_.reset();
     if (thread_progress_array_) {
         for (size_t i = 0; i < thread_progress_count_; ++i) {
             thread_progress_array_[i].~ThreadProgress();
@@ -97,6 +100,7 @@ void TickSimulation::initProgressSync() {
     if (num_clusters == 0) return;
 
     freeThreadProgressArray();
+    worker_run_scratch_.resize(num_threads);
     thread_progress_count_ = num_clusters;
     void* mem = std::aligned_alloc(64, num_clusters * sizeof(ThreadProgress));
     thread_progress_array_ = static_cast<ThreadProgress*>(mem);
@@ -318,7 +322,8 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     };
     // This cache spans the worker invocation (the entire run in EpochFree mode),
     // allowing all locally-owned clusters to reuse acquired predecessor progress.
-    WorkerPredecessorCycleCache predecessor_cache(thread_progress_count_);
+    auto& predecessor_cache = worker_run_scratch_[thread_idx].predecessor;
+    predecessor_cache.reset(thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;

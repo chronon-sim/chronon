@@ -622,12 +622,15 @@ private:
     bool forceEpochFreeMigrationAtBoundary_(Unit* unit, size_t target_thread);
 
     /// Worker-private lower bounds for predecessor progress. Each cache lives
-    /// for one worker invocation and needs no atomic synchronization of its own.
+    /// across invocations, but its values reset at each invocation. It needs no
+    /// atomic synchronization of its own.
     /// ThreadProgress is release-published and never decreases, so a value read
     /// with acquire remains a valid lower bound for all later dependency checks
     /// on that worker. The extra slot is reserved for the synthetic lookahead
     /// floor dependency (pred_id == thread_progress_count_).
     struct alignas(64) WorkerPredecessorCycleCache {
+        WorkerPredecessorCycleCache() = default;
+        void reset(size_t num_clusters) { observed_cycles.assign(num_clusters + 1, 0); }
         explicit WorkerPredecessorCycleCache(size_t num_clusters)
             : observed_cycles(num_clusters + 1, 0) {}
 
@@ -635,6 +638,21 @@ private:
 
         std::vector<uint64_t> observed_cycles;
     };
+
+    // Indexed by logical worker, never by an OS thread ID. Bulk task completion
+    // joins every access before a subsequent public run call can reuse storage.
+    // Only capacities survive: progress/readiness and ownership views are reset
+    // on entry, including the clock scheduler's separate settling invocation.
+    struct WorkerRunScratch {
+        WorkerPredecessorCycleCache predecessor;
+        std::vector<size_t> owned_clusters, owned_bridges, owned_actors, ownership;
+        std::vector<uint64_t> priority_blocker, ready_through;
+        std::vector<double> priority_cost;
+    };
+    std::vector<WorkerRunScratch> worker_run_scratch_;
+    struct PlanningScratch;
+    std::shared_ptr<PlanningScratch> planning_scratch_;
+    friend struct SchedulerScratchTestAccess;
 
     /// Return a predecessor-progress lower bound sufficient for `needed` when
     /// possible. A cache hit deliberately does not load the remote atomic. On a

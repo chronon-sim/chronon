@@ -306,10 +306,17 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         auto work =
             stdexec::bulk(stdexec::just(), stdexec::par, thread_units_.size(), [&](size_t worker) {
                 try {
-                    WorkerPredecessorCycleCache cache(thread_progress_count_);
-                    auto owned_clusters = thread_clusters_[worker];
-                    auto owned_bridges = runtime.worker_bridges[worker];
-                    std::vector<size_t> owned_actors, ownership_scratch;
+                    auto& scratch = worker_run_scratch_[worker];
+                    auto& cache = scratch.predecessor;
+                    cache.reset(thread_progress_count_);
+                    auto& owned_clusters = scratch.owned_clusters;
+                    auto& owned_bridges = scratch.owned_bridges;
+                    auto& owned_actors = scratch.owned_actors;
+                    auto& ownership_scratch = scratch.ownership;
+                    owned_clusters = thread_clusters_[worker];
+                    owned_bridges = runtime.worker_bridges[worker];
+                    owned_actors.clear();
+                    ownership_scratch.clear();
                     uint64_t seen_generation = 0;
                     uint64_t idle_sweeps = 0;
                     uint64_t wait_sequence = 0;
