@@ -669,6 +669,10 @@ private:
         std::vector<double> priority_cost;
     };
     struct PlanningScratch;
+    struct SchedulerScratch {
+        std::vector<WorkerRunScratch> workers;
+        std::shared_ptr<PlanningScratch> planning;
+    };
     friend struct SchedulerScratchTestAccess;
 
     /// Return a predecessor-progress lower bound sufficient for `needed` when
@@ -950,9 +954,10 @@ private:
     uint64_t cycles_since_last_actual_rebalance_ = 0;
     uint64_t rebalance_count_ = 0;
 
-    // Append scratch so existing hot fields keep their offsets and alignment.
-    std::vector<WorkerRunScratch> worker_run_scratch_;
-    std::shared_ptr<PlanningScratch> planning_scratch_;
+    // One cold pointer fits in the existing tail padding on the measured ABI,
+    // preserving both hot-field offsets and the original simulation object size.
+    // Sequential execution allocates no scheduler scratch.
+    std::unique_ptr<SchedulerScratch> scheduler_scratch_;
 };
 
 }  // namespace chronon::sender

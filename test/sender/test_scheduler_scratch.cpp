@@ -9,14 +9,16 @@ namespace chronon::sender {
 struct SchedulerScratchTestAccess {
     static std::vector<const void*> storage(const TickSimulation& sim) {
         std::vector<const void*> result;
-        for (const auto& worker : sim.worker_run_scratch_) {
+        if (!sim.scheduler_scratch_) return result;
+        for (const auto& worker : sim.scheduler_scratch_->workers) {
             result.push_back(worker.predecessor.observed_cycles.data());
             result.push_back(worker.ready_through.data());
         }
         return result;
     }
     static void poison(TickSimulation& sim) {
-        for (auto& worker : sim.worker_run_scratch_) {
+        if (!sim.scheduler_scratch_) return;
+        for (auto& worker : sim.scheduler_scratch_->workers) {
             std::fill(worker.predecessor.observed_cycles.begin(),
                       worker.predecessor.observed_cycles.end(), UINT64_MAX);
             std::fill(worker.ready_through.begin(), worker.ready_through.end(), UINT64_MAX);

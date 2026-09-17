@@ -13,10 +13,12 @@
 namespace chronon::sender {
 struct SchedulerScratchTestAccess {
     static size_t bytes(const TickSimulation& sim) {
+        if (!sim.scheduler_scratch_) return 0;
         size_t result =
-            sim.worker_run_scratch_.capacity() * sizeof(TickSimulation::WorkerRunScratch);
+            sizeof(TickSimulation::SchedulerScratch) +
+            sim.scheduler_scratch_->workers.capacity() * sizeof(TickSimulation::WorkerRunScratch);
         const auto bytes = [](const auto& values) { return values.capacity() * sizeof(values[0]); };
-        for (const auto& worker : sim.worker_run_scratch_) {
+        for (const auto& worker : sim.scheduler_scratch_->workers) {
             result += bytes(worker.predecessor.observed_cycles) + bytes(worker.owned_clusters) +
                       bytes(worker.owned_bridges) + bytes(worker.owned_actors) +
                       bytes(worker.ownership) + bytes(worker.priority_blocker) +

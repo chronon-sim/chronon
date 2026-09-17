@@ -177,7 +177,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
         return enabled;
     };
     const size_t num_clusters = dynamic_runtime_cluster_count_;
-    auto& scratch = worker_run_scratch_[thread_idx];
+    auto& scratch = scheduler_scratch_->workers[thread_idx];
     auto& owned_clusters = scratch.owned_clusters;
     auto& refreshed_clusters = scratch.ownership;
     owned_clusters.clear();
