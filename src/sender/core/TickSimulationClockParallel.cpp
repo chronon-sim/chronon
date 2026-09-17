@@ -90,6 +90,13 @@ void TickSimulation::initializeClockParallel_() {
         runtime.worker_bridges[worker].push_back(runtime.bridges.size());
         runtime.bridges.push_back(std::move(bridge));
     }
+    for (auto& [id, serial] : clock_runtime_) {
+        auto& domain = runtime.domains.at(id);
+        domain.serial = &serial;
+        runtime.indexed_domains.push_back(&domain);
+    }
+    runtime.pending.resize(config_.max_lookahead_cycles);
+    for (auto& batch : runtime.pending) batch.edges.reserve(runtime.indexed_domains.size());
     if (config_.enable_dynamic_rebalance) initializeClockMigration_();
 }
 
@@ -121,17 +128,28 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
     const auto coordinate = [&](bool settling, ClockSchedulerProfile* profile) {
         detail::ClockProfileScope retirement(profile ? &profile->retirement_ns : nullptr);
         bool progress = false;
-        while (!runtime.pending.empty()) {
-            const auto& batch = runtime.pending.front();
+        if (++runtime.coordinator_sweep == 0) {
+            for (auto* domain : runtime.indexed_domains) domain->completion_sweep = 0;
+            ++runtime.coordinator_sweep;
+        }
+        while (runtime.pending_size) {
+            const auto& batch = runtime.pendingAt(0);
             bool ready = true;
             for (const auto& edge : batch.edges) {
-                for (const auto* progress : runtime.domains.at(edge.domain->id()).completions) {
-                    if (profile) ++profile->completion_loads;
-                    if (progress->load(std::memory_order_acquire) <= edge.cycle) {
-                        ready = false;
-                        break;
+                auto& domain = *edge.domain;
+                if (domain.completion_sweep != runtime.coordinator_sweep) {
+                    domain.acquired_completed = UINT64_MAX;
+                    for (const auto* completed : domain.completions) {
+                        if (profile) ++profile->completion_loads;
+                        domain.acquired_completed = std::min(
+                            domain.acquired_completed, completed->load(std::memory_order_acquire));
+                        // A partial minimum is still conservative if it already
+                        // blocks the oldest batch; retry on the next sweep.
+                        if (domain.acquired_completed <= edge.cycle) break;
                     }
+                    domain.completion_sweep = runtime.coordinator_sweep;
                 }
+                ready = domain.acquired_completed > edge.cycle;
                 if (!ready) break;
             }
             if (!ready) break;
@@ -139,14 +157,14 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                 throw std::overflow_error("scheduler progress overflow");
             (void)clock_calendar_->pop();
             for (const auto& edge : batch.edges) {
-                clock_runtime_.at(edge.domain->id()).next_cycle = edge.cycle + 1;
-                runtime.domains.at(edge.domain->id())
-                    .retired.store(edge.cycle + 1, std::memory_order_release);
+                edge.domain->serial->next_cycle = edge.cycle + 1;
+                edge.domain->retired.store(edge.cycle + 1, std::memory_order_release);
             }
             clock_time_ = batch.time;
             ++current_cycle_;
             ++completed;
-            runtime.pending.pop_front();
+            runtime.pending_head = (runtime.pending_head + 1) % runtime.pending.size();
+            --runtime.pending_size;
             progress = true;
         }
         if (dynamic && progress)
@@ -159,25 +177,27 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         retirement.finish();
         detail::ClockProfileScope admission(profile ? &profile->admission_ns : nullptr);
         if (!settling) {
-            while (runtime.pending.size() < config_.max_lookahead_cycles &&
-                   scheduled < max_batches && !calendar.empty() &&
-                   within_limit(calendar.nextTime()) && !token.stop_requested()) {
+            while (runtime.pending_size < runtime.pending.size() && scheduled < max_batches &&
+                   !calendar.empty() && within_limit(calendar.nextTime()) &&
+                   !token.stop_requested()) {
                 if (trace && !trace->tryAdmitClockBatch(calendar.nextTime())) break;
                 if (scheduled >= UINT64_MAX - (current_cycle_ - completed))
                     throw std::overflow_error("scheduler progress overflow");
                 const auto edges = calendar.pop();  // Validates representable successor edges.
-                runtime.pending.push_back({edges.front().time, {edges.begin(), edges.end()}});
+                auto& batch = runtime.pendingAt(runtime.pending_size++);
+                batch.time = edges.front().time;
+                batch.edges.clear();
                 for (const auto& edge : edges) {
-                    runtime.domains.at(edge.domain->id())
-                        .allowed.store(edge.cycle + 1, std::memory_order_release);
+                    auto* domain = runtime.indexed_domains[edge.calendar_index];
+                    batch.edges.push_back({domain, edge.cycle});
+                    domain->allowed.store(edge.cycle + 1, std::memory_order_release);
                 }
                 ++scheduled;
                 progress = true;
             }
         }
-        if (runtime.pending.empty() &&
-            (settling || scheduled == max_batches || calendar.empty() ||
-             !within_limit(calendar.nextTime()) || token.stop_requested()))
+        if (!runtime.pending_size && (settling || scheduled == max_batches || calendar.empty() ||
+                                      !within_limit(calendar.nextTime()) || token.stop_requested()))
             done.store(true, std::memory_order_release);
         return progress;
     };
@@ -417,7 +437,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         execute(false);
         finishClockMigrationRun_();
         if (error) std::rethrow_exception(error);
-        if (!runtime.pending.empty()) {
+        if (runtime.pending_size) {
             // Termination freezes admission. After joining the workers, settle
             // exactly through the latest edge already begun (including bridge
             // snapshots), not the unused remainder of the lookahead window.
@@ -435,16 +455,15 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     const auto prepared = endpoint.prepared.load(std::memory_order_relaxed);
                     if (prepared) boundary = std::max(boundary, endpoint.clock->edge(prepared - 1));
                 }
-            while (!runtime.pending.empty() && runtime.pending.back().time > boundary)
-                runtime.pending.pop_back();
-            for (auto& [id, domain] : runtime.domains) {
-                auto target = clock_runtime_.at(id).next_cycle;
-                for (const auto& batch : runtime.pending)
-                    for (const auto& edge : batch.edges)
-                        if (edge.domain->id() == id) target = edge.cycle + 1;
-                domain.allowed.store(target, std::memory_order_relaxed);
-            }
-            done.store(runtime.pending.empty(), std::memory_order_relaxed);
+            while (runtime.pending_size &&
+                   runtime.pendingAt(runtime.pending_size - 1).time > boundary)
+                --runtime.pending_size;
+            for (auto* domain : runtime.indexed_domains)
+                domain->allowed.store(domain->serial->next_cycle, std::memory_order_relaxed);
+            for (size_t b = 0; b < runtime.pending_size; ++b)
+                for (const auto& edge : runtime.pendingAt(b).edges)
+                    edge.domain->allowed.store(edge.cycle + 1, std::memory_order_relaxed);
+            done.store(runtime.pending_size == 0, std::memory_order_relaxed);
             execute(true);
             if (error) std::rethrow_exception(error);
         }

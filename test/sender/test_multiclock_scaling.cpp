@@ -78,6 +78,19 @@ struct BatchProbe : sender::CdcComponent {
 
 namespace chronon::sender {
 struct ClockScalingTestAccess {
+    static std::vector<const void*> pendingStorage(const TickSimulation& sim) {
+        std::vector<const void*> result;
+        if (sim.clock_parallel_) {
+            const auto& runtime = *sim.clock_parallel_;
+            assert(runtime.pending.size() == sim.config_.max_lookahead_cycles);
+            assert(runtime.pending_size == 0);
+            for (const auto& batch : runtime.pending) {
+                assert(batch.edges.capacity() >= runtime.indexed_domains.size());
+                result.push_back(batch.edges.data());
+            }
+        }
+        return result;
+    }
     static BatchProbe* probe(TickSimulation& sim) {
         auto probe = std::make_unique<BatchProbe>(std::move(sim.cdc_.front()));
         auto* result = probe.get();
@@ -135,6 +148,7 @@ Result run(size_t workers, bool dynamic, bool segmented, bool coincident, bool c
     }
     sim.initialize();
     assert(sim.useParallelExecution() == (workers > 1));
+    const auto storage = sender::ClockScalingTestAccess::pendingStorage(sim);
     size_t requests = 0;
     if (migrating) {
         w->callback = [&] {
@@ -156,6 +170,7 @@ Result run(size_t workers, bool dynamic, bool segmented, bool coincident, bool c
     }
     if (probe) assert(probe->begins == sim.schedulerSteps() && probe->commits == probe->begins);
     assert(!sim.totalTransportOverflowEvents());
+    assert(storage == sender::ClockScalingTestAccess::pendingStorage(sim));
     Result result;
     for (auto* unit : {w, r, w2, r2}) result.state.push_back(unit->events);
     for (const auto* fifo : fifos) {

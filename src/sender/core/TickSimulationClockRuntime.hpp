@@ -12,6 +12,8 @@ namespace chronon::sender {
 struct TickSimulation::ClockParallelRuntime {
     struct Domain {
         const ClockDomain* clock = nullptr;
+        ClockRuntime* serial = nullptr;
+        uint64_t completion_sweep = 0, acquired_completed = 0;  // Coordinator-private.
         std::atomic<uint64_t> allowed{0};
         std::atomic<uint64_t> retired{0};
         std::vector<const std::atomic<uint64_t>*> completions;
@@ -45,16 +47,26 @@ struct TickSimulation::ClockParallelRuntime {
         bool sample = false;
         uint64_t sample_ns = 0;  // begin + commit execution time, excluding dependency waits.
     };
+    struct BatchEdge {
+        Domain* domain;
+        uint64_t cycle;
+    };
     struct Batch {
         SimTime time;
-        std::vector<ClockEdge> edges;
+        std::vector<BatchEdge> edges;
     };
 
     std::unique_ptr<Cluster[]> clusters;
     std::unordered_map<ClockDomainId, Domain> domains;
     std::vector<std::unique_ptr<Bridge>> bridges;
     std::vector<std::vector<size_t>> worker_bridges;
-    std::deque<Batch> pending;
+    // Bounded reusable ring: only the coordinator accesses slots. Pop does not
+    // free edge storage. Dense references avoid hardware-ID lookup at retirement.
+    std::vector<Domain*> indexed_domains;
+    std::vector<Batch> pending;
+    size_t pending_head = 0, pending_size = 0;
+    uint64_t coordinator_sweep = 0;
+    Batch& pendingAt(size_t index) { return pending[(pending_head + index) % pending.size()]; }
     // Migration heuristics use reference-clock cycles of retired physical time,
     // never incomparable actor-local cycles or calendar batch counts.
     std::atomic<uint64_t> rebalance_cycle{0};
