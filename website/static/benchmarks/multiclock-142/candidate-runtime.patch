@@ -1,0 +1,968 @@
+diff --git a/benchmark/ClockAllocationCount.hpp b/benchmark/ClockAllocationCount.hpp
+index 4b1deaf9c062ea4e596f0cc207a3f802bf22fea0..9d78df6df5731f55952197a8d0fa7c1f17cd1c69 100644
+--- a/benchmark/ClockAllocationCount.hpp
++++ b/benchmark/ClockAllocationCount.hpp
+@@ -2,6 +2,7 @@
+ #pragma once
+ #include <atomic>
+ #include <cstddef>
++#include <cstdint>
+ 
+ // Linker wrappers count C++ scalar/array allocations in the statically linked
+ // executable, not malloc, aligned new, shared-library internals, or peak live bytes.
+diff --git a/scripts/run_multiclock_benchmark.py b/scripts/run_multiclock_benchmark.py
+index ce8cfbd71524865d4202f4ebb7a846b1fbc57c35..11670d43e82d50557978a112ab2fc71b5694c6a3 100644
+--- a/scripts/run_multiclock_benchmark.py
++++ b/scripts/run_multiclock_benchmark.py
+@@ -11,18 +11,21 @@ import platform
+ import random
+ import statistics
+ import subprocess
++import time
+ 
+ 
+ def execute(binary, arguments, cpus):
+     command = [str(binary), *map(str, arguments)]
+     if cpus:
+         command = ["taskset", "-c", cpus, *command]
++    started = time.perf_counter()
+     result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+     if result.returncode:
+         raise RuntimeError(f"benchmark failed ({result.returncode}): {command}\n{result.stderr}")
+     rows = list(csv.DictReader(io.StringIO(result.stdout)))
+     if len(rows) != 1:
+         raise ValueError(f"unexpected benchmark output: {result.stdout}")
++    rows[0]["process_wall_s"] = time.perf_counter() - started
+     return rows[0]
+ 
+ 
+@@ -54,6 +57,10 @@ def host_topology(cpus):
+                 selected_physical_cores=len({(p["socket"], p["core"]) for p in processors}),
+                 selected_numa_nodes=sorted({p["node"] for p in processors}),
+                 affinity="process mask inherited by workers and recorder; no per-thread pinning",
++                cgroup=Path("/proc/self/cgroup").read_text(),
++                cpu_quota={str(path): path.read_text().strip() for path in map(Path, (
++                    "/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
++                    "/sys/fs/cgroup/cpu/cpu.cfs_period_us")) if path.exists()},
+                 compiler=capture(["c++", "--version"]),
+                 git_revision=capture(["git", "rev-parse", "HEAD"]),
+                 git_status=capture(["git", "status", "--short"]))
+@@ -153,6 +160,9 @@ def scaling(args):
+                     raise AssertionError("benchmark silently fell back from requested parallel mode")
+                 if not args.lossy and int(row.get("dropped", 0)):
+                     raise AssertionError("lossless recording dropped events")
++                if mode != "off" and not args.lossy:
++                    if expected.setdefault((name, "events"), row["events"]) != row["events"]:
++                        raise AssertionError(f"lossless event count differs: {name}")
+                 row.update(scenario=name, variant=variant, repetition=repetition, trace=mode)
+                 rows.append(row)
+                 raw.write(json.dumps(dict(command=[str(binary), *map(str, arguments)], affinity=args.cpus, result=row)) + "\n")
+@@ -176,7 +186,7 @@ def scaling(args):
+         item = dict(scenario=name, variant=variant, threads=count, dynamic=dynamic, trace=mode,
+                     run_s=median, run_min_s=min(wall), run_max_s=max(wall), serial_speedup=serial / median,
+                     unit_ticks_per_s=int(selected[0]["unit_ticks"]) / median)
+-        for field in ("init_s", "wall_s", "total_s", "close_s", "init_cpu_s", "run_cpu_s", "total_cpu_s",
++        for field in ("init_s", "wall_s", "process_wall_s", "total_s", "close_s", "init_cpu_s", "run_cpu_s", "total_cpu_s",
+                       "cpu_s", "migrations", "init_allocations", "run_allocations", "partition_ns", "events", "dropped",
+                       "producer_stalls", "producer_stall_ns", "admission_retries", "progress_stalls", "progress_stall_ns"):
+             if field in selected[0]:
+diff --git a/scripts/validate_clock_traces.py b/scripts/validate_clock_traces.py
+index 5691153f51a9db1443ecd735e0df5c6bd8b88b44..cc3dc64dcd879e9d93e031f77138e400b3484068 100644
+--- a/scripts/validate_clock_traces.py
++++ b/scripts/validate_clock_traces.py
+@@ -182,6 +182,9 @@ def run(args, root):
+     if args.epoch_free_binary:
+         subprocess.run([str(args.epoch_free_binary), str(root / "epoch-free")], check=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    if args.scaling_binary:
++        subprocess.run([str(args.scaling_binary), str(root / "scaling")], check=True,
++                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+     directories = sorted({path.parent for path in root.rglob("reference.tsv")})
+     if not directories:
+         raise ValueError("no generated reference fixtures found")
+@@ -219,6 +222,7 @@ def main():
+     parser.add_argument("--multiclock-binary", type=Path)
+     parser.add_argument("--recorder-binary", type=Path)
+     parser.add_argument("--epoch-free-binary", type=Path)
++    parser.add_argument("--scaling-binary", type=Path)
+     parser.add_argument("--check-prefix", action="store_true")
+     args = parser.parse_args()
+     if args.directory:
+diff --git a/src/sender/core/TickSimulation.hpp b/src/sender/core/TickSimulation.hpp
+index cbd639dacb724312b464ed2bdb15efd2c5e6dfb3..93434a1a21bdeeeb38736d9de6f58426359afeee 100644
+--- a/src/sender/core/TickSimulation.hpp
++++ b/src/sender/core/TickSimulation.hpp
+@@ -409,7 +409,7 @@ private:
+     void selectClockExecutionMode_();
+     void initializeClockParallel_();
+     void addClockPartitionActors_(PartitionInput& input,
+-                                  const std::unordered_map<Unit*, size_t>& unit_indices) const;
++                                  const std::unordered_map<Unit*, size_t>& unit_indices);
+     uint64_t runClockEpochFree_(uint64_t max_batches, std::optional<SimTime> limit = {},
+                                 bool inclusive = false);
+     bool executeClockBatch_();
+@@ -607,6 +607,7 @@ private:
+     friend struct EpochFreeDifferentialTestAccess;
+     /// Test-only source-owner migration commit validation.
+     friend struct DynamicMigrationTestAccess;
++    friend struct ClockScalingTestAccess;
+     /// Test-only transparent-broadcast fusion selection inspection.
+     friend struct TransparentBroadcastFusionTestAccess;
+ 
+@@ -733,6 +734,7 @@ private:
+     struct ClockRuntime {
+         const ClockDomain* clock = nullptr;
+         std::vector<TickableUnit*> units;
++        std::vector<size_t> cdc;
+         uint64_t next_cycle = 0;
+     };
+     std::map<ClockDomainId, ClockRuntime> clock_runtime_;
+@@ -741,7 +743,10 @@ private:
+     // The out-of-line runtime owns bridge tasks and their progress atomics.
+     std::shared_ptr<ClockParallelRuntime> clock_parallel_;
+     std::vector<size_t> clock_bridge_owners_;
++    std::vector<std::vector<size_t>> clock_bridge_groups_;
+     std::vector<std::unique_ptr<CdcComponent>> cdc_;
++    std::vector<size_t> clock_always_cdc_, clock_active_cdc_;
++    std::vector<uint8_t> clock_cdc_seen_;
+     std::unique_ptr<observe::ClockTraceRecorder> clock_trace_;
+     uint64_t current_cycle_;
+     bool initialized_;
+diff --git a/src/sender/core/TickSimulationClockMigration.cpp b/src/sender/core/TickSimulationClockMigration.cpp
+index 598ff6e369910c72ed9039f3615c852cc87525d6..476d32a76c1f0a160396aa16328618445e84b322 100644
+--- a/src/sender/core/TickSimulationClockMigration.cpp
++++ b/src/sender/core/TickSimulationClockMigration.cpp
+@@ -13,12 +13,27 @@ double edgeRate(const ClockDomain& clock, uint64_t reference_hz) {
+ }  // namespace
+ 
+ void TickSimulation::addClockPartitionActors_(
+-    PartitionInput& input, const std::unordered_map<Unit*, size_t>& unit_indices) const {
++    PartitionInput& input, const std::unordered_map<Unit*, size_t>& unit_indices) {
+     const auto rate = [&](const ClockDomain& clock) {
+         return edgeRate(clock, config_.tick_frequency_hz);
+     };
+     const size_t clusters = clusters_.numClusters();
+-    input.num_units += cdc_.size();
++    // Stable FIFO-ID traversal gives stable group identities. Matching clock
++    // pairs alone is insufficient: that would add unrelated endpoint waits.
++    clock_bridge_groups_.clear();
++    std::map<std::array<size_t, 5>, size_t> group_index;
++    for (size_t f = 0; f < cdc_.size(); ++f) {
++        const auto* fifo = cdc_[f].get();
++        const std::array<size_t, 5> key{unit_to_cluster_[unit_indices.at(fifo->writeOwner())],
++                                        unit_to_cluster_[unit_indices.at(fifo->readOwner())],
++                                        fifo->writeOwner()->clockDomainId(),
++                                        fifo->readOwner()->clockDomainId(),
++                                        fifo->endpointEdgesOnly() ? SIZE_MAX : f};
++        const auto [it, inserted] = group_index.emplace(key, clock_bridge_groups_.size());
++        if (inserted) clock_bridge_groups_.emplace_back();
++        clock_bridge_groups_[it->second].push_back(f);
++    }
++    input.num_units += clock_bridge_groups_.size();
+     input.unit_cost_ns.resize(input.num_units);
+     input.adjacency.resize(input.num_units);
+     for (size_t c = 0; c < clusters; ++c) {
+@@ -26,16 +41,18 @@ void TickSimulation::addClockPartitionActors_(
+         input.unit_cost_ns[c] *= rate(clock);
+         for (auto& edge : input.adjacency[c]) edge.activity_rate = rate(clock);
+     }
+-    for (size_t b = 0; b < cdc_.size(); ++b) {
++    for (size_t b = 0; b < clock_bridge_groups_.size(); ++b) {
+         const size_t actor = clusters + b;
+-        for (auto* unit : {cdc_[b]->writeOwner(), cdc_[b]->readOwner()}) {
++        const auto& lanes = clock_bridge_groups_[b];
++        const auto* fifo = cdc_[lanes.front()].get();
++        for (auto* unit : {fifo->writeOwner(), fifo->readOwner()}) {
+             const size_t endpoint = unit_to_cluster_[unit_indices.at(unit)];
+             const double frequency = rate(unit->clockDomain());
+             // No speculative simulation warmup: use the existing uniform-cost
+             // prior for each endpoint until live bridge samples become ready.
+-            input.unit_cost_ns[actor] += frequency;
+-            input.adjacency[actor].push_back({endpoint, 1, 1, frequency});
+-            input.adjacency[endpoint].push_back({actor, 1, 1, frequency});
++            input.unit_cost_ns[actor] += frequency * lanes.size();
++            input.adjacency[actor].push_back({endpoint, lanes.size(), 1, frequency});
++            input.adjacency[endpoint].push_back({actor, lanes.size(), 1, frequency});
+         }
+     }
+ }
+@@ -123,8 +140,11 @@ void TickSimulation::initializeClockMigration_() {
+             runtime.actor_rates[actor] += endpoint_rate;
+             // Endpoint-specific begin/commit handshakes, not a zero-delay edge
+             // merging two hardware domains into one scheduling cluster.
+-            dynamic_rebalance_adjacency_[actor].push_back({endpoint.cluster, 1, 1, endpoint_rate});
+-            dynamic_rebalance_adjacency_[endpoint.cluster].push_back({actor, 1, 1, endpoint_rate});
++            const auto lanes = runtime.bridges[b]->lanes.size();
++            dynamic_rebalance_adjacency_[actor].push_back(
++                {endpoint.cluster, lanes, 1, endpoint_rate});
++            dynamic_rebalance_adjacency_[endpoint.cluster].push_back(
++                {actor, lanes, 1, endpoint_rate});
+         }
+     }
+     const uint64_t start = clockRebalanceCycle_(clock_calendar_->nextTime());
+@@ -148,7 +168,8 @@ TickSimulation::DynamicRuntimeCostEstimate TickSimulation::dynamicClockActorCost
+             samples ? std::max(0.001, static_cast<double>(cluster_sample_time_ns_[actor].load(
+                                           std::memory_order_relaxed)) /
+                                           static_cast<double>(samples))
+-                    : 1.0;
++                    : static_cast<double>(
++                          clock_parallel_->bridges[actor - clusters_.numClusters()]->lanes.size());
+     }
+     estimate.cost *= clock_parallel_->actor_rates.at(actor);
+     return estimate;
+diff --git a/src/sender/core/TickSimulationClockParallel.cpp b/src/sender/core/TickSimulationClockParallel.cpp
+index 52d615d005e5bb96f16f046baa73f114590ecf8b..1319627800064edbc86df4ce63648d3994fcfa61 100644
+--- a/src/sender/core/TickSimulationClockParallel.cpp
++++ b/src/sender/core/TickSimulationClockParallel.cpp
+@@ -59,24 +59,30 @@ void TickSimulation::initializeClockParallel_() {
+             cluster_of.emplace(unit, c);
+         }
+     }
+-    for (auto& fifo : cdc_) {
++    for (const auto& group : clock_bridge_groups_) {
+         auto bridge = std::make_unique<ClockParallelRuntime::Bridge>();
+-        bridge->circuit = fifo.get();
+-        const std::array<Unit*, 2> owners{fifo->writeOwner(), fifo->readOwner()};
+-        if (clock_trace_ && clock_trace_->enabled()) {
+-            // Stable logical producers survive host placement changes. Units
+-            // record evaluate events; only this bridge writes its commit streams.
+-            const auto producer = uint64_t{fifo->id()} + 1;
+-            bridge->trace[0] =
+-                clock_trace_->addProducerStream(owners[0]->clockTraceStream(), producer);
+-            // A self-loop has one logical unit and one bridge producer. Share
+-            // its stream to preserve the FIFO's write/read commit event order.
+-            bridge->trace[1] =
+-                owners[0] == owners[1]
+-                    ? bridge->trace[0]
+-                    : clock_trace_->addProducerStream(owners[1]->clockTraceStream(), producer);
+-            fifo->setClockTraceStreams(bridge->trace[0], bridge->trace[1]);
++        bridge->lanes.reserve(group.size());
++        for (const auto f : group) {
++            auto& fifo = cdc_[f];
++            ClockParallelRuntime::Lane lane;
++            lane.circuit = fifo.get();
++            const std::array<Unit*, 2> owners{fifo->writeOwner(), fifo->readOwner()};
++            if (clock_trace_ && clock_trace_->enabled()) {
++                // Scheduling groups do not merge logical producers, lane IDs,
++                // ordinals, event budgets or FIFO circuit state.
++                const auto producer = uint64_t{fifo->id()} + 1;
++                lane.trace[0] =
++                    clock_trace_->addProducerStream(owners[0]->clockTraceStream(), producer);
++                lane.trace[1] =
++                    owners[0] == owners[1]
++                        ? lane.trace[0]
++                        : clock_trace_->addProducerStream(owners[1]->clockTraceStream(), producer);
++                fifo->setClockTraceStreams(lane.trace[0], lane.trace[1]);
++            }
++            bridge->lanes.push_back(lane);
+         }
++        const auto* first = bridge->lanes.front().circuit;
++        const std::array<Unit*, 2> owners{first->writeOwner(), first->readOwner()};
+         for (size_t side = 0; side < owners.size(); ++side) {
+             auto& endpoint = bridge->endpoints[side];
+             endpoint.cluster = cluster_of.at(owners[side]);
+@@ -90,6 +96,13 @@ void TickSimulation::initializeClockParallel_() {
+         runtime.worker_bridges[worker].push_back(runtime.bridges.size());
+         runtime.bridges.push_back(std::move(bridge));
+     }
++    for (auto& [id, serial] : clock_runtime_) {
++        auto& domain = runtime.domains.at(id);
++        domain.serial = &serial;
++        runtime.indexed_domains.push_back(&domain);
++    }
++    runtime.pending.resize(config_.max_lookahead_cycles);
++    for (auto& batch : runtime.pending) batch.edges.reserve(runtime.indexed_domains.size());
+     if (config_.enable_dynamic_rebalance) initializeClockMigration_();
+ }
+ 
+@@ -121,17 +134,28 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+     const auto coordinate = [&](bool settling, ClockSchedulerProfile* profile) {
+         detail::ClockProfileScope retirement(profile ? &profile->retirement_ns : nullptr);
+         bool progress = false;
+-        while (!runtime.pending.empty()) {
+-            const auto& batch = runtime.pending.front();
++        if (++runtime.coordinator_sweep == 0) {
++            for (auto* domain : runtime.indexed_domains) domain->completion_sweep = 0;
++            ++runtime.coordinator_sweep;
++        }
++        while (runtime.pending_size) {
++            const auto& batch = runtime.pendingAt(0);
+             bool ready = true;
+             for (const auto& edge : batch.edges) {
+-                for (const auto* progress : runtime.domains.at(edge.domain->id()).completions) {
+-                    if (profile) ++profile->completion_loads;
+-                    if (progress->load(std::memory_order_acquire) <= edge.cycle) {
+-                        ready = false;
+-                        break;
++                auto& domain = *edge.domain;
++                if (domain.completion_sweep != runtime.coordinator_sweep) {
++                    domain.acquired_completed = UINT64_MAX;
++                    for (const auto* completed : domain.completions) {
++                        if (profile) ++profile->completion_loads;
++                        domain.acquired_completed = std::min(
++                            domain.acquired_completed, completed->load(std::memory_order_acquire));
++                        // A partial minimum is still conservative if it already
++                        // blocks the oldest batch; retry on the next sweep.
++                        if (domain.acquired_completed <= edge.cycle) break;
+                     }
++                    domain.completion_sweep = runtime.coordinator_sweep;
+                 }
++                ready = domain.acquired_completed > edge.cycle;
+                 if (!ready) break;
+             }
+             if (!ready) break;
+@@ -139,14 +163,14 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+                 throw std::overflow_error("scheduler progress overflow");
+             (void)clock_calendar_->pop();
+             for (const auto& edge : batch.edges) {
+-                clock_runtime_.at(edge.domain->id()).next_cycle = edge.cycle + 1;
+-                runtime.domains.at(edge.domain->id())
+-                    .retired.store(edge.cycle + 1, std::memory_order_release);
++                edge.domain->serial->next_cycle = edge.cycle + 1;
++                edge.domain->retired.store(edge.cycle + 1, std::memory_order_release);
+             }
+             clock_time_ = batch.time;
+             ++current_cycle_;
+             ++completed;
+-            runtime.pending.pop_front();
++            if (++runtime.pending_head == runtime.pending.size()) runtime.pending_head = 0;
++            --runtime.pending_size;
+             progress = true;
+         }
+         if (dynamic && progress)
+@@ -159,25 +183,27 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+         retirement.finish();
+         detail::ClockProfileScope admission(profile ? &profile->admission_ns : nullptr);
+         if (!settling) {
+-            while (runtime.pending.size() < config_.max_lookahead_cycles &&
+-                   scheduled < max_batches && !calendar.empty() &&
+-                   within_limit(calendar.nextTime()) && !token.stop_requested()) {
++            while (runtime.pending_size < runtime.pending.size() && scheduled < max_batches &&
++                   !calendar.empty() && within_limit(calendar.nextTime()) &&
++                   !token.stop_requested()) {
+                 if (trace && !trace->tryAdmitClockBatch(calendar.nextTime())) break;
+                 if (scheduled >= UINT64_MAX - (current_cycle_ - completed))
+                     throw std::overflow_error("scheduler progress overflow");
+                 const auto edges = calendar.pop();  // Validates representable successor edges.
+-                runtime.pending.push_back({edges.front().time, {edges.begin(), edges.end()}});
++                auto& batch = runtime.pendingAt(runtime.pending_size++);
++                batch.time = edges.front().time;
++                batch.edges.clear();
+                 for (const auto& edge : edges) {
+-                    runtime.domains.at(edge.domain->id())
+-                        .allowed.store(edge.cycle + 1, std::memory_order_release);
++                    auto* domain = runtime.indexed_domains[edge.calendar_index];
++                    batch.edges.push_back({domain, edge.cycle});
++                    domain->allowed.store(edge.cycle + 1, std::memory_order_release);
+                 }
+                 ++scheduled;
+                 progress = true;
+             }
+         }
+-        if (runtime.pending.empty() &&
+-            (settling || scheduled == max_batches || calendar.empty() ||
+-             !within_limit(calendar.nextTime()) || token.stop_requested()))
++        if (!runtime.pending_size && (settling || scheduled == max_batches || calendar.empty() ||
++                                      !within_limit(calendar.nextTime()) || token.stop_requested()))
+             done.store(true, std::memory_order_release);
+         return progress;
+     };
+@@ -200,13 +226,17 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+             if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
+             {
+                 detail::ClockProfileScope commit_profile(profile ? &profile->bridge_ns : nullptr);
+-                bridge.circuit->commit();
++                // Commit EVERY lane before publishing completion or allowing
++                // this actor to transfer to another owner at the sweep boundary.
++                for (auto& lane : bridge.lanes) lane.circuit->commit();
+             }
+             if (profile) ++profile->bridge_commits;
+             for (size_t side = 0; side < 2; ++side) {
+                 auto& endpoint = bridge.endpoints[side];
+                 if (bridge.participating[side]) {
+-                    if (trace && bridge.trace[side]) bridge.trace[side]->endEdge();
++                    if (trace)
++                        for (auto& lane : bridge.lanes)
++                            if (lane.trace[side]) lane.trace[side]->endEdge();
+                     ++endpoint.next;
+                     endpoint.next_time = endpoint.clock->edge(endpoint.next);
+                     endpoint.completed.store(endpoint.next, std::memory_order_release);
+@@ -252,7 +282,10 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+         if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
+         {
+             detail::ClockProfileScope begin_profile(profile ? &profile->bridge_ns : nullptr);
+-            bridge.circuit->begin(std::span(bridge.edges.data(), bridge.edge_count));
++            // All lanes snapshot old state before either endpoint cluster is
++            // released. Coincident edges cannot observe another lane's commit.
++            for (auto& lane : bridge.lanes)
++                lane.circuit->begin(std::span(bridge.edges.data(), bridge.edge_count));
+         }
+         if (bridge.sample) {
+             dynamic_cluster_last_tick_sample_cycle_[actor] = cycle;
+@@ -318,11 +351,18 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+                         };
+                         SchedulerTimelineTrace::TimePoint wait_begin{};
+                         if (sample_wait) wait_begin = SchedulerTimelineTrace::Clock::now();
++                        // Reuse the single-clock stable-sweep protocol. Only
++                        // this worker can relinquish its actors, in service()
++                        // AFTER the entire sweep. A concurrent peer handoff can
++                        // only add an actor; refresh acquires it on the next sweep.
++                        const bool stable_sweep =
++                            !dynamic || migration_request_.state.load(std::memory_order_acquire) ==
++                                            static_cast<uint8_t>(MigrationRequestState::None);
+                         if (dynamic && seen_generation != cluster_assignment_generation_.load(
+                                                               std::memory_order_acquire))
+                             refresh();
+                         for (const auto index : owned_bridges) {
+-                            if (dynamic &&
++                            if (dynamic && !stable_sweep &&
+                                 cluster_runtime_owner_[clusters_.numClusters() + index].load(
+                                     std::memory_order_acquire) != worker)
+                                 continue;
+@@ -330,7 +370,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+                             progress = bridge_step(index, blocked, profile) || progress;
+                         }
+                         for (const auto c : owned_clusters) {
+-                            if (dynamic &&
++                            if (dynamic && !stable_sweep &&
+                                 cluster_runtime_owner_[c].load(std::memory_order_acquire) != worker)
+                                 continue;
+                             if (profile) ++profile->cluster_polls;
+@@ -417,7 +457,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+         execute(false);
+         finishClockMigrationRun_();
+         if (error) std::rethrow_exception(error);
+-        if (!runtime.pending.empty()) {
++        if (runtime.pending_size) {
+             // Termination freezes admission. After joining the workers, settle
+             // exactly through the latest edge already begun (including bridge
+             // snapshots), not the unused remainder of the lookahead window.
+@@ -435,16 +475,15 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
+                     const auto prepared = endpoint.prepared.load(std::memory_order_relaxed);
+                     if (prepared) boundary = std::max(boundary, endpoint.clock->edge(prepared - 1));
+                 }
+-            while (!runtime.pending.empty() && runtime.pending.back().time > boundary)
+-                runtime.pending.pop_back();
+-            for (auto& [id, domain] : runtime.domains) {
+-                auto target = clock_runtime_.at(id).next_cycle;
+-                for (const auto& batch : runtime.pending)
+-                    for (const auto& edge : batch.edges)
+-                        if (edge.domain->id() == id) target = edge.cycle + 1;
+-                domain.allowed.store(target, std::memory_order_relaxed);
+-            }
+-            done.store(runtime.pending.empty(), std::memory_order_relaxed);
++            while (runtime.pending_size &&
++                   runtime.pendingAt(runtime.pending_size - 1).time > boundary)
++                --runtime.pending_size;
++            for (auto* domain : runtime.indexed_domains)
++                domain->allowed.store(domain->serial->next_cycle, std::memory_order_relaxed);
++            for (size_t b = 0; b < runtime.pending_size; ++b)
++                for (const auto& edge : runtime.pendingAt(b).edges)
++                    edge.domain->allowed.store(edge.cycle + 1, std::memory_order_relaxed);
++            done.store(runtime.pending_size == 0, std::memory_order_relaxed);
+             execute(true);
+             if (error) std::rethrow_exception(error);
+         }
+diff --git a/src/sender/core/TickSimulationClockRuntime.hpp b/src/sender/core/TickSimulationClockRuntime.hpp
+index 51b7b329f035745eba308450f19e3302cfe3e714..25b5de49299863e8cc470e2fbb01d4da653d7641 100644
+--- a/src/sender/core/TickSimulationClockRuntime.hpp
++++ b/src/sender/core/TickSimulationClockRuntime.hpp
+@@ -12,6 +12,8 @@ namespace chronon::sender {
+ struct TickSimulation::ClockParallelRuntime {
+     struct Domain {
+         const ClockDomain* clock = nullptr;
++        ClockRuntime* serial = nullptr;
++        uint64_t completion_sweep = 0, acquired_completed = 0;  // Coordinator-private.
+         std::atomic<uint64_t> allowed{0};
+         std::atomic<uint64_t> retired{0};
+         std::vector<const std::atomic<uint64_t>*> completions;
+@@ -34,27 +36,43 @@ struct TickSimulation::ClockParallelRuntime {
+         std::atomic<uint64_t> prepared{0};
+         std::atomic<uint64_t> completed{0};
+     };
+-    struct Bridge {
++    struct Lane {
+         CdcComponent* circuit = nullptr;
++        std::array<observe::ClockTraceStream*, 2> trace{};
++    };
++    struct Bridge {
++        std::vector<Lane> lanes;
+         std::array<Endpoint, 2> endpoints;
+         std::array<ClockEdge, 2> edges;
+         std::array<bool, 2> participating{};
+-        std::array<observe::ClockTraceStream*, 2> trace{};
+         size_t edge_count = 0;
+         std::atomic<uint64_t> completed{0};  // Committed merged-edge transactions.
+         bool sample = false;
+         uint64_t sample_ns = 0;  // begin + commit execution time, excluding dependency waits.
+     };
++    struct BatchEdge {
++        Domain* domain;
++        uint64_t cycle;
++    };
+     struct Batch {
+         SimTime time;
+-        std::vector<ClockEdge> edges;
++        std::vector<BatchEdge> edges;
+     };
+ 
+     std::unique_ptr<Cluster[]> clusters;
+     std::unordered_map<ClockDomainId, Domain> domains;
+     std::vector<std::unique_ptr<Bridge>> bridges;
+     std::vector<std::vector<size_t>> worker_bridges;
+-    std::deque<Batch> pending;
++    // Bounded reusable ring: only the coordinator accesses slots. Pop does not
++    // free edge storage. Dense references avoid hardware-ID lookup at retirement.
++    std::vector<Domain*> indexed_domains;
++    std::vector<Batch> pending;
++    size_t pending_head = 0, pending_size = 0;
++    uint64_t coordinator_sweep = 0;
++    Batch& pendingAt(size_t index) {
++        const auto slot = pending_head + index;
++        return pending[slot < pending.size() ? slot : slot - pending.size()];
++    }
+     // Migration heuristics use reference-clock cycles of retired physical time,
+     // never incomparable actor-local cycles or calendar batch counts.
+     std::atomic<uint64_t> rebalance_cycle{0};
+diff --git a/src/sender/core/TickSimulationClocks.cpp b/src/sender/core/TickSimulationClocks.cpp
+index c894d7705f97a1433c0e15b2ffa9742d009c1101..a8073ab94d5c9c0923effaa1816ee2b4ea7a947e 100644
+--- a/src/sender/core/TickSimulationClocks.cpp
++++ b/src/sender/core/TickSimulationClocks.cpp
+@@ -130,6 +130,19 @@ void TickSimulation::initializeClockRuntime_() {
+                 clock_trace_->addStream(unit->clockDomain(), unit->id(), unit->fullPath());
+         }
+     }
++    clock_active_cdc_.reserve(cdc_.size());
++    clock_cdc_seen_.resize(cdc_.size());
++    for (size_t f = 0; f < cdc_.size(); ++f) {
++        const auto& fifo = *cdc_[f];
++        if (!fifo.endpointEdgesOnly()) {
++            clock_always_cdc_.push_back(f);
++            continue;
++        }
++        const auto write = fifo.writeOwner()->clockDomainId();
++        const auto read = fifo.readOwner()->clockDomainId();
++        clock_runtime_.at(write).cdc.push_back(f);
++        if (read != write) clock_runtime_.at(read).cdc.push_back(f);
++    }
+     std::vector<const ClockDomain*> clocks;
+     for (const auto& [id, runtime] : clock_runtime_) {
+         (void)id;
+@@ -172,9 +185,30 @@ bool TickSimulation::executeClockBatch_() {
+         detail::ClockProfileScope actors_profile(profile ? &profile->actor_ns : nullptr);
+         if (clock_trace_ && clock_trace_->needsProgress())
+             clock_trace_->beginClockBatch(edges.front().time);
++        // Most phased calendars select one domain. Borrow its sorted list;
++        // coincident edges union the lists in preallocated scratch, then restore
++        // stable FIFO-ID order. Never skip an empty lane's synchronizer edges.
++        std::span<const size_t> active;
++        if (edges.size() == 1 && clock_always_cdc_.empty()) {
++            active = clock_runtime_.at(edges.front().domain->id()).cdc;
++        } else {
++            clock_active_cdc_.clear();
++            const auto append = [&](size_t f) {
++                if (!clock_cdc_seen_[f]) {
++                    clock_cdc_seen_[f] = 1;
++                    clock_active_cdc_.push_back(f);
++                }
++            };
++            for (const auto f : clock_always_cdc_) append(f);
++            for (const auto& edge : edges)
++                for (const auto f : clock_runtime_.at(edge.domain->id()).cdc) append(f);
++            std::sort(clock_active_cdc_.begin(), clock_active_cdc_.end());
++            for (const auto f : clock_active_cdc_) clock_cdc_seen_[f] = 0;
++            active = clock_active_cdc_;
++        }
+         {
+             detail::ClockProfileScope bridge_profile(profile ? &profile->bridge_ns : nullptr);
+-            for (auto& fifo : cdc_) fifo->begin(edges);
++            for (const auto f : active) cdc_[f]->begin(edges);
+         }
+         detail::ClockProfileScope ticks_profile(profile ? &profile->tick_ns : nullptr);
+         for (const auto& edge : edges) {
+@@ -189,8 +223,8 @@ bool TickSimulation::executeClockBatch_() {
+         // Every CDC component sampled before ANY participating domain committed.
+         {
+             detail::ClockProfileScope bridge_profile(profile ? &profile->bridge_ns : nullptr);
+-            for (auto& fifo : cdc_) fifo->commit();
+-            if (profile) profile->bridge_commits += cdc_.size();
++            for (const auto f : active) cdc_[f]->commit();
++            if (profile) profile->bridge_commits += active.size();
+         }
+         actors_profile.finish();
+         for (const auto& edge : edges)
+diff --git a/src/sender/port/AsyncFifo.hpp b/src/sender/port/AsyncFifo.hpp
+index f645776625fdf98203c2b128d8f6a147c40b1ec1..bf2f6ada63b20ac5e5f59de1c41c5d6f4822e72c 100644
+--- a/src/sender/port/AsyncFifo.hpp
++++ b/src/sender/port/AsyncFifo.hpp
+@@ -239,6 +239,10 @@ public:
+     virtual Unit* readOwner() const noexcept = 0;
+     virtual void setClockTraceStreams(observe::ClockTraceStream* write,
+                                       observe::ClockTraceStream* read) noexcept = 0;
++    /// Opt in only if begin/commit on unrelated-domain batches have no callback,
++    /// hardware, wakeup or trace effects. Other bridge implementations retain
++    /// the conservative every-batch serial contract.
++    virtual bool endpointEdgesOnly() const noexcept { return false; }
+     virtual void begin(std::span<const ClockEdge> edges) = 0;
+     virtual void commit() = 0;
+     virtual bool drained() const noexcept = 0;
+@@ -326,6 +330,7 @@ public:
+         write_trace_ = write;
+         read_trace_ = read;
+     }
++    bool endpointEdgesOnly() const noexcept override { return true; }
+     void begin(std::span<const ClockEdge> edges) override {
+         bool w = false, r = false;
+         for (const auto& edge : edges) {
+diff --git a/src/sender/schedule/ClockCalendar.hpp b/src/sender/schedule/ClockCalendar.hpp
+index 870ae4118c70fb089f8c2d4e425061fdf5526e60..7f6093f1accbf95959ed3ac24c84eb3dc215296d 100644
+--- a/src/sender/schedule/ClockCalendar.hpp
++++ b/src/sender/schedule/ClockCalendar.hpp
+@@ -14,6 +14,7 @@ struct ClockEdge {
+     const ClockDomain* domain;
+     uint64_t cycle;
+     SimTime time;
++    size_t calendar_index = 0;  // Dense calendar-local metadata, independent of hardware ID.
+ };
+ 
+ /// Calendar over real edges, never over the LCM's fine-grained time lattice.
+@@ -21,7 +22,8 @@ class ClockCalendar {
+ public:
+     explicit ClockCalendar(std::span<const ClockDomain* const> clocks) {
+         batch_.reserve(clocks.size());
+-        for (auto* clock : clocks) heap_.push({clock, 0, clock->edge(0)});
++        for (size_t i = 0; i < clocks.size(); ++i)
++            heap_.push({clocks[i], 0, clocks[i]->edge(0), i});
+     }
+     bool empty() const noexcept { return heap_.empty(); }
+     SimTime nextTime() const {
+@@ -37,8 +39,8 @@ public:
+             auto edge = heap_.top();
+             // Check the successor before changing the calendar or evaluating hardware.
+             if (edge.cycle == UINT64_MAX) throw std::overflow_error("clock edge index overflow");
+-            auto successor =
+-                ClockEdge{edge.domain, edge.cycle + 1, edge.domain->edge(edge.cycle + 1)};
++            auto successor = ClockEdge{edge.domain, edge.cycle + 1,
++                                       edge.domain->edge(edge.cycle + 1), edge.calendar_index};
+             heap_.pop();
+             heap_.push(successor);
+             batch_.push_back(edge);
+diff --git a/test/sender/CMakeLists.txt b/test/sender/CMakeLists.txt
+index 87dbc1849cd25091bbb68bcf56a0696b2193098c..b98f552a6b6b76ac3aab16e0992cce803ec8d4c5 100644
+--- a/test/sender/CMakeLists.txt
++++ b/test/sender/CMakeLists.txt
+@@ -13,7 +13,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+ endif()
+ 
+ # Test executables (prefixed with sender_ to avoid conflicts)
+-foreach(clock_test clock_time async_fifo_circuit multiclock multiclock_epoch_free multiclock_migration clock_trace_budget)
++foreach(clock_test clock_time async_fifo_circuit multiclock multiclock_epoch_free multiclock_migration multiclock_scaling clock_trace_budget)
+     add_executable(sender_test_${clock_test} test_${clock_test}.cpp)
+     target_link_libraries(sender_test_${clock_test} PRIVATE chronon::core chronon_compile_options)
+     add_test(NAME sender_${clock_test} COMMAND sender_test_${clock_test})
+@@ -29,6 +29,7 @@ else()
+     set_tests_properties(sender_multiclock_epoch_free PROPERTIES TIMEOUT 300)
+ endif()
+ set_tests_properties(sender_multiclock_migration PROPERTIES TIMEOUT 45)
++set_tests_properties(sender_multiclock_scaling PROPERTIES TIMEOUT 120 PROCESSORS 8)
+ 
+ set(CHRONON_TRACE_PROCESSOR "" CACHE FILEPATH "Optional real Perfetto Trace Processor for multiclock acceptance")
+ if(CHRONON_TRACE_PROCESSOR)
+@@ -39,6 +40,7 @@ if(CHRONON_TRACE_PROCESSOR)
+             --multiclock-binary $<TARGET_FILE:sender_test_multiclock>
+             --recorder-binary $<TARGET_FILE:test_clock_trace>
+             --epoch-free-binary $<TARGET_FILE:sender_test_multiclock_epoch_free>
++            --scaling-binary $<TARGET_FILE:sender_test_multiclock_scaling>
+             --check-prefix)
+     set_tests_properties(multiclock_trace_processor PROPERTIES TIMEOUT 180)
+ endif()
+diff --git a/test/sender/test_multiclock_scaling.cpp b/test/sender/test_multiclock_scaling.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7a24eea5f842928141295abfe7a5fb69efa10e2
+--- /dev/null
++++ b/test/sender/test_multiclock_scaling.cpp
+@@ -0,0 +1,284 @@
++// SPDX-License-Identifier: MPL-2.0
++#include <cassert>
++#include <filesystem>
++#include <fstream>
++#include <functional>
++#include <iostream>
++#include <sstream>
++
++#include "ClockMigrationTestAccess.hpp"
++#include "chronon/Chronon.hpp"
++
++using namespace chronon;
++using Access = sender::DynamicMigrationTestAccess;
++std::filesystem::path fixture_root;
++bool export_fixtures = false;
++
++struct LaneUnit : TickableUnit {
++    OutPort<int> order_out{this, "order_out"};
++    InPort<int> order_in{this, "order_in"};
++    std::vector<std::unique_ptr<AsyncWritePort<uint64_t>>> outputs;
++    std::vector<std::unique_ptr<AsyncReadPort<uint64_t>>> inputs;
++    std::vector<uint64_t> sent, received, events, transaction_prefix;
++    std::function<void()> callback;
++    explicit LaneUnit(std::string name) : TickableUnit(std::move(name)) {}
++    auto& output() {
++        outputs.push_back(std::make_unique<AsyncWritePort<uint64_t>>(
++            this, "out" + std::to_string(outputs.size())));
++        sent.push_back(0);
++        transaction_prefix.push_back(0);
++        return *outputs.back();
++    }
++    auto& input() {
++        inputs.push_back(
++            std::make_unique<AsyncReadPort<uint64_t>>(this, "in" + std::to_string(inputs.size())));
++        received.push_back(0);
++        return *inputs.back();
++    }
++    void tick() override {
++        for (size_t i = 0; i < inputs.size(); ++i) {
++            uint64_t taken = 0;
++            // Different lane stalls exercise independent RAM/output registers.
++            if ((localCycle() + i) % 13 < 5) {
++                if (auto packet = inputs[i]->take()) {
++                    taken = packet->data;
++                    assert(taken == ++received[i]);
++                }
++                inputs[i]->requestRead();
++            }
++            events.insert(events.end(), {localCycle(), i, taken, inputs[i]->outputValid()});
++        }
++        for (size_t i = 0; i < outputs.size(); ++i) {
++            const bool full = !outputs[i]->canSend();
++            if ((localCycle() + i) % 7 &&
++                outputs[i]->send({transaction_prefix[i] + sent[i] + 1, sent[i] + 1}))
++                ++sent[i];
++            events.insert(events.end(), {localCycle(), i, sent[i], full});
++        }
++        if (callback) callback();
++    }
++};
++
++// This deliberately observes every physical batch. Its native delegate would
++// permit skipping unrelated domains, but the wrapper does not opt in.
++struct BatchProbe : sender::CdcComponent {
++    std::unique_ptr<sender::CdcComponent> delegate;
++    uint64_t begins = 0, commits = 0;
++    explicit BatchProbe(std::unique_ptr<sender::CdcComponent> fifo) : delegate(std::move(fifo)) {}
++    uint32_t id() const noexcept override { return delegate->id(); }
++    sender::Unit* writeOwner() const noexcept override { return delegate->writeOwner(); }
++    sender::Unit* readOwner() const noexcept override { return delegate->readOwner(); }
++    void setClockTraceStreams(observe::ClockTraceStream* w,
++                              observe::ClockTraceStream* r) noexcept override {
++        delegate->setClockTraceStreams(w, r);
++    }
++    void begin(std::span<const sender::ClockEdge> edges) override {
++        ++begins;
++        delegate->begin(edges);
++    }
++    void commit() override {
++        ++commits;
++        delegate->commit();
++    }
++    bool drained() const noexcept override { return delegate->drained(); }
++};
++
++namespace chronon::sender {
++struct ClockScalingTestAccess {
++    static std::vector<const void*> pendingStorage(const TickSimulation& sim) {
++        std::vector<const void*> result;
++        if (sim.clock_parallel_) {
++            const auto& runtime = *sim.clock_parallel_;
++            assert(runtime.pending.size() == sim.config_.max_lookahead_cycles);
++            assert(runtime.pending_size == 0);
++            for (const auto& batch : runtime.pending) {
++                assert(batch.edges.capacity() >= runtime.indexed_domains.size());
++                result.push_back(batch.edges.data());
++            }
++        }
++        return result;
++    }
++    static size_t sharedActor(TickSimulation& sim, size_t lanes) {
++        const auto& runtime = *sim.clock_parallel_;
++        assert(runtime.bridges.size() ==
++               (lanes == 8 ? 4 : 3));  // shared, reverse, self, optionally unrelated
++        for (size_t b = 0; b < runtime.bridges.size(); ++b) {
++            const auto& group = *runtime.bridges[b];
++            if (group.lanes.size() != lanes) continue;
++            assert(group.lanes.front().circuit->id() == (lanes == 8 ? 93 : 92));
++            assert(group.lanes.back().circuit->id() == 100);
++            const auto actor = sim.clusters_.numClusters() + b;
++            if (sim.config_.enable_dynamic_rebalance) {
++                for (const auto& edge : sim.dynamic_rebalance_adjacency_[actor])
++                    assert(edge.num_connections == lanes);
++                // Unmeasured work prior remains the SUM of all lane costs.
++                assert(std::abs(sim.dynamicClockActorCost_(actor).cost - 1.5 * lanes) < 1e-9);
++            }
++            return actor;
++        }
++        assert(false);
++        return SIZE_MAX;
++    }
++    static BatchProbe* probe(TickSimulation& sim) {
++        auto probe = std::make_unique<BatchProbe>(std::move(sim.cdc_.front()));
++        auto* result = probe.get();
++        sim.cdc_.front() = std::move(probe);
++        return result;
++    }
++};
++}  // namespace chronon::sender
++
++struct Result {
++    std::vector<std::vector<uint64_t>> state;
++    std::vector<std::string> trace;
++    bool operator==(const Result&) const = default;
++};
++
++Result run(size_t workers, bool dynamic, bool segmented, bool coincident, bool custom, bool tracing,
++           bool migrating = false, bool clustered = false) {
++    TickSimulationConfig config;
++    config.num_threads = workers;
++    config.enable_parallel = workers > 1;
++    config.enable_dynamic_rebalance = dynamic;
++    config.rebalance_check_interval_cycles = UINT64_MAX;
++    config.max_lookahead_cycles = 7;
++    config.profile_clock_scheduler = true;
++    TickSimulation sim(config);
++    sim.addClockDomain(ClockDomain::fromHz(3, "write", 1'000'000'000));
++    sim.addClockDomain(ClockDomain::fromHz(97, "read", 500'000'000, 1,
++                                           SimTime::picoseconds(coincident ? 0 : 137)));
++    sim.addClockDomain(ClockDomain::fromHz(4093, "unrelated", 2'000'000'000));
++    auto* w = sim.createUnitInDomain<LaneUnit>(3, "writer");
++    auto* r = sim.createUnitInDomain<LaneUnit>(97, "reader");
++    auto* w2 = sim.createUnitInDomain<LaneUnit>(3, "other_writer");
++    auto* r2 = sim.createUnitInDomain<LaneUnit>(97, "other_reader");
++    sim.createUnitInDomain<LaneUnit>(4093, "unrelated");
++    if (clustered) {
++        sim.connect(w->order_out, w2->order_in, 0);
++        sim.connect(r->order_out, r2->order_in, 0);
++    }
++    std::vector<AsyncFifo<uint64_t>*> fifos;
++    const auto connect = [&](LaneUnit* a, LaneUnit* b, size_t depth, size_t stages) {
++        // Deliberately insert IDs out of order; runtime order must be stable.
++        const auto id = 100 - fifos.size();
++        fifos.push_back(sim.connectAsyncFifo(id, a->output(), b->input(), {depth, stages}));
++        a->transaction_prefix.back() = uint64_t{id} << 32;
++    };
++    for (size_t lane = 0; lane < 8; ++lane) connect(w, r, 2ULL << (lane % 3), 2 + lane % 3);
++    connect(w2, r2, 2, 2);  // Same clock pair, different ordered endpoint pair.
++    connect(r, w, 4, 3);    // Reverse direction must remain independent.
++    connect(w, w, 2, 2);    // Coincident sides of a self-loop.
++    auto* probe = custom ? sender::ClockScalingTestAccess::probe(sim) : nullptr;
++    const auto output =
++        fixture_root / ("shared-t" + std::to_string(workers) + "-d" + std::to_string(dynamic) +
++                        "-c" + std::to_string(coincident) + "-custom" + std::to_string(custom) +
++                        "-seg" + std::to_string(segmented));
++    const bool keep = export_fixtures && workers == 4 && migrating;
++    if (tracing) {
++        ClockTraceRecorder::Config trace;
++        trace.output_dir = output;
++        trace.stream_capacity = 2;
++        trace.drain_batch = 1;
++        trace.perfetto_options.clock_buffer_records = 1024;
++        sim.configureClockTrace(trace);
++    }
++    sim.initialize();
++    assert(sim.useParallelExecution() == (workers > 1));
++    const auto storage = sender::ClockScalingTestAccess::pendingStorage(sim);
++    const auto shared = workers > 1
++                            ? sender::ClockScalingTestAccess::sharedActor(sim, clustered ? 9 : 8)
++                            : SIZE_MAX;
++    size_t requests = 0;
++    if (migrating) {
++        w->callback = [&] {
++            if (requests < 3 && w->localCycle() >= 11 + 47 * requests &&
++                Access::request(sim, shared))
++                ++requests;
++        };
++    }
++    if (segmented) {
++        for (unsigned i = 0; i < 10; ++i) assert(sim.runClockEvents(37) == 37);
++    } else {
++        assert(sim.runClockEvents(370) == 370);
++    }
++    sim.runUntilTime(SimTime::nanoseconds(400));
++    sim.runDomainCycles(97, 19);
++    if (migrating) {
++        assert(requests == 3 && sim.rebalanceCount() == 3);
++        Access::assertIdle(sim);
++    }
++    if (probe) assert(probe->begins == sim.schedulerSteps() && probe->commits == probe->begins);
++    assert(!sim.totalTransportOverflowEvents());
++    assert(storage == sender::ClockScalingTestAccess::pendingStorage(sim));
++    Result result;
++    for (auto* unit : {w, r, w2, r2}) result.state.push_back(unit->events);
++    for (const auto* fifo : fifos) {
++        const auto state = fifo->diagnostics();
++        result.state.push_back({state.write_binary, state.read_binary, state.write_sync,
++                                state.read_sync, state.full, state.empty, state.output_valid,
++                                state.ram_occupancy, state.writes, state.reads});
++    }
++    result.state.push_back({sim.schedulerSteps(), sim.domainCycleCount(3), sim.domainCycleCount(97),
++                            sim.domainCycleCount(4093), sim.lastCommittedTime().numerator(),
++                            sim.lastCommittedTime().denominator()});
++    sim.closeClockTrace();
++    if (tracing) {
++        const auto stats = sim.clockTraceRecorder()->stats();
++        assert(stats.events && !stats.dropped);
++        std::ofstream reference;
++        if (keep) {
++            reference.open(output / "reference.tsv");
++            reference
++                << "ts\tunit\tlocal_cycle\tevent\tphase\ttransaction_id\tfifo_id\tvalue\tordinal\n";
++        }
++        for (const auto& entry : std::filesystem::directory_iterator(output)) {
++            if (!entry.path().filename().string().starts_with("text-domain-")) continue;
++            std::ifstream file(entry.path());
++            std::string line;
++            while (std::getline(file, line)) {
++                if (line.starts_with('#')) continue;
++                std::istringstream row(line);
++                uint64_t cycle, id;
++                row >> cycle >> id;
++                std::string name;
++                uint64_t ts = 0;
++                for (auto* u : {w, r, w2, r2}) {
++                    if (u->id() == id) {
++                        name = u->fullPath();
++                        ts = u->clockDomain().edge(cycle).floorNanoseconds();
++                    }
++                }
++                assert(!name.empty());
++                std::string rest;
++                std::getline(row, rest);
++                result.trace.push_back(name + " " + std::to_string(cycle) + rest);
++                if (keep) reference << ts << '\t' << name << '\t' << cycle << rest << '\n';
++            }
++        }
++        std::sort(result.trace.begin(), result.trace.end());
++        if (!keep) std::filesystem::remove_all(output);
++    }
++    return result;
++}
++
++int main(int argc, char** argv) {
++    export_fixtures = argc > 1;
++    fixture_root =
++        export_fixtures
++            ? std::filesystem::path(argv[1])
++            : std::filesystem::temp_directory_path() /
++                  ("chronon-scaling-" +
++                   std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++    for (bool coincident : {false, true}) {
++        const auto reference = run(1, false, false, coincident, false, true);
++        assert(run(1, false, true, coincident, true, true) == reference);
++        for (size_t workers : {2, 4, 8})
++            for (bool dynamic : {false, true})
++                assert(run(workers, dynamic, true, coincident, false, true, dynamic) == reference);
++    }
++    const auto clustered = run(1, false, false, true, false, false, false, true);
++    assert(run(4, true, true, true, false, false, true, true) == clustered);
++    if (!export_fixtures) std::filesystem::remove(fixture_root);
++    std::cout
++        << "shared lanes, sparse domains, fallback callbacks, segmentation and migration passed\n";
++}

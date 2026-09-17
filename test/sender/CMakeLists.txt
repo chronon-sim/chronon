@@ -26,7 +26,7 @@ add_test(NAME sender_cluster_headroom_clock COMMAND sender_test_cluster_headroom
 set_tests_properties(sender_cluster_headroom_clock PROPERTIES TIMEOUT 120 PROCESSORS 4)
 add_dependencies(regress sender_test_cluster_headroom_clock)
 
-foreach(clock_test clock_time async_fifo_circuit multiclock multiclock_epoch_free multiclock_migration clock_trace_budget)
+foreach(clock_test clock_time async_fifo_circuit multiclock multiclock_epoch_free multiclock_migration multiclock_scaling clock_trace_budget)
     add_executable(sender_test_${clock_test} test_${clock_test}.cpp)
     target_link_libraries(sender_test_${clock_test} PRIVATE chronon::core chronon_compile_options)
     add_test(NAME sender_${clock_test} COMMAND sender_test_${clock_test})
@@ -42,6 +42,7 @@ else()
     set_tests_properties(sender_multiclock_epoch_free PROPERTIES TIMEOUT 300)
 endif()
 set_tests_properties(sender_multiclock_migration PROPERTIES TIMEOUT 45)
+set_tests_properties(sender_multiclock_scaling PROPERTIES TIMEOUT 120 PROCESSORS 8)
 
 set(CHRONON_TRACE_PROCESSOR "" CACHE FILEPATH "Optional real Perfetto Trace Processor for multiclock acceptance")
 if(CHRONON_TRACE_PROCESSOR)
@@ -52,6 +53,7 @@ if(CHRONON_TRACE_PROCESSOR)
             --multiclock-binary $<TARGET_FILE:sender_test_multiclock>
             --recorder-binary $<TARGET_FILE:test_clock_trace>
             --epoch-free-binary $<TARGET_FILE:sender_test_multiclock_epoch_free>
+            --scaling-binary $<TARGET_FILE:sender_test_multiclock_scaling>
             --check-prefix)
     set_tests_properties(multiclock_trace_processor PROPERTIES TIMEOUT 180)
 endif()

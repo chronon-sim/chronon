@@ -61,6 +61,9 @@ struct TickSimulationConfig {
 
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< 1 GHz default.
 
+    /// Sample multi-clock scheduler components every 64 sweeps (no speculative ticks).
+    bool profile_clock_scheduler = false;
+
     bool trace_execution = false;
     SchedulerTimelineTraceConfig timeline_trace;
 

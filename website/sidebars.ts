@@ -55,6 +55,7 @@ const sidebars: SidebarsConfig = {
       items: [
         'guides/performance',
         'guides/multiclock-validation',
+        'guides/multiclock-scaling',
         'guides/faq',
         'guides/changelog',
       ],

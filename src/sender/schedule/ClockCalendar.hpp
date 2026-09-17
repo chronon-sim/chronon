@@ -14,6 +14,7 @@ struct ClockEdge {
     const ClockDomain* domain;
     uint64_t cycle;
     SimTime time;
+    size_t calendar_index = 0;  // Dense calendar-local metadata, independent of hardware ID.
 };
 
 /// Calendar over real edges, never over the LCM's fine-grained time lattice.
@@ -21,7 +22,8 @@ class ClockCalendar {
 public:
     explicit ClockCalendar(std::span<const ClockDomain* const> clocks) {
         batch_.reserve(clocks.size());
-        for (auto* clock : clocks) heap_.push({clock, 0, clock->edge(0)});
+        for (size_t i = 0; i < clocks.size(); ++i)
+            heap_.push({clocks[i], 0, clocks[i]->edge(0), i});
     }
     bool empty() const noexcept { return heap_.empty(); }
     SimTime nextTime() const {
@@ -37,8 +39,8 @@ public:
             auto edge = heap_.top();
             // Check the successor before changing the calendar or evaluating hardware.
             if (edge.cycle == UINT64_MAX) throw std::overflow_error("clock edge index overflow");
-            auto successor =
-                ClockEdge{edge.domain, edge.cycle + 1, edge.domain->edge(edge.cycle + 1)};
+            auto successor = ClockEdge{edge.domain, edge.cycle + 1,
+                                       edge.domain->edge(edge.cycle + 1), edge.calendar_index};
             heap_.pop();
             heap_.push(successor);
             batch_.push_back(edge);

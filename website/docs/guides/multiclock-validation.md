@@ -119,6 +119,9 @@ the existing reverse-drain, lossy, phase and prefix-recovery matrix remains acti
 
 ## Epoch-free placement and scaling
 
+For the follow-up through 16 workers, shared CDC lanes, recorder throughput,
+and raw baseline/candidate artifacts, see [Multi-clock scaling measurements](multiclock-scaling.md).
+
 Measured on 2026-09-16, Intel Core i9-14900K, Linux 6.1, GCC 12.2 Release,
 pinned to logical CPUs `20,21,22,23` (four distinct cores). Three fresh-process
 repetitions interleave baseline/candidate, serial/static/dynamic and all graph

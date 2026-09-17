@@ -22,6 +22,7 @@
 #include "../schedule/SchedulerTimelineTrace.hpp"
 #include "../schedule/SimulatedAnnealingPartitioner.hpp"
 #include "../schedule/WeightedPartitioner.hpp"
+#include "ClockSchedulerProfile.hpp"
 #include "TerminationRequest.hpp"
 #include "TickSimulationConfig.hpp"
 #include "TickSimulationCycleUtils.hpp"
@@ -188,6 +189,12 @@ public:
     }
 
     void initialize();
+
+    /// Host-only, between run calls. Empty unless profile_clock_scheduler is enabled.
+    const std::vector<ClockSchedulerProfile>& clockSchedulerProfile() const noexcept {
+        return clock_scheduler_profile_;
+    }
+    uint64_t clockPartitionTimeNs() const noexcept { return clock_partition_time_ns_; }
 
     /// Static configuration only. ID 0 is the legacy default clock; UINT32_MAX is reserved.
     const ClockDomain& addClockDomain(ClockDomain domain);
@@ -402,7 +409,7 @@ private:
     void selectClockExecutionMode_();
     void initializeClockParallel_();
     void addClockPartitionActors_(PartitionInput& input,
-                                  const std::unordered_map<Unit*, size_t>& unit_indices) const;
+                                  const std::unordered_map<Unit*, size_t>& unit_indices);
     uint64_t runClockEpochFree_(uint64_t max_batches, std::optional<SimTime> limit = {},
                                 bool inclusive = false);
     bool executeClockBatch_();
@@ -605,6 +612,7 @@ private:
     friend struct EpochFreeDifferentialTestAccess;
     /// Test-only source-owner migration commit validation.
     friend struct DynamicMigrationTestAccess;
+    friend struct ClockScalingTestAccess;
     /// Test-only transparent-broadcast fusion selection inspection.
     friend struct TransparentBroadcastFusionTestAccess;
 
@@ -725,10 +733,13 @@ private:
     std::deque<ClockDomain> clock_domains_;
     bool clock_mode_ = false;
     bool clock_failed_ = false;
+    std::vector<ClockSchedulerProfile> clock_scheduler_profile_;
+    uint64_t clock_partition_time_ns_ = 0;
     SimTime clock_time_;
     struct ClockRuntime {
         const ClockDomain* clock = nullptr;
         std::vector<TickableUnit*> units;
+        std::vector<size_t> cdc;
         uint64_t next_cycle = 0;
     };
     std::map<ClockDomainId, ClockRuntime> clock_runtime_;
@@ -737,7 +748,10 @@ private:
     // The out-of-line runtime owns bridge tasks and their progress atomics.
     std::shared_ptr<ClockParallelRuntime> clock_parallel_;
     std::vector<size_t> clock_bridge_owners_;
+    std::vector<std::vector<size_t>> clock_bridge_groups_;
     std::vector<std::unique_ptr<CdcComponent>> cdc_;
+    std::vector<size_t> clock_always_cdc_, clock_active_cdc_;
+    std::vector<uint8_t> clock_cdc_seen_;
     std::unique_ptr<observe::ClockTraceRecorder> clock_trace_;
     uint64_t current_cycle_;
     bool initialized_;
