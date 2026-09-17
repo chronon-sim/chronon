@@ -132,8 +132,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
     // physical instants. Workers gate on local dependencies inside that window.
     // Keep calendar admission/retirement out of the actor polling loop. Inlining
     // this large coordinator increases its register pressure and instruction footprint.
-    const auto coordinate = [&](bool settling,
-                                ClockSchedulerProfile* profile) __attribute__((noinline)) {
+    using Profile = ClockSchedulerProfile;
+    const auto coordinate = [&](bool settling, Profile* profile) __attribute__((noinline)) {
         detail::ClockProfileScope retirement(profile ? &profile->retirement_ns : nullptr);
         bool progress = false;
         if (++runtime.coordinator_sweep == 0) {
