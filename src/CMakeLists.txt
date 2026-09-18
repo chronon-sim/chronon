@@ -45,7 +45,7 @@ target_include_directories(chronon
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-        $<INSTALL_INTERFACE:include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
@@ -91,33 +91,33 @@ target_link_libraries(chronon PUBLIC chronon_observe)
 # stdexec supplies its own installed package; export the private static SDK too.
 if(CHRONON_INSTALL)
     install(DIRECTORY chronon sender tree observe params time
-        DESTINATION include
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
         FILES_MATCHING PATTERN "*.hpp"
     )
 
     install(TARGETS chronon chronon_observe chronon_compile_options perfetto_sdk
         EXPORT ChrononTargets
-        LIBRARY DESTINATION lib
-        ARCHIVE DESTINATION lib
-        RUNTIME DESTINATION bin
-        INCLUDES DESTINATION include
+        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+        ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+        INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
     )
 
     install(EXPORT ChrononTargets
         FILE ChrononTargets.cmake
         NAMESPACE chronon::
-        DESTINATION lib/cmake/chronon
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/chronon"
     )
     include(CMakePackageConfigHelpers)
     configure_package_config_file(${PROJECT_SOURCE_DIR}/cmake/chronon-config.cmake.in
         ${CMAKE_CURRENT_BINARY_DIR}/chronon-config.cmake
-        INSTALL_DESTINATION lib/cmake/chronon)
+        INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/chronon")
     write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/chronon-config-version.cmake
         VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/chronon-config.cmake
         ${CMAKE_CURRENT_BINARY_DIR}/chronon-config-version.cmake
         ${PROJECT_SOURCE_DIR}/cmake/ChrononFindFmt.cmake
-        DESTINATION lib/cmake/chronon)
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/chronon")
 endif()
 
 # Framework configuration summary

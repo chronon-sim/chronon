@@ -12,8 +12,10 @@
 include_guard(GLOBAL)
 
 # ── Debug: use -g3 for full macro debug info ──────────────────────────
-set(CMAKE_C_FLAGS_DEBUG   "-O0 -g3" CACHE STRING "C flags for Debug" FORCE)
-set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g3" CACHE STRING "C++ flags for Debug" FORCE)
+if(PROJECT_IS_TOP_LEVEL)
+    set(CMAKE_C_FLAGS_DEBUG   "-O0 -g3" CACHE STRING "C flags for Debug" FORCE)
+    set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g3" CACHE STRING "C++ flags for Debug" FORCE)
+endif()
 
 # ── Options ──────────────────────────────────────────────────────────────
 option(CHRONON_ENABLE_WERROR     "Treat warnings as errors"         OFF)

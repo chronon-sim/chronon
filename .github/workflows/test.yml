@@ -392,3 +392,36 @@ jobs:
         name: coverage-lcov
         path: coverage_filtered.info
         retention-days: 30
+
+  # Exercise source consumption and a relocated non-default install layout.
+  package-consumers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build ccache g++-12 libyaml-cpp-dev libfmt-dev zlib1g-dev
+    - uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ runner.os }}-gcc-12-package-consumers
+    - name: Configure custom install layout
+      env:
+        CXX: g++-12
+      run: |
+        cmake -S . -B build-packages -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
+          -DCHRONON_INSTALL=ON -DCMAKE_INSTALL_LIBDIR=lib64 \
+          -DCMAKE_INSTALL_INCLUDEDIR=include/chronon-custom
+    - name: Build libraries
+      run: cmake --build build-packages --target chronon system_context --parallel $(nproc)
+    - name: Check relocated install and CPM consumers
+      run: ctest --test-dir build-packages -R '^(installed_consumer|cpm_consumers)$' --output-on-failure
+    - name: Upload consumer diagnostics on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: package-consumer-results
+        path: build-packages/test/out/
+        retention-days: 5

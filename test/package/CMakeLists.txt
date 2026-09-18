@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MPL-2.0
+cmake_minimum_required(VERSION 3.25)
+project(chronon_cpm_consumer LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DCONSUMER_DEBUG=1" CACHE STRING "Consumer flags" FORCE)
+include("${CPM_MODULE}")
+if(PRELOAD_DEPENDENCIES)
+    CPMAddPackage(NAME stdexec GITHUB_REPOSITORY NVIDIA/stdexec GIT_TAG nvhpc-25.09
+        OPTIONS "STDEXEC_BUILD_TESTS OFF" "STDEXEC_BUILD_EXAMPLES OFF" "BUILD_TESTING OFF")
+    CPMAddPackage(NAME perfetto
+        URL https://github.com/google/perfetto/releases/download/v56.1/perfetto-cpp-sdk-src.zip
+        DOWNLOAD_ONLY YES)
+endif()
+if(NESTED)
+    CPMAddPackage(NAME chronon_consumer_bridge SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nested")
+else()
+    include("${CMAKE_CURRENT_SOURCE_DIR}/consume.cmake")
+endif()
+if(NOT PROJECT_NAME STREQUAL "chronon_cpm_consumer" OR NOT CMAKE_CXX_STANDARD EQUAL 17 OR
+   NOT CMAKE_CXX_FLAGS_DEBUG STREQUAL "-O0 -g -DCONSUMER_DEBUG=1")
+    message(FATAL_ERROR "Chronon changed the consuming project's settings")
+endif()
+if(NOT TARGET chronon::core OR NOT TARGET chronon::observe OR NOT TARGET perfetto_sdk)
+    message(FATAL_ERROR "Chronon did not expose its library/dependency targets")
+endif()
+if(TARGET test_tree_node)
+    message(FATAL_ERROR "Chronon built its tests despite CHRONON_BUILD_TESTS=OFF")
+endif()
+add_executable(package_consumer "${CMAKE_CURRENT_SOURCE_DIR}/../install/main.cpp")
+target_link_libraries(package_consumer PRIVATE chronon::core)
+enable_testing()
+add_test(NAME consumer_run COMMAND package_consumer)

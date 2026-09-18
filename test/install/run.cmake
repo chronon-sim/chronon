@@ -14,7 +14,9 @@ file(RENAME "${WORK_DIR}/staging" "${WORK_DIR}/relocated")
 foreach(fmt_fallback OFF ON)
     set(consumer_build "${WORK_DIR}/consumer-${fmt_fallback}")
     run("${CMAKE_COMMAND}" -S "${CONSUMER_SOURCE}" -B "${consumer_build}"
-        "-DCMAKE_PREFIX_PATH=${WORK_DIR}/relocated" "-DCMAKE_CXX_COMPILER=${CXX}"
+        "-DCMAKE_PREFIX_PATH=${WORK_DIR}/relocated"
+        "-Dchronon_DIR=${WORK_DIR}/relocated/${INSTALL_LIBDIR}/cmake/chronon"
+        "-Dstdexec_DIR=${WORK_DIR}/relocated/${INSTALL_LIBDIR}/cmake/stdexec" "-DCMAKE_CXX_COMPILER=${CXX}"
         "-DCHRONON_TEST_FMT_FALLBACK=${fmt_fallback}"
         -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF -DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF)
     run("${CMAKE_COMMAND}" --build "${consumer_build}" --config "${CONFIG}" -j2)
