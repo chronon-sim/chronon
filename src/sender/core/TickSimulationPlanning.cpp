@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 #include "TickSimulation.hpp"
 #include "sender/schedule/PreparedTopologyCost.hpp"
+#include "sender/schedule/SmallPlacementCost.hpp"
 
 namespace chronon::sender {
 namespace {
@@ -358,13 +359,46 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
 }  // namespace chronon::sender
 
 namespace chronon::sender::epoch_free_cost {
-std::vector<size_t> improvePreparedPlacement(const PartitionInput& input,
-                                             std::vector<size_t> assignment, size_t num_threads) {
+namespace {
+[[gnu::noinline]] std::vector<size_t> improveSmallPlacement(const PartitionInput& input,
+                                                            std::vector<size_t> assignment,
+                                                            size_t num_threads) {
+    const SmallPlacementCost prepared(input, num_threads);
+    auto best = prepared.evaluate(assignment);
+    for (size_t pass = 0; pass < 3; ++pass) {
+        size_t best_unit = SIZE_MAX, best_target = SIZE_MAX;
+        auto best_candidate = best;
+        for (size_t u = 0; u < input.num_units; ++u) {
+            const size_t from = assignment[u];
+            for (size_t target = 0; target < num_threads; ++target) {
+                if (target == from || moveWouldSplitZeroDelay(input, assignment, u, target))
+                    continue;
+                assignment[u] = target;
+                const auto candidate = prepared.evaluate(assignment);
+                assignment[u] = from;
+                if (candidate.active_threads < best.active_threads) continue;
+                if (candidate.max_active > best.max_active + 0.01 &&
+                    candidate.max_incoming_pressure >= best.max_incoming_pressure - 0.01 &&
+                    candidate.cross_pressure >= best.cross_pressure - 0.01)
+                    continue;
+                if (candidate.objective < best_candidate.objective - 0.01) {
+                    best_candidate = candidate;
+                    best_unit = u;
+                    best_target = target;
+                }
+            }
+        }
+        if (best_unit == SIZE_MAX) break;
+        assignment[best_unit] = best_target;
+        best = best_candidate;
+    }
+    return assignment;
+}
+
+[[gnu::noinline]] std::vector<size_t> improveLargePlacement(const PartitionInput& input,
+                                                            std::vector<size_t> assignment,
+                                                            size_t num_threads) {
     if (input.num_units <= 1 || num_threads <= 1 || input.sync_cost_ns <= 0.0) return assignment;
-    // Tiny one-off searches cannot amortize snapshot setup. Keep both
-    // initial evaluators out of the common partitioning instruction stream.
-    if (input.num_units <= 8)
-        return improveInitialPlacement(input, std::move(assignment), num_threads);
     PreparedTopologyCost prepared;
     prepared.prepare(input, assignment);
     ObjectiveSummary candidate;
@@ -404,6 +438,17 @@ std::vector<size_t> improvePreparedPlacement(const PartitionInput& input,
         prepared.resetAssignment();
     }
     return assignment;
+}
+
+}  // namespace
+
+std::vector<size_t> improvePreparedPlacement(const PartitionInput& input,
+                                             std::vector<size_t> assignment, size_t num_threads) {
+    if (input.num_units <= 1 || num_threads <= 1 || input.sync_cost_ns <= 0.0) return assignment;
+    if (input.num_units <= SmallPlacementCost::kCapacity &&
+        num_threads <= SmallPlacementCost::kCapacity)
+        return improveSmallPlacement(input, std::move(assignment), num_threads);
+    return improveLargePlacement(input, std::move(assignment), num_threads);
 }
 
 }  // namespace chronon::sender::epoch_free_cost

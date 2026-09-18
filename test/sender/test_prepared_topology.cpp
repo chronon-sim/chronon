@@ -2,8 +2,10 @@
 #include <cassert>
 #include <iostream>
 #include <random>
+#include <utility>
 
 #include "sender/schedule/PreparedTopologyCost.hpp"
+#include "sender/schedule/SmallPlacementCost.hpp"
 
 using namespace chronon::sender;
 using namespace chronon::sender::epoch_free_cost;
@@ -86,7 +88,92 @@ static void newlyExposedPressure() {
         equal(prepared.scoreFull(4, 1, 0.01, penalty), prepared.scoreMove(4, 1, 0.01, penalty));
 }
 
+static void smallInitialSnapshots() {
+    // Negative uniform costs select all eight actors as heavy. Exercise every
+    // pair slot, including the last one, against the independent full oracle.
+    {
+        PartitionInput input;
+        input.num_units = input.num_threads = SmallPlacementCost::kCapacity;
+        input.sync_cost_ns = 1.0;
+        input.unit_cost_ns.assign(input.num_units, -1.0);
+        input.adjacency.resize(input.num_units);
+        const std::vector<size_t> assignment(input.num_units, 0);
+        const auto actual = SmallPlacementCost(input, input.num_threads).evaluate(assignment);
+        const auto expected = summarize(input, assignment, input.num_threads);
+        assert(actual.heavy_count[0] == SmallPlacementCost::kCapacity);
+        assert(actual.heavy_colocation_penalty == expected.heavy_colocation_penalty);
+        assert(actual.objective == expected.objective);
+    }
+    // Both dimensions bound stack storage. Exceeding either one must use the
+    // general evaluator even when the other still fits.
+    for (const auto& [units, threads] :
+         {std::pair{size_t{8}, size_t{9}}, std::pair{size_t{9}, size_t{8}}}) {
+        PartitionInput input;
+        input.num_units = units;
+        input.num_threads = threads;
+        input.sync_cost_ns = 8.0;
+        input.unit_cost_ns.assign(units, 1.0);
+        input.unit_cost_ns.front() = 7.0;
+        input.adjacency.resize(units);
+        std::vector<size_t> assignment(units);
+        for (size_t u = 0; u < units; ++u) {
+            assignment[u] = u % threads;
+            input.adjacency[u].push_back({(u + 1) % units, 1, 2});
+        }
+        assert(improvePreparedPlacement(input, assignment, threads) ==
+               improveInitialPlacement(input, assignment, threads));
+    }
+    std::mt19937_64 random(143815);
+    for (size_t sample = 0; sample < 512; ++sample) {
+        PartitionInput input;
+        input.num_units = 1 + random() % SmallPlacementCost::kCapacity;
+        input.num_threads = 1 + random() % SmallPlacementCost::kCapacity;
+        input.sync_cost_ns = sample % 9 ? std::ldexp(1.0, random() % 20) : 0.0;
+        input.adjacency.resize(input.num_units);
+        std::vector<size_t> assignment(input.num_units);
+        for (size_t u = 0; u < input.num_units; ++u) {
+            assignment[u] = random() % input.num_threads;
+            input.unit_cost_ns.push_back(
+                sample % 11 ? std::ldexp(static_cast<double>(random() % 100), random() % 20)
+                            : static_cast<double>(static_cast<int>(random() % 7) - 3));
+            for (size_t e = 0; e < random() % 8; ++e)
+                input.adjacency[u].push_back({random() % input.num_units, 1 + random() % 4,
+                                              static_cast<uint32_t>(random() % 4),
+                                              (random() % 100) / 7.0});
+        }
+        const SmallPlacementCost prepared(input, input.num_threads);
+        const auto compare = [&] {
+            const auto actual = prepared.evaluate(assignment);
+            const auto expected = summarize(input, assignment, input.num_threads);
+            assert(actual.objective == expected.objective);
+            assert(actual.max_active == expected.max_active);
+            assert(actual.cross_pressure == expected.cross_pressure);
+            assert(actual.max_incoming_pressure == expected.max_incoming_pressure);
+            assert(actual.heavy_colocation_penalty == expected.heavy_colocation_penalty);
+            assert(actual.idle_thread_penalty == expected.idle_thread_penalty);
+            assert(actual.active_threads == expected.active_threads);
+            for (size_t t = 0; t < input.num_threads; ++t) {
+                assert(actual.active[t] == expected.active[t]);
+                assert(actual.incoming_pressure[t] == expected.incoming_pressure[t]);
+                assert(actual.heavy_count[t] == expected.heavy_count[t]);
+            }
+        };
+        compare();
+        for (size_t u = 0; u < input.num_units; ++u) {
+            const size_t from = assignment[u];
+            for (size_t target = 0; target < input.num_threads; ++target) {
+                assignment[u] = target;
+                compare();
+            }
+            assignment[u] = from;
+        }
+        assert(improvePreparedPlacement(input, assignment, input.num_threads) ==
+               improveInitialPlacement(input, assignment, input.num_threads));
+    }
+}
+
 int main() {
+    smallInitialSnapshots();
     newlyExposedPressure();
     std::mt19937_64 random(143);
     PreparedTopologyCost prepared;
