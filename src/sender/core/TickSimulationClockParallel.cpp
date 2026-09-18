@@ -435,6 +435,9 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             }
                             if (profile) ++profile->cluster_ticks;
                             published.store(cycle + 1, std::memory_order_release);
+                            // This worker already sees its own actor's completed
+                            // work; local dependents need no redundant acquire.
+                            predecessor_cycles[c] = cycle + 1;
                             progress = true;
                         }
                         actors_profile.finish();

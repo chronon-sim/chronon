@@ -56,7 +56,7 @@ struct SchedulerScratchTestAccess {
         }
     }
     static void assertLocalProgress(const TickSimulation& sim) {
-        if (!sim.thread_progress_array_ || sim.clock_parallel_) return;
+        if (!sim.thread_progress_array_ || sim.schedulerScratch_().workers.empty()) return;
         for (size_t worker = 0; worker < sim.thread_clusters_.size(); ++worker) {
             const auto& observed =
                 sim.schedulerScratch_().workers[worker].predecessor.observed_cycles;
