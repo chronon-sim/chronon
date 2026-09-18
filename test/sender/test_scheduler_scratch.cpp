@@ -4,6 +4,7 @@
 
 #include "../../benchmark/SchedulerInvocationModel.hpp"
 #include "ClockMigrationTestAccess.hpp"
+#include "clock_reference.hpp"
 
 namespace chronon::sender {
 struct SchedulerScratchTestAccess {
@@ -120,7 +121,60 @@ static std::vector<uint64_t> exercise(bool clock, bool dynamic, size_t workers, 
     return invocationState(units);
 }
 
+static void exerciseCoincidentCdcLists() {
+    TickSimulationConfig config;
+    config.num_threads = 1;
+    config.enable_parallel = false;
+    TickSimulation sim(config);
+    const std::array<ClockDomainId, 3> ids{11, 29, 3};
+    for (size_t i = 0; i < ids.size(); ++i)
+        sim.addClockDomain(ClockDomain(ids[i], "clock-" + std::to_string(i), SimTime(i ? 3 : 2),
+                                       SimTime(i ? 1 : 0)));
+    std::vector<InvocationUnit*> writers, readers;
+    std::vector<AsyncFifo<uint64_t>*> fifos;
+    std::array<clock_reference::Fifo, 3> oracle{
+        clock_reference::Fifo(16, 2), clock_reference::Fifo(16, 2), clock_reference::Fifo(16, 2)};
+    const std::array<uint64_t, 3> fifo_ids{31, 7, 19};
+    for (size_t i = 0; i < ids.size(); ++i) {
+        writers.push_back(sim.createUnitInDomain<InvocationUnit>(
+            ids[i], "writer-" + std::to_string(i), true, true, 0));
+        readers.push_back(sim.createUnitInDomain<InvocationUnit>(
+            ids[(i + 1) % ids.size()], "reader-" + std::to_string(i), true, false, 0));
+        fifos.push_back(sim.connectAsyncFifo(fifo_ids[i], writers[i]->async_out,
+                                             readers[i]->async_in, {16, 2}));
+    }
+    std::array<uint64_t, 3> cycles{};
+    // Two coincident domains have both shared and unique lanes. Other batches
+    // select one or all three domains, interleaving the merge and general paths.
+    for (size_t step = 0; step < 200; ++step) {
+        auto time = sim.clockDomain(ids.front()).edge(cycles.front());
+        for (size_t i = 1; i < ids.size(); ++i)
+            time = std::min(time, sim.clockDomain(ids[i]).edge(cycles[i]));
+        std::array<bool, 3> active;
+        for (size_t i = 0; i < ids.size(); ++i)
+            active[i] = sim.clockDomain(ids[i]).edge(cycles[i]) == time;
+        assert(sim.runClockEvents(1) == 1);
+        assert(sim.lastCommittedTime() == time);
+        for (size_t i = 0; i < ids.size(); ++i) {
+            const auto next = (i + 1) % ids.size();
+            oracle[i].step(active[i], active[next], true, true, cycles[i], cycles[next]);
+            const auto state = fifos[i]->diagnostics();
+            assert(state.write_binary == oracle[i].writes % 32);
+            assert(state.read_binary == oracle[i].reads % 32);
+            assert(state.full == oracle[i].full && state.empty == oracle[i].empty);
+            assert(state.output_valid == bool(oracle[i].output));
+            assert(state.ram_occupancy == oracle[i].memory.size());
+        }
+        for (size_t i = 0; i < ids.size(); ++i) {
+            cycles[i] += active[i];
+            assert(sim.domainCycleCount(ids[i]) == cycles[i]);
+        }
+        assert(sim.totalTransportOverflowEvents() == 0);
+    }
+}
+
 int main() {
+    exerciseCoincidentCdcLists();
     // A one-unit ordinary graph retains its original index order.
     {
         TickSimulationConfig config;

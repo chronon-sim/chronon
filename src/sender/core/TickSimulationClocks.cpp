@@ -1,6 +1,7 @@
 // Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
 // SPDX-License-Identifier: MPL-2.0
 #include <iostream>
+#include <iterator>
 #include <set>
 #include <tuple>
 
@@ -202,6 +203,15 @@ bool TickSimulation::executeClockBatch_() {
         std::span<const size_t> active;
         if (edges.size() == 1 && clock_always_cdc_.empty()) {
             active = clock_runtime_.at(edges.front().domain->id()).cdc;
+        } else if (edges.size() == 2 && clock_always_cdc_.empty()) {
+            // Initialization appends FIFO indices in sorted order. Merge two
+            // coincident domains directly, emitting shared lanes only once.
+            const auto& a = clock_runtime_.at(edges[0].domain->id()).cdc;
+            const auto& b = clock_runtime_.at(edges[1].domain->id()).cdc;
+            clock_active_cdc_.clear();
+            std::set_union(a.begin(), a.end(), b.begin(), b.end(),
+                           std::back_inserter(clock_active_cdc_));
+            active = clock_active_cdc_;
         } else {
             clock_active_cdc_.clear();
             const auto append = [&](size_t f) {
