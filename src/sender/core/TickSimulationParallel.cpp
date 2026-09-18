@@ -79,6 +79,12 @@ void TickSimulation::installMultiProducerProgress_() {
 // Progress-sync allocation
 // ---------------------------------------------------------------------------
 
+TickSimulation::WorkerPredecessorCycleCache::WorkerPredecessorCycleCache(
+    WorkerPredecessorCycleCache& retained, size_t num_clusters)
+    : observed_cycles(std::move(retained.observed_cycles)), return_to(&retained) {
+    reset(num_clusters);
+}
+
 // Keep vector growth and small-buffer setup out of the worker's scheduling loop.
 // This also keeps register allocation independent of the cache initialization paths.
 TickSimulation::InvocationPredecessorCache::InvocationPredecessorCache(
@@ -115,12 +121,12 @@ void TickSimulation::initProgressSync() {
     const size_t num_threads = thread_units_.size();
     const size_t num_clusters = clusters_.numClusters();
     if (num_clusters == 0) return;
-    // Static small graphs borrow immutable ownership lists and keep every
-    // predecessor bound on the invocation stack; they need no worker metadata.
-    const size_t scratch_workers =
-        config_.enable_dynamic_rebalance || num_clusters >= InvocationPredecessorCache::kInlineSlots
-            ? num_threads
-            : 0;
+    // Ordinary workers keep the original invocation-local cache header and
+    // retain its allocation. Small static clock graphs need no worker metadata.
+    const size_t scratch_workers = !clock_mode_ || config_.enable_dynamic_rebalance ||
+                                           num_clusters >= InvocationPredecessorCache::kInlineSlots
+                                       ? num_threads
+                                       : 0;
 
     freeThreadProgressArray();
     if (scratch_workers > (SIZE_MAX - kSchedulerScratchStorageBytes) / sizeof(WorkerRunScratch))
@@ -363,10 +369,8 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     };
     // This cache spans the worker invocation (the entire run in EpochFree mode),
     // allowing all locally-owned clusters to reuse acquired predecessor progress.
-    auto& scratch_workers = schedulerScratch_().workers;
-    InvocationPredecessorCache predecessor_cache(
-        scratch_workers.empty() ? nullptr : &scratch_workers[thread_idx].predecessor,
-        thread_progress_count_);
+    WorkerPredecessorCycleCache predecessor_cache(
+        schedulerScratch_().workers[thread_idx].predecessor, thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;

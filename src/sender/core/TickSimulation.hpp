@@ -647,6 +647,15 @@ private:
     /// floor dependency (pred_id == thread_progress_count_).
     struct alignas(64) WorkerPredecessorCycleCache {
         WorkerPredecessorCycleCache() = default;
+        // Keep the vector header local to the worker invocation while retaining
+        // its allocation in the logical worker between joined tasks.
+        [[gnu::noinline]] WorkerPredecessorCycleCache(WorkerPredecessorCycleCache& retained,
+                                                      size_t num_clusters);
+        ~WorkerPredecessorCycleCache() {
+            if (return_to) observed_cycles.swap(return_to->observed_cycles);
+        }
+        WorkerPredecessorCycleCache(const WorkerPredecessorCycleCache&) = delete;
+        WorkerPredecessorCycleCache& operator=(const WorkerPredecessorCycleCache&) = delete;
         void reset(size_t num_clusters) { observed_cycles.assign(num_clusters + 1, 0); }
         explicit WorkerPredecessorCycleCache(size_t num_clusters)
             : observed_cycles(num_clusters + 1, 0) {}
@@ -654,7 +663,9 @@ private:
         uint64_t* data() noexcept { return observed_cycles.data(); }
 
         std::vector<uint64_t> observed_cycles;
+        WorkerPredecessorCycleCache* return_to = nullptr;
     };
+    static_assert(sizeof(WorkerPredecessorCycleCache) == 64);
 
     // Small graphs need no heap-backed predecessor cache. The invocation owns
     // these slots on its stack so task stealing cannot bounce a retained cache
