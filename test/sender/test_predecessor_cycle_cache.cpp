@@ -137,7 +137,8 @@ struct PredecessorCycleCacheTestAccess {
         return result;
     }
 
-    static ShortCircuitObservations exerciseFirstBlockerShortCircuit(bool short_circuit) {
+    static ShortCircuitObservations exerciseFirstBlockerShortCircuit(bool short_circuit,
+                                                                     size_t fan_in = 4) {
         TickSimulationConfig config;
         config.num_threads = 1;
         TickSimulation sim(config);
@@ -154,6 +155,9 @@ struct PredecessorCycleCacheTestAccess {
             {&pred2, /*min_delay=*/3, /*pred_id=*/2},
             {&pred3, /*min_delay=*/4, /*pred_id=*/3},
         };
+
+        // Exercise both scalar fallbacks as well as the ordinary mask path.
+        sim.thread_resolved_deps_[0].resize(fan_in, sim.thread_resolved_deps_[0].back());
 
         TickSimulation::WorkerPredecessorCycleCache cache(/*num_clusters=*/4);
         auto* const cycles = cache.data();
@@ -248,6 +252,24 @@ int main() {
           "sampled dynamic wait refinement refreshes the skipped lanes");
     check(short_scan.sampled_blocked_predecessor == 2 && short_scan.sampled_blocked_deficit == 4,
           "sampled dynamic wait refinement restores the maximum-deficit blocker");
+
+    for (const size_t fan_in : {size_t{3}, size_t{65}}) {
+        const auto full =
+            PredecessorCycleCacheTestAccess::exerciseFirstBlockerShortCircuit(false, fan_in);
+        const auto first =
+            PredecessorCycleCacheTestAccess::exerciseFirstBlockerShortCircuit(true, fan_in);
+        check(!full.ready && !first.ready, "scalar full and short scans agree on readiness");
+        check(full.blocked_predecessor == 2 && full.blocked_deficit == 4,
+              "scalar full scan selects the maximum deficit");
+        check(first.blocked_predecessor == 1 && first.blocked_deficit == 2,
+              "scalar short scan reports the first exact blocker");
+        check(first.later_blocked_lane_cache == 0 && first.later_ready_lane_cache == 0,
+              "scalar short scan leaves later predecessor bounds untouched");
+        check(first.sampled_blocked_predecessor == 2 && first.sampled_blocked_deficit == 4 &&
+                  first.sampled_later_blocked_lane_cache == 4 &&
+                  first.sampled_later_ready_lane_cache == (fan_in > 3 ? 10 : 0),
+              "scalar diagnostic refinement refreshes skipped bounds and restores the maximum");
+    }
 
     std::cout << "\n" << (failures == 0 ? "ALL PASSED" : "FAILED") << "\n";
     return failures == 0 ? 0 : 1;

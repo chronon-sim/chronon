@@ -55,6 +55,19 @@ struct SchedulerScratchTestAccess {
             assert(std::all_of(seen.begin(), seen.end(), [](auto n) { return n == 1; }));
         }
     }
+    static void assertLocalProgress(const TickSimulation& sim) {
+        if (!sim.thread_progress_array_ || sim.clock_parallel_) return;
+        for (size_t worker = 0; worker < sim.thread_clusters_.size(); ++worker) {
+            const auto& observed =
+                sim.schedulerScratch_().workers[worker].predecessor.observed_cycles;
+            // Small dynamic invocations use stack slots, which do not survive
+            // the join. Larger graphs and static workers retain their storage.
+            if (observed.empty()) continue;
+            for (size_t cluster : sim.thread_clusters_[worker])
+                assert(observed[cluster] ==
+                       sim.thread_progress_array_[cluster].completed_cycle.load());
+        }
+    }
     static void poison(TickSimulation& sim) {
         if (!sim.thread_progress_array_) return;
         if (auto& calendar = sim.schedulerScratch_().admission_calendar)
@@ -96,6 +109,7 @@ static std::vector<uint64_t> exercise(bool clock, bool dynamic, size_t workers, 
     };
     assert(advance(128) == 128);
     Scratch::assertOwnershipLists(sim);
+    Scratch::assertLocalProgress(sim);
     const auto storage = Scratch::storage(sim);
     if (dynamic && workers > 1) {
         const auto actor = clock ? Migration::bridge(sim, 0) : Migration::cluster(sim, units[0]);
@@ -118,6 +132,7 @@ static std::vector<uint64_t> exercise(bool clock, bool dynamic, size_t workers, 
     // Continue with a fresh limit after the poisoned predicate boundary.
     assert(advance(19) == 19);
     Scratch::assertOwnershipLists(sim);
+    Scratch::assertLocalProgress(sim);
     return invocationState(units);
 }
 

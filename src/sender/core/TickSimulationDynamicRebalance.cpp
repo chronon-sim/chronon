@@ -407,6 +407,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                     }
                 }
                 progress.store(reached_cycle, std::memory_order_release);
+                predecessor_cycles[cluster] = reached_cycle;
             } else {
                 uint64_t next_counter_cycle = UINT64_MAX;
                 if constexpr (PushPeriodicCounters) {
@@ -450,6 +451,9 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                     ++cycle;
                     progress.store(cycle, std::memory_order_release);
                 } while (cycle < burst_end && !token.stop_requested());
+                // All work in this burst is sequenced before local dependents.
+                // The bound remains valid if ownership migrates afterwards.
+                predecessor_cycles[cluster] = cycle;
             }
 
             made_progress = true;
