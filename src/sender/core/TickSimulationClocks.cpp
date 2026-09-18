@@ -1,6 +1,7 @@
 // Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
 // SPDX-License-Identifier: MPL-2.0
 #include <iostream>
+#include <iterator>
 #include <set>
 #include <tuple>
 
@@ -57,9 +58,9 @@ void TickSimulation::prepareClockTopology_() {
         throw std::logic_error(
             "scheduler wall-time tracing for multiclock is unsupported; use configureClockTrace");
     }
-    std::set<std::string> names;
+    std::map<std::string, TickableUnit*> names;
     for (auto* unit : unit_ptrs_) {
-        if (!names.insert(unit->fullPath()).second) {
+        if (!names.emplace(unit->fullPath(), unit).second) {
             throw std::invalid_argument("multiclock units require unique fullPath identities");
         }
         for (auto* port : unit->ports()) port->appendOutgoingConnections(connections_);
@@ -88,26 +89,37 @@ void TickSimulation::prepareClockTopology_() {
 
     // Canonical Kahn order for same-domain zero-delay combinational paths.
     // Registered edges and CDC do not constrain evaluation order at one instant.
-    std::map<Unit*, size_t> incoming;
-    std::map<Unit*, std::vector<Unit*>> outgoing;
-    std::map<std::string, TickableUnit*> ready;
-    for (auto* unit : unit_ptrs_) incoming[unit] = 0;
-    for (auto* connection : connections_) {
-        if (!connection->delay()) {
-            ++incoming[connection->destination()];
-            outgoing[connection->source()].push_back(connection->destination());
-        }
-    }
-    for (auto* unit : unit_ptrs_)
-        if (!incoming[unit]) ready.emplace(unit->fullPath(), unit);
     std::vector<TickableUnit*> order;
-    while (!ready.empty()) {
-        auto* unit = ready.begin()->second;
-        ready.erase(ready.begin());
-        order.push_back(unit);
-        for (auto* successor : outgoing[unit]) {
-            if (--incoming[successor] == 0)
-                ready.emplace(successor->fullPath(), static_cast<TickableUnit*>(successor));
+    order.reserve(unit_ptrs_.size());
+    if (std::none_of(connections_.begin(), connections_.end(),
+                     [](const auto* connection) { return connection->delay() == 0; })) {
+        // With no same-instant dependency, Kahn's ready queue is simply the
+        // already-validated name order. Avoid rebuilding per-unit maps.
+        for (const auto& [name, unit] : names) {
+            (void)name;
+            order.push_back(unit);
+        }
+    } else {
+        std::map<Unit*, size_t> incoming;
+        std::map<Unit*, std::vector<Unit*>> outgoing;
+        std::map<std::string, TickableUnit*> ready;
+        for (auto* unit : unit_ptrs_) incoming[unit] = 0;
+        for (auto* connection : connections_) {
+            if (!connection->delay()) {
+                ++incoming[connection->destination()];
+                outgoing[connection->source()].push_back(connection->destination());
+            }
+        }
+        for (auto* unit : unit_ptrs_)
+            if (!incoming[unit]) ready.emplace(unit->fullPath(), unit);
+        while (!ready.empty()) {
+            auto* unit = ready.begin()->second;
+            ready.erase(ready.begin());
+            order.push_back(unit);
+            for (auto* successor : outgoing[unit]) {
+                if (--incoming[successor] == 0)
+                    ready.emplace(successor->fullPath(), static_cast<TickableUnit*>(successor));
+            }
         }
     }
     if (order.size() != unit_ptrs_.size())
@@ -191,6 +203,15 @@ bool TickSimulation::executeClockBatch_() {
         std::span<const size_t> active;
         if (edges.size() == 1 && clock_always_cdc_.empty()) {
             active = clock_runtime_.at(edges.front().domain->id()).cdc;
+        } else if (edges.size() == 2 && clock_always_cdc_.empty()) {
+            // Initialization appends FIFO indices in sorted order. Merge two
+            // coincident domains directly, emitting shared lanes only once.
+            const auto& a = clock_runtime_.at(edges[0].domain->id()).cdc;
+            const auto& b = clock_runtime_.at(edges[1].domain->id()).cdc;
+            clock_active_cdc_.clear();
+            std::set_union(a.begin(), a.end(), b.begin(), b.end(),
+                           std::back_inserter(clock_active_cdc_));
+            active = clock_active_cdc_;
         } else {
             clock_active_cdc_.clear();
             const auto append = [&](size_t f) {
@@ -246,6 +267,8 @@ bool TickSimulation::executeClockBatch_() {
 uint64_t TickSimulation::runClockEvents(uint64_t max_event_batches) {
     requireClockRun_();
     if (shouldUseParallelExecution_()) return runClockEpochFree_(max_event_batches);
+    // A predicate interval of one needs a single batch, with no counted loop.
+    if (max_event_batches == 1) return executeClockBatch_();
     uint64_t count = 0;
     while (count < max_event_batches && executeClockBatch_()) ++count;
     return count;

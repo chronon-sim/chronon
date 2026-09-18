@@ -28,6 +28,7 @@ add_library(chronon STATIC
     sender/core/TickSimulationParallel.cpp
     sender/core/TickSimulationTrace.cpp
     sender/core/TickSimulationDynamicSampling.cpp
+    sender/core/TickSimulationPlanning.cpp
     sender/core/TickSimulationDynamicRebalance.cpp
     sender/core/TickSimulationDynamicRuntime.cpp
     sender/core/TickSimulationValidation.cpp

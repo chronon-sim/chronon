@@ -39,11 +39,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -256,15 +259,10 @@ public:
             initialize();
         }
 
-        uint64_t executed = 0;
-        while (executed < max_cycles && !should_stop()) {
-            const uint64_t polling_interval = std::max<uint64_t>(1, config_.epoch_size);
-            uint64_t batch = std::min(polling_interval, max_cycles - executed);
-            const auto step = clock_mode_ ? runClockEvents(batch) : run(batch);
-            executed += step;
-            if (clock_mode_ && (!step || wasTerminationRequested())) break;
-        }
-        return executed;
+        // Clock topology is immutable after initialization. Select the loop
+        // once, retaining every predicate boundary and per-call run limit.
+        return clock_mode_ ? runUntilImpl_<true>(should_stop, max_cycles)
+                           : runUntilImpl_<false>(should_stop, max_cycles);
     }
 
     uint64_t runUntilComplete(uint64_t max_cycles = UINT64_MAX) {
@@ -403,6 +401,25 @@ public:
     void forceStableConnectionQueues() noexcept { force_stable_connection_queues_ = true; }
 
 private:
+    template <bool ClockMode, typename Predicate>
+    uint64_t runUntilImpl_(Predicate& should_stop, uint64_t max_cycles) {
+        uint64_t executed = 0;
+        while (executed < max_cycles && !should_stop()) {
+            const uint64_t polling_interval = std::max<uint64_t>(1, config_.epoch_size);
+            const uint64_t batch = std::min(polling_interval, max_cycles - executed);
+            uint64_t step;
+            if constexpr (ClockMode)
+                step = runClockEvents(batch);
+            else
+                step = run(batch);
+            executed += step;
+            if constexpr (ClockMode) {
+                if (!step || wasTerminationRequested()) break;
+            }
+        }
+        return executed;
+    }
+
     void validateClockOwner_(const Unit* unit) const;
     void prepareClockTopology_();
     void initializeClockRuntime_();
@@ -460,7 +477,7 @@ private:
         }
     }
 
-    void buildDependencyGraph();
+    void buildDependencyGraph(bool calculate_lookahead = true);
     void validateNoZeroDelayCycles_() const;
 
     /**
@@ -585,7 +602,7 @@ private:
     void executeThreadRunWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
                                                uint64_t run_start, uint64_t period,
                                                stdexec::inplace_stop_token token);
-    template <bool PushPeriodicCounters>
+    template <bool PushPeriodicCounters, bool LocalCacheHeader>
     void executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle, uint64_t run_start,
                                uint64_t period, stdexec::inplace_stop_token token);
     void executeThreadRunDynamic_(size_t thread_idx, uint64_t end_cycle,
@@ -622,12 +639,15 @@ private:
     bool forceEpochFreeMigrationAtBoundary_(Unit* unit, size_t target_thread);
 
     /// Worker-private lower bounds for predecessor progress. Each cache lives
-    /// for one worker invocation and needs no atomic synchronization of its own.
+    /// across invocations, but its values reset at each invocation. It needs no
+    /// atomic synchronization of its own.
     /// ThreadProgress is release-published and never decreases, so a value read
     /// with acquire remains a valid lower bound for all later dependency checks
     /// on that worker. The extra slot is reserved for the synthetic lookahead
     /// floor dependency (pred_id == thread_progress_count_).
     struct alignas(64) WorkerPredecessorCycleCache {
+        WorkerPredecessorCycleCache() = default;
+        void reset(size_t num_clusters) { observed_cycles.assign(num_clusters + 1, 0); }
         explicit WorkerPredecessorCycleCache(size_t num_clusters)
             : observed_cycles(num_clusters + 1, 0) {}
 
@@ -635,6 +655,66 @@ private:
 
         std::vector<uint64_t> observed_cycles;
     };
+
+    // Small ordinary static workers keep the original compact local vector
+    // header. Its allocation returns to the logical worker on every exit.
+    struct alignas(64) InvocationRetainedPredecessorCache {
+        std::vector<uint64_t> observed_cycles;
+        WorkerPredecessorCycleCache* return_to;
+        [[gnu::noinline]] InvocationRetainedPredecessorCache(WorkerPredecessorCycleCache* retained,
+                                                             size_t num_clusters);
+        ~InvocationRetainedPredecessorCache() { observed_cycles.swap(return_to->observed_cycles); }
+        InvocationRetainedPredecessorCache(const InvocationRetainedPredecessorCache&) = delete;
+        InvocationRetainedPredecessorCache& operator=(const InvocationRetainedPredecessorCache&) =
+            delete;
+        uint64_t* data() noexcept { return observed_cycles.data(); }
+    };
+    static_assert(sizeof(InvocationRetainedPredecessorCache) == 64);
+
+    // Small graphs use invocation-local slots so task stealing cannot bounce a
+    // retained cache line between cores. Large graphs reuse a retained vector.
+    struct alignas(64) InvocationPredecessorCache {
+        static constexpr size_t kInlineSlots = 16;
+        std::array<uint64_t, kInlineSlots> local;
+        uint64_t* cycles;
+        [[gnu::noinline]] InvocationPredecessorCache(WorkerPredecessorCycleCache* retained,
+                                                     size_t clusters);
+        uint64_t* data() noexcept { return cycles; }
+    };
+
+    // Indexed by logical worker, never by an OS thread ID. Bulk task completion
+    // joins every access before a subsequent public run call can reuse storage.
+    // Only capacities survive: progress/readiness and ownership views are reset
+    // on entry, including the clock scheduler's separate settling invocation.
+    struct WorkerRunScratch {
+        WorkerPredecessorCycleCache predecessor;
+        std::vector<size_t> owned_clusters, owned_bridges, owned_actors, ownership;
+        std::vector<uint64_t> priority_blocker, ready_through;
+        std::vector<double> priority_cost;
+    };
+    struct PlanningScratch;
+    struct SchedulerScratch {
+        std::span<WorkerRunScratch> workers;
+        std::shared_ptr<PlanningScratch> planning;
+        uint64_t assignment_lists_generation = 0;
+        std::shared_ptr<ClockCalendar> admission_calendar;
+    };
+    // Coallocate cold scratch after the cache-line-aligned progress
+    // array. Its lifetime already ends after joined workers on topology reset or
+    // destruction. Sequential simulations keep their original object layout and
+    // constructor/destructor, and allocate neither progress nor scratch storage.
+    static constexpr size_t kSchedulerScratchStorageBytes =
+        ((sizeof(SchedulerScratch) + alignof(ThreadProgress) - 1) / alignof(ThreadProgress)) *
+        alignof(ThreadProgress);
+    static_assert(alignof(SchedulerScratch) <= alignof(ThreadProgress));
+    static_assert(alignof(WorkerRunScratch) <= alignof(ThreadProgress));
+    static_assert(sizeof(WorkerRunScratch) % alignof(ThreadProgress) == 0);
+    SchedulerScratch& schedulerScratch_() const noexcept {
+        return *std::launder(reinterpret_cast<SchedulerScratch*>(
+            reinterpret_cast<std::byte*>(thread_progress_array_) +
+            thread_progress_count_ * sizeof(ThreadProgress)));
+    }
+    friend struct SchedulerScratchTestAccess;
 
     /// Return a predecessor-progress lower bound sufficient for `needed` when
     /// possible. A cache hit deliberately does not load the remote atomic. On a
@@ -659,6 +739,7 @@ private:
                                                      uint64_t* predecessor_cache,
                                                      uint64_t refresh_mask,
                                                      bool stop_on_first_blocker) const;
+    template <bool StopOnFirstBlocker>
     [[gnu::noinline]] bool clusterCanAdvanceScalarSlow_(size_t cluster, uint64_t cycle,
                                                         BlockedClusterInfo& blocker,
                                                         uint64_t* predecessor_cache) const;

@@ -1,5 +1,87 @@
 # Chronon benchmarks
 
+## Scheduler planning and repeated calls
+
+Configure Release with `-DCHRONON_BUILD_BENCHMARKS=ON` and build
+`chronon_placement_scoring_benchmark` and `chronon_scheduler_invocation_benchmark`.
+The first compares the retained full oracle, prepared full evaluation and
+incremental evaluation on the same generated graph:
+
+```sh
+# MODE UNITS THREADS SKEW PASSES
+./build/benchmark/chronon_placement_scoring_benchmark oracle 128 8 8 10
+./build/benchmark/chronon_placement_scoring_benchmark prepared 128 8 8 10
+./build/benchmark/chronon_placement_scoring_benchmark incremental 128 8 8 10
+```
+
+Timing executables leave allocation counters disabled. On supported Linux static
+builds, the matching `chronon_placement_scoring_allocations` and
+`chronon_scheduler_invocation_allocations` executables enable counters for a
+separate allocation-only run; their timing must not be used as throughput data.
+Pass `--count-allocations` to the baseline builder to produce the latter baseline
+counter executable.
+
+Check `valid` and `selection` before comparing the separately reported preparation
+and scoring time/allocation counts. Include preparation in total planning cost.
+`retained_bytes` includes the prepared snapshot and its vector capacities.
+
+The invocation probe fixes the graph, work, FIFO settings and check cadence:
+
+```sh
+# CLOCK THREADS PAIRS WORK SKEW DYNAMIC INTERVAL STEPS
+taskset -c 0,2,4,6 ./build/benchmark/chronon_scheduler_invocation_benchmark 1 4 4 64 1 0 1 20000
+```
+
+`CLOCK=0` uses ordinary delayed ports; `CLOCK=1` uses 250/500 MHz domains with
+0/37 ps phases and depth-16, two-stage async FIFOs. Interval zero selects one
+run call; a positive interval is the actual `runUntil` predicate cadence.
+An identical 128-step warmup precedes the measurement. Output separates
+initialization/run timing and allocations, reports predicate calls, and includes
+ticks, transactions, checksum, work digest, overflow and actual parallel mode.
+Compare all state columns against both the baseline and sequential execution.
+
+Build the baseline with the same Release flags, GCC/Clang and dependencies, using
+the Unix Makefiles generator and `CHRONON_BUILD_BENCHMARKS=ON`, then link this same
+probe source against its headers and libraries:
+
+```sh
+python3 benchmark/build_baseline_invocation.py /path/to/baseline/build
+```
+
+Run fresh processes in interleaved, shuffled order with the same physical CPU
+affinity and no competing builds/tests. Report repeated medians and ranges for
+each scenario independently. An optional Linux control,
+`CHRONON_BENCH_PIN_WORKERS=1`, assigns each existing pool thread to a distinct CPU
+from that mask before model construction and timing, and pins the caller to the
+last allowed CPU (the first for sequential runs). Use the same setting on both
+revisions and choose distinct physical cores. Keep ordinary-mask measurements
+separate: the OS may otherwise place mutually waiting workers on the same CPU.
+`run_cpu_s` and voluntary/involuntary context switches help identify that noise.
+With pinning enabled, `CHRONON_BENCH_WARM_CPUS=1` adds a 150 ms CPU warmup
+on each selected core before the identical model warmup. These temporary threads
+join before the measured run. Apply it to both revisions and report this control;
+it changes neither model work nor predicate cadence.
+
+The comparison runner records the binary hashes, exact case matrix, raw results
+and per-case medians/ranges, and rejects mismatched state or predicate counts:
+
+```sh
+python3 benchmark/run_scheduler_comparison.py /path/to/baseline/build ./build ./comparison \
+  --repeats 21 --pin-workers --warm-cpus --cpus 0,2,4,6,8,10,12,14
+```
+
+Choose physical CPUs available on the measurement host. `--long-focus --scale 10`
+extends one-call and interval-64 cases while preserving check cadence;
+`--allocations --repeats 3` selects the separate counting executables.
+
+The C++ allocation wrappers count scalar/array
+`new` in statically linked code; they exclude aligned allocation, `malloc` and
+shared-library internals. `worker_scratch_bytes` measures retained worker vector
+capacity plus the worker scratch objects in the candidate allocation executable
+(zero in the baseline and in both timing executables);
+`rss_kib` is process peak RSS, not a precise scratch measurement. These probes do
+not establish universal downstream speedups.
+
 The small queue benchmarks in this directory isolate individual transport hot
 paths. `chronon_representative_workload_benchmark` complements them with a full
 `TickSimulation`: variable-cost units execute real memory-dependent work while

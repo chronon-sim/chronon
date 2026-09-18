@@ -113,7 +113,14 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
     if (!within_limit(clock_calendar_->nextTime())) return 0;
     ++epoch_free_run_count_;
     auto& runtime = *clock_parallel_;
-    auto calendar = *clock_calendar_;
+    // Only capacity survives a public call. Restart speculative admission from
+    // committed progress after the previous workers (including settling) joined.
+    auto& saved_calendar = schedulerScratch_().admission_calendar;
+    if (!saved_calendar)
+        saved_calendar = std::make_shared<ClockCalendar>(*clock_calendar_);
+    else
+        *saved_calendar = *clock_calendar_;
+    auto& calendar = *saved_calendar;
     const size_t window_limit = std::min<uint64_t>(config_.max_lookahead_cycles, max_batches);
     uint64_t scheduled = 0, completed = 0;
     std::atomic<bool> done{false}, failed{false};
@@ -130,7 +137,10 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
     // Only worker zero manipulates the calendar. It grants a rolling bounded
     // window, never waits for a whole window, and retires individual completed
     // physical instants. Workers gate on local dependencies inside that window.
-    const auto coordinate = [&](bool settling, ClockSchedulerProfile* profile) {
+    // Keep calendar admission/retirement out of the actor polling loop. Inlining
+    // this large coordinator increases its register pressure and instruction footprint.
+    using Profile = ClockSchedulerProfile;
+    const auto coordinate = [&](bool settling, Profile* profile) __attribute__((noinline)) {
         detail::ClockProfileScope retirement(profile ? &profile->retirement_ns : nullptr);
         bool progress = false;
         if (++runtime.coordinator_sweep == 0) {
@@ -306,15 +316,29 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         auto work =
             stdexec::bulk(stdexec::just(), stdexec::par, thread_units_.size(), [&](size_t worker) {
                 try {
-                    WorkerPredecessorCycleCache cache(thread_progress_count_);
-                    auto owned_clusters = thread_clusters_[worker];
-                    auto owned_bridges = runtime.worker_bridges[worker];
-                    std::vector<size_t> owned_actors, ownership_scratch;
+                    auto& scratch_workers = schedulerScratch_().workers;
+                    auto* scratch = scratch_workers.empty() ? nullptr : &scratch_workers[worker];
+                    InvocationPredecessorCache cache(scratch ? &scratch->predecessor : nullptr,
+                                                     thread_progress_count_);
+                    uint64_t* const predecessor_cycles = cache.data();
+                    // Static ownership is immutable for this invocation. Borrow
+                    // its lists; dynamic workers rebuild their private views on
+                    // the first sweep and after assignment-generation changes.
+                    std::span<const size_t> cluster_view = thread_clusters_[worker];
+                    std::span<const size_t> bridge_view = runtime.worker_bridges[worker];
+                    if (dynamic) {
+                        scratch->owned_actors.clear();
+                        scratch->ownership.clear();
+                    }
                     uint64_t seen_generation = 0;
                     uint64_t idle_sweeps = 0;
                     uint64_t wait_sequence = 0;
                     uint64_t profile_sequence = worker;
                     const auto refresh = [&] {
+                        auto& owned_clusters = scratch->owned_clusters;
+                        auto& owned_bridges = scratch->owned_bridges;
+                        auto& owned_actors = scratch->owned_actors;
+                        auto& ownership_scratch = scratch->ownership;
                         refreshDynamicOwnedActors_(worker, owned_actors, ownership_scratch,
                                                    seen_generation);
                         owned_clusters.clear();
@@ -325,6 +349,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             else
                                 owned_bridges.push_back(actor - clusters_.numClusters());
                         }
+                        cluster_view = owned_clusters;
+                        bridge_view = owned_bridges;
                     };
                     while (!failed.load(std::memory_order_acquire) &&
                            !done.load(std::memory_order_acquire) &&
@@ -361,7 +387,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                         if (dynamic && seen_generation != cluster_assignment_generation_.load(
                                                               std::memory_order_acquire))
                             refresh();
-                        for (const auto index : owned_bridges) {
+                        for (const auto index : bridge_view) {
                             if (dynamic && !stable_sweep &&
                                 cluster_runtime_owner_[clusters_.numClusters() + index].load(
                                     std::memory_order_acquire) != worker)
@@ -369,7 +395,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             if (profile) ++profile->bridge_polls;
                             progress = bridge_step(index, blocked, profile) || progress;
                         }
-                        for (const auto c : owned_clusters) {
+                        for (const auto c : cluster_view) {
                             if (dynamic && !stable_sweep &&
                                 cluster_runtime_owner_[c].load(std::memory_order_acquire) != worker)
                                 continue;
@@ -395,7 +421,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             }
                             BlockedClusterInfo blocker;
                             if (!ready) continue;
-                            if (!clusterCanAdvance_(c, cycle, blocker, cache.data())) {
+                            if (!clusterCanAdvance_(c, cycle, blocker, predecessor_cycles)) {
                                 if (profile) ++profile->dependency_waits;
                                 if (sample_wait)
                                     blocked(c, blocker.pred_cluster, state.clock->edge(cycle));
@@ -409,6 +435,9 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             }
                             if (profile) ++profile->cluster_ticks;
                             published.store(cycle + 1, std::memory_order_release);
+                            // This worker already sees its own actor's completed
+                            // work; local dependents need no redundant acquire.
+                            predecessor_cycles[c] = cycle + 1;
                             progress = true;
                         }
                         actors_profile.finish();

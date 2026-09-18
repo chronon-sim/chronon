@@ -16,7 +16,7 @@
 #include <unordered_map>
 
 #include "TickSimulation.hpp"
-#include "sender/schedule/EpochFreeTopologyCost.hpp"
+#include "sender/schedule/PreparedTopologyCost.hpp"
 
 namespace chronon::sender {
 
@@ -211,7 +211,7 @@ void TickSimulation::applyClusteredThreadAssignment_(size_t num_threads,
     }
     auto result = runPartitionSolver_(cluster_input);
     if (config_.enable_lookahead && config_.enable_epoch_free_lookahead && num_threads > 1) {
-        auto improved = epoch_free_cost::improveInitialPlacement(
+        auto improved = epoch_free_cost::improvePreparedPlacement(
             cluster_input, result.unit_to_thread, num_threads);
         if (improved != result.unit_to_thread) {
             auto stats = result.stats;

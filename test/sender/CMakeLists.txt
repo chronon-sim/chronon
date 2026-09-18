@@ -13,6 +13,17 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 # Test executables (prefixed with sender_ to avoid conflicts)
+add_executable(sender_test_scheduler_scratch test_scheduler_scratch.cpp)
+target_link_libraries(sender_test_scheduler_scratch PRIVATE chronon::core chronon_compile_options)
+add_test(NAME sender_scheduler_scratch COMMAND sender_test_scheduler_scratch)
+set_tests_properties(sender_scheduler_scratch PROPERTIES TIMEOUT 120 PROCESSORS 4)
+add_dependencies(regress sender_test_scheduler_scratch)
+
+add_executable(sender_test_prepared_topology test_prepared_topology.cpp)
+target_link_libraries(sender_test_prepared_topology PRIVATE chronon::core chronon_compile_options)
+add_test(NAME sender_prepared_topology COMMAND sender_test_prepared_topology)
+add_dependencies(regress sender_test_prepared_topology)
+
 add_executable(sender_test_cluster_headroom test_cluster_headroom.cpp)
 target_link_libraries(sender_test_cluster_headroom PRIVATE chronon::core chronon_compile_options)
 foreach(mode pair fanin feedback transitive)

@@ -327,6 +327,134 @@ inline std::vector<size_t> improveInitialPlacement(const PartitionInput& input,
     return assignment;
 }
 
+inline double averageDependencyWait(const RuntimeWaits& waits) {
+    double total_dep_wait = 0.0;
+    if (waits.thread_dep_wait_ns) {
+        for (uint64_t wait : *waits.thread_dep_wait_ns) total_dep_wait += static_cast<double>(wait);
+    }
+    return waits.thread_dep_wait_ns && !waits.thread_dep_wait_ns->empty()
+               ? total_dep_wait / static_cast<double>(waits.thread_dep_wait_ns->size())
+               : 0.0;
+}
+
+// Shared decision arithmetic; the independent full graph evaluator below remains
+// the numerical oracle for prepared and incremental candidates.
+inline MoveBreakdown scoreSummaries(double cluster_cost, size_t cluster, size_t source_thread,
+                                    size_t target_thread, size_t num_threads,
+                                    const RuntimeWaits& waits, double min_gain_fraction,
+                                    double churn_penalty, const ObjectiveSummary& old_summary,
+                                    const ObjectiveSummary& new_summary,
+                                    double local_topology_delta, double avg_dep_wait,
+                                    double roundoff = 0.0, bool* uncertain = nullptr) {
+    const auto gt = [&](double a, double b) {
+        if (uncertain && std::abs(a - b) <= roundoff) *uncertain = true;
+        return a > b;
+    };
+    const auto ge = [&](double a, double b) {
+        if (uncertain && std::abs(a - b) <= roundoff) *uncertain = true;
+        return a >= b;
+    };
+    MoveBreakdown out;
+    const double target_floor = waitAt(waits.thread_floor_wait_ns, target_thread);
+    const double target_dep = waitAt(waits.thread_dep_wait_ns, target_thread);
+    const double target_no_ready = waitAt(waits.thread_no_ready_wait_ns, target_thread);
+    const double target_wait_total = target_floor + target_dep + target_no_ready;
+    const double floor_ratio = target_wait_total > 0.0 ? target_floor / target_wait_total : 0.0;
+    const double dep_ratio = target_wait_total > 0.0 ? target_dep / target_wait_total : 0.0;
+    const double no_ready_ratio =
+        target_wait_total > 0.0 ? target_no_ready / target_wait_total : 0.0;
+
+    double total_active = 0.0;
+    for (double active : old_summary.active) total_active += active;
+    const double avg_active =
+        num_threads > 0 ? total_active / static_cast<double>(num_threads) : 0.0;
+    const double target_active_before =
+        target_thread < old_summary.active.size() ? old_summary.active[target_thread] : 0.0;
+    const double source_active_before =
+        source_thread < old_summary.active.size() ? old_summary.active[source_thread] : 0.0;
+    out.target_active_after = target_active_before + cluster_cost;
+    out.active_budget = std::max(avg_active * 1.15, old_summary.max_active * 0.72);
+
+    const double blocker_wait = waitAt(waits.cluster_blocker_wait_ns, cluster);
+    const double cluster_wait = waitAt(waits.cluster_blocked_wait_ns, cluster) + blocker_wait;
+    const double wait_scale = avg_dep_wait > 0.0 ? std::min(3.0, cluster_wait / avg_dep_wait) : 0.0;
+
+    out.objective_gain = old_summary.objective - new_summary.objective;
+    out.active_gain = old_summary.max_active - new_summary.max_active;
+    out.topology_delta = (old_summary.cross_pressure + old_summary.max_incoming_pressure) -
+                         (new_summary.cross_pressure + new_summary.max_incoming_pressure);
+    out.measured_dep_bonus = std::max(0.0, local_topology_delta) * wait_scale * 0.20;
+    out.floor_slack_bonus = cluster_cost * (0.45 * floor_ratio + 0.10 * no_ready_ratio);
+    out.target_dep_penalty = cluster_cost * 0.55 * dep_ratio +
+                             std::max(0.0, new_summary.incoming_pressure[target_thread] -
+                                               old_summary.incoming_pressure[target_thread]) *
+                                 0.20;
+    if (gt(out.topology_delta, 0.0)) {
+        out.target_dep_penalty = std::max(0.0, out.target_dep_penalty - out.topology_delta * 0.50);
+    }
+    const size_t old_heavy = old_summary.heavy_count[target_thread];
+    const size_t new_heavy = new_summary.heavy_count[target_thread];
+    out.active_stack_penalty =
+        new_heavy > old_heavy ? cluster_cost * 0.15 * static_cast<double>(new_heavy - old_heavy)
+                              : 0.0;
+    out.churn_penalty = churn_penalty;
+    out.old_max_active = old_summary.max_active;
+    out.new_max_active = new_summary.max_active;
+    out.old_target_dep_pressure = old_summary.incoming_pressure[target_thread];
+    out.new_target_dep_pressure = new_summary.incoming_pressure[target_thread];
+    out.target_heavy_before = old_summary.heavy_count[target_thread];
+    out.target_heavy_after = new_summary.heavy_count[target_thread];
+
+    const bool strong_dep_relief =
+        gt(out.topology_delta, std::max(cluster_cost * 0.20, old_summary.objective * 0.02)) ||
+        out.measured_dep_bonus > cluster_cost * 0.25;
+    const bool stacks_heavy =
+        out.target_heavy_after > out.target_heavy_before && out.target_heavy_before > 0;
+    const bool target_over_budget = out.target_active_after > out.active_budget;
+    const bool relieves_source_balance = source_active_before > avg_active * 1.15 &&
+                                         target_active_before < source_active_before &&
+                                         out.target_active_after <= source_active_before &&
+                                         ge(old_summary.max_active * 1.02, new_summary.max_active);
+    const bool relieves_active = gt(
+        out.active_gain, std::max(cluster_cost * 0.05, old_summary.max_active * min_gain_fraction));
+    const bool active_or_balance_relief = relieves_active || relieves_source_balance;
+    const bool relieves_critical_blocker =
+        active_or_balance_relief && avg_dep_wait > 0.0 && blocker_wait > avg_dep_wait * 0.50;
+    if (stacks_heavy && !(strong_dep_relief || active_or_balance_relief)) return out;
+    if (target_over_budget && !(strong_dep_relief || active_or_balance_relief)) return out;
+    if (gt(-std::max(0.01, old_summary.max_active * min_gain_fraction * 0.50), out.active_gain) &&
+        !strong_dep_relief) {
+        return out;
+    }
+
+    const double floor_capacity =
+        avg_active > 0.0 ? std::max(0.0, (avg_active - target_active_before) / avg_active) : 0.0;
+    out.floor_slack_bonus =
+        cluster_cost * (0.08 * floor_ratio + 0.03 * no_ready_ratio) * std::min(1.0, floor_capacity);
+    if (stacks_heavy && !relieves_source_balance) {
+        out.active_stack_penalty += cluster_cost * 0.50;
+    }
+    if (target_over_budget) {
+        out.active_stack_penalty += out.target_active_after - out.active_budget;
+    }
+
+    out.score = out.objective_gain + out.measured_dep_bonus + out.floor_slack_bonus -
+                out.target_dep_penalty - out.active_stack_penalty - out.churn_penalty;
+
+    const double min_score = std::max(0.01, min_gain_fraction * old_summary.objective * 0.25);
+    if (gt(new_summary.max_active, old_summary.max_active * (1.0 + min_gain_fraction * 0.5)) &&
+        ge(0.0, out.topology_delta)) {
+        return out;
+    }
+    if (dep_ratio > 0.50 && ge(0.0, out.topology_delta) && !relieves_critical_blocker) return out;
+    if (relieves_source_balance && ge(out.score, -cluster_cost * 0.25)) {
+        out.valid = true;
+        return out;
+    }
+    out.valid = ge(out.score, min_score);
+    return out;
+}
+
 inline MoveBreakdown scoreMove(const PartitionInput& input, const std::vector<size_t>& assignment,
                                size_t cluster, size_t target_thread, const RuntimeWaits& waits,
                                double min_gain_fraction, double churn_penalty) {
@@ -355,112 +483,9 @@ inline MoveBreakdown scoreMove(const PartitionInput& input, const std::vector<si
         crossPressureForCluster(input, candidate, cluster, target_thread);
     const double local_topology_delta = old_local_cross - new_local_cross;
 
-    const double target_floor = waitAt(waits.thread_floor_wait_ns, target_thread);
-    const double target_dep = waitAt(waits.thread_dep_wait_ns, target_thread);
-    const double target_no_ready = waitAt(waits.thread_no_ready_wait_ns, target_thread);
-    const double target_wait_total = target_floor + target_dep + target_no_ready;
-    const double floor_ratio = target_wait_total > 0.0 ? target_floor / target_wait_total : 0.0;
-    const double dep_ratio = target_wait_total > 0.0 ? target_dep / target_wait_total : 0.0;
-    const double no_ready_ratio =
-        target_wait_total > 0.0 ? target_no_ready / target_wait_total : 0.0;
-
-    double total_active = 0.0;
-    for (double active : old_summary.active) total_active += active;
-    const double avg_active =
-        num_threads > 0 ? total_active / static_cast<double>(num_threads) : 0.0;
-    const double target_active_before =
-        target_thread < old_summary.active.size() ? old_summary.active[target_thread] : 0.0;
-    const double source_active_before =
-        source_thread < old_summary.active.size() ? old_summary.active[source_thread] : 0.0;
-    out.target_active_after = target_active_before + cluster_cost;
-    out.active_budget = std::max(avg_active * 1.15, old_summary.max_active * 0.72);
-
-    const double blocker_wait = waitAt(waits.cluster_blocker_wait_ns, cluster);
-    const double cluster_wait = waitAt(waits.cluster_blocked_wait_ns, cluster) + blocker_wait;
-    double total_dep_wait = 0.0;
-    if (waits.thread_dep_wait_ns) {
-        for (uint64_t wait : *waits.thread_dep_wait_ns) total_dep_wait += static_cast<double>(wait);
-    }
-    const double avg_dep_wait =
-        waits.thread_dep_wait_ns && !waits.thread_dep_wait_ns->empty()
-            ? total_dep_wait / static_cast<double>(waits.thread_dep_wait_ns->size())
-            : 0.0;
-    const double wait_scale = avg_dep_wait > 0.0 ? std::min(3.0, cluster_wait / avg_dep_wait) : 0.0;
-
-    out.objective_gain = old_summary.objective - new_summary.objective;
-    out.active_gain = old_summary.max_active - new_summary.max_active;
-    out.topology_delta = (old_summary.cross_pressure + old_summary.max_incoming_pressure) -
-                         (new_summary.cross_pressure + new_summary.max_incoming_pressure);
-    out.measured_dep_bonus = std::max(0.0, local_topology_delta) * wait_scale * 0.20;
-    out.floor_slack_bonus = cluster_cost * (0.45 * floor_ratio + 0.10 * no_ready_ratio);
-    out.target_dep_penalty = cluster_cost * 0.55 * dep_ratio +
-                             std::max(0.0, new_summary.incoming_pressure[target_thread] -
-                                               old_summary.incoming_pressure[target_thread]) *
-                                 0.20;
-    if (out.topology_delta > 0.0) {
-        out.target_dep_penalty = std::max(0.0, out.target_dep_penalty - out.topology_delta * 0.50);
-    }
-    const size_t old_heavy = old_summary.heavy_count[target_thread];
-    const size_t new_heavy = new_summary.heavy_count[target_thread];
-    out.active_stack_penalty =
-        new_heavy > old_heavy ? cluster_cost * 0.15 * static_cast<double>(new_heavy - old_heavy)
-                              : 0.0;
-    out.churn_penalty = churn_penalty;
-    out.old_max_active = old_summary.max_active;
-    out.new_max_active = new_summary.max_active;
-    out.old_target_dep_pressure = old_summary.incoming_pressure[target_thread];
-    out.new_target_dep_pressure = new_summary.incoming_pressure[target_thread];
-    out.target_heavy_before = old_summary.heavy_count[target_thread];
-    out.target_heavy_after = new_summary.heavy_count[target_thread];
-
-    const bool strong_dep_relief =
-        out.topology_delta > std::max(cluster_cost * 0.20, old_summary.objective * 0.02) ||
-        out.measured_dep_bonus > cluster_cost * 0.25;
-    const bool stacks_heavy =
-        out.target_heavy_after > out.target_heavy_before && out.target_heavy_before > 0;
-    const bool target_over_budget = out.target_active_after > out.active_budget;
-    const bool relieves_source_balance = source_active_before > avg_active * 1.15 &&
-                                         target_active_before < source_active_before &&
-                                         out.target_active_after <= source_active_before &&
-                                         new_summary.max_active <= old_summary.max_active * 1.02;
-    const bool relieves_active =
-        out.active_gain > std::max(cluster_cost * 0.05, old_summary.max_active * min_gain_fraction);
-    const bool active_or_balance_relief = relieves_active || relieves_source_balance;
-    const bool relieves_critical_blocker =
-        active_or_balance_relief && avg_dep_wait > 0.0 && blocker_wait > avg_dep_wait * 0.50;
-    if (stacks_heavy && !(strong_dep_relief || active_or_balance_relief)) return out;
-    if (target_over_budget && !(strong_dep_relief || active_or_balance_relief)) return out;
-    if (out.active_gain < -std::max(0.01, old_summary.max_active * min_gain_fraction * 0.50) &&
-        !strong_dep_relief) {
-        return out;
-    }
-
-    const double floor_capacity =
-        avg_active > 0.0 ? std::max(0.0, (avg_active - target_active_before) / avg_active) : 0.0;
-    out.floor_slack_bonus =
-        cluster_cost * (0.08 * floor_ratio + 0.03 * no_ready_ratio) * std::min(1.0, floor_capacity);
-    if (stacks_heavy && !relieves_source_balance) {
-        out.active_stack_penalty += cluster_cost * 0.50;
-    }
-    if (target_over_budget) {
-        out.active_stack_penalty += out.target_active_after - out.active_budget;
-    }
-
-    out.score = out.objective_gain + out.measured_dep_bonus + out.floor_slack_bonus -
-                out.target_dep_penalty - out.active_stack_penalty - out.churn_penalty;
-
-    const double min_score = std::max(0.01, min_gain_fraction * old_summary.objective * 0.25);
-    if (new_summary.max_active > old_summary.max_active * (1.0 + min_gain_fraction * 0.5) &&
-        out.topology_delta <= 0.0) {
-        return out;
-    }
-    if (dep_ratio > 0.50 && out.topology_delta <= 0.0 && !relieves_critical_blocker) return out;
-    if (relieves_source_balance && out.score >= -cluster_cost * 0.25) {
-        out.valid = true;
-        return out;
-    }
-    out.valid = out.score >= min_score;
-    return out;
+    return scoreSummaries(cluster_cost, cluster, source_thread, target_thread, num_threads, waits,
+                          min_gain_fraction, churn_penalty, old_summary, new_summary,
+                          local_topology_delta, averageDependencyWait(waits));
 }
 
 }  // namespace chronon::sender::epoch_free_cost

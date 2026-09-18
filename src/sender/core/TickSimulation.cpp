@@ -32,16 +32,20 @@ namespace chronon::sender {
 void TickSimulation::initialize() {
     if (initialized_) return;
 
-    if (clock_mode_) prepareClockTopology_();
-
-    buildDependencyGraph();
-    validateNoZeroDelayCycles_();
-
-    // Topologically reorder unit_ptrs_ so zero-delay producers tick before
-    // same-cycle consumers in the per-cycle loop. Full-graph SCC condensation
-    // handles registered feedback; creation order is a tie-break only.
-    if (!clock_mode_) reorderUnitsTopologically_();
-    buildDependencyGraph();
+    if (clock_mode_) {
+        // Clock topology already validates zero-delay cycles and fixes the
+        // canonical unit order. Build the final dependency graph just once.
+        prepareClockTopology_();
+        buildDependencyGraph();
+    } else {
+        buildDependencyGraph(false);
+        validateNoZeroDelayCycles_();
+        // Topologically reorder so zero-delay producers tick before same-cycle
+        // consumers. Full-graph SCC condensation handles registered feedback;
+        // creation order is a tie-break only. Rebuild after finalizing indices.
+        reorderUnitsTopologically_();
+        buildDependencyGraph();
+    }
 
     // Remap pre-computed costs to the new index order.
     // setPrecomputedUnitCosts() stores costs in creation order (by unit
@@ -128,7 +132,7 @@ void TickSimulation::initialize() {
     if (config_.enable_lookahead && shouldUseParallelExecution_() && has_thread_assignment_ &&
         !thread_units_.empty()) {
         initProgressSync();
-        installMultiProducerProgress_();
+        if (!multi_producer_ports_.empty()) installMultiProducerProgress_();
     }
 
     // Barrier-based fallbacks no longer exist. Resolve the complete epoch-free
@@ -424,14 +428,17 @@ uint64_t TickSimulation::runEpochFree(uint64_t num_cycles) {
 // Dependency analysis and topological ordering
 // ---------------------------------------------------------------------------
 
-void TickSimulation::buildDependencyGraph() {
+void TickSimulation::buildDependencyGraph(bool calculate_lookahead) {
     std::vector<Unit*> unit_as_base;
     unit_as_base.reserve(unit_ptrs_.size());
     for (auto* unit : unit_ptrs_) {
         unit_as_base.push_back(static_cast<Unit*>(unit));
     }
 
-    dep_graph_.build(unit_as_base, connections_);
+    if (calculate_lookahead)
+        dep_graph_.build(unit_as_base, connections_);
+    else
+        dep_graph_.buildTopology_(unit_as_base, connections_);
 }
 
 void TickSimulation::reorderUnitsTopologically_() {

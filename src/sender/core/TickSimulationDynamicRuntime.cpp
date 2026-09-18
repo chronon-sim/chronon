@@ -140,6 +140,7 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         dynamic_cluster_blocker_wait_ns_[c].store(0, std::memory_order_relaxed);
     }
     if (reset_runtime) {
+        schedulerScratch_().assignment_lists_generation = 0;
         std::fill(dynamic_unit_last_active_sample_cycle_.begin(),
                   dynamic_unit_last_active_sample_cycle_.end(), detail::kNoDynamicTickSample);
         std::fill(dynamic_unit_last_inactive_sample_cycle_.begin(),
@@ -248,6 +249,12 @@ void TickSimulation::rebuildThreadUnitsFromClusterOwners_() {
         return;
     }
 
+    // All workers have joined. An unchanged assignment cannot change these
+    // derived lists; preserve them across short calls until a migration commits.
+    const uint64_t generation = cluster_assignment_generation_.load(std::memory_order_acquire);
+    auto& published_generation = schedulerScratch_().assignment_lists_generation;
+    if (published_generation == generation) return;
+
     const size_t num_threads = thread_units_.size();
     thread_units_.assign(num_threads, {});
     thread_clusters_.assign(num_threads, {});
@@ -276,6 +283,7 @@ void TickSimulation::rebuildThreadUnitsFromClusterOwners_() {
             thread_unit_ptrs_[t].push_back(unit_ptrs_[idx]);
         }
     }
+    published_generation = generation;
 }
 
 bool TickSimulation::forceEpochFreeMigrationAtBoundary_(Unit* unit, size_t target_thread) {

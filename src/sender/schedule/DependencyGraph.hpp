@@ -26,26 +26,7 @@ public:
     DependencyGraph() = default;
 
     void build(const std::vector<Unit*>& units, const std::vector<ConnectionBase*>& connections) {
-        units_ = units;
-        unit_to_index_.clear();
-
-        for (size_t i = 0; i < units.size(); ++i) {
-            unit_to_index_[units[i]] = i;
-        }
-
-        graph_ = std::make_unique<DirectedGraph>(units.size());
-
-        for (const auto* conn : connections) {
-            Unit* src = conn->source();
-            Unit* dst = conn->destination();
-
-            if (src && dst) {
-                size_t src_idx = unit_to_index_[src];
-                size_t dst_idx = unit_to_index_[dst];
-                graph_->addEdge(src_idx, dst_idx, conn->delay());
-            }
-        }
-
+        buildTopology_(units, connections);
         computeLookahead();
     }
 
@@ -189,6 +170,34 @@ public:
     const std::vector<std::vector<uint32_t>>& distances() const { return distances_; }
 
 private:
+    friend class TickSimulation;
+    // Initialization needs only direct edges until unit indices are final.
+    // This incomplete state stays private; public build() always computes paths.
+    void buildTopology_(const std::vector<Unit*>& units,
+                        const std::vector<ConnectionBase*>& connections) {
+        units_ = units;
+        unit_to_index_.clear();
+
+        for (size_t i = 0; i < units.size(); ++i) {
+            unit_to_index_[units[i]] = i;
+        }
+
+        graph_ = std::make_unique<DirectedGraph>(units.size());
+
+        for (const auto* conn : connections) {
+            Unit* src = conn->source();
+            Unit* dst = conn->destination();
+
+            if (src && dst) {
+                size_t src_idx = unit_to_index_[src];
+                size_t dst_idx = unit_to_index_[dst];
+                graph_->addEdge(src_idx, dst_idx, conn->delay());
+            }
+        }
+
+        distances_.clear();
+    }
+
     void computeLookahead() {
         if (graph_) {
             distances_ = floydWarshall(*graph_);

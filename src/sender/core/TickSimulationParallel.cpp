@@ -11,6 +11,7 @@
 /// dependency spin-waits, and progress-sync initialization.
 
 #include <bit>
+#include <cassert>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -18,6 +19,7 @@
 #include <limits>
 #include <new>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 
 #if defined(__linux__)
@@ -78,8 +80,33 @@ void TickSimulation::installMultiProducerProgress_() {
 // Progress-sync allocation
 // ---------------------------------------------------------------------------
 
+TickSimulation::InvocationRetainedPredecessorCache::InvocationRetainedPredecessorCache(
+    WorkerPredecessorCycleCache* retained, size_t num_clusters)
+    : observed_cycles(std::move(retained->observed_cycles)), return_to(retained) {
+    observed_cycles.assign(num_clusters + 1, 0);
+}
+
+// Keep vector growth and small-buffer setup out of the worker's scheduling loop.
+// This also keeps register allocation independent of the cache initialization paths.
+TickSimulation::InvocationPredecessorCache::InvocationPredecessorCache(
+    WorkerPredecessorCycleCache* retained, size_t clusters) {
+    if (clusters < kInlineSlots) {
+        cycles = local.data();
+        std::fill_n(cycles, clusters + 1, 0);
+    } else {
+        assert(retained);
+        retained->reset(clusters);
+        cycles = retained->data();
+    }
+}
+
 void TickSimulation::freeThreadProgressArray() {
+    // Topology/progress replacement happens with all worker tasks joined.
     if (thread_progress_array_) {
+        auto* storage = &schedulerScratch_();
+        const auto workers = storage->workers;
+        std::destroy_at(storage);
+        if (!workers.empty()) std::destroy_n(workers.data(), workers.size());
         for (size_t i = 0; i < thread_progress_count_; ++i) {
             thread_progress_array_[i].~ThreadProgress();
         }
@@ -95,11 +122,27 @@ void TickSimulation::initProgressSync() {
     const size_t num_threads = thread_units_.size();
     const size_t num_clusters = clusters_.numClusters();
     if (num_clusters == 0) return;
+    // Ordinary workers keep the original invocation-local cache header and
+    // retain its allocation. Small static clock graphs need no worker metadata.
+    const size_t scratch_workers = !clock_mode_ || config_.enable_dynamic_rebalance ||
+                                           num_clusters >= InvocationPredecessorCache::kInlineSlots
+                                       ? num_threads
+                                       : 0;
 
     freeThreadProgressArray();
-    thread_progress_count_ = num_clusters;
-    void* mem = std::aligned_alloc(64, num_clusters * sizeof(ThreadProgress));
+    if (scratch_workers > (SIZE_MAX - kSchedulerScratchStorageBytes) / sizeof(WorkerRunScratch))
+        throw std::bad_array_new_length();
+    const size_t scratch_bytes =
+        kSchedulerScratchStorageBytes + scratch_workers * sizeof(WorkerRunScratch);
+    if (num_clusters > (SIZE_MAX - scratch_bytes) / sizeof(ThreadProgress))
+        throw std::bad_array_new_length();
+    void* mem = std::aligned_alloc(alignof(ThreadProgress),
+                                   scratch_bytes + num_clusters * sizeof(ThreadProgress));
+    if (!mem) throw std::bad_alloc();
+    std::construct_at(reinterpret_cast<SchedulerScratch*>(static_cast<std::byte*>(mem) +
+                                                          num_clusters * sizeof(ThreadProgress)));
     thread_progress_array_ = static_cast<ThreadProgress*>(mem);
+    thread_progress_count_ = num_clusters;
     for (size_t i = 0; i < num_clusters; ++i) {
         new (&thread_progress_array_[i]) ThreadProgress();
         uint64_t cycle = 0;
@@ -168,6 +211,15 @@ void TickSimulation::initProgressSync() {
 
     if (!clock_mode_ && config_.enable_dynamic_rebalance) {
         initDynamicMigrationRuntime_();
+    }
+    // Fixed worker metadata shares the progress allocation. Construct it after
+    // the hot dependency tables; no additional aligned allocation is needed.
+    auto* workers = reinterpret_cast<WorkerRunScratch*>(static_cast<std::byte*>(mem) +
+                                                        num_clusters * sizeof(ThreadProgress) +
+                                                        kSchedulerScratchStorageBytes);
+    if (scratch_workers) {
+        std::uninitialized_value_construct_n(workers, scratch_workers);
+        schedulerScratch_().workers = {workers, scratch_workers};
     }
 }
 
@@ -305,7 +357,7 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
 // Per-thread run driver
 // ---------------------------------------------------------------------------
 
-template <bool PushPeriodicCounters>
+template <bool PushPeriodicCounters, bool LocalCacheHeader>
 void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle,
                                            uint64_t run_start, uint64_t period,
                                            stdexec::inplace_stop_token token) {
@@ -318,7 +370,10 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     };
     // This cache spans the worker invocation (the entire run in EpochFree mode),
     // allowing all locally-owned clusters to reuse acquired predecessor progress.
-    WorkerPredecessorCycleCache predecessor_cache(thread_progress_count_);
+    using Cache = std::conditional_t<LocalCacheHeader, InvocationRetainedPredecessorCache,
+                                     InvocationPredecessorCache>;
+    Cache predecessor_cache(&schedulerScratch_().workers[thread_idx].predecessor,
+                            thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;
@@ -377,10 +432,14 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
                                        idle_begin, idle_end);
                 }
                 progress.store(reached_cycle, std::memory_order_release);
+                predecessor_cycles[cluster] = reached_cycle;
             } else {
                 executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units);
                 progress.store(cycle + 1, std::memory_order_release);
+                predecessor_cycles[cluster] = cycle + 1;
             }
+            // Our own completed work is already visible on this worker. Keep
+            // that lower bound so local dependents need no redundant acquire.
             // Floor not recomputed per advance (that was an O(num_clusters)
             // cross-core scan on the hot path). It is refreshed lazily, only
             // when a cluster is actually blocked — see below and the spin-wait.
@@ -475,13 +534,19 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
 
 void TickSimulation::executeThreadRun_(size_t thread_idx, uint64_t end_cycle,
                                        stdexec::inplace_stop_token token) {
-    executeThreadRunImpl_<false>(thread_idx, end_cycle, 0, 0, token);
+    if (thread_progress_count_ < InvocationPredecessorCache::kInlineSlots)
+        executeThreadRunImpl_<false, true>(thread_idx, end_cycle, 0, 0, token);
+    else
+        executeThreadRunImpl_<false, false>(thread_idx, end_cycle, 0, 0, token);
 }
 
 void TickSimulation::executeThreadRunWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
                                                            uint64_t run_start, uint64_t period,
                                                            stdexec::inplace_stop_token token) {
-    executeThreadRunImpl_<true>(thread_idx, end_cycle, run_start, period, token);
+    if (thread_progress_count_ < InvocationPredecessorCache::kInlineSlots)
+        executeThreadRunImpl_<true, true>(thread_idx, end_cycle, run_start, period, token);
+    else
+        executeThreadRunImpl_<true, false>(thread_idx, end_cycle, run_start, period, token);
 }
 
 // ---------------------------------------------------------------------------
@@ -519,7 +584,9 @@ bool TickSimulation::clusterCanAdvance_(size_t cluster, uint64_t cycle, BlockedC
     constexpr size_t kMaxMaskLanes = 64;
     const auto& deps = thread_resolved_deps_[cluster];
     if (deps.size() < kMinMaskLanes || deps.size() > kMaxMaskLanes) {
-        return clusterCanAdvanceScalarSlow_(cluster, cycle, blocker, predecessor_cache);
+        if (stop_on_first_blocker)
+            return clusterCanAdvanceScalarSlow_<true>(cluster, cycle, blocker, predecessor_cache);
+        return clusterCanAdvanceScalarSlow_<false>(cluster, cycle, blocker, predecessor_cache);
     }
 
     uint64_t refresh_mask = 0;
@@ -567,6 +634,7 @@ bool TickSimulation::refreshPredecessorMisses_(size_t cluster, uint64_t cycle,
     return ready;
 }
 
+template <bool StopOnFirstBlocker>
 bool TickSimulation::clusterCanAdvanceScalarSlow_(size_t cluster, uint64_t cycle,
                                                   BlockedClusterInfo& blocker,
                                                   uint64_t* predecessor_cache) const {
@@ -586,6 +654,7 @@ bool TickSimulation::clusterCanAdvanceScalarSlow_(size_t cluster, uint64_t cycle
             blocker.delay = dep.min_delay;
             blocker.deficit = deficit;
         }
+        if constexpr (StopOnFirstBlocker) return false;
     }
     return ready;
 }
