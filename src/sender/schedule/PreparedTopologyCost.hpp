@@ -297,49 +297,9 @@ private:
     ObjectiveSummary baseline_, candidate_;
 };
 
-inline std::vector<size_t> improvePreparedPlacement(const PartitionInput& input,
-                                                    std::vector<size_t> assignment,
-                                                    size_t num_threads) {
-    if (input.num_units <= 1 || num_threads <= 1 || input.sync_cost_ns <= 0.0) return assignment;
-    PreparedTopologyCost prepared;
-    prepared.prepare(input, assignment);
-    ObjectiveSummary candidate;
-    for (size_t pass = 0; pass < 3; ++pass) {
-        const auto& best = prepared.baseline();
-        double best_objective = best.objective;
-        size_t best_unit = SIZE_MAX, best_target = SIZE_MAX;
-        for (size_t u = 0; u < input.num_units; ++u) {
-            for (size_t target = 0; target < num_threads; ++target) {
-                if (target == assignment[u] || prepared.splitsZeroDelay(u, target)) continue;
-                prepared.evaluateMove(candidate, u, target);
-                const double error = prepared.roundoff();
-                if (std::abs(candidate.max_active - best.max_active - 0.01) <= error ||
-                    std::abs(candidate.max_incoming_pressure - best.max_incoming_pressure + 0.01) <=
-                        error ||
-                    std::abs(candidate.cross_pressure - best.cross_pressure + 0.01) <= error ||
-                    std::abs(candidate.objective - best_objective + 0.01) <= error)
-                    prepared.evaluateFull(candidate, u, target);
-                if (candidate.active_threads < best.active_threads) continue;
-                if (candidate.max_active > best.max_active + 0.01 &&
-                    candidate.max_incoming_pressure >= best.max_incoming_pressure - 0.01 &&
-                    candidate.cross_pressure >= best.cross_pressure - 0.01)
-                    continue;
-                if (candidate.objective < best_objective - 0.01) {
-                    // Keep the incumbent exact, so subsequent near ties use the
-                    // same deterministic comparisons as the original search.
-                    prepared.evaluateFull(candidate, u, target);
-                    if (candidate.objective >= best_objective - 0.01) continue;
-                    best_objective = candidate.objective;
-                    best_unit = u;
-                    best_target = target;
-                }
-            }
-        }
-        if (best_unit == SIZE_MAX) break;
-        assignment[best_unit] = best_target;
-        prepared.resetAssignment();
-    }
-    return assignment;
-}
+// Kept out of the partitioning translation unit: its cold evaluator setup
+// should not enlarge the common small-topology initialization path.
+std::vector<size_t> improvePreparedPlacement(const PartitionInput& input,
+                                             std::vector<size_t> assignment, size_t num_threads);
 
 }  // namespace chronon::sender::epoch_free_cost

@@ -193,7 +193,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     } restore_ownership{scratch, owned_clusters, refreshed_clusters};
     owned_clusters.clear();
     refreshed_clusters.clear();
-    InvocationPredecessorCache predecessor_cache(scratch.predecessor, thread_progress_count_);
+    InvocationPredecessorCache predecessor_cache(&scratch.predecessor, thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
     scratch.priority_blocker.assign(num_clusters, 0);
     scratch.priority_cost.assign(num_clusters, 0.0);

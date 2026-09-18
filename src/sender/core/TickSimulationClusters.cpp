@@ -1,6 +1,7 @@
 // Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
 // SPDX-License-Identifier: MPL-2.0
 
+#include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -45,22 +46,28 @@ void TickSimulation::buildSchedulingClusters_() {
     // cannot start asynchronously, but can run as one ordinary per-cycle group.
     // Contract SCCs of this scheduling graph, not SCCs of the data graph. The
     // SCC condensation is acyclic, so one pass closes all transitive merges.
-    DirectedGraph zero_slack(clusters_.numClusters());
-    for (const auto& edge : edges) {
-        const size_t source = clusters_.cluster_id[edge.source];
-        const size_t destination = clusters_.cluster_id[edge.destination];
-        if (source != destination && edge.headroom == 1) zero_slack.addEdge(destination, source, 0);
+    // Without a headroom-one edge there is no reverse zero-delay wait and
+    // therefore no additional feedback component to merge.
+    if (std::any_of(edges.begin(), edges.end(),
+                    [](const Edge& edge) { return edge.headroom == 1; })) {
+        DirectedGraph zero_slack(clusters_.numClusters());
+        for (const auto& edge : edges) {
+            const size_t source = clusters_.cluster_id[edge.source];
+            const size_t destination = clusters_.cluster_id[edge.destination];
+            if (source != destination && edge.headroom == 1)
+                zero_slack.addEdge(destination, source, 0);
+        }
+        const auto feedback = tarjanSCC(zero_slack);
+        bool merged_feedback = false;
+        for (const auto& component : feedback.components) {
+            if (component.size() < 2) continue;
+            const size_t anchor = clusters_.clusters[component.front()].front();
+            for (size_t i = 1; i < component.size(); ++i)
+                co_location.emplace_back(anchor, clusters_.clusters[component[i]].front());
+            merged_feedback = true;
+        }
+        if (merged_feedback) clusters_ = findTightCouplingClusters(graph, co_location);
     }
-    const auto feedback = tarjanSCC(zero_slack);
-    bool merged_feedback = false;
-    for (const auto& component : feedback.components) {
-        if (component.size() < 2) continue;
-        const size_t anchor = clusters_.clusters[component.front()].front();
-        for (size_t i = 1; i < component.size(); ++i)
-            co_location.emplace_back(anchor, clusters_.clusters[component[i]].front());
-        merged_feedback = true;
-    }
-    if (merged_feedback) clusters_ = findTightCouplingClusters(graph, co_location);
     unit_to_cluster_ = clusters_.cluster_id;
 
     cross_cluster_connections_.clear();

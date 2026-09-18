@@ -11,6 +11,7 @@
 /// dependency spin-waits, and progress-sync initialization.
 
 #include <bit>
+#include <cassert>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -50,8 +51,7 @@ uint64_t saturatingCycleAdd(uint64_t base, uint64_t delta) noexcept {
 // ---------------------------------------------------------------------------
 
 void TickSimulation::installMultiProducerProgress_() {
-    if (multi_producer_ports_.empty() || !thread_progress_array_ || thread_progress_count_ == 0)
-        return;
+    if (!thread_progress_array_ || thread_progress_count_ == 0) return;
 
     std::unordered_map<Unit*, size_t> unit_to_cluster;
     for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
@@ -82,13 +82,14 @@ void TickSimulation::installMultiProducerProgress_() {
 // Keep vector growth and small-buffer setup out of the worker's scheduling loop.
 // This also keeps register allocation independent of the cache initialization paths.
 TickSimulation::InvocationPredecessorCache::InvocationPredecessorCache(
-    WorkerPredecessorCycleCache& retained, size_t clusters) {
+    WorkerPredecessorCycleCache* retained, size_t clusters) {
     if (clusters < kInlineSlots) {
         cycles = local.data();
         std::fill_n(cycles, clusters + 1, 0);
     } else {
-        retained.reset(clusters);
-        cycles = retained.data();
+        assert(retained);
+        retained->reset(clusters);
+        cycles = retained->data();
     }
 }
 
@@ -96,7 +97,9 @@ void TickSimulation::freeThreadProgressArray() {
     // Topology/progress replacement happens with all worker tasks joined.
     if (thread_progress_array_) {
         auto* storage = &schedulerScratch_();
+        const auto workers = storage->workers;
         std::destroy_at(storage);
+        if (!workers.empty()) std::destroy_n(workers.data(), workers.size());
         for (size_t i = 0; i < thread_progress_count_; ++i) {
             thread_progress_array_[i].~ThreadProgress();
         }
@@ -112,13 +115,22 @@ void TickSimulation::initProgressSync() {
     const size_t num_threads = thread_units_.size();
     const size_t num_clusters = clusters_.numClusters();
     if (num_clusters == 0) return;
+    // Static small graphs borrow immutable ownership lists and keep every
+    // predecessor bound on the invocation stack; they need no worker metadata.
+    const size_t scratch_workers =
+        config_.enable_dynamic_rebalance || num_clusters >= InvocationPredecessorCache::kInlineSlots
+            ? num_threads
+            : 0;
 
     freeThreadProgressArray();
-    if (num_clusters > (SIZE_MAX - kSchedulerScratchStorageBytes) / sizeof(ThreadProgress))
+    if (scratch_workers > (SIZE_MAX - kSchedulerScratchStorageBytes) / sizeof(WorkerRunScratch))
         throw std::bad_array_new_length();
-    void* mem =
-        std::aligned_alloc(alignof(ThreadProgress),
-                           kSchedulerScratchStorageBytes + num_clusters * sizeof(ThreadProgress));
+    const size_t scratch_bytes =
+        kSchedulerScratchStorageBytes + scratch_workers * sizeof(WorkerRunScratch);
+    if (num_clusters > (SIZE_MAX - scratch_bytes) / sizeof(ThreadProgress))
+        throw std::bad_array_new_length();
+    void* mem = std::aligned_alloc(alignof(ThreadProgress),
+                                   scratch_bytes + num_clusters * sizeof(ThreadProgress));
     if (!mem) throw std::bad_alloc();
     std::construct_at(reinterpret_cast<SchedulerScratch*>(static_cast<std::byte*>(mem) +
                                                           num_clusters * sizeof(ThreadProgress)));
@@ -193,9 +205,15 @@ void TickSimulation::initProgressSync() {
     if (!clock_mode_ && config_.enable_dynamic_rebalance) {
         initDynamicMigrationRuntime_();
     }
-    // Allocate cold worker metadata after the dependency tables, preserving
-    // locality of the progress and dependency storage used by the hot loop.
-    schedulerScratch_().workers.resize(num_threads);
+    // Fixed worker metadata shares the progress allocation. Construct it after
+    // the hot dependency tables; no additional aligned allocation is needed.
+    auto* workers = reinterpret_cast<WorkerRunScratch*>(static_cast<std::byte*>(mem) +
+                                                        num_clusters * sizeof(ThreadProgress) +
+                                                        kSchedulerScratchStorageBytes);
+    if (scratch_workers) {
+        std::uninitialized_value_construct_n(workers, scratch_workers);
+        schedulerScratch_().workers = {workers, scratch_workers};
+    }
 }
 
 bool TickSimulation::allMultiProducerPortsHaveProgress_() const noexcept {
@@ -345,8 +363,10 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     };
     // This cache spans the worker invocation (the entire run in EpochFree mode),
     // allowing all locally-owned clusters to reuse acquired predecessor progress.
+    auto& scratch_workers = schedulerScratch_().workers;
     InvocationPredecessorCache predecessor_cache(
-        schedulerScratch_().workers[thread_idx].predecessor, thread_progress_count_);
+        scratch_workers.empty() ? nullptr : &scratch_workers[thread_idx].predecessor,
+        thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;

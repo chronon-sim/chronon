@@ -46,6 +46,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -485,9 +486,9 @@ private:
      * same-cycle producers tick before consumers; creation order is the
      * tie-breaker. Result is stable for a given graph but not fully canonical
      * (Tarjan traversal order plus builder ids).
-     * Returns whether graph indices changed and need rebuilding.
+     * Must be followed by buildDependencyGraph() to rebuild graph indices.
      */
-    bool reorderUnitsTopologically_();
+    void reorderUnitsTopologically_();
 
     bool hasTightConnections() const;
 
@@ -662,7 +663,7 @@ private:
         static constexpr size_t kInlineSlots = 16;
         std::array<uint64_t, kInlineSlots> local;
         uint64_t* cycles;
-        [[gnu::noinline]] InvocationPredecessorCache(WorkerPredecessorCycleCache& retained,
+        [[gnu::noinline]] InvocationPredecessorCache(WorkerPredecessorCycleCache* retained,
                                                      size_t clusters);
         uint64_t* data() noexcept { return cycles; }
     };
@@ -679,7 +680,7 @@ private:
     };
     struct PlanningScratch;
     struct SchedulerScratch {
-        std::vector<WorkerRunScratch> workers;
+        std::span<WorkerRunScratch> workers;
         std::shared_ptr<PlanningScratch> planning;
         uint64_t assignment_lists_generation = 0;
         std::shared_ptr<ClockCalendar> admission_calendar;
@@ -692,6 +693,8 @@ private:
         ((sizeof(SchedulerScratch) + alignof(ThreadProgress) - 1) / alignof(ThreadProgress)) *
         alignof(ThreadProgress);
     static_assert(alignof(SchedulerScratch) <= alignof(ThreadProgress));
+    static_assert(alignof(WorkerRunScratch) <= alignof(ThreadProgress));
+    static_assert(sizeof(WorkerRunScratch) % alignof(ThreadProgress) == 0);
     SchedulerScratch& schedulerScratch_() const noexcept {
         return *std::launder(reinterpret_cast<SchedulerScratch*>(
             reinterpret_cast<std::byte*>(thread_progress_array_) +

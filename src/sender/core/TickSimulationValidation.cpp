@@ -35,6 +35,10 @@ void TickSimulation::validateNoZeroDelayCycles_() const {
         return;
     }
 
+    // With no zero-delay edge there cannot be a combinational cycle. Avoid
+    // constructing a disconnected graph and one SCC allocation per unit.
+    if (!hasTightConnections()) return;
+
     const size_t n = graph->numNodes();
     DirectedGraph zero_delay_graph(n);
     for (size_t u = 0; u < n; ++u) {

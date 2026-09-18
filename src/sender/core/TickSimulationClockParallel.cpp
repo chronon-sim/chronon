@@ -316,27 +316,29 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         auto work =
             stdexec::bulk(stdexec::just(), stdexec::par, thread_units_.size(), [&](size_t worker) {
                 try {
-                    auto& scratch = schedulerScratch_().workers[worker];
-                    InvocationPredecessorCache cache(scratch.predecessor, thread_progress_count_);
+                    auto& scratch_workers = schedulerScratch_().workers;
+                    auto* scratch = scratch_workers.empty() ? nullptr : &scratch_workers[worker];
+                    InvocationPredecessorCache cache(scratch ? &scratch->predecessor : nullptr,
+                                                     thread_progress_count_);
                     uint64_t* const predecessor_cycles = cache.data();
-                    auto& owned_clusters = scratch.owned_clusters;
-                    auto& owned_bridges = scratch.owned_bridges;
-                    auto& owned_actors = scratch.owned_actors;
-                    auto& ownership_scratch = scratch.ownership;
                     // Static ownership is immutable for this invocation. Borrow
                     // its lists; dynamic workers rebuild their private views on
                     // the first sweep and after assignment-generation changes.
                     std::span<const size_t> cluster_view = thread_clusters_[worker];
                     std::span<const size_t> bridge_view = runtime.worker_bridges[worker];
                     if (dynamic) {
-                        owned_actors.clear();
-                        ownership_scratch.clear();
+                        scratch->owned_actors.clear();
+                        scratch->ownership.clear();
                     }
                     uint64_t seen_generation = 0;
                     uint64_t idle_sweeps = 0;
                     uint64_t wait_sequence = 0;
                     uint64_t profile_sequence = worker;
                     const auto refresh = [&] {
+                        auto& owned_clusters = scratch->owned_clusters;
+                        auto& owned_bridges = scratch->owned_bridges;
+                        auto& owned_actors = scratch->owned_actors;
+                        auto& ownership_scratch = scratch->ownership;
                         refreshDynamicOwnedActors_(worker, owned_actors, ownership_scratch,
                                                    seen_generation);
                         owned_clusters.clear();

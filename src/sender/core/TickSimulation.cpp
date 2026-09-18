@@ -32,18 +32,20 @@ namespace chronon::sender {
 void TickSimulation::initialize() {
     if (initialized_) return;
 
-    if (clock_mode_) prepareClockTopology_();
-
-    buildDependencyGraph(false);
-    validateNoZeroDelayCycles_();
-
-    // Topologically reorder unit_ptrs_ so zero-delay producers tick before
-    // same-cycle consumers in the per-cycle loop. Full-graph SCC condensation
-    // handles registered feedback; creation order is a tie-break only.
-    if (!clock_mode_ && reorderUnitsTopologically_())
+    if (clock_mode_) {
+        // Clock topology already validates zero-delay cycles and fixes the
+        // canonical unit order. Build the final dependency graph just once.
+        prepareClockTopology_();
         buildDependencyGraph();
-    else
-        dep_graph_.recomputeLookahead();
+    } else {
+        buildDependencyGraph(false);
+        validateNoZeroDelayCycles_();
+        // Topologically reorder so zero-delay producers tick before same-cycle
+        // consumers. Full-graph SCC condensation handles registered feedback;
+        // creation order is a tie-break only. Rebuild after finalizing indices.
+        reorderUnitsTopologically_();
+        buildDependencyGraph();
+    }
 
     // Remap pre-computed costs to the new index order.
     // setPrecomputedUnitCosts() stores costs in creation order (by unit
@@ -130,7 +132,7 @@ void TickSimulation::initialize() {
     if (config_.enable_lookahead && shouldUseParallelExecution_() && has_thread_assignment_ &&
         !thread_units_.empty()) {
         initProgressSync();
-        installMultiProducerProgress_();
+        if (!multi_producer_ports_.empty()) installMultiProducerProgress_();
     }
 
     // Barrier-based fallbacks no longer exist. Resolve the complete epoch-free
@@ -439,10 +441,10 @@ void TickSimulation::buildDependencyGraph(bool calculate_lookahead) {
         dep_graph_.buildTopology_(unit_as_base, connections_);
 }
 
-bool TickSimulation::reorderUnitsTopologically_() {
+void TickSimulation::reorderUnitsTopologically_() {
     const auto* graph = dep_graph_.graph();
     if (!graph || graph->numNodes() <= 1) {
-        return false;
+        return;
     }
 
     const size_t n = graph->numNodes();
@@ -507,9 +509,7 @@ bool TickSimulation::reorderUnitsTopologically_() {
         }
     }
 
-    if (new_order == unit_ptrs_) return false;
     unit_ptrs_ = std::move(new_order);
-    return true;
 }
 
 bool TickSimulation::hasTightConnections() const {

@@ -22,7 +22,7 @@ struct SchedulerScratchTestAccess {
         if (!sim.thread_progress_array_) return 0;
         size_t result =
             TickSimulation::kSchedulerScratchStorageBytes +
-            sim.schedulerScratch_().workers.capacity() * sizeof(TickSimulation::WorkerRunScratch);
+            sim.schedulerScratch_().workers.size() * sizeof(TickSimulation::WorkerRunScratch);
         const auto bytes = [](const auto& values) { return values.capacity() * sizeof(values[0]); };
         for (const auto& worker : sim.schedulerScratch_().workers) {
             result += bytes(worker.predecessor.observed_cycles) + bytes(worker.owned_clusters) +
