@@ -30,7 +30,11 @@ namespace chronon::sender {
 // ---------------------------------------------------------------------------
 
 void TickSimulation::initialize() {
+    if (finalized_) throw std::logic_error("cannot initialize a finalized simulation");
     if (initialized_) return;
+    if (initialization_started_)
+        throw std::logic_error("simulation initialization already started or failed");
+    initialization_started_ = true;
 
     if (clock_mode_) {
         // Clock topology already validates zero-delay cycles and fixes the
@@ -82,6 +86,7 @@ void TickSimulation::initialize() {
     for (auto& unit : units_) {
         unit->setTerminationController(&termination_ctrl_);
         unit->initialize();
+        unit->state_ = UnitState::Initialized;
     }
 
     for (auto* connection : connections_) connection->prepareRegisteredCapacity();

@@ -33,7 +33,7 @@ namespace chronon::sender {
 
 class TickSimulation;
 
-enum class UnitState { Created, Initialized };
+enum class UnitState { Created, Initialized, Finalized };
 
 namespace detail {
 
@@ -96,7 +96,8 @@ public:
     /// Called after all connections are made, before run() starts.
     virtual void initialize() {}
 
-    /// Called after run() completes or simulation is stopped.
+    /// Called once by TickSimulation::finalize(), after successful initialize().
+    /// A run() segment does not end the simulation's lifetime.
     virtual void finalize() {}
 
     const std::string& name() const noexcept { return name_; }
@@ -267,6 +268,10 @@ public:
 
     /// Triggers registration of all pending ports to PortDirectory.
     void setTreeNode(tree::TreeNode* node) {
+        if (state_ != UnitState::Created)
+            throw std::logic_error("cannot rebind unit tree after initialization");
+        if (tree_node_ && tree_node_ != node)
+            throw std::logic_error("unit tree binding is immutable");
         tree_node_ = node;
         registerAllPendingPorts();
     }
@@ -286,8 +291,16 @@ public:
 
 protected:
     friend class TickSimulation;
+    friend PortDirectory& portDirectoryForUnit(Unit* unit);
 
     void setId(uint32_t id) { id_ = id; }
+
+    void setInstanceName_(std::string name) {
+        name_ = std::move(name);
+        crash_name_len_ = static_cast<uint8_t>(std::min(name_.size(), sizeof(crash_name_) - 1));
+        std::memcpy(crash_name_, name_.c_str(), crash_name_len_);
+        crash_name_[crash_name_len_] = '\0';
+    }
 
     void setLocalCycle(uint64_t cycle) {
         local_cycle_ = cycle;
@@ -451,6 +464,7 @@ private:
     std::vector<PortBase*> ports_;
     /// Lazily allocated: the common Unit has no receiver cycle hook.
     std::unique_ptr<std::vector<PortBase*>> cycle_prepared_ports_;
+    PortDirectory* port_directory_ = nullptr;
     tree::TreeNode* tree_node_ = nullptr;
     std::vector<std::function<void(const std::string&)>> pending_port_registrations_;
 };
@@ -486,6 +500,10 @@ inline std::string Unit::fullPath() const {
         return tree_node_->path();
     }
     return name_;
+}
+
+inline PortDirectory& portDirectoryForUnit(Unit* unit) {
+    return unit && unit->port_directory_ ? *unit->port_directory_ : PortDirectory::instance();
 }
 
 /// Defined here (free function) to avoid the Port.hpp → Unit.hpp circular

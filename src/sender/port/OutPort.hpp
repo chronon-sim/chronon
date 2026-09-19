@@ -66,7 +66,7 @@ public:
         if (owner_) {
             addPortRegistrationToUnit(owner_, [this](const std::string& prefix) {
                 std::string full_path = prefix + "." + name_;
-                PortDirectory::instance().registerPort(
+                portDirectoryForUnit(owner_).registerPort(
                     full_path, std::make_unique<OutPortHandle<T>>(this, owner_, name_, full_path));
             });
         }

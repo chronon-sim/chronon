@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
+# SPDX-License-Identifier: MPL-2.0
+"""Fail closed on state changes or an unproven 1% throughput non-regression.
+
+Run identical baseline/candidate binaries in interleaved fresh processes on the
+same physical CPU set. Bootstrap paired log speedups; each case must have a
+one-sided 95% lower confidence bound >= 0.99. Preserve every sample, including
+outliers. Do not build or run other tests concurrently with this measurement.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import io
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import random
+import statistics
+import subprocess
+import sys
+
+
+STATE_FIELDS = ("predicates", "parallel", "ticks", "sent", "received", "checksum", "digest", "overflow")
+MIN_SPEEDUP = 0.99
+
+
+def confidence(samples: list[float], seed: int = 149) -> dict:
+    if len(samples) < 15 or any(not math.isfinite(x) or x <= 0 for x in samples):
+        raise ValueError("at least 15 finite positive paired speedups are required")
+    logs = [math.log(x) for x in samples]
+    rng = random.Random(seed)
+    bootstrap = sorted(statistics.median(rng.choices(logs, k=len(logs))) for _ in range(20000))
+    return {
+        "median_speedup": math.exp(statistics.median(logs)),
+        "lower_95_speedup": math.exp(bootstrap[999]),
+        "upper_95_speedup": math.exp(bootstrap[19000]),
+        "min_speedup": min(samples),
+        "max_speedup": max(samples),
+        "pass": math.exp(bootstrap[999]) >= MIN_SPEEDUP,
+    }
+
+
+def physical_cpus() -> list[int]:
+    allowed = os.sched_getaffinity(0)
+    rows = subprocess.check_output(["lscpu", "-p=CPU,CORE,SOCKET"], text=True)
+    cores = {}
+    for line in rows.splitlines():
+        if line.startswith("#"):
+            continue
+        cpu, core, socket = map(int, line.split(","))
+        if cpu in allowed:
+            cores.setdefault((socket, core), cpu)
+    return list(cores.values())[:4]
+
+
+def cases(workers: int) -> list[dict]:
+    result = [{"name": "single-clock-floor", "kind": "floor", "cycles": 10000000}]
+    for clock in (0, 1):
+        for threads in (1, workers):
+            for dynamic in ((0,) if threads == 1 else (0, 1)):
+                for interval in (0, 1, 64):
+                    result.append({"name": f"clock{clock}-threads{threads}-dynamic{dynamic}-poll{interval}",
+                                   "kind": "scheduler", "args": [clock, threads, 4, 64, 1, dynamic, interval],
+                                   "cycles": 2000})
+    for profile in ("nucleus", "port", "broadcast", "backpressure", "memory"):
+        for threads in (1, workers):
+            result.append({"name": f"{profile}-threads{threads}", "kind": "representative",
+                           "profile": profile, "threads": threads, "cycles": 1000})
+    return result
+
+
+def executable(case: dict) -> str:
+    return {"floor": "chronon_single_clock_regression_benchmark",
+            "scheduler": "chronon_scheduler_invocation_benchmark",
+            "representative": "chronon_representative_workload_benchmark"}[case["kind"]]
+
+
+def command(build: Path, case: dict, cpus: list[int]) -> list[str]:
+    mask = cpus[:1] if case["kind"] == "floor" else cpus
+    argv = ["taskset", "-c", ",".join(map(str, mask)), str(build / "benchmark" / executable(case))]
+    if case["kind"] == "floor":
+        return argv + [str(case["cycles"])]
+    if case["kind"] == "scheduler":
+        return argv + [*map(str, case["args"]), str(case["cycles"])]
+    return argv + ["--profile", case["profile"], "--seed", "149", "--units", "16",
+                   "--threads", str(case["threads"]), "--warmup", "512",
+                   "--cycles", str(case["cycles"]), "--repetitions", "1"]
+
+
+def parse(case: dict, output: str) -> tuple[float, dict]:
+    lines = output.strip().splitlines()
+    if case["kind"] in ("floor", "scheduler"):
+        row = next(csv.DictReader(io.StringIO("\n".join(lines[-2:]))))
+        keys = ("cycles", "digest") if case["kind"] == "floor" else STATE_FIELDS
+        if case["kind"] == "scheduler" and row["overflow"] != "0":
+            raise ValueError("transport overflow")
+        seconds = float(row["wall_s" if case["kind"] == "floor" else "run_s"])
+        state = {key: row[key] for key in keys}
+    else:
+        machine = [line for line in lines if line.startswith("RESULT ")]
+        digests = [line.strip() for line in lines if line.strip().startswith("digest=")]
+        if len(machine) != 1 or len(digests) != 1:
+            raise ValueError("expected exactly one result and one state digest")
+        row = dict(field.split("=", 1) for field in machine[0].split()[1:])
+        seconds = float(row["median_seconds"])
+        state = dict(field.split("=", 1) for field in digests[0].split())
+        state["mode"] = row["mode"]
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("invalid elapsed time")
+    return seconds, state
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("baseline", type=Path)
+    parser.add_argument("candidate", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--base-sha", required=True)
+    parser.add_argument("--head-sha", required=True)
+    parser.add_argument("--repeats", type=int, default=31)
+    parser.add_argument("--seconds", type=float, default=0.5)
+    parser.add_argument("--cpus", help="homogeneous physical CPU IDs; default first four physical cores")
+    parser.add_argument("--case", action="append", help="exact case names for diagnosis; never a full gate")
+    args = parser.parse_args()
+    if args.repeats < 15 or args.seconds < 0.25:
+        parser.error("at least 15 pairs and 0.25 seconds per sample are required")
+    cpus = list(map(int, args.cpus.split(","))) if args.cpus else physical_cpus()
+    if len(cpus) < 2 or len(set(cpus)) != len(cpus) or not set(cpus) <= os.sched_getaffinity(0):
+        parser.error("at least two distinct allowed physical CPUs are required")
+    matrix = cases(min(4, len(cpus)))
+    if args.case:
+        requested = set(args.case)
+        matrix = [case for case in matrix if case["name"] in requested]
+        if {case["name"] for case in matrix} != requested:
+            parser.error("unknown case name")
+    builds = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
+    args.output.mkdir(parents=True, exist_ok=False)
+    metadata = {"base_sha": args.base_sha, "head_sha": args.head_sha, "platform": platform.platform(),
+                "cpus": cpus, "repeats": args.repeats, "minimum_speedup": MIN_SPEEDUP,
+                "target_seconds": args.seconds, "complete_matrix": not args.case,
+                "lscpu": subprocess.check_output(["lscpu"], text=True), "binaries": {}}
+    for variant, build in builds.items():
+        metadata["binaries"][variant] = {}
+        for name in sorted({executable(case) for case in matrix}):
+            binary = build / "benchmark" / name
+            metadata["binaries"][variant][name] = hashlib.sha256(binary.read_bytes()).hexdigest()
+        metadata[variant + "_cache"] = (build / "CMakeCache.txt").read_text()
+    (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    env = os.environ.copy()
+    env["CHRONON_BENCH_PIN_WORKERS"] = "1"
+    env["CHRONON_BENCH_WARM_CPUS"] = "1"
+    rng = random.Random(149)
+    results = []
+
+    def run(variant: str, case: dict, label: str) -> tuple[float, dict]:
+        argv = command(builds[variant], case, cpus)
+        proc = subprocess.run(argv, env=env, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=180)
+        stem = args.output / f"{case['name']}-{label}-{variant}"
+        stem.with_suffix(".log").write_text(proc.stdout)
+        if proc.returncode:
+            raise RuntimeError(f"benchmark failed: {argv}; see {stem}.log")
+        return parse(case, proc.stdout)
+
+    for case in matrix:
+        # Calibration fixes identical work for both variants; it is never a sample.
+        timings = [run(variant, case, "calibration")[0] for variant in builds]
+        case["cycles"] = min(1000000000, max(case["cycles"],
+            math.ceil(case["cycles"] * args.seconds / min(timings))))
+        (args.output / "cases.json").write_text(json.dumps(matrix, indent=2) + "\n")
+        reference = None
+        pairs = []
+        samples = []
+        for repetition in range(args.repeats):
+            order = list(builds)
+            rng.shuffle(order)
+            pair = {}
+            for variant in order:
+                seconds, state = run(variant, case, str(repetition))
+                if reference is not None and state != reference:
+                    raise RuntimeError(f"determinism mismatch: {case['name']} {variant}: {state} != {reference}")
+                reference = state
+                pair[variant] = seconds
+            pairs.append(pair)
+            samples.append(pair["baseline"] / pair["candidate"])
+            (args.output / f"{case['name']}-samples.json").write_text(json.dumps(pairs, indent=2) + "\n")
+        result = {"case": case, "state": reference, **confidence(samples)}
+        results.append(result)
+        (args.output / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
+        print(f"{case['name']}: median={result['median_speedup']:.5f} "
+              f"lower95={result['lower_95_speedup']:.5f} {'PASS' if result['pass'] else 'FAIL/UNCERTAIN'}",
+              flush=True)
+    passed = all(result["pass"] for result in results)
+    (args.output / "verdict.json").write_text(json.dumps({"pass": passed,
+        "complete_matrix": not args.case, "base_sha": args.base_sha, "head_sha": args.head_sha}, indent=2) + "\n")
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

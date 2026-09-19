@@ -81,39 +81,14 @@ public:
         return requested == 0 ? 1 : requested;
     }
 
-    explicit TickSimulation(const TickSimulationConfig& config = {})
-        : config_(config),
-          default_clock_(ClockDomain::fromHz(0, "default", config.tick_frequency_hz)),
-          current_cycle_(0),
-          initialized_(false),
-          pool_(static_cast<uint32_t>(normalizeThreadCount(config.num_threads))) {
-        config_.num_threads = normalizeThreadCount(config_.num_threads);
-        timeline_trace_.configure(config_.timeline_trace);
-        resolveSolver_();
-    }
+    explicit TickSimulation(const TickSimulationConfig& config = {});
 
-    ~TickSimulation() { freeThreadProgressArray(); }
+    ~TickSimulation();
 
     TickSimulation(const TickSimulation&) = delete;
     TickSimulation& operator=(const TickSimulation&) = delete;
 
-    size_t assignedThread(Unit* unit) const {
-        if (!unit) return SIZE_MAX;
-        for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-            if (static_cast<Unit*>(unit_ptrs_[i]) != unit) continue;
-            if (i < unit_to_cluster_.size()) {
-                size_t cluster = unit_to_cluster_[i];
-                if (cluster < cluster_to_thread_.size()) {
-                    return cluster_to_thread_[cluster];
-                }
-            }
-            if (i < cluster_to_thread_.size()) {
-                return cluster_to_thread_[i];
-            }
-            return SIZE_MAX;
-        }
-        return SIZE_MAX;
-    }
+    size_t assignedThread(Unit* unit) const;
 
     uint64_t rebalanceCount() const { return rebalance_count_; }
 
@@ -122,11 +97,17 @@ public:
         static_assert(std::is_base_of_v<TickableUnit, UnitT>,
                       "UnitT must derive from TickableUnit");
 
-        if (initialized_) throw std::logic_error("cannot create units after initialization");
+        if (initialization_started_ || finalized_)
+            throw std::logic_error("cannot create units after initialization has started");
         auto unit = std::make_unique<UnitT>(std::forward<Args>(args)...);
         auto* ptr = unit.get();
 
+        if (auto* observable = dynamic_cast<observe::ObservableUnit*>(ptr)) {
+            observable->observe_cycle_ = &static_cast<Unit*>(ptr)->local_cycle_;
+        }
+
         ptr->clock_ = &default_clock_;
+        ptr->port_directory_ = &port_directory_;
 
         ptr->setId(static_cast<uint32_t>(units_.size()));
         ptr->bindActivitySchedulingState_(&any_activity_scheduling_);
@@ -168,7 +149,10 @@ public:
 
     template <typename T>
     Connection<T>* connect(OutPort<T>& from, InPort<T>& to, uint32_t delay = 1) {
-        if (initialized_) throw std::logic_error("cannot connect after initialization");
+        if (initialization_started_ || finalized_)
+            throw std::logic_error("cannot connect after initialization has started");
+        validateClockOwner_(from.owner());
+        validateClockOwner_(to.owner());
         if (from.owner() && to.owner() &&
             from.owner()->clockDomainId() != to.owner()->clockDomainId()) {
             throw std::invalid_argument(
@@ -183,15 +167,29 @@ public:
     /// For YAML-driven builders that create connections via type-erased port
     /// handles rather than the templated connect() above.
     void registerConnection(ConnectionBase* conn) {
-        if (clock_mode_ && initialized_)
+        if (initialization_started_ || finalized_)
             throw std::logic_error("runtime connection registration is unsupported");
         if (conn) {
+            validateClockOwner_(conn->source());
+            validateClockOwner_(conn->destination());
             conn->setConnId(static_cast<uint32_t>(connections_.size()));
             connections_.push_back(conn);
         }
     }
 
     void initialize();
+
+    /// End this session. Calls every successfully initialized unit's finalize()
+    /// once, in creation order, even if another finalizer throws. Idempotent.
+    /// Call explicitly to observe finalizer failures; destruction is best effort.
+    /// Host-only, between runs. A finalized simulation cannot be run again.
+    void finalize();
+    bool isFinalized() const noexcept { return finalized_; }
+    PortDirectory& portDirectory() noexcept { return port_directory_; }
+    const PortDirectory& portDirectory() const noexcept { return port_directory_; }
+
+    /// Assign the factory instance identity before initialization. Host-only.
+    void setUnitName(Unit& unit, std::string name);
 
     /// Host-only, between run calls. Empty unless profile_clock_scheduler is enabled.
     const std::vector<ClockSchedulerProfile>& clockSchedulerProfile() const noexcept {
@@ -213,7 +211,8 @@ public:
     template <typename T>
     AsyncFifo<T>* connectAsyncFifo(uint32_t id, AsyncWritePort<T>& write, AsyncReadPort<T>& read,
                                    AsyncFifoConfig config = {}) {
-        if (initialized_) throw std::logic_error("cannot add CDC after initialization");
+        if (initialization_started_ || finalized_)
+            throw std::logic_error("cannot add CDC after initialization has started");
         validateClockOwner_(write.owner());
         validateClockOwner_(read.owner());
         for (const auto& fifo : cdc_) {
@@ -334,17 +333,7 @@ public:
      * running, the file is placed in its timestamped output directory; otherwise
      * it is written relative to cwd.
      */
-    void writeTimelineTrace() {
-        if (!timeline_trace_.enabled()) {
-            return;
-        }
-        auto& obs = observe::ObservationManager::instance();
-        if (obs.isBackendRunning() && obs.backend()) {
-            timeline_trace_.write(obs.backend()->outputDir());
-        } else {
-            timeline_trace_.write();
-        }
-    }
+    void writeTimelineTrace();
 
     /// Number of epoch-free scheduler invocations. Sequential fallback leaves
     /// this unchanged, making the counter useful for safety-gate coverage.
@@ -369,14 +358,7 @@ public:
     bool isParallelBeneficial() const noexcept { return parallel_beneficial_; }
     bool useParallelExecution() const noexcept { return shouldUseParallelExecution_(); }
 
-    TickableUnit* getUnit(const std::string& name) {
-        for (auto& unit : units_) {
-            if (unit->name() == name) {
-                return unit.get();
-            }
-        }
-        return nullptr;
-    }
+    TickableUnit* getUnit(const std::string& name);
 
     template <typename UnitT>
     UnitT* getUnit(const std::string& name) {
@@ -810,6 +792,8 @@ private:
     [[noreturn]] [[gnu::cold]] [[gnu::noinline]] static void throwTickException();
 
     TickSimulationConfig config_;
+    bool initialization_started_ = false;
+    bool finalized_ = false;
     ClockDomain default_clock_;
     std::deque<ClockDomain> clock_domains_;
     bool clock_mode_ = false;
@@ -853,6 +837,7 @@ private:
     ::exec::static_thread_pool pool_;
 
     // Reverse member destruction keeps parameters valid through unit teardown.
+    PortDirectory port_directory_;
     std::vector<std::unique_ptr<params::ParameterSet>> unit_parameters_;
     std::vector<std::unique_ptr<TickableUnit>> units_;
     std::vector<TickableUnit*> unit_ptrs_;

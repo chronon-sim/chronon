@@ -107,10 +107,10 @@ public:
     bool isCompleted() const override { return value_ >= 1000; }
 
     void tick() override {
-        if (out.canSend()) {
-            out.send(value_++);
+        if (out.send(value_)) {
             ++produced_;
             event<"produced">(DATA_FLOW, arg<"value">(value_));
+            ++value_;
         }
     }
 
@@ -126,9 +126,9 @@ public:
     Consumer() : TickableUnit("consumer") {}
 
     void tick() override {
-        if (auto value = in.tryReceive(localCycle())) {
+        if (auto value = in.tryReceive()) {
             ++consumed_;
-            debug<"Consumed: {}">(value);
+            debug<"Consumed: {}">(*value);
         }
     }
 
@@ -148,6 +148,7 @@ int main() {
 
     sim.initialize();
     sim.run(2000);  // ~90+ Mcycles/sec
+    sim.finalize();
 }
 ```
 

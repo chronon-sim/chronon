@@ -112,7 +112,7 @@ private:
         if (owner_) {
             addPortRegistrationToUnit(owner_, [this](const std::string& prefix) {
                 std::string full_path = prefix + "." + name_;
-                PortDirectory::instance().registerPort(
+                portDirectoryForUnit(owner_).registerPort(
                     full_path, std::make_unique<InPortHandle<T>>(this, owner_, name_, full_path));
             });
         }
@@ -560,6 +560,9 @@ public:
         return tryReceiveFiltered(current_cycle, [](const T&) noexcept { return true; });
     }
 
+    /// Receive at the owning unit's current local cycle, just as send() does.
+    std::optional<T> tryReceive() { return tryReceive(getCurrentCycle()); }
+
     /**
      * Receive the first ready message accepted by @p filter.
      *
@@ -978,23 +981,6 @@ private:
     std::unique_ptr<ProducerTransactionStates> producer_transaction_states_;
 };
 
-template <typename T>
-IMultiProducerPort* Connection<T>::registerOnDestMPSC() {
-    if (thread_queue_id_ == SIZE_MAX || !to_) {
-        return nullptr;
-    }
-    to_->registerMPSCConnection(this);
-    return static_cast<IMultiProducerPort*>(to_);
-}
-
-template <typename T>
-bool Connection<T>::finalizeTransparentBroadcastForDestination(size_t producer_count) {
-    return to_ && to_->finalizeTransparentBroadcastReplay(producer_count);
-}
-
-template <typename T>
-PortBase* InPortHandle<T>::portBase() const {
-    return port_;
-}
-
 }  // namespace chronon::sender
+
+#include "detail/InPortBindings.hpp"

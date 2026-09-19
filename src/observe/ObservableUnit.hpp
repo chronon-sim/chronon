@@ -22,6 +22,10 @@
 #include "TimelineObserve.hpp"
 #include "Types.hpp"
 
+namespace chronon::sender {
+class TickSimulation;
+}
+
 namespace chronon::observe {
 
 // Forward declarations
@@ -38,7 +42,7 @@ class TimelineTrackBase;
  * @code
  *   inline const auto CACHE_HIT = Category<"cache_hit", "Cache hit">{};
  *
- *   class MyUnit : public Unit, public ObservableUnit {
+ *   class MyUnit : public TickableUnit, public ObservableUnit {
  *       EventCounter ops_{this, "ops", "Operations executed"};
  *
  *   public:
@@ -101,10 +105,12 @@ public:
     /**
      * Get the current cycle for observation timestamps.
      *
-     * Override this in derived classes to return the unit's local cycle.
-     * Default returns 0.
+     * TickSimulation binds the owning unit's local cycle automatically when
+     * creating the unit. Standalone observers may override this method.
      */
-    virtual uint64_t getObserveCycle() const noexcept { return 0; }
+    virtual uint64_t getObserveCycle() const noexcept {
+        return observe_cycle_ ? *observe_cycle_ : 0;
+    }
 
     /**
      * Check if observability is enabled.
@@ -263,6 +269,9 @@ protected:
     ObservationContext* observe_ctx_ = nullptr;
 
 private:
+    friend class chronon::sender::TickSimulation;
+    const uint64_t* observe_cycle_ = nullptr;
+
     template <LogLevel Level, FixedString Fmt, typename... Args>
     void emitLog_(Args&&... args) {
         if (observe_ctx_ && observe_ctx_->template shouldLog<Level>()) {

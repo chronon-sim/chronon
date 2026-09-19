@@ -1,0 +1,92 @@
+name: API contracts and performance
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'test/**'
+      - 'examples/**'
+      - 'benchmark/**'
+      - 'scripts/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - '.github/workflows/**'
+      - 'README.md'
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Immutable baseline commit SHA
+        required: true
+        default: '8563cea58fb0d84306c3252be1fd68044c07afbc'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: api-contracts-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  differential-performance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/checkout@v4
+        with:
+          path: baseline
+          ref: ${{ github.event.pull_request.base.sha || inputs.base }}
+      - name: Install identical build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ccache g++-12 libyaml-cpp-dev libfmt-dev zlib1g-dev
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: api-contracts-gcc12-release
+      - name: Configure both revisions
+        env:
+          CXX: g++-12
+          CPM_SOURCE_CACHE: ${{ github.workspace }}/dependencies
+        run: |
+          for variant in baseline candidate; do
+            cmake -S "$variant" -B "$variant/build-perf" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
+              -DCHRONON_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          done
+      - name: Verify identical benchmark sources
+        run: |
+          for file in single_clock_regression.cpp scheduler_invocation_benchmark.cpp \
+              SchedulerInvocationModel.hpp BenchmarkThreadAffinity.hpp \
+              representative_workload_benchmark.cpp RepresentativeWorkload.hpp \
+              RepresentativeWorkloadCalibration.hpp RepresentativeWorkloadOptions.hpp \
+              RepresentativeWorkloadReporting.hpp; do
+            cmp "baseline/benchmark/$file" "candidate/benchmark/$file"
+          done
+      - name: Build both measurements and candidate tests
+        run: |
+          cmake --build baseline/build-perf --parallel 4 --target \
+            chronon_single_clock_regression_benchmark \
+            chronon_scheduler_invocation_benchmark chronon_representative_workload_benchmark
+          cmake --build candidate/build-perf --parallel 4
+      - name: Run Release correctness and deterministic equivalence tests
+        run: ctest --test-dir candidate/build-perf --output-on-failure --parallel 4
+      - name: Validate performance gate logic
+        run: python3 -m unittest discover -s candidate/test/scripts -p 'test_api_performance.py'
+      - name: Enforce per-scenario 1 percent throughput limit
+        run: |
+          python3 candidate/scripts/check_api_performance.py \
+            baseline/build-perf candidate/build-perf performance-results \
+            --base-sha "$(git -C baseline rev-parse HEAD)" \
+            --head-sha "$(git -C candidate rev-parse HEAD)"
+      - name: Retain exact commits, raw runs, statistics and test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-contracts-validation
+          path: |
+            performance-results/
+            candidate/build-perf/Testing/Temporary/
+          retention-days: 30

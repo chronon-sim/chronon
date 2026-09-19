@@ -10,7 +10,7 @@
 namespace chronon::sender {
 
 const ClockDomain& TickSimulation::addClockDomain(ClockDomain domain) {
-    if (initialized_ || current_cycle_)
+    if (initialization_started_ || finalized_ || current_cycle_)
         throw std::logic_error(
             "Clock domains must be configured before initialization and execution");
     if (domain.id() == 0 || domain.id() == UINT32_MAX || domain.name() == "default") {
@@ -40,7 +40,7 @@ void TickSimulation::validateClockOwner_(const Unit* unit) const {
 }
 
 void TickSimulation::assignClockDomain(Unit& unit, ClockDomainId id) {
-    if (initialized_ || current_cycle_)
+    if (initialization_started_ || finalized_ || current_cycle_)
         throw std::logic_error("runtime domain rebinding is unsupported");
     validateClockOwner_(&unit);
     unit.clock_ = &clockDomain(id);

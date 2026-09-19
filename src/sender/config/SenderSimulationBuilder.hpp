@@ -46,8 +46,8 @@ class SenderSimulationBuilder {
 public:
     /** @brief Build output: simulation, tree, and per-phase statistics. */
     struct Result {
-        std::unique_ptr<TickSimulation> simulation;
         std::unique_ptr<tree::TreeNode> root_node;
+        std::unique_ptr<TickSimulation> simulation;
         SimulationYAMLConfig config;
 
         size_t units_created = 0;
@@ -192,8 +192,7 @@ private:
             if (obs_unit) {
                 // Hierarchical fullPath() (e.g. "cpu0.fetch") gives per-instance counters.
                 auto* ctx = obs_mgr.createContextForUnit(
-                    unit->fullPath(),
-                    [sim = result.simulation.get()]() { return sim->currentCycle(); }, 0);
+                    unit->fullPath(), [unit]() { return unit->localCycle(); }, 0);
 
                 if (ctx) {
                     obs_unit->setObservationContext(ctx);
@@ -203,7 +202,7 @@ private:
     }
 
     void phaseBind(Result& result) {
-        auto& port_dir = PortDirectory::instance();
+        auto& port_dir = result.simulation->portDirectory();
         auto& bind_registry = PortBindingRegistry::instance();
 
         for (const auto& [name, unit] : result.unit_map) {

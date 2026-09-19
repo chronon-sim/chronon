@@ -40,8 +40,8 @@ class SimulationApp {
 public:
     /** @brief Simulation outcome: builder output plus runtime stats and termination state. */
     struct Result {
-        std::unique_ptr<sender::TickSimulation> simulation;
         std::unique_ptr<tree::TreeNode> root_node;
+        std::unique_ptr<sender::TickSimulation> simulation;
         sender::config::SimulationYAMLConfig config;
         size_t units_created = 0;
         size_t ports_registered = 0;

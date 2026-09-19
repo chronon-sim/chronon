@@ -212,6 +212,7 @@ int SimulationApp::run(int argc, char* argv[]) {
         result.cycles_executed = result.simulation->runUntilTermination(run_cycles);
         auto end = std::chrono::high_resolution_clock::now();
         result.wall_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        result.simulation->finalize();
 
         if (result.simulation->timelineTraceEnabled()) {
             result.simulation->writeTimelineTrace();

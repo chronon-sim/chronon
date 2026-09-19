@@ -24,6 +24,8 @@ struct TerminationRequest;
 class TerminationController;
 
 class PortBase;
+class PortDirectory;
+PortDirectory& portDirectoryForUnit(Unit* unit);
 template <typename T>
 class InPort;
 template <typename T>

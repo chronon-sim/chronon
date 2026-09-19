@@ -17,6 +17,7 @@ add_library(chronon STATIC
 
     # Tick-based simulation driver (split by concern)
     sender/core/TickSimulation.cpp
+    sender/core/TickSimulationLifecycle.cpp
     sender/core/TickSimulationClocks.cpp
     sender/core/TickSimulationClockParallel.cpp
     sender/core/TickSimulationClockMigration.cpp
