@@ -252,10 +252,11 @@ public:
             initialize();
         }
 
-        // Clock topology is immutable after initialization. Select the loop
-        // once, retaining every predicate boundary and per-call run limit.
-        return clock_mode_ ? runUntilImpl_<true>(should_stop, max_cycles)
-                           : runUntilImpl_<false>(should_stop, max_cycles);
+        // Topology and execution mode are immutable after initialization.
+        // Select once, retaining every predicate boundary and per-call limit.
+        if (clock_mode_) return runUntilImpl_<true>(should_stop, max_cycles);
+        return shouldUseParallelExecution_() ? runUntilImpl_<false, true>(should_stop, max_cycles)
+                                             : runUntilImpl_<false, false>(should_stop, max_cycles);
     }
 
     uint64_t runUntilComplete(uint64_t max_cycles = UINT64_MAX) {
@@ -379,17 +380,28 @@ public:
 private:
     /// Resolve per-lane progress only after topology and transport selection.
     void installMultiProducerProgress_();
-    template <bool ClockMode, typename Predicate>
+    // Shared advancement after the caller checks initialization and clock mode.
+    template <bool Parallel>
+    [[gnu::always_inline]] inline uint64_t advanceInitializedTicks_(uint64_t cycles) {
+        if (units_.empty()) return 0;
+        const auto step = Parallel ? runEpochFree(cycles) : runSequential(cycles);
+        current_cycle_ += step;
+        return step;
+    }
+    template <bool ClockMode, bool Parallel = false, typename Predicate>
     uint64_t runUntilImpl_(Predicate& should_stop, uint64_t max_cycles) {
         uint64_t executed = 0;
         while (executed < max_cycles && !should_stop()) {
             const uint64_t polling_interval = std::max<uint64_t>(1, config_.epoch_size);
             const uint64_t batch = std::min(polling_interval, max_cycles - executed);
             uint64_t step;
-            if constexpr (ClockMode)
+            if constexpr (ClockMode) {
                 step = runClockEvents(batch);
-            else
-                step = run(batch);
+            } else {
+                // A predicate can finalize the session between advances.
+                if (!initialized_) initialize();
+                step = advanceInitializedTicks_<Parallel>(batch);
+            }
             executed += step;
             if constexpr (ClockMode) {
                 if (!step || wasTerminationRequested()) break;

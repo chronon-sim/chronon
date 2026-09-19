@@ -110,3 +110,12 @@ the contract repair, rather than weakening existing equivalence checks.
   the short four-worker case at 51 pairs (median 1.005811, lower97.5 0.997469),
   with every state digest equal. This is one diagnostic case; the full final-head
   matrix and Actions remain required.
+- `2638e65` completed local floor and sequential poll0 cases passed, but
+  sequential poll1 showed a clear regression at 51 pairs (median 0.988636,
+  lower97.5 0.987451, upper97.5 0.989490). Digests matched. The matrix was
+  stopped and retained before further changes; all correctness Actions passed.
+- `runUntil` now selects the immutable sequential/parallel dispatch once,
+  preserving each predicate boundary, advancement count, and lifecycle check.
+  Regressions cover predicates that advance the simulation or finalize it, on
+  verified sequential and parallel paths; the same tests passed before changing
+  dispatch. Final-head performance and correctness acceptance is still pending.

@@ -123,6 +123,44 @@ void lifecycleFailures() {
     CHECK(events == (std::vector<std::string>{"init:a", "finish:a"}));
 }
 
+void pollingPredicateBoundaries() {
+    for (size_t threads : {size_t{1}, size_t{4}}) {
+        auto cfg = config(threads);
+        cfg.enable_weighted_partitioning = false;
+        cfg.setPollingIntervalCycles(2);
+        std::vector<std::string> events;
+        TickSimulation sim(cfg);
+        auto* a = sim.createUnit<LifecycleUnit>("a", events);
+        auto* b = sim.createUnit<LifecycleUnit>("b", events);
+        for (size_t i = 2; i < 12; ++i)
+            sim.createUnit<LifecycleUnit>("extra_" + std::to_string(i), events);
+        sim.initialize();
+        CHECK(sim.useParallelExecution() == (threads > 1));
+        std::vector<uint64_t> observed;
+        CHECK(sim.runUntil(
+                  [&] {
+                      observed.push_back(sim.currentCycle());
+                      // A predicate may advance the simulation itself. That
+                      // advancement is outside this runUntil call's limit.
+                      if (observed.size() == 1) CHECK(sim.run(1) == 1);
+                      return false;
+                  },
+                  5) == 5);
+        CHECK(observed == (std::vector<uint64_t>{0, 3, 5}));
+        CHECK(sim.currentCycle() == 6 && a->ticks == 6 && b->ticks == 6);
+        // The next advancement must still reject finalization by a predicate.
+        rejects([&] {
+            sim.runUntil(
+                [&] {
+                    sim.finalize();
+                    return false;
+                },
+                1);
+        });
+        CHECK(a->ticks == 6 && b->ticks == 6);
+    }
+}
+
 class NamedUnit : public AutoRegisteredUnit<NamedUnit>, public ObservableUnit {
 public:
     using ParameterSet = chronon::ParameterSet;
@@ -366,6 +404,7 @@ int main() {
     lifecycle(1);
     lifecycle(4);
     lifecycleFailures();
+    pollingPredicateBoundaries();
     identityAndReceive();
     independentPortDirectories();
     configurationContracts();

@@ -193,15 +193,8 @@ uint64_t TickSimulation::run(uint64_t num_cycles) {
         initialize();
     }
 
-    if (units_.empty()) {
-        return 0;
-    }
-
-    const uint64_t executed =
-        shouldUseParallelExecution_() ? runEpochFree(num_cycles) : runSequential(num_cycles);
-
-    current_cycle_ += executed;
-    return executed;
+    return shouldUseParallelExecution_() ? advanceInitializedTicks_<true>(num_cycles)
+                                         : advanceInitializedTicks_<false>(num_cycles);
 }
 
 uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {
