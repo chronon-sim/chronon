@@ -168,8 +168,9 @@ private:
 class EventNameRegistry : public TimelineStringRegistry {
 public:
     static EventNameRegistry& instance() {
-        static EventNameRegistry registry;
-        return registry;
+        // Static call sites cache these IDs beyond individual sessions.
+        static auto* registry = new EventNameRegistry;
+        return *registry;
     }
 };
 
@@ -177,8 +178,8 @@ public:
 class AnnotationKeyRegistry : public TimelineStringRegistry {
 public:
     static AnnotationKeyRegistry& instance() {
-        static AnnotationKeyRegistry registry;
-        return registry;
+        static auto* registry = new AnnotationKeyRegistry;
+        return *registry;
     }
 };
 
@@ -211,8 +212,8 @@ public:
     }
 
     static AnnotationValueRegistry& instance() {
-        static AnnotationValueRegistry registry;
-        return registry;
+        static auto* registry = new AnnotationValueRegistry;
+        return *registry;
     }
 
 private:
@@ -244,8 +245,9 @@ struct TimelineTrackInfo {
 class TimelineTrackRegistry {
 public:
     static TimelineTrackRegistry& instance() {
-        static TimelineTrackRegistry registry;
-        return registry;
+        // Queued events and backend caches may be drained by static owners.
+        static auto* registry = new TimelineTrackRegistry;
+        return *registry;
     }
 
     // declaration_index is a 1-based position across all owners sharing a context;

@@ -84,3 +84,13 @@ the contract repair, rather than weakening existing equivalence checks.
 - Session bookkeeping now uses a count and an explicit registration flag,
   avoiding an allocation on observation-free initialization. Lease management
   methods are private to the simulation instead of expanding the public API.
+
+- Static lifetime regression: a static simulation finalized after the process
+  observer's destruction and segfaulted after main returned. The regressions
+  check queued-log and annotated-timeline draining after static destruction, plus
+  finalizer logging when
+  explicitly finalized before main returns. The observer service is constructed
+  before the simulation; lazily interned metadata retains process lifetime so
+  static finalizers and backend drains cannot use destroyed format/track tables.
+  Logs after the main thread has retired its TLS producer may be dropped, as in
+  the existing producer-lifetime contract; explicit finalization avoids this.

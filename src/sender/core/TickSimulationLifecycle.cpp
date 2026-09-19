@@ -13,6 +13,9 @@ TickSimulation::TickSimulation(const TickSimulationConfig& config)
       current_cycle_(0),
       initialized_(false),
       pool_(static_cast<uint32_t>(normalizeThreadCount(config.num_threads))) {
+    // Register observation teardown before this object's destructor, including
+    // static simulations. Finalizers and pool teardown must see live services.
+    (void)observe::ObservationManager::instance();
     config_.num_threads = normalizeThreadCount(config_.num_threads);
     timeline_trace_.configure(config_.timeline_trace);
     resolveSolver_();

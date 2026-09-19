@@ -20,7 +20,10 @@ and `SimulationApp` arrange this lifetime automatically. Port lookup uses
 units after each segment. Call `sim.finalize()` after the last segment to receive
 finalizer errors. It finalizes each successfully initialized unit exactly once
 in creation order, continuing if a hook throws and reporting the first error.
-Destruction makes the same best-effort attempt. A finalized simulation cannot
+Destruction makes the same best-effort attempt. For static simulations, call
+`finalize()` before returning from `main()` if finalizer logs must be retained:
+the main thread retires its observation producer before static destruction.
+Queued records still drain safely during teardown. A finalized simulation cannot
 run again. Initialization failures cannot be retried on the same instance.
 
 `UnitState` changes from `Created` to `Initialized` after a successful initialize
@@ -109,6 +112,9 @@ and releases contexts afterward. Failed YAML builds also release their session.
 Do not call `reset`, `shutdown`, or `initialize` on the singleton while a managed
 session owns it. The singleton remains a compatibility interface for standalone
 observation clients; those clients must manage context and producer lifetimes.
+Interned format/category and timeline metadata is allocated lazily and retained
+for the process lifetime because static call sites and backend caches hold its
+IDs. Session contexts, queues and backend resources still have explicit owners.
 
 ## Compatibility names
 
