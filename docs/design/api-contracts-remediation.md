@@ -219,3 +219,21 @@ the contract repair, rather than weakening existing equivalence checks.
   and retaining raw samples, annotated instructions, build metadata and hashes.
   Profiling artifacts are explicitly incomplete and never constitute throughput
   acceptance. Normal PR validation keeps the same full matrix and strict gate.
+- The first two manual profile runs used process affinity but omitted the gate's
+  worker-pinning and CPU-warmup environment flags. Their raw data is retained,
+  with that limitation; they cannot attribute the acceptance failures. Profiling
+  now passes those flags explicitly through `sudo` and records them in metadata.
+  It also archives both executables and validates whole-executable instruction
+  annotations, avoiding version-dependent demangled symbol filters. Very brief
+  scheduled tasks can be under-sampled by software CPU-clock timers.
+- Generated code independently shows an outlined per-unit dispatch lambda inside
+  `executeClusterOneCycle_`. That lambda is now explicitly inlined, retaining its
+  clock, activity and exception behavior while removing a per-unit call boundary.
+  GCC/Clang accept the attribute; all 135 regressions and 18 gate tests pass.
+  The gate measures previously failing parallel paths first and records the case
+  order. All 29 case definitions, the threshold and statistical rules are unchanged.
+- Four local diagnostics of the inlined dispatch passed at 51 pairs with equal
+  states: two-worker static poll0 lower97.5 1.329728, two-worker dynamic poll1
+  1.045107, four-worker dynamic poll1 1.022083, and four-worker static poll1
+  0.999736. These incomplete diagnostics require fresh full local/CI matrices on
+  the final committed revision; they do not establish hardware-independent gains.

@@ -115,7 +115,12 @@ def cases(workers: int) -> list[dict]:
         for threads in (1, workers):
             result.append({"name": f"{profile}-threads{threads}", "kind": "representative",
                            "profile": profile, "threads": threads, "cycles": 1000})
-    return result
+    # Exercise the previously failing paths first. Every case and acceptance
+    # rule is unchanged; a negative decision can now provide feedback sooner.
+    priority = {f"clock0-threads{workers}-dynamic0-poll0": 0,
+                f"clock0-threads{workers}-dynamic1-poll1": 1,
+                f"clock0-threads{workers}-dynamic0-poll1": 2}
+    return sorted(result, key=lambda case: priority.get(case["name"], 3))
 
 
 def executable(case: dict) -> str:
@@ -193,6 +198,7 @@ def main() -> int:
                 "minimum_speedup": MIN_SPEEDUP, "per_look_confidence": LOOK_CONFIDENCE,
                 "maximum_looks": 2, "false_acceptance_budget": 0.05,
                 "target_seconds": args.seconds, "complete_matrix": not args.case,
+                "case_order": [case["name"] for case in matrix],
                 "maximum_calibration_rounds": MAX_CALIBRATION_ROUNDS,
                 "calibration_cycle_cap": MAX_CYCLES,
                 "lscpu": subprocess.check_output(["lscpu"], text=True), "binaries": {}}

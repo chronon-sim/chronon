@@ -147,6 +147,8 @@ jobs:
           perf = sorted(pathlib.Path('/usr/lib/linux-tools').glob('*/perf'))[-1]
           metadata = {'purpose': 'CPU profiling only, not throughput acceptance',
                       'complete_matrix': False, 'cpus': cpus, 'binaries': {},
+                      'benchmark_env': {'CHRONON_BENCH_PIN_WORKERS': '1',
+                                        'CHRONON_BENCH_WARM_CPUS': '1'},
                       'lscpu': subprocess.check_output(['lscpu'], text=True)}
           for variant in ('baseline', 'candidate'):
               metadata[variant + '_sha'] = subprocess.check_output(
@@ -167,7 +169,10 @@ jobs:
               for variant in ('baseline', 'candidate'):
                   name = f'dynamic{dynamic}-poll{interval}-{variant}'
                   data = out / (name + '.data')
-                  command = gate.command(pathlib.Path(variant, 'build-perf'), case, cpus)
+                  # sudo resets the environment; pass benchmark controls to the
+                  # profiled child explicitly, matching normal gate invocations.
+                  command = ['env', 'CHRONON_BENCH_PIN_WORKERS=1', 'CHRONON_BENCH_WARM_CPUS=1',
+                             *gate.command(pathlib.Path(variant, 'build-perf'), case, cpus)]
                   result = subprocess.run(['sudo', str(perf), 'record', '-e', 'cpu-clock',
                                            '-F', '499', '-g', '-o', str(data), '--', *command],
                                           text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

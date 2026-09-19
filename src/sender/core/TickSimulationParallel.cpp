@@ -738,7 +738,10 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
     auto* const* units = cluster_unit_ptrs_[cluster].data();
     const size_t num_units = cluster_unit_ptrs_[cluster].size();
 
-    const auto execute = [&](TickableUnit* unit) {
+    // Keep per-unit dispatch in this call frame, including traced/clocked paths.
+    // Otherwise the expanded tick guard can cause the compiler to outline this
+    // lambda and reintroduce an extra call for every unit and cycle.
+    const auto execute = [&](TickableUnit* unit) __attribute__((always_inline)) {
         if (!clock_mode_) return executeUnitCycle_(unit, cycle);
         unit->clock_edge_executing_ = true;
         const bool active = executeUnitCycle_(unit, cycle);
