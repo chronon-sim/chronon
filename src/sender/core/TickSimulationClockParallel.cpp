@@ -312,9 +312,11 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         return true;
     };
 
+    // Use the same caller-connected, nonthrowing worker boundary as tick runs.
     const auto execute = [&](bool settling) {
-        auto work =
-            stdexec::bulk(stdexec::just(), stdexec::par, thread_units_.size(), [&](size_t worker) {
+        auto work = stdexec::bulk(
+            stdexec::schedule(pool_.get_scheduler()), stdexec::par, thread_units_.size(),
+            [&](size_t worker) noexcept {
                 try {
                     auto& scratch_workers = schedulerScratch_().workers;
                     auto* scratch = scratch_workers.empty() ? nullptr : &scratch_workers[worker];
@@ -479,7 +481,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     stop_source_->request_stop();
                 }
             });
-        stdexec::sync_wait(stdexec::starts_on(pool_.get_scheduler(), std::move(work)));
+        stdexec::sync_wait(std::move(work));
     };
 
     try {

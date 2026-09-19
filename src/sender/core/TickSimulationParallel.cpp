@@ -316,27 +316,30 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
     std::exception_ptr captured;
     std::atomic_flag captured_set = ATOMIC_FLAG_INIT;
 
+    // Connect bulk work on the caller before scheduling. Worker failures are
+    // captured here and rethrown after the join, so this callback is noexcept.
     auto work =
-        stdexec::bulk(stdexec::just(), stdexec::par, nthreads, [&, token](std::size_t thread_idx) {
-            // Drive this worker's clusters straight to run_target. The try-catch
-            // captures the first exception and requests stop so peers leave their
-            // dependency spin-waits; sync_wait below is the sole join.
-            try {
-                if (push_periodic_counters) {
-                    executeThreadRunWithPeriodicCounters_(thread_idx, run_target, run_start,
-                                                          counter_period, token);
-                } else {
-                    executeThreadRun_(thread_idx, run_target, token);
-                }
-            } catch (...) {
-                if (!captured_set.test_and_set(std::memory_order_relaxed)) {
-                    captured = std::current_exception();
-                }
-                stop_source_->request_stop();
-            }
-        });
+        stdexec::bulk(stdexec::schedule(sched), stdexec::par, nthreads,
+                      [&, token](std::size_t thread_idx) noexcept {
+                          // Drive this worker's clusters straight to run_target. The try-catch
+                          // captures the first exception and requests stop so peers leave their
+                          // dependency spin-waits; sync_wait below is the sole join.
+                          try {
+                              if (push_periodic_counters) {
+                                  executeThreadRunWithPeriodicCounters_(
+                                      thread_idx, run_target, run_start, counter_period, token);
+                              } else {
+                                  executeThreadRun_(thread_idx, run_target, token);
+                              }
+                          } catch (...) {
+                              if (!captured_set.test_and_set(std::memory_order_relaxed)) {
+                                  captured = std::current_exception();
+                              }
+                              stop_source_->request_stop();
+                          }
+                      });
 
-    stdexec::sync_wait(stdexec::starts_on(sched, std::move(work)));
+    stdexec::sync_wait(std::move(work));
 
     if (captured) std::rethrow_exception(captured);
 

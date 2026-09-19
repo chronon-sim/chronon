@@ -94,3 +94,19 @@ the contract repair, rather than weakening existing equivalence checks.
   static finalizers and backend drains cannot use destroyed format/track tables.
   Logs after the main thread has retired its TLS producer may be dropped, as in
   the existing producer-lifetime contract; explicit finalization avoids this.
+
+- `e5a7e07` completed local cases: six passed, while the four-worker fixed
+  scheduler with polling interval 1 remained uncertain at the fixed 201-pair
+  cap (median 0.994983, lower97.5 0.989525). Every state digest matched. The
+  remaining matrix was stopped and retained before building the next fix.
+- A direct untraced static-worker tick path did not establish acceptance
+  (201-pair diagnostic median 0.991881, lower97.5 0.989350); it was reverted.
+- Parallel launches now compose `bulk(schedule(scheduler), ...)` directly,
+  avoiding the nested connection in `starts_on(..., bulk(just(), ...))`.
+  Worker callbacks declare `noexcept` because they already capture exceptions,
+  request peer stop, join, and rethrow on the caller. Static, dynamic and clock
+  launches use the same boundary. Measured acceptance is still required.
+- The direct `bulk(schedule(...))` plus nonthrowing callback diagnostic passed
+  the short four-worker case at 51 pairs (median 1.005811, lower97.5 0.997469),
+  with every state digest equal. This is one diagnostic case; the full final-head
+  matrix and Actions remain required.
