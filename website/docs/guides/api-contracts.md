@@ -76,7 +76,8 @@ InPort<Data> in{this, "in", QueueDepth{16}};
 |---|---|
 | `SendRate` / `sendRate()` | Source sends per owning unit cycle |
 | `QueueDepth` / `queueDepth()` | Model-visible destination FIFO entries |
-| `InPort::capacity()` | Physical storage exposed by the selected adapter |
+| `InPort::capacity()` | Selected adapter's admission capacity; may be bounded by storage |
+| `InPort::storageCapacity()` | Physical queue capacity (per lane for MPSC) |
 | Connection `delay` | Same-cycle eligibility at zero, N-cycle eligibility at N |
 | YAML `destination_depth` | Shared destination depth override; fan-in overrides must agree |
 | YAML edge `rate` | Registered edge admission rate; distinct from source port rate |

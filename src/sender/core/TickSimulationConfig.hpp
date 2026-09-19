@@ -7,7 +7,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 /// @file
-/// Configuration and per-thread descriptor structs for TickSimulation.
+/// Model configuration for TickSimulation; runtime descriptors are kept separately.
 
 #pragma once
 
