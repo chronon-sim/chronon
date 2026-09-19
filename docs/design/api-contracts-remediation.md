@@ -261,3 +261,13 @@ the contract repair, rather than weakening existing equivalence checks.
   all 18 gate tests pass. Fresh performance measurements are still required.
   Static poll64 now runs first to expose the latest failure promptly; all 29
   workload definitions and acceptance rules remain unchanged.
+- `1e35ba5` failed CI static two-worker poll64 on Intel Xeon Platinum 8573C
+  at 51 pairs: median 0.978230, lower97.5 0.967329, upper97.5 0.986175. Every
+  state matched. Its local matrix was stopped after three passes; static
+  four-worker poll64 had lower 1.066559. This does not establish that the cache
+  simplification resolves the CI regression; the raw failure is retained.
+- Diagnostic profiling now includes static poll64 and probes hardware cycle
+  sampling, retaining the probe output and the selected event/frequency. If the
+  runner does not expose a PMU, software CPU-clock sampling remains explicitly
+  labeled with its short-task sampling limitation. This profiling-only update
+  does not change runtime code or retry performance acceptance on failed code.
