@@ -207,3 +207,15 @@ the contract repair, rather than weakening existing equivalence checks.
   with equal states: two-worker dynamic poll1 lower97.5 1.050485, four-worker
   dynamic poll0 0.993081, and four-worker dynamic poll1 1.021420. These targeted
   results do not replace complete final-head local and CI acceptance.
+- `b6fae75` passed all applicable correctness and documentation Actions. Its CI
+  performance host was AMD EPYC 9V45, whereas the preceding two runs used EPYC
+  7763. After four passing cases, static two-worker poll0 clearly failed at 51
+  pairs (median 0.972262, lower97.5 0.964632, upper97.5 0.978448); all states
+  matched. The local matrix was stopped and retained after six passing cases,
+  with minimum lower bound 0.990461. Neither matrix establishes acceptance.
+- The performance workflow provides an explicit manual profiling mode for exact
+  baseline/candidate commits. It captures CPU samples on the CI hardware for
+  static long calls and static/dynamic short calls, comparing workload states
+  and retaining raw samples, annotated instructions, build metadata and hashes.
+  Profiling artifacts are explicitly incomplete and never constitute throughput
+  acceptance. Normal PR validation keeps the same full matrix and strict gate.

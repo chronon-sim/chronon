@@ -18,16 +18,24 @@ on:
         description: Immutable baseline commit SHA
         required: true
         default: '8563cea58fb0d84306c3252be1fd68044c07afbc'
+      profile_only:
+        description: Collect diagnostic CPU profiles without running acceptance
+        type: boolean
+        default: false
+      profile_head:
+        description: Exact candidate SHA for diagnostic profiles (empty uses this ref)
+        required: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: api-contracts-${{ github.event.pull_request.number || github.ref }}
+  group: api-contracts-${{ github.event.pull_request.number || github.ref }}-${{ inputs.profile_only || false }}
   cancel-in-progress: true
 
 jobs:
   differential-performance:
+    if: ${{ !inputs.profile_only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -89,4 +97,103 @@ jobs:
           path: |
             performance-results/
             candidate/build-perf/Testing/Temporary/
+          retention-days: 30
+
+  diagnostic-profiles:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile_only }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          ref: ${{ inputs.profile_head || github.sha }}
+      - uses: actions/checkout@v4
+        with:
+          path: baseline
+          ref: ${{ inputs.base }}
+      - name: Install identical build and profiling dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ccache g++-12 libyaml-cpp-dev libfmt-dev zlib1g-dev linux-tools-generic
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: api-contracts-gcc12-release
+      - name: Build unchanged scheduler workload for both commits
+        env:
+          CXX: g++-12
+          CPM_SOURCE_CACHE: ${{ github.workspace }}/dependencies
+        run: |
+          for file in scheduler_invocation_benchmark.cpp SchedulerInvocationModel.hpp BenchmarkThreadAffinity.hpp; do
+            cmp "baseline/benchmark/$file" "candidate/benchmark/$file"
+          done
+          for variant in baseline candidate; do
+            cmake -S "$variant" -B "$variant/build-perf" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
+              -DCHRONON_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            cmake --build "$variant/build-perf" --parallel 4 --target chronon_scheduler_invocation_benchmark
+          done
+      - name: Profile fixed workloads (diagnostic only, never acceptance)
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess, sys
+          sys.path.insert(0, 'candidate/scripts')
+          import check_api_performance as gate
+          out = pathlib.Path('diagnostic-profiles')
+          out.mkdir()
+          cpus = gate.physical_cpus()[:2]
+          if len(cpus) != 2:
+              raise RuntimeError('two physical CPUs required for the failed scenarios')
+          perf = sorted(pathlib.Path('/usr/lib/linux-tools').glob('*/perf'))[-1]
+          metadata = {'purpose': 'CPU profiling only, not throughput acceptance',
+                      'complete_matrix': False, 'cpus': cpus, 'binaries': {},
+                      'lscpu': subprocess.check_output(['lscpu'], text=True)}
+          for variant in ('baseline', 'candidate'):
+              metadata[variant + '_sha'] = subprocess.check_output(
+                  ['git', '-C', variant, 'rev-parse', 'HEAD'], text=True).strip()
+              binary = pathlib.Path(variant, 'build-perf/benchmark/chronon_scheduler_invocation_benchmark')
+              metadata['binaries'][variant] = hashlib.sha256(binary.read_bytes()).hexdigest()
+              (out / (variant + '-CMakeCache.txt')).write_text(
+                  pathlib.Path(variant, 'build-perf/CMakeCache.txt').read_text())
+          (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
+          profiles = [(0, 0, 20000000), (0, 1, 500000), (1, 1, 500000)]
+          symbols = ['chronon::sender::TickSimulation::executeThreadRunImpl_<false, true>',
+                     'chronon::sender::TickSimulation::executeThreadRunDynamicImpl_<false, false, false>',
+                     'chronon::sender::TickSimulation::executeClusterOneCycle_',
+                     'chronon::sender::TickSimulation::clusterCanAdvance_',
+                     'chronon::benchmark::InvocationUnit::tick']
+          for dynamic, interval, cycles in profiles:
+              case = {'kind': 'scheduler', 'args': [0, 2, 4, 64, 1, dynamic, interval],
+                      'cycles': cycles}
+              states = []
+              for variant in ('baseline', 'candidate'):
+                  name = f'dynamic{dynamic}-poll{interval}-{variant}'
+                  data = out / (name + '.data')
+                  command = gate.command(pathlib.Path(variant, 'build-perf'), case, cpus)
+                  result = subprocess.run(['sudo', str(perf), 'record', '-e', 'cpu-clock',
+                                           '-F', '499', '-g', '-o', str(data), '--', *command],
+                                          text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                  (out / (name + '.log')).write_text(result.stdout + result.stderr)
+                  subprocess.run(['sudo', 'chown', str(os.getuid()) + ':' + str(os.getgid()), str(data)], check=True)
+                  result.check_returncode()
+                  states.append(gate.parse(case, result.stdout)[1])
+                  with (out / (name + '-report.txt')).open('w') as stream:
+                      subprocess.run([str(perf), 'report', '--stdio', '--no-children',
+                                      '--call-graph', 'none', '--percent-limit', '0.1', '-i', str(data)],
+                                     stdout=stream, stderr=subprocess.STDOUT, check=True)
+                  for index, symbol in enumerate(symbols):
+                      with (out / (name + f'-annotate-{index}.txt')).open('w') as stream:
+                          subprocess.run([str(perf), 'annotate', '--stdio', '--no-source',
+                                          '--symbol', symbol, '-i', str(data)],
+                                         stdout=stream, stderr=subprocess.STDOUT)
+              if states[0] != states[1]:
+                  raise RuntimeError('profile workload states differ: ' + str(case))
+          (out / 'PROFILE_ONLY').write_text('State comparisons matched. No performance acceptance was attempted.\n')
+          PY
+      - name: Retain diagnostic CPU samples and exact build metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-contracts-profiles
+          path: diagnostic-profiles/
           retention-days: 30
