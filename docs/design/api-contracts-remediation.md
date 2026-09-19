@@ -42,7 +42,10 @@ Working branch: `fix/api-contracts-determinism`.
       complete PR checks on final head, no automatic merge.
 
 Implementation checks above record code completion; the final acceptance item
-remains open until the final revision passes every required gate.
+remains open until the final revision passes every required gate. The tested
+commit and final acceptance record are maintained in
+[PR #150](https://github.com/chronon-sim/chronon/pull/150), without changing the
+revision after its measurements.
 
 ## Implementation decisions
 
@@ -135,3 +138,23 @@ the contract repair, rather than weakening existing equivalence checks.
   51 pairs (median 1.006356, lower97.5 0.993970), with equal states throughout.
   Calibration reached roughly 2.1 seconds after four rounds. This remains one
   diagnostic; a fresh complete final-head matrix and Actions are required.
+- `8cf7821` completed fourteen local cases: thirteen passed, including all
+  single-clock cases and multiclock sequential polling configurations. Multiclock
+  four-worker static poll0 failed at 51 pairs (median 0.940839, lower97.5
+  0.927774). Every state comparison matched; the incomplete matrix was retained.
+- Specializing the immutable clock migration policy removed its repeated runtime
+  branches, but the diagnostic remained uncertain at 201 pairs (median 0.997154,
+  lower97.5 0.981661). This result failed acceptance and is retained.
+- CPU sampling placed most execution time in the clock actor polling loop,
+  including admission loads. Domain admission now occupies a separate cache line
+  from coordinator-private retirement scratch. Invocation counters also occupy
+  their own cache line, away from the flags and captures read by all workers.
+  These storage changes retain the same loads, stores, memory orders, bridge
+  transactions and migration boundaries. All 135 regressions passed; measured
+  performance acceptance remains required.
+- With migration-policy specialization and cache-line isolation, all six local
+  multiclock/four-worker diagnostics passed at 51 pairs each. The smallest
+  lower97.5 bound was 1.012501 (dynamic poll1); static poll0 reached median
+  1.656348 and lower97.5 1.621825. Every state comparison matched. These targeted
+  diagnostics are explicitly an incomplete matrix; full final-head validation
+  is still required.
