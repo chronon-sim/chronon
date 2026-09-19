@@ -11,6 +11,7 @@ on:
       - 'CMakeLists.txt'
       - '.github/workflows/**'
       - 'cmake/**'
+      - 'README.md'
 
 jobs:
   # ================================================================

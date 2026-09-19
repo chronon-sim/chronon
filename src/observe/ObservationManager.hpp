@@ -177,6 +177,14 @@ public:
     size_t contextCount() const noexcept;
 
 private:
+    friend class chronon::sender::TickSimulation;
+    // TickSimulation owns the backend lease; model code cannot replace it.
+    void acquireSession(const ObservationYAMLConfig& config, const void* owner);
+    void releaseSession(const void* owner);
+    bool ownsSession(const void* owner) const noexcept { return session_owner_ == owner; }
+    void registerSimulation(const void* simulation);
+    void unregisterSimulation() noexcept;
+
     ObservationManager();
     ~ObservationManager();
 
@@ -189,6 +197,7 @@ private:
 
     /// PRECONDITION: mutex_ held.
     void shutdownLocked_();
+    void initializeLocked_(const ObservationYAMLConfig& config);
 
     bool enabled_ = false;
     bool initialized_ = false;
@@ -203,6 +212,10 @@ private:
     SourceNameRegistry source_registry_;
 
     mutable std::mutex mutex_;
+    const void* session_owner_ = nullptr;
+    // Only exclusivity needs tracking. Avoid allocating a process-wide registry
+    // on the otherwise observation-free simulation initialization path.
+    size_t initialized_simulation_count_ = 0;
 };
 
 }  // namespace chronon::observe

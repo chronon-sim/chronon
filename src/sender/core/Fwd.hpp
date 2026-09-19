@@ -24,6 +24,7 @@ struct TerminationRequest;
 class TerminationController;
 
 class PortBase;
+class PortDirectory;
 template <typename T>
 class InPort;
 template <typename T>

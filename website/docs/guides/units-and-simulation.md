@@ -303,10 +303,23 @@ public:
     }
 
     void finalize() override {
-        // Called at simulation end
+        // Called once when the simulation session is finalized
     }
 };
 ```
+
+`run()` advances a resumable simulation; it does not call `finalize()` after
+each segment. Call `sim.finalize()` once all segments are complete to observe
+errors from unit finalizers. Repeated finalization is harmless. A finalized
+simulation cannot be initialized or run again. `SimulationApp` finalizes before
+the final counter snapshot and observation shutdown. The simulation destructor
+also performs best-effort finalization, but cannot report finalizer exceptions.
+
+Only units whose `initialize()` completed successfully are finalized, in creation
+order. Every eligible finalizer is attempted even when an earlier one throws;
+explicit finalization then rethrows the first error. Failed initialization cannot
+be retried on the same simulation. `state()` reports `Created`, `Initialized` or
+`Finalized` accordingly.
 
 ## Pipeline Registers
 

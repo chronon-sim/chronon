@@ -16,9 +16,11 @@ struct TickSimulation::ClockParallelRuntime {
         const ClockDomain* clock = nullptr;
         ClockRuntime* serial = nullptr;
         uint64_t completion_sweep = 0, acquired_completed = 0;  // Coordinator-private.
-        std::atomic<uint64_t> allowed{0};
         std::atomic<uint64_t> retired{0};
         std::vector<const std::atomic<uint64_t>*> completions;
+        // All actors poll admission. Coordinator-private retirement scratch must
+        // not invalidate that cache line on every sweep, including blocked sweeps.
+        alignas(64) std::atomic<uint64_t> allowed{0};
     };
     struct Dependency {
         size_t actor;

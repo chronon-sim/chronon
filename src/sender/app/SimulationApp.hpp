@@ -40,8 +40,8 @@ class SimulationApp {
 public:
     /** @brief Simulation outcome: builder output plus runtime stats and termination state. */
     struct Result {
-        std::unique_ptr<sender::TickSimulation> simulation;
         std::unique_ptr<tree::TreeNode> root_node;
+        std::unique_ptr<sender::TickSimulation> simulation;
         sender::config::SimulationYAMLConfig config;
         size_t units_created = 0;
         size_t ports_registered = 0;
@@ -85,7 +85,7 @@ public:
     /// 0 = inherit YAML or system default.
     SimulationApp& setDefaultThreads(uint32_t n);
 
-    /// 0 = run until completion.
+    /// 0 retains the application's 10-million-cycle fallback limit.
     SimulationApp& setDefaultCycles(uint64_t n);
 
     /// Hook to mutate YAML before parsing — useful for programmatic config changes.

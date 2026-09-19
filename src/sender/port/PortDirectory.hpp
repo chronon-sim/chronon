@@ -122,12 +122,15 @@ private:
 };
 
 /**
- * PortDirectory - Singleton registry for port discovery.
+ * PortDirectory - Registry for port discovery within one simulation.
  *
  * Thread-safe registration and lookup by full path.
  */
 class PortDirectory : public chronon::ThreadSafeRegistry<IPortHandle> {
 public:
+    PortDirectory() = default;
+
+    /// Compatibility directory for standalone Units outside TickSimulation.
     static PortDirectory& instance() {
         static PortDirectory dir;
         return dir;
@@ -139,9 +142,6 @@ public:
 
     IPortHandle* findPort(const std::string& full_path) { return find(full_path); }
     bool hasPort(const std::string& full_path) const { return has(full_path); }
-
-private:
-    PortDirectory() = default;
 };
 
 /**

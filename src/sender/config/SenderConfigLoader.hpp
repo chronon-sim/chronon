@@ -69,6 +69,19 @@ public:
     }
 
 private:
+    static std::optional<size_t> parseDestinationDepth(const YAML::Node& node,
+                                                       const std::string& source) {
+        std::optional<size_t> depth;
+        if (node["capacity"]) depth = node["capacity"].as<size_t>();
+        if (node["destination_depth"]) {
+            const auto canonical = node["destination_depth"].as<size_t>();
+            if (depth && *depth != canonical)
+                throw ConfigLoadError(source, "destination_depth conflicts with capacity");
+            depth = canonical;
+        }
+        return depth;
+    }
+
     SimulationYAMLConfig parseRoot(const YAML::Node& root, const std::string& source) {
         SimulationYAMLConfig config;
 
@@ -103,6 +116,28 @@ private:
         LOAD_IF_PRESENT(sim, config, partition_solver);
         LOAD_IF_PRESENT(sim, config, sa_critical_path_weight);
         LOAD_IF_PRESENT(sim, config, initial_partition_sync_cost_ns);
+
+        // Decode canonical names once; conflicting compatibility spellings
+        // are errors, never an order-dependent override.
+        if (sim["polling_interval_cycles"]) {
+            const auto interval = sim["polling_interval_cycles"].as<uint64_t>();
+            if (sim["epoch_size"] && interval != config.epoch_size)
+                throw ConfigLoadError(source, "polling_interval_cycles conflicts with epoch_size");
+            config.epoch_size = interval;
+        }
+        if (sim["execution_policy"]) {
+            const auto policy = sim["execution_policy"].as<std::string>();
+            if (policy != "auto" && policy != "sequential")
+                throw ConfigLoadError(source, "execution_policy must be auto or sequential");
+            for (const char* key :
+                 {"enable_parallel", "enable_lookahead", "enable_epoch_free_lookahead"}) {
+                if (sim[key])
+                    throw ConfigLoadError(
+                        source, "execution_policy cannot be mixed with legacy execution switches");
+            }
+            config.enable_parallel = policy == "auto";
+            config.enable_lookahead = config.enable_epoch_free_lookahead = true;
+        }
 
         if (sim["observation"]) {
             parseObservation(sim["observation"], config, source);
@@ -452,10 +487,7 @@ private:
             if (bus_def["delay"]) {
                 delay = bus_def["delay"].as<uint32_t>();
             }
-            std::optional<size_t> capacity;
-            if (bus_def["capacity"]) {
-                capacity = bus_def["capacity"].as<size_t>();
-            }
+            const auto capacity = parseDestinationDepth(bus_def, source);
             std::optional<size_t> rate;
             if (bus_def["rate"]) {
                 rate = bus_def["rate"].as<size_t>();
@@ -577,9 +609,7 @@ private:
         if (conn_node["delay"]) {
             spec.delay = conn_node["delay"].as<uint32_t>();
         }
-        if (conn_node["capacity"]) {
-            spec.capacity = conn_node["capacity"].as<size_t>();
-        }
+        spec.capacity = parseDestinationDepth(conn_node, source);
         if (conn_node["rate"]) {
             spec.rate = conn_node["rate"].as<size_t>();
         }

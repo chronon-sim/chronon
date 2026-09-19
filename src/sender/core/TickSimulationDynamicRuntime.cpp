@@ -17,6 +17,7 @@
 #include <memory>
 #include <vector>
 
+#include "../../observe/ObservationManager.hpp"
 #include "TickSimulation.hpp"
 #include "TickSimulationClockRuntime.hpp"
 
@@ -203,24 +204,27 @@ uint64_t TickSimulation::executeRunEpochFreeDynamic_(uint64_t total_cycles) {
     std::exception_ptr captured;
     std::atomic_flag captured_set = ATOMIC_FLAG_INIT;
 
+    // Connect bulk work on the caller before scheduling. Worker failures are
+    // captured here and rethrown after the join, so this callback is noexcept.
     auto work =
-        stdexec::bulk(stdexec::just(), stdexec::par, nthreads, [&, token](std::size_t thread_idx) {
-            try {
-                if (push_periodic_counters) {
-                    executeThreadRunDynamicWithPeriodicCounters_(thread_idx, run_target, run_start,
-                                                                 counter_period, token);
-                } else {
-                    executeThreadRunDynamic_(thread_idx, run_target, token);
-                }
-            } catch (...) {
-                if (!captured_set.test_and_set(std::memory_order_relaxed)) {
-                    captured = std::current_exception();
-                }
-                stop_source_->request_stop();
-            }
-        });
+        stdexec::bulk(stdexec::schedule(sched), stdexec::par, nthreads,
+                      [&, token](std::size_t thread_idx) noexcept {
+                          try {
+                              if (push_periodic_counters) {
+                                  executeThreadRunDynamicWithPeriodicCounters_(
+                                      thread_idx, run_target, run_start, counter_period, token);
+                              } else {
+                                  executeThreadRunDynamic_(thread_idx, run_target, token);
+                              }
+                          } catch (...) {
+                              if (!captured_set.test_and_set(std::memory_order_relaxed)) {
+                                  captured = std::current_exception();
+                              }
+                              stop_source_->request_stop();
+                          }
+                      });
 
-    stdexec::sync_wait(stdexec::starts_on(sched, std::move(work)));
+    stdexec::sync_wait(std::move(work));
 
     epoch_free_dynamic_runtime_active_.store(false, std::memory_order_release);
 

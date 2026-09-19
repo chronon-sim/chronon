@@ -60,15 +60,19 @@ public:
      */
     static constexpr size_t UNLIMITED_CAPACITY = std::numeric_limits<size_t>::max();
 
+    OutPort(Unit* owner, std::string name, SendRate rate)
+        : OutPort(owner, std::move(name), rate.entries_per_cycle) {}
+
     OutPort(Unit* owner, std::string name, size_t per_cycle_capacity = 1)
         : PortBase(owner, std::move(name)),
           per_cycle_capacity_(normalizeCapacity_(per_cycle_capacity)) {
         if (owner_) {
-            addPortRegistrationToUnit(owner_, [this](const std::string& prefix) {
-                std::string full_path = prefix + "." + name_;
-                PortDirectory::instance().registerPort(
-                    full_path, std::make_unique<OutPortHandle<T>>(this, owner_, name_, full_path));
-            });
+            addPortRegistrationToUnit(
+                owner_, [this](const std::string& prefix, PortDirectory& directory) {
+                    std::string full_path = prefix + "." + name_;
+                    directory.registerPort(full_path, std::make_unique<OutPortHandle<T>>(
+                                                          this, owner_, name_, full_path));
+                });
         }
     }
 
@@ -192,6 +196,7 @@ public:
         return result;
     }
 
+    /// Compatibility alias of send(); connection delay is unchanged.
     [[nodiscard]]
     bool sendImmediate(const T& data) {
         return send(data);
@@ -332,6 +337,7 @@ public:
 
     /// @return Max sends per cycle (UNLIMITED_CAPACITY = unlimited).
     size_t perCycleCapacity() const { return per_cycle_capacity_; }
+    SendRate sendRate() const noexcept { return {per_cycle_capacity_}; }
 
     size_t sentThisCycle() const {
         if (per_cycle_capacity_ == UNLIMITED_CAPACITY) return 0;

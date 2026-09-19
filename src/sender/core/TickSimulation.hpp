@@ -12,7 +12,7 @@
 
 #pragma once
 
-#include "../../observe/ObservationManager.hpp"
+#include "../../observe/ObservableUnit.hpp"
 #include "../../params/ParameterSet.hpp"
 #include "../port/AsyncFifo.hpp"
 #include "../port/Connection.hpp"
@@ -26,6 +26,7 @@
 #include "TerminationRequest.hpp"
 #include "TickSimulationConfig.hpp"
 #include "TickSimulationCycleUtils.hpp"
+#include "TickSimulationDescriptors.hpp"
 #include "TickableUnit.hpp"
 
 #pragma GCC diagnostic push
@@ -52,6 +53,10 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+namespace chronon::observe {
+struct ObservationYAMLConfig;
+}
 
 namespace chronon::sender {
 
@@ -81,39 +86,14 @@ public:
         return requested == 0 ? 1 : requested;
     }
 
-    explicit TickSimulation(const TickSimulationConfig& config = {})
-        : config_(config),
-          default_clock_(ClockDomain::fromHz(0, "default", config.tick_frequency_hz)),
-          current_cycle_(0),
-          initialized_(false),
-          pool_(static_cast<uint32_t>(normalizeThreadCount(config.num_threads))) {
-        config_.num_threads = normalizeThreadCount(config_.num_threads);
-        timeline_trace_.configure(config_.timeline_trace);
-        resolveSolver_();
-    }
+    explicit TickSimulation(const TickSimulationConfig& config = {});
 
-    ~TickSimulation() { freeThreadProgressArray(); }
+    ~TickSimulation();
 
     TickSimulation(const TickSimulation&) = delete;
     TickSimulation& operator=(const TickSimulation&) = delete;
 
-    size_t assignedThread(Unit* unit) const {
-        if (!unit) return SIZE_MAX;
-        for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
-            if (static_cast<Unit*>(unit_ptrs_[i]) != unit) continue;
-            if (i < unit_to_cluster_.size()) {
-                size_t cluster = unit_to_cluster_[i];
-                if (cluster < cluster_to_thread_.size()) {
-                    return cluster_to_thread_[cluster];
-                }
-            }
-            if (i < cluster_to_thread_.size()) {
-                return cluster_to_thread_[i];
-            }
-            return SIZE_MAX;
-        }
-        return SIZE_MAX;
-    }
+    size_t assignedThread(Unit* unit) const;
 
     uint64_t rebalanceCount() const { return rebalance_count_; }
 
@@ -122,9 +102,14 @@ public:
         static_assert(std::is_base_of_v<TickableUnit, UnitT>,
                       "UnitT must derive from TickableUnit");
 
-        if (initialized_) throw std::logic_error("cannot create units after initialization");
+        if (initialization_started_ || finalized_)
+            throw std::logic_error("cannot create units after initialization has started");
         auto unit = std::make_unique<UnitT>(std::forward<Args>(args)...);
         auto* ptr = unit.get();
+
+        if (auto* observable = dynamic_cast<observe::ObservableUnit*>(ptr)) {
+            observable->observe_cycle_ = &static_cast<Unit*>(ptr)->local_cycle_;
+        }
 
         ptr->clock_ = &default_clock_;
 
@@ -168,7 +153,10 @@ public:
 
     template <typename T>
     Connection<T>* connect(OutPort<T>& from, InPort<T>& to, uint32_t delay = 1) {
-        if (initialized_) throw std::logic_error("cannot connect after initialization");
+        if (initialization_started_ || finalized_)
+            throw std::logic_error("cannot connect after initialization has started");
+        validateClockOwner_(from.owner());
+        validateClockOwner_(to.owner());
         if (from.owner() && to.owner() &&
             from.owner()->clockDomainId() != to.owner()->clockDomainId()) {
             throw std::invalid_argument(
@@ -180,18 +168,26 @@ public:
         return conn;
     }
 
-    /// For YAML-driven builders that create connections via type-erased port
-    /// handles rather than the templated connect() above.
-    void registerConnection(ConnectionBase* conn) {
-        if (clock_mode_ && initialized_)
-            throw std::logic_error("runtime connection registration is unsupported");
-        if (conn) {
-            conn->setConnId(static_cast<uint32_t>(connections_.size()));
-            connections_.push_back(conn);
-        }
-    }
+    /// Type-erased connection registration used by configuration builders.
+    void registerConnection(ConnectionBase* connection);
 
     void initialize();
+    /// Own the process observation backend for this session. Configure before initialize().
+    /// Observed sessions are exclusive; multiclock uses configureClockTrace instead.
+    void configureObservation(const observe::ObservationYAMLConfig& config);
+
+    /// End this session. Calls every successfully initialized unit's finalize()
+    /// once, in creation order, even if another finalizer throws. Idempotent.
+    /// Call explicitly to observe finalizer failures; destruction is best effort.
+    /// Host-only, between runs. A finalized simulation cannot be run again.
+    void finalize();
+    bool isFinalized() const noexcept { return finalized_; }
+    PortDirectory& portDirectory();
+    const PortDirectory& portDirectory() const;
+    void bindTreeNode(Unit& unit, tree::TreeNode& node);
+
+    /// Assign the factory instance identity before initialization. Host-only.
+    void setUnitName(Unit& unit, std::string name);
 
     /// Host-only, between run calls. Empty unless profile_clock_scheduler is enabled.
     const std::vector<ClockSchedulerProfile>& clockSchedulerProfile() const noexcept {
@@ -213,7 +209,8 @@ public:
     template <typename T>
     AsyncFifo<T>* connectAsyncFifo(uint32_t id, AsyncWritePort<T>& write, AsyncReadPort<T>& read,
                                    AsyncFifoConfig config = {}) {
-        if (initialized_) throw std::logic_error("cannot add CDC after initialization");
+        if (initialization_started_ || finalized_)
+            throw std::logic_error("cannot add CDC after initialization has started");
         validateClockOwner_(write.owner());
         validateClockOwner_(read.owner());
         for (const auto& fifo : cdc_) {
@@ -244,10 +241,6 @@ public:
     observe::ClockTraceRecorder* clockTraceRecorder() noexcept { return clock_trace_.get(); }
     void closeClockTrace();
 
-    /// Resolve one producer-cluster completed-cycle atomic for each direct
-    /// MPSC lane. Complete coverage is required by epoch-free lookahead.
-    void installMultiProducerProgress_();
-
     /// Run for the specified cycles. Internally dispatches to parallel or
     /// sequential execution based on cluster analysis.
     uint64_t run(uint64_t num_cycles);
@@ -259,10 +252,11 @@ public:
             initialize();
         }
 
-        // Clock topology is immutable after initialization. Select the loop
-        // once, retaining every predicate boundary and per-call run limit.
-        return clock_mode_ ? runUntilImpl_<true>(should_stop, max_cycles)
-                           : runUntilImpl_<false>(should_stop, max_cycles);
+        // Topology and execution mode are immutable after initialization.
+        // Select once, retaining every predicate boundary and per-call limit.
+        if (clock_mode_) return runUntilImpl_<true>(should_stop, max_cycles);
+        return shouldUseParallelExecution_() ? runUntilImpl_<false, true>(should_stop, max_cycles)
+                                             : runUntilImpl_<false, false>(should_stop, max_cycles);
     }
 
     uint64_t runUntilComplete(uint64_t max_cycles = UINT64_MAX) {
@@ -334,17 +328,7 @@ public:
      * running, the file is placed in its timestamped output directory; otherwise
      * it is written relative to cwd.
      */
-    void writeTimelineTrace() {
-        if (!timeline_trace_.enabled()) {
-            return;
-        }
-        auto& obs = observe::ObservationManager::instance();
-        if (obs.isBackendRunning() && obs.backend()) {
-            timeline_trace_.write(obs.backend()->outputDir());
-        } else {
-            timeline_trace_.write();
-        }
-    }
+    void writeTimelineTrace();
 
     /// Number of epoch-free scheduler invocations. Sequential fallback leaves
     /// this unchanged, making the counter useful for safety-gate coverage.
@@ -369,14 +353,7 @@ public:
     bool isParallelBeneficial() const noexcept { return parallel_beneficial_; }
     bool useParallelExecution() const noexcept { return shouldUseParallelExecution_(); }
 
-    TickableUnit* getUnit(const std::string& name) {
-        for (auto& unit : units_) {
-            if (unit->name() == name) {
-                return unit.get();
-            }
-        }
-        return nullptr;
-    }
+    TickableUnit* getUnit(const std::string& name);
 
     template <typename UnitT>
     UnitT* getUnit(const std::string& name) {
@@ -401,17 +378,30 @@ public:
     void forceStableConnectionQueues() noexcept { force_stable_connection_queues_ = true; }
 
 private:
-    template <bool ClockMode, typename Predicate>
+    /// Resolve per-lane progress only after topology and transport selection.
+    void installMultiProducerProgress_();
+    // Shared advancement after the caller checks initialization and clock mode.
+    template <bool Parallel>
+    [[gnu::always_inline]] inline uint64_t advanceInitializedTicks_(uint64_t cycles) {
+        if (units_.empty()) return 0;
+        const auto step = Parallel ? runEpochFree(cycles) : runSequential(cycles);
+        current_cycle_ += step;
+        return step;
+    }
+    template <bool ClockMode, bool Parallel = false, typename Predicate>
     uint64_t runUntilImpl_(Predicate& should_stop, uint64_t max_cycles) {
         uint64_t executed = 0;
         while (executed < max_cycles && !should_stop()) {
             const uint64_t polling_interval = std::max<uint64_t>(1, config_.epoch_size);
             const uint64_t batch = std::min(polling_interval, max_cycles - executed);
             uint64_t step;
-            if constexpr (ClockMode)
+            if constexpr (ClockMode) {
                 step = runClockEvents(batch);
-            else
-                step = run(batch);
+            } else {
+                // A predicate can finalize the session between advances.
+                if (!initialized_) initialize();
+                step = advanceInitializedTicks_<Parallel>(batch);
+            }
             executed += step;
             if constexpr (ClockMode) {
                 if (!step || wasTerminationRequested()) break;
@@ -459,7 +449,9 @@ private:
     std::string epochFreeVetoReason_() const;
     void warnParallelFallbackIfNeeded_();
 
-    bool executeUnitCycle_(TickableUnit* unit, uint64_t cycle) {
+    // Preserve the specialized tick path at the call site: an outlined helper
+    // adds a dispatch call for every unit and cycle, even without activity scheduling.
+    [[gnu::always_inline]] inline bool executeUnitCycle_(TickableUnit* unit, uint64_t cycle) {
         if (!any_activity_scheduling_.enabled.load(std::memory_order_acquire)) {
             unit->executeTickAlwaysActive();
             return true;
@@ -995,6 +987,12 @@ private:
 
     uint64_t cycles_since_last_actual_rebalance_ = 0;
     uint64_t rebalance_count_ = 0;
+
+    // Cold lifecycle metadata stays after runtime state to preserve hot layout.
+    bool initialization_started_ = false;
+    bool finalized_ = false;
+    bool observation_registered_ = false;
+    mutable std::unique_ptr<PortDirectory> port_directory_;
 };
 
 }  // namespace chronon::sender

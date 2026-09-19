@@ -11,6 +11,7 @@
 /// one-cluster migration commits, and dynamic worker ownership refresh.
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <exception>
 #include <limits>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include "../../chronon/CpuPause.hpp"
+#include "../../observe/ObservationManager.hpp"
 #include "DynamicWaitPolicy.hpp"
 #include "TickSimulation.hpp"
 #include "TickSimulationCycleUtils.hpp"
@@ -195,12 +197,27 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     refreshed_clusters.clear();
     InvocationPredecessorCache predecessor_cache(&scratch.predecessor, thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
-    scratch.priority_blocker.assign(num_clusters, 0);
-    scratch.priority_cost.assign(num_clusters, 0.0);
-    scratch.ready_through.assign(num_clusters, 0);
-    auto* const priority_blocker_ns = scratch.priority_blocker.data();
-    auto* const priority_cost_ns = scratch.priority_cost.data();
-    auto* const ready_through_cycle = scratch.ready_through.data();
+    // Like predecessor progress, small-graph ranking and readiness are private
+    // to this invocation. Pool task stealing must not bounce retained buffer
+    // cache lines between cores on every short run. Larger graphs reuse capacity.
+    constexpr size_t inline_slots = InvocationPredecessorCache::kInlineSlots;
+    alignas(64) std::array<uint64_t, inline_slots> local_priority_blocker;
+    alignas(64) std::array<double, inline_slots> local_priority_cost;
+    alignas(64) std::array<uint64_t, inline_slots> local_ready_through;
+    auto* priority_blocker_ns = local_priority_blocker.data();
+    auto* priority_cost_ns = local_priority_cost.data();
+    auto* ready_through_cycle = local_ready_through.data();
+    if (num_clusters > inline_slots) {
+        scratch.priority_blocker.resize(num_clusters);
+        scratch.priority_cost.resize(num_clusters);
+        scratch.ready_through.resize(num_clusters);
+        priority_blocker_ns = scratch.priority_blocker.data();
+        priority_cost_ns = scratch.priority_cost.data();
+        ready_through_cycle = scratch.ready_through.data();
+    }
+    // Ranking is written for every owned cluster before sorting. Readiness must
+    // start empty even when the previous invocation reached a larger frontier.
+    std::fill_n(ready_through_cycle, num_clusters, 0);
     uint64_t seen_generation = 0;
     uint64_t priority_refresh = 0;
     uint64_t wait_sample_sequence = 0;
@@ -415,10 +432,14 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                 }
                 const uint64_t burst_end = detail::dynamicClusterBurstEnd(
                     cycle, end_cycle, ready_through_cycle[cluster], next_counter_cycle);
+                // Ownership cannot migrate within this burst. Cache the stable
+                // topology and owner-private sampling state, while still
+                // observing runtime activity opt-in after every tick below.
+                const auto units = std::span(cluster_unit_ptrs_[cluster]);
+                bool sample_units = cluster < dynamic_cluster_unit_sampling_.size() &&
+                                    dynamic_cluster_unit_sampling_[cluster] != 0;
+                uint64_t last_sample = dynamic_cluster_last_tick_sample_cycle_[cluster];
                 do {
-                    const bool sample_units = cluster < dynamic_cluster_unit_sampling_.size() &&
-                                              dynamic_cluster_unit_sampling_[cluster] != 0;
-                    const uint64_t last_sample = dynamic_cluster_last_tick_sample_cycle_[cluster];
                     const bool sample_tick =
                         !sample_units && detail::shouldSampleDynamicTick(cycle, last_sample);
                     SchedulerTimelineTrace::TimePoint begin{};
@@ -428,7 +449,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                     }
                     if (!trace_units && !sample_units) {
                         // No trace scratch or per-unit samples are needed in this hot path.
-                        for (auto* unit : cluster_unit_ptrs_[cluster]) {
+                        for (auto* unit : units) {
                             executeUnitCycle_(unit, cycle);
                         }
                     } else {
@@ -441,12 +462,15 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                             std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
                                 .count());
                         recordClusterTickSample_(cluster, elapsed_ns, true);
-                        dynamic_cluster_last_tick_sample_cycle_[cluster] = cycle;
+                        last_sample = cycle;
+                        dynamic_cluster_last_tick_sample_cycle_[cluster] = last_sample;
                     }
                     if (!sample_units && cluster_activity_scheduling_ &&
                         cluster_activity_scheduling_[cluster].enabled.load(
                             std::memory_order_acquire)) {
                         enable_cluster_unit_sampling(cluster, cycle);
+                        sample_units = cluster < dynamic_cluster_unit_sampling_.size() &&
+                                       dynamic_cluster_unit_sampling_[cluster] != 0;
                     }
                     ++cycle;
                     progress.store(cycle, std::memory_order_release);

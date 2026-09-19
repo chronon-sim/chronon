@@ -45,6 +45,11 @@ inline const auto CACHE_MISS = Category<"cache_miss", "Cache miss events">{};
 
 ### Use in Units
 
+Units created through `TickSimulation` automatically use their owning unit's
+local cycle for event timestamps. A `getObserveCycle()` override is only needed
+for standalone observers or a deliberate custom time source. This binding does
+not add work to the simulation's tick dispatch.
+
 ```cpp
 class FetchUnit : public TickableUnit, public ObservableUnit {
     EventCounter cache_hits_{this, "cache_hits", "Cache hit count"};

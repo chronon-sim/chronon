@@ -101,8 +101,8 @@ struct AllocationProbe {
 
 class IdleMPSCReceiverUnit : public TickableUnit {
 public:
+    using TickableUnit::advanceIdleTick;  // Standalone queue-adapter test.
     explicit IdleMPSCReceiverUnit(std::string name) : TickableUnit(std::move(name)) {}
-
     InPort<int> in{this, "in", 8};
 
     void tick() override {}

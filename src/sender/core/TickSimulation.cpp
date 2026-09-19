@@ -21,6 +21,7 @@
 #include <unordered_map>
 
 #include "../../observe/ObservableUnit.hpp"
+#include "../../observe/ObservationManager.hpp"
 #include "TickSimulationCycleUtils.hpp"
 
 namespace chronon::sender {
@@ -30,7 +31,13 @@ namespace chronon::sender {
 // ---------------------------------------------------------------------------
 
 void TickSimulation::initialize() {
+    if (finalized_) throw std::logic_error("cannot initialize a finalized simulation");
     if (initialized_) return;
+    if (initialization_started_)
+        throw std::logic_error("simulation initialization already started or failed");
+    initialization_started_ = true;
+    observe::ObservationManager::instance().registerSimulation(this);
+    observation_registered_ = true;
 
     if (clock_mode_) {
         // Clock topology already validates zero-delay cycles and fixes the
@@ -82,8 +89,20 @@ void TickSimulation::initialize() {
     for (auto& unit : units_) {
         unit->setTerminationController(&termination_ctrl_);
         unit->initialize();
+        unit->state_ = UnitState::Initialized;
     }
 
+    // Validate all explicit fan-in depths before applying any override. A
+    // connection's capacity configures the shared destination, not a private lane.
+    std::unordered_map<void*, size_t> destination_depths;
+    for (auto* connection : connections_) {
+        if (auto depth = connection->destinationDepthOverride()) {
+            auto [entry, inserted] = destination_depths.emplace(connection->destPortPtr(), *depth);
+            if (!inserted && entry->second != *depth)
+                throw std::invalid_argument("conflicting destination depths for input port " +
+                                            std::string(connection->destinationPortName()));
+        }
+    }
     for (auto* connection : connections_) connection->prepareRegisteredCapacity();
 
     // Unit::initialize() may finalize Port capacities. Discover transparent
@@ -174,15 +193,8 @@ uint64_t TickSimulation::run(uint64_t num_cycles) {
         initialize();
     }
 
-    if (units_.empty()) {
-        return 0;
-    }
-
-    const uint64_t executed =
-        shouldUseParallelExecution_() ? runEpochFree(num_cycles) : runSequential(num_cycles);
-
-    current_cycle_ += executed;
-    return executed;
+    return shouldUseParallelExecution_() ? advanceInitializedTicks_<true>(num_cycles)
+                                         : advanceInitializedTicks_<false>(num_cycles);
 }
 
 uint64_t TickSimulation::runUntilTermination(uint64_t max_cycles) {

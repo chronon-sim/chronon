@@ -70,14 +70,18 @@ public:
     const std::string& typeName() const override { return type_name_; }
     const std::string& description() const override { return description_; }
 
-    Unit* createUnit(TickSimulation* sim, [[maybe_unused]] const std::string& name,
+    Unit* createUnit(TickSimulation* sim, const std::string& name,
                      const YAML::Node& yaml_params) override {
+        if (name.empty()) throw std::invalid_argument("unit instance name must not be empty");
+        std::string instance_name = name;
         auto params = std::make_unique<ParameterSetT>();
         if (yaml_params.IsDefined() && !yaml_params.IsNull()) {
             params->deserializeYAML(&yaml_params);
         }
 
-        return sim->createUnitWithParameters<UnitT>(std::move(params));
+        auto* unit = sim->createUnitWithParameters<UnitT>(std::move(params));
+        sim->setUnitName(*unit, std::move(instance_name));
+        return unit;
     }
 
 private:

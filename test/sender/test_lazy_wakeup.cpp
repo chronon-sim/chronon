@@ -15,6 +15,7 @@ struct ModeConfig {
     const char* name;
     bool enable_parallel;
     bool enable_lookahead;
+    bool enable_dynamic_rebalance = false;
 };
 
 constexpr int PARALLEL_TEST_UNIT_COUNT = 10;
@@ -26,7 +27,7 @@ TickSimulationConfig makeConfig(const ModeConfig& mode) {
     config.enable_lookahead = mode.enable_lookahead;
     config.enable_epoch_free_lookahead = true;
     config.enable_weighted_partitioning = false;
-    config.enable_dynamic_rebalance = false;
+    config.enable_dynamic_rebalance = mode.enable_dynamic_rebalance;
     config.epoch_size = 8;
     config.max_lookahead_cycles = 4;
     return config;
@@ -484,6 +485,7 @@ int main() {
     const ModeConfig modes[] = {
         {"sequential", false, false},
         {"epoch-free", true, true},
+        {"epoch-free dynamic", true, true, true},
     };
 
     for (const auto& mode : modes) {

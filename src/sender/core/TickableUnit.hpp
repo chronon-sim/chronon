@@ -48,6 +48,9 @@ public:
     /// Return true to signal the simulation can stop.
     virtual bool isCompleted() const { return false; }
 
+protected:
+    // Scheduler entry points. Model code implements tick(); only the scheduler
+    // may advance a managed unit's time and prepare its transport state.
     /// Inlined hot path executed millions of times per second.
     [[gnu::always_inline]] inline void executeTick() {
         detail::TickContextGuard tick_ctx(this, localCycle(), crashName(), crashNameLen(), "tick");

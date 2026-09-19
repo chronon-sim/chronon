@@ -7,7 +7,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 /// @file
-/// Configuration and per-thread descriptor structs for TickSimulation.
+/// Model configuration for TickSimulation; runtime descriptors are kept separately.
 
 #pragma once
 
@@ -20,6 +20,9 @@
 #include "../schedule/SchedulerTimelineTrace.hpp"
 
 namespace chronon::sender {
+
+/// Auto selects epoch-free execution when safe and useful, otherwise sequential.
+enum class ExecutionPolicy { Auto, Sequential };
 
 /**
  * Configuration for tick-based simulation.
@@ -101,51 +104,21 @@ struct TickSimulationConfig {
     /// platform_metrics_, so dynamic rebalance decides migrations on its own
     /// inputs (measured unit costs + platform_metrics_) and is unaffected by it.
     double initial_partition_sync_cost_ns = 8.0;
-};
 
-/**
- * Per-cluster progress counter for dependency-driven sync.
- *
- * Each thread publishes its completed cycle count to a cache-line-aligned
- * atomic; peers read only their predecessors', avoiding centralized barrier
- * contention.
- */
-struct alignas(64) ThreadProgress {
-    std::atomic<uint64_t> completed_cycle{0};
-};
-
-/**
- * Cross-thread dependency descriptor: thread T at cycle C may proceed once
- * pred_thread has completed cycle (C - min_delay).
- */
-struct ThreadCrossDep {
-    size_t pred_thread;
-    uint32_t min_delay;
-};
-
-/**
- * Pre-resolved dependency for hot-path access.
- *
- * Stores a direct pointer to the predecessor's progress atomic, removing
- * the vector<unique_ptr> indirection in the spin loop. Thread T at cycle C
- * may run when `*progress_ptr >= C + 1 - min_delay`.
- */
-struct ResolvedDep {
-    std::atomic<uint64_t>* progress_ptr;
-    uint32_t min_delay;
-    /// Stable predecessor cluster index, also used as the worker-local cache
-    /// index. Real dependencies use [0, num_clusters); the synthetic
-    /// lookahead-floor dependency uses the reserved num_clusters slot.
-    size_t pred_id = 0;
-};
-
-struct BlockedClusterInfo {
-    size_t cluster = SIZE_MAX;
-    size_t pred_cluster = SIZE_MAX;
-    uint64_t needed = 0;
-    uint64_t observed = 0;
-    uint32_t delay = 0;
-    uint64_t deficit = 0;
+    /// Canonical configuration API. The booleans above are compatibility fields.
+    /// This reports the requested policy, not the resolved execution backend.
+    ExecutionPolicy executionPolicy() const noexcept {
+        return enable_parallel && enable_lookahead && enable_epoch_free_lookahead
+                   ? ExecutionPolicy::Auto
+                   : ExecutionPolicy::Sequential;
+    }
+    void setExecutionPolicy(ExecutionPolicy policy) noexcept {
+        enable_parallel = policy == ExecutionPolicy::Auto;
+        enable_lookahead = true;
+        enable_epoch_free_lookahead = true;
+    }
+    uint64_t pollingIntervalCycles() const noexcept { return epoch_size; }
+    void setPollingIntervalCycles(uint64_t cycles) noexcept { epoch_size = cycles; }
 };
 
 }  // namespace chronon::sender

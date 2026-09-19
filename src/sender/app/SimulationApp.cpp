@@ -199,7 +199,8 @@ int SimulationApp::run(int argc, char* argv[]) {
         if (run_cycles == 0) {
             run_cycles = 10'000'000;  // Safety upper bound when YAML didn't specify.
             if (opts.verbose) {
-                std::cout << "\nRunning until completion (max " << run_cycles << " cycles)...\n";
+                std::cout << "\nRunning until termination request (max " << run_cycles
+                          << " cycles)...\n";
             }
         } else {
             if (opts.verbose) {
@@ -212,6 +213,7 @@ int SimulationApp::run(int argc, char* argv[]) {
         result.cycles_executed = result.simulation->runUntilTermination(run_cycles);
         auto end = std::chrono::high_resolution_clock::now();
         result.wall_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        result.simulation->finalize();
 
         if (result.simulation->timelineTraceEnabled()) {
             result.simulation->writeTimelineTrace();
@@ -364,7 +366,7 @@ SimulationApp::ParsedOptions SimulationApp::parseArgs(int argc, char* argv[]) {
             continue;
         }
 
-        if (arg == "--epoch-size") {
+        if (arg == "--polling-interval-cycles" || arg == "--epoch-size") {
             if (i + 1 >= argc) {
                 throw std::runtime_error("Missing value for " + arg);
             }
@@ -388,7 +390,7 @@ SimulationApp::ParsedOptions SimulationApp::parseArgs(int argc, char* argv[]) {
                 opts.run_cycles = std::stoull(val);
             } else if (opt == "-t" || opt == "--threads") {
                 opts.threads = std::stoul(val);
-            } else if (opt == "--epoch-size") {
+            } else if (opt == "--polling-interval-cycles" || opt == "--epoch-size") {
                 opts.epoch_size = std::stoull(val);
             } else {
                 throw std::runtime_error("Unknown option: " + opt);
@@ -452,7 +454,8 @@ void SimulationApp::applyConvenienceOverrides(YAML::Node& yaml, const ParsedOpti
     }
 
     if (opts.epoch_size.has_value()) {
-        yaml["simulation"]["epoch_size"] = *opts.epoch_size;
+        yaml["simulation"].remove("epoch_size");
+        yaml["simulation"]["polling_interval_cycles"] = *opts.epoch_size;
     }
 
     if (opts.no_observe) {
@@ -491,9 +494,10 @@ void SimulationApp::printUsage(std::ostream& os, const char* program) {
     os << "  -c, --config <path>       YAML configuration file\n";
     os << "  -p, --param KEY=VALUE     Override YAML value (repeatable)\n";
     os << "  -o, --output-dir <path>   Override observation output directory\n";
-    os << "  -n, --run-cycles <N>      Override simulation run cycles (0 = until completion)\n";
+    os << "  -n, --run-cycles <N>      Override cycle limit (0 = application default)\n";
     os << "  -t, --threads <N>         Override number of worker threads\n";
-    os << "  --epoch-size <N>          Set host/Sequential polling interval (compatibility)\n";
+    os << "  --polling-interval-cycles <N>  Set host/Sequential polling interval\n";
+    os << "  --epoch-size <N>          Compatibility alias for --polling-interval-cycles\n";
     os << "  --no-observe              Disable observation system\n";
     os << "  -v, --verbose             Increase output verbosity\n";
     os << "  -h, --help                Show this help message\n";
@@ -504,7 +508,7 @@ void SimulationApp::printUsage(std::ostream& os, const char* program) {
     os << "  " << program << " config.yaml\n";
     os << "  " << program << " config.yaml -p simulation.num_workers=4\n";
     os << "  " << program << " config.yaml --threads=2 --run-cycles=1000000\n";
-    os << "  " << program << " config.yaml --epoch-size=1024\n";
+    os << "  " << program << " config.yaml --polling-interval-cycles=1024\n";
     os << "  " << program << " config.yaml --output-dir=/tmp/sim_output\n";
     os << "  " << program << " config.yaml --no-observe\n";
     os << "\n";
