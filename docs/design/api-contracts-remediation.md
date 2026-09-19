@@ -189,3 +189,21 @@ the contract repair, rather than weakening existing equivalence checks.
   0.999495, two-worker dynamic poll1 1.034698, and four-worker dynamic poll1
   1.018149. These are incomplete diagnostic matrices; the CI AMD host and complete
   final-head matrices still require validation.
+- `40eeebf` CI passed eight cases, then clearly failed two-worker dynamic poll1
+  at 51 pairs (median 0.980516, lower97.5 0.973446, upper97.5 0.985863).
+  All state comparisons matched. Its local matrix was stopped and retained after
+  eleven passing cases, including multiclock sequential poll0 (lower 1.000324).
+  Neither the local passes nor the earlier targeted diagnostics establish CI
+  acceptance; the sampling rule and threshold remain unchanged.
+- Short dynamic invocations now reuse the immutable, published ownership lists
+  while their generation matches, retaining the before/after generation check
+  and atomic owner scan after migration. Clock actor discovery still includes
+  bridges through the existing scan. Runtime sampling preparation avoids the
+  per-unit scan only while the existing activity summary proves no unit has
+  opted in; constructor binding, interval changes and sleep operations publish
+  that summary. Claim resets, sampling decisions and progress ordering remain
+  unchanged. A boundary interval/sleep/wake regression passed before the change;
+  all 135 regressions passed afterward. Three local 51-pair diagnostics passed
+  with equal states: two-worker dynamic poll1 lower97.5 1.050485, four-worker
+  dynamic poll0 0.993081, and four-worker dynamic poll1 1.021420. These targeted
+  results do not replace complete final-head local and CI acceptance.
