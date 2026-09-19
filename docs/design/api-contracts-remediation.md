@@ -237,3 +237,10 @@ the contract repair, rather than weakening existing equivalence checks.
   1.045107, four-worker dynamic poll1 1.022083, and four-worker static poll1
   0.999736. These incomplete diagnostics require fresh full local/CI matrices on
   the final committed revision; they do not establish hardware-independent gains.
+- `bd1b0ca` validation was interrupted for a CI formatting failure: older
+  clang-format versions misparsed the explicitly typed GNU-attributed lambda
+  parameter. Using `auto*` produces stable formatting under versions 14 and 20.
+  All 135 regressions pass, and all three local benchmark executables are
+  byte-identical before/after this spelling change. The interrupted local matrix
+  retains two passing cases and partial samples; fresh final-head validation is
+  still required, with no observed performance failure discarded.
