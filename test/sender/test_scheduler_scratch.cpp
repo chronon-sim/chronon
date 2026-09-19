@@ -202,11 +202,12 @@ int main() {
         assert(sim.dependencyGraph().lookahead(unit, unit) == 0);
     }
     for (bool clock : {false, true}) {
-        for (size_t pairs : {4, 12}) {
+        for (size_t pairs : {4, 8, 9, 12}) {
             const auto serial = exercise(clock, false, 1, 1, pairs);
-            for (bool dynamic : {false, true})
-                for (uint64_t interval : {1, 7, 64})
-                    assert(exercise(clock, dynamic, 4, interval, pairs) == serial);
+            for (size_t workers : {2, 4})
+                for (bool dynamic : {false, true})
+                    for (uint64_t interval : {1, 7, 64})
+                        assert(exercise(clock, dynamic, workers, interval, pairs) == serial);
         }
     }
     std::cout << "Repeated runs reset scratch and preserve state across migration\n";

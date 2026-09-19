@@ -11,6 +11,7 @@
 /// one-cluster migration commits, and dynamic worker ownership refresh.
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <exception>
 #include <limits>
@@ -196,12 +197,27 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     refreshed_clusters.clear();
     InvocationPredecessorCache predecessor_cache(&scratch.predecessor, thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
-    scratch.priority_blocker.assign(num_clusters, 0);
-    scratch.priority_cost.assign(num_clusters, 0.0);
-    scratch.ready_through.assign(num_clusters, 0);
-    auto* const priority_blocker_ns = scratch.priority_blocker.data();
-    auto* const priority_cost_ns = scratch.priority_cost.data();
-    auto* const ready_through_cycle = scratch.ready_through.data();
+    // Like predecessor progress, small-graph ranking and readiness are private
+    // to this invocation. Pool task stealing must not bounce retained buffer
+    // cache lines between cores on every short run. Larger graphs reuse capacity.
+    constexpr size_t inline_slots = InvocationPredecessorCache::kInlineSlots;
+    alignas(64) std::array<uint64_t, inline_slots> local_priority_blocker;
+    alignas(64) std::array<double, inline_slots> local_priority_cost;
+    alignas(64) std::array<uint64_t, inline_slots> local_ready_through;
+    auto* priority_blocker_ns = local_priority_blocker.data();
+    auto* priority_cost_ns = local_priority_cost.data();
+    auto* ready_through_cycle = local_ready_through.data();
+    if (num_clusters > inline_slots) {
+        scratch.priority_blocker.resize(num_clusters);
+        scratch.priority_cost.resize(num_clusters);
+        scratch.ready_through.resize(num_clusters);
+        priority_blocker_ns = scratch.priority_blocker.data();
+        priority_cost_ns = scratch.priority_cost.data();
+        ready_through_cycle = scratch.ready_through.data();
+    }
+    // Ranking is written for every owned cluster before sorting. Readiness must
+    // start empty even when the previous invocation reached a larger frontier.
+    std::fill_n(ready_through_cycle, num_clusters, 0);
     uint64_t seen_generation = 0;
     uint64_t priority_refresh = 0;
     uint64_t wait_sample_sequence = 0;

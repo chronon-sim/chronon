@@ -172,3 +172,20 @@ the contract repair, rather than weakening existing equivalence checks.
   incomplete matrix; a successful full gate still requires every scenario.
   Eighteen gate tests include CLI sampling, retained samples, early rejection,
   extension before rejection, and successful partial versus full matrices.
+- `10872ca` failed both complete-matrix attempts after fixed 201-pair decisions:
+  local multiclock sequential poll0 had median 0.988559 and lower97.5 0.987942;
+  CI two-worker single-clock dynamic poll1 had median 0.989927 and lower97.5
+  0.986792. Ten prior local cases and eight prior CI cases passed. Every state
+  comparison matched; both early-exit artifacts explicitly mark incomplete matrices.
+- Sequential single-domain clock batches now resolve their runtime once and reuse
+  it for CDC selection, unit execution and retirement. Small dynamic graphs use
+  invocation-local ranking/readiness buffers, following the predecessor-cache
+  design; larger graphs retain vector capacity. Readiness resets on every call
+  and ranking is written before sorting. Execution and migration order are unchanged.
+- Poisoned-boundary and forced-migration equivalence coverage now includes 2/4
+  workers and 4/8/9/12 producer-consumer pairs. The expanded test passed before
+  these optimizations; all 135 regressions passed afterward. Three 51-pair local
+  diagnostics passed with equal states: multiclock sequential poll0 lower97.5
+  0.999495, two-worker dynamic poll1 1.034698, and four-worker dynamic poll1
+  1.018149. These are incomplete diagnostic matrices; the CI AMD host and complete
+  final-head matrices still require validation.

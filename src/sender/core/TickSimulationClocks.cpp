@@ -201,9 +201,16 @@ bool TickSimulation::executeClockBatch_() {
         // Most phased calendars select one domain. Borrow its sorted list;
         // coincident edges union the lists in preallocated scratch, then restore
         // stable FIFO-ID order. Never skip an empty lane's synchronizer edges.
+        // Resolve that domain once for the whole batch. Topology is immutable,
+        // so CDC selection, unit execution and retirement share the same object.
+        auto* const single_runtime =
+            edges.size() == 1 ? &clock_runtime_.at(edges.front().domain->id()) : nullptr;
+        const auto runtime_for = [&](const ClockEdge& edge) -> ClockRuntime& {
+            return single_runtime ? *single_runtime : clock_runtime_.at(edge.domain->id());
+        };
         std::span<const size_t> active;
         if (edges.size() == 1 && clock_always_cdc_.empty()) {
-            active = clock_runtime_.at(edges.front().domain->id()).cdc;
+            active = single_runtime->cdc;
         } else if (edges.size() == 2 && clock_always_cdc_.empty()) {
             // Initialization appends FIFO indices in sorted order. Merge two
             // coincident domains directly, emitting shared lanes only once.
@@ -223,7 +230,7 @@ bool TickSimulation::executeClockBatch_() {
             };
             for (const auto f : clock_always_cdc_) append(f);
             for (const auto& edge : edges)
-                for (const auto f : clock_runtime_.at(edge.domain->id()).cdc) append(f);
+                for (const auto f : runtime_for(edge).cdc) append(f);
             std::sort(clock_active_cdc_.begin(), clock_active_cdc_.end());
             for (const auto f : clock_active_cdc_) clock_cdc_seen_[f] = 0;
             active = clock_active_cdc_;
@@ -234,7 +241,7 @@ bool TickSimulation::executeClockBatch_() {
         }
         detail::ClockProfileScope ticks_profile(profile ? &profile->tick_ns : nullptr);
         for (const auto& edge : edges) {
-            auto& runtime = clock_runtime_.at(edge.domain->id());
+            auto& runtime = runtime_for(edge);
             for (auto* unit : runtime.units) {
                 unit->clock_edge_executing_ = true;
                 executeUnitCycle_(unit, edge.cycle);
@@ -249,8 +256,7 @@ bool TickSimulation::executeClockBatch_() {
             if (profile) profile->bridge_commits += active.size();
         }
         actors_profile.finish();
-        for (const auto& edge : edges)
-            clock_runtime_.at(edge.domain->id()).next_cycle = edge.cycle + 1;
+        for (const auto& edge : edges) runtime_for(edge).next_cycle = edge.cycle + 1;
         clock_time_ = edges.front().time;
         ++current_cycle_;
         termination_ctrl_.setSettledTime(clock_time_);
