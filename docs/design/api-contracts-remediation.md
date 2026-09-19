@@ -158,3 +158,17 @@ the contract repair, rather than weakening existing equivalence checks.
   1.656348 and lower97.5 1.621825. Every state comparison matched. These targeted
   diagnostics are explicitly an incomplete matrix; full final-head validation
   is still required.
+- The retained `8cf7821` CI matrix completed eighteen cases before cancellation:
+  thirteen passed and five failed. In addition to three multiclock failures,
+  two-worker single-clock dynamic poll0 and poll1 failed at 201 pairs
+  (lower97.5 0.987581 and 0.985595). The CI host was AMD EPYC; local measurements
+  use Intel physical cores. These failures cannot be replaced by local passes.
+- `56fb154` local two-worker dynamic poll0 and poll1 diagnostics passed at 51
+  pairs (lower97.5 1.007197 and 1.037221), with equal states. Runtime code remains
+  unchanged while the exact candidate still requires complete CI validation.
+- The gate now returns immediately after a scenario's final negative decision,
+  uploading its evidence without waiting for unrelated scenarios. An uncertain
+  first look still extends to 201 before this decision. An early exit records an
+  incomplete matrix; a successful full gate still requires every scenario.
+  Eighteen gate tests include CLI sampling, retained samples, early rejection,
+  extension before rejection, and successful partial versus full matrices.

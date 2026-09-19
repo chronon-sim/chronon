@@ -258,9 +258,16 @@ def main() -> int:
               f"lower97.5={result['lower_speedup']:.5f} pairs={result['sample_count']} "
               f"{'PASS' if result['pass'] else 'FAIL/UNCERTAIN'}",
               flush=True)
-    passed = all(result["pass"] for result in results)
+        # A final negative result already rejects this revision. Return its raw
+        # evidence to CI immediately; later cases cannot compensate for it.
+        if not result["pass"]:
+            break
+    complete = len(results) == len(matrix)
+    passed = bool(results) and complete and all(result["pass"] for result in results)
     (args.output / "verdict.json").write_text(json.dumps({"pass": passed,
-        "complete_matrix": not args.case, "base_sha": args.base_sha, "head_sha": args.head_sha}, indent=2) + "\n")
+        "complete_matrix": not args.case and complete,
+        "completed_cases": len(results), "expected_cases": len(matrix),
+        "base_sha": args.base_sha, "head_sha": args.head_sha}, indent=2) + "\n")
     return 0 if passed else 1
 
 
