@@ -1,6 +1,8 @@
 // Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
 // SPDX-License-Identifier: MPL-2.0
 
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -234,6 +236,54 @@ void configurationContracts() {
     CHECK(manual.unitNames() == (std::vector<std::string>{"a", "z"}));
     manual.unit_order = {"z"};
     CHECK(manual.unitNames() == (std::vector<std::string>{"z", "a"}));
+    const auto port_config = loader.loadFromString(R"yaml(
+simulation:
+  unit:
+    source:
+      type: APIContractNamedUnit
+      port:
+        out: {to: target.in, destination_depth: 8, capacity: 8}
+    target: {type: APIContractNamedUnit}
+)yaml");
+    CHECK(port_config.connections.at(0).capacity == 8);
+    rejects([&] {
+        loader.loadFromString(R"yaml(
+simulation:
+  unit:
+    source:
+      type: APIContractNamedUnit
+      port:
+        out: {to: target.in, destination_depth: 8, capacity: 4}
+)yaml");
+    });
+}
+
+void pollingCLIOverrides() {
+    const auto path = std::filesystem::temp_directory_path() / "chronon-api-polling.yaml";
+    for (bool canonical_yaml : {false, true}) {
+        {
+            std::ofstream file(path);
+            file << "simulation: {num_workers: 1, run_cycles: 1, "
+                 << (canonical_yaml ? "polling_interval_cycles" : "epoch_size") << ": 64}\n";
+        }
+        for (const char* option : {"--epoch-size", "--polling-interval-cycles"}) {
+            for (bool equals : {false, true}) {
+                bool built = false;
+                SimulationApp app("polling override");
+                app.setDefaultConfig(path.string()).onPostBuild([&](auto& result) {
+                    built = true;
+                    CHECK(result.config.epoch_size == 0);
+                });
+                std::string argument = option;
+                if (equals) argument += "=0";
+                char program[] = "polling_test", value[] = "0";
+                char* argv[] = {program, argument.data(), value};
+                CHECK(app.run(equals ? 2 : 3, argv) == 0);
+                CHECK(built);
+            }
+        }
+    }
+    std::filesystem::remove(path);
 }
 
 void portCapacityContracts() {
@@ -319,6 +369,7 @@ int main() {
     identityAndReceive();
     independentPortDirectories();
     configurationContracts();
+    pollingCLIOverrides();
     portCapacityContracts();
     observationSessionLifetime();
     std::cout << "API contracts passed\n";

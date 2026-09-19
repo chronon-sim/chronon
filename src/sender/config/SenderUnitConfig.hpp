@@ -80,7 +80,7 @@ struct SimulationYAMLConfig {
     /// Compatibility switch for epoch-free execution. False forces Sequential;
     /// no epoch-boundary fallback remains.
     bool enable_epoch_free_lookahead = TickSimulationConfig{}.enable_epoch_free_lookahead;
-    uint64_t run_cycles = 0;  ///< 0 = run until completion.
+    uint64_t run_cycles = 0;  ///< 0 uses the application default (10 million if unset).
     std::string name = "simulation";
     uint64_t tick_frequency_hz = TickSimulationConfig{}.tick_frequency_hz;  ///< Default 1 GHz.
 

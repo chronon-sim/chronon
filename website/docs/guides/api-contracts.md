@@ -53,6 +53,11 @@ state and `parallelFallbackReason()` describe the selected backend.
 
 The interval controls host predicate and sequential termination polling.
 It does not add a barrier or epoch to the persistent parallel workers.
+`--polling-interval-cycles N` overrides either YAML interval spelling;
+`--epoch-size N` remains a CLI alias. `SimulationApp` runs until a termination
+request or its cycle limit. A zero YAML limit uses the application default,
+falling back to 10 million cycles. Direct callers that want all units'
+`isCompleted()` predicates should use `runUntilComplete()` explicitly.
 YAML configuration converts through `SimulationYAMLConfig::toRuntimeConfig()`;
 shared numeric and boolean defaults come from `TickSimulationConfig`.
 The historical worker defaults remain distinct: YAML uses four workers and C++

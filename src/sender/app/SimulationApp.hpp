@@ -85,7 +85,7 @@ public:
     /// 0 = inherit YAML or system default.
     SimulationApp& setDefaultThreads(uint32_t n);
 
-    /// 0 = run until completion.
+    /// 0 retains the application's 10-million-cycle fallback limit.
     SimulationApp& setDefaultCycles(uint64_t n);
 
     /// Hook to mutate YAML before parsing — useful for programmatic config changes.

@@ -119,7 +119,8 @@ int main(int argc, char* argv[]) {
 | `-o, --output-dir <path>` | Override output directory |
 | `-n, --run-cycles <N>` | Override run cycles |
 | `-t, --threads <N>` | Override thread count |
-| `--epoch-size <N>` | Set host/Sequential polling interval (compatibility name) |
+| `--polling-interval-cycles <N>` | Set host/Sequential polling interval |
+| `--epoch-size <N>` | Compatibility alias for the polling interval |
 | `--no-observe` | Disable observation |
 | `-v, --verbose` | Verbose output |
 
