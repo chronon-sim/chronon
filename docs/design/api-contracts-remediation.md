@@ -119,3 +119,19 @@ the contract repair, rather than weakening existing equivalence checks.
   Regressions cover predicates that advance the simulation or finalize it, on
   verified sequential and parallel paths; the same tests passed before changing
   dispatch. Final-head performance and correctness acceptance is still pending.
+- `38b93a0` completed nine local cases: eight passed, while four-worker dynamic
+  poll0 remained uncertain at 201 pairs (median 0.993022, lower97.5 0.984796).
+  State digests matched. The incomplete matrix and every sample were retained.
+- Calibration had targeted two seconds using one tiny linear estimate; dynamic
+  poll0 actually measured a median of about 1.25 seconds. Calibration now checks
+  each scaled workload (at most five rounds), compares both states, and saves
+  all round durations. The existing billion-cycle cap is explicit in artifacts.
+  The 51/201-pair rule, per-look confidence and 0.99 threshold are unchanged.
+- Dynamic workers cache owner-private sampling state and the immutable unit list
+  within a burst. They still observe activity opt-in after every tick and publish
+  progress in the same order. Dynamic wakeup/opt-in regressions passed before
+  this optimization and are included in the full suite afterward.
+- The burst-cache plus feedback-calibration diagnostic passed dynamic poll0 at
+  51 pairs (median 1.006356, lower97.5 0.993970), with equal states throughout.
+  Calibration reached roughly 2.1 seconds after four rounds. This remains one
+  diagnostic; a fresh complete final-head matrix and Actions are required.

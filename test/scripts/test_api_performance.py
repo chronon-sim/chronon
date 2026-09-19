@@ -13,6 +13,43 @@ SPEC.loader.exec_module(gate)
 
 
 class PerformanceAcceptance(unittest.TestCase):
+    def test_calibration_rechecks_nonlinear_scale_up(self):
+        case = {"name": "nonlinear", "cycles": 100}
+        calls = []
+
+        def run(variant, current, label):
+            cycles = current["cycles"]
+            calls.append((variant, cycles, label))
+            seconds = cycles / (100 if cycles <= 100 else 1000)
+            return seconds, {"cycles": cycles}
+
+        records = gate.calibrate(case, 2.0, run)
+        self.assertEqual(len(records), 3)
+        self.assertTrue(records[-1]["target_reached"])
+        self.assertGreaterEqual(min(records[-1]["seconds"].values()), 2.0)
+        for a, b in zip(calls[::2], calls[1::2]):
+            self.assertEqual(a[1:], b[1:])
+
+    def test_calibration_records_cycle_cap(self):
+        case = {"name": "capped", "cycles": gate.MAX_CYCLES - 1}
+        records = gate.calibrate(case, 2.0, lambda *args: (0.1, {"digest": 1}))
+        self.assertEqual(case["cycles"], gate.MAX_CYCLES)
+        self.assertTrue(records[-1]["capped"])
+        self.assertFalse(records[-1]["target_reached"])
+
+    def test_calibration_preserves_failed_state_evidence(self):
+        saved = []
+        with self.assertRaisesRegex(RuntimeError, "determinism mismatch"):
+            gate.calibrate({"name": "bad", "cycles": 1}, 2.0,
+                           lambda variant, *args: (2.0, {"digest": variant}),
+                           lambda records: saved.extend(records))
+        self.assertFalse(saved[0]["state_matches"])
+
+    def test_calibration_is_bounded(self):
+        with self.assertRaisesRegex(RuntimeError, "target not reached"):
+            gate.calibrate({"name": "never", "cycles": 1}, 2.0,
+                           lambda *args: (1.0, {"digest": 1}))
+
     def test_identical_and_faster(self):
         self.assertTrue(gate.confidence([1.0] * 31)["pass"])
         self.assertTrue(gate.confidence([1.1] * 31)["pass"])

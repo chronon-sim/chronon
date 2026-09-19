@@ -144,7 +144,10 @@ promise of interchangeable backends or a stable binary layout.
 
 PR validation compares immutable baseline and candidate commits using identical
 workloads, compiler settings, seeds and CPU affinity. State digests must match
-on every repetition. Each performance scenario must independently establish
+on every repetition, including calibration pairs. Calibration rechecks scaled
+workloads for up to five rounds and retains each round's durations and state
+comparison. The billion-cycle measurement cap is recorded explicitly when it
+limits the two-second target. Each performance scenario must independently establish
 throughput at least 99% of baseline. There are at most two predeclared looks:
 51 paired runs initially, and a fixed total of 201 only if the initial interval
 is uncertain. Both looks use a one-sided 97.5% lower bound, sharing a nominal

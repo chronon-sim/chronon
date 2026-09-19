@@ -416,10 +416,14 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                 }
                 const uint64_t burst_end = detail::dynamicClusterBurstEnd(
                     cycle, end_cycle, ready_through_cycle[cluster], next_counter_cycle);
+                // Ownership cannot migrate within this burst. Cache the stable
+                // topology and owner-private sampling state, while still
+                // observing runtime activity opt-in after every tick below.
+                const auto units = std::span(cluster_unit_ptrs_[cluster]);
+                bool sample_units = cluster < dynamic_cluster_unit_sampling_.size() &&
+                                    dynamic_cluster_unit_sampling_[cluster] != 0;
+                uint64_t last_sample = dynamic_cluster_last_tick_sample_cycle_[cluster];
                 do {
-                    const bool sample_units = cluster < dynamic_cluster_unit_sampling_.size() &&
-                                              dynamic_cluster_unit_sampling_[cluster] != 0;
-                    const uint64_t last_sample = dynamic_cluster_last_tick_sample_cycle_[cluster];
                     const bool sample_tick =
                         !sample_units && detail::shouldSampleDynamicTick(cycle, last_sample);
                     SchedulerTimelineTrace::TimePoint begin{};
@@ -429,7 +433,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                     }
                     if (!trace_units && !sample_units) {
                         // No trace scratch or per-unit samples are needed in this hot path.
-                        for (auto* unit : cluster_unit_ptrs_[cluster]) {
+                        for (auto* unit : units) {
                             executeUnitCycle_(unit, cycle);
                         }
                     } else {
@@ -442,12 +446,15 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                             std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
                                 .count());
                         recordClusterTickSample_(cluster, elapsed_ns, true);
-                        dynamic_cluster_last_tick_sample_cycle_[cluster] = cycle;
+                        last_sample = cycle;
+                        dynamic_cluster_last_tick_sample_cycle_[cluster] = last_sample;
                     }
                     if (!sample_units && cluster_activity_scheduling_ &&
                         cluster_activity_scheduling_[cluster].enabled.load(
                             std::memory_order_acquire)) {
                         enable_cluster_unit_sampling(cluster, cycle);
+                        sample_units = cluster < dynamic_cluster_unit_sampling_.size() &&
+                                       dynamic_cluster_unit_sampling_[cluster] != 0;
                     }
                     ++cycle;
                     progress.store(cycle, std::memory_order_release);

@@ -30,6 +30,39 @@ import sys
 STATE_FIELDS = ("predicates", "parallel", "ticks", "sent", "received", "checksum", "digest", "overflow")
 MIN_SPEEDUP = 0.99
 LOOK_CONFIDENCE = 0.975
+MAX_CALIBRATION_ROUNDS = 5
+MAX_CYCLES = 1000000000
+
+
+def calibrate(case: dict, target: float, run, save=None) -> list[dict]:
+    """Fix identical work after checking the scaled run, including startup effects.
+
+    Calibration is never included in acceptance samples. The workload cycle cap
+    can limit duration; retain that fact rather than silently claiming the target.
+    """
+    records = []
+    for attempt in range(MAX_CALIBRATION_ROUNDS):
+        trials = {variant: run(variant, case, f"calibration-{attempt}")
+                  for variant in ("baseline", "candidate")}
+        elapsed = {variant: result[0] for variant, result in trials.items()}
+        if any(not math.isfinite(t) or t <= 0 for t in elapsed.values()):
+            raise ValueError("invalid calibration elapsed time")
+        equal = trials["baseline"][1] == trials["candidate"][1]
+        reached = min(elapsed.values()) >= target
+        capped = case["cycles"] >= MAX_CYCLES
+        records.append({"cycles": case["cycles"], "seconds": elapsed,
+                        "state_matches": equal, "target_reached": reached, "capped": capped})
+        if save is not None:
+            save(records)
+        if not equal:
+            raise RuntimeError(f"calibration determinism mismatch: {case['name']}")
+        if reached or capped:
+            return records
+        if attempt + 1 == MAX_CALIBRATION_ROUNDS:
+            raise RuntimeError(f"calibration target not reached: {case['name']}")
+        case["cycles"] = min(MAX_CYCLES, max(case["cycles"] + 1,
+            math.ceil(case["cycles"] * target * 1.05 / min(elapsed.values()))))
+    raise AssertionError("unreachable calibration state")
 
 
 def confidence(samples: list[float], seed: int = 149) -> dict:
@@ -160,6 +193,8 @@ def main() -> int:
                 "minimum_speedup": MIN_SPEEDUP, "per_look_confidence": LOOK_CONFIDENCE,
                 "maximum_looks": 2, "false_acceptance_budget": 0.05,
                 "target_seconds": args.seconds, "complete_matrix": not args.case,
+                "maximum_calibration_rounds": MAX_CALIBRATION_ROUNDS,
+                "calibration_cycle_cap": MAX_CYCLES,
                 "lscpu": subprocess.check_output(["lscpu"], text=True), "binaries": {}}
     for variant, build in builds.items():
         metadata["binaries"][variant] = {}
@@ -186,10 +221,11 @@ def main() -> int:
 
     for case in matrix:
         # Calibration fixes identical work for both variants; it is never a sample.
-        timings = [run(variant, case, "calibration")[0] for variant in builds]
-        case["cycles"] = min(1000000000, max(case["cycles"],
-            math.ceil(case["cycles"] * args.seconds / min(timings))))
-        (args.output / "cases.json").write_text(json.dumps(matrix, indent=2) + "\n")
+        def save_calibration(records):
+            (args.output / f"{case['name']}-calibration.json").write_text(
+                json.dumps(records, indent=2) + "\n")
+            (args.output / "cases.json").write_text(json.dumps(matrix, indent=2) + "\n")
+        calibrate(case, args.seconds, run, save_calibration)
         reference = None
         pairs = []
         samples = []
