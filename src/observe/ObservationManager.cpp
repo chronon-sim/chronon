@@ -46,11 +46,20 @@ void ObservationManager::initialize(const ObservationYAMLConfig& config) {
 
 void ObservationManager::acquireSession(const ObservationYAMLConfig& config, const void* owner) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!owner || session_owner_ || initialized_ || !simulations_.empty())
+    if (!owner || session_owner_ || initialized_ || initialized_simulation_count_ != 0)
         throw std::logic_error(
             "observation requires an exclusive simulation session; destroy the previous session "
             "first");
-    initializeLocked_(config);
+    try {
+        initializeLocked_(config);
+    } catch (...) {
+        const auto failure = std::current_exception();
+        try {
+            shutdownLocked_();
+        } catch (...) {
+        }
+        std::rethrow_exception(failure);
+    }
     session_owner_ = owner;
 }
 
@@ -65,12 +74,12 @@ void ObservationManager::registerSimulation(const void* simulation) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (session_owner_ && session_owner_ != simulation)
         throw std::logic_error("another simulation owns the process observation backend");
-    simulations_.push_back(simulation);
+    ++initialized_simulation_count_;
 }
 
-void ObservationManager::unregisterSimulation(const void* simulation) noexcept {
+void ObservationManager::unregisterSimulation() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::erase(simulations_, simulation);
+    --initialized_simulation_count_;
 }
 
 void ObservationManager::initializeLocked_(const ObservationYAMLConfig& config) {

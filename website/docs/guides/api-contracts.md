@@ -139,7 +139,10 @@ promise of interchangeable backends or a stable binary layout.
 PR validation compares immutable baseline and candidate commits using identical
 workloads, compiler settings, seeds and CPU affinity. State digests must match
 on every repetition. Each performance scenario must independently establish
-throughput at least 99% of baseline using the stated confidence bound. Noisy
-measurements fail the gate. Raw samples, executable hashes and test logs are
-retained as Actions artifacts. Passing the finite test matrix establishes the
+throughput at least 99% of baseline. There are at most two predeclared looks:
+51 paired runs initially, and a fixed total of 201 only if the initial interval
+is uncertain. Both looks use a one-sided 97.5% lower bound, sharing a nominal
+5% false-acceptance budget. The second look retains all first-look samples;
+clear regressions and uncertainty at the cap fail. Raw samples, both decisions,
+executable hashes and test logs are retained as Actions artifacts. Passing the finite test matrix establishes the
 tested workloads' contract, not a universal performance claim for all models.

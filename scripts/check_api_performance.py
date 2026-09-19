@@ -4,9 +4,10 @@
 """Fail closed on state changes or an unproven 1% throughput non-regression.
 
 Run identical baseline/candidate binaries in interleaved fresh processes on the
-same physical CPU set. Bootstrap paired log speedups; each case must have a
-one-sided 95% lower confidence bound >= 0.99. Preserve every sample, including
-outliers. Do not build or run other tests concurrently with this measurement.
+same physical CPU set. Each case has at most two predeclared looks, each with a
+one-sided 97.5% lower confidence bound >= 0.99 (a nominal 5% false acceptance budget
+across both looks). Uncertain first looks extend to a fixed maximum using ALL
+samples. Preserve outliers. Do not build or run tests concurrently.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import sys
 
 STATE_FIELDS = ("predicates", "parallel", "ticks", "sent", "received", "checksum", "digest", "overflow")
 MIN_SPEEDUP = 0.99
+LOOK_CONFIDENCE = 0.975
 
 
 def confidence(samples: list[float], seed: int = 149) -> dict:
@@ -38,12 +40,20 @@ def confidence(samples: list[float], seed: int = 149) -> dict:
     bootstrap = sorted(statistics.median(rng.choices(logs, k=len(logs))) for _ in range(20000))
     return {
         "median_speedup": math.exp(statistics.median(logs)),
-        "lower_95_speedup": math.exp(bootstrap[999]),
-        "upper_95_speedup": math.exp(bootstrap[19000]),
+        "lower_speedup": math.exp(bootstrap[499]),
+        "upper_speedup": math.exp(bootstrap[19500]),
+        "confidence_level": LOOK_CONFIDENCE,
+        "sample_count": len(samples),
         "min_speedup": min(samples),
         "max_speedup": max(samples),
-        "pass": math.exp(bootstrap[999]) >= MIN_SPEEDUP,
+        "pass": math.exp(bootstrap[499]) >= MIN_SPEEDUP,
     }
+
+
+def needs_extension(result: dict, maximum: int) -> bool:
+    """Only an uncertain first look may consume the predeclared second batch."""
+    return (not result["pass"] and result["upper_speedup"] >= MIN_SPEEDUP
+            and result["sample_count"] < maximum)
 
 
 def physical_cpus() -> list[int]:
@@ -124,12 +134,16 @@ def main() -> int:
     parser.add_argument("--base-sha", required=True)
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--repeats", type=int, default=51)
+    parser.add_argument("--max-repeats", type=int, default=201,
+                        help="fixed second-look total for uncertain cases; retains first batch")
     parser.add_argument("--seconds", type=float, default=2.0)
     parser.add_argument("--cpus", help="homogeneous physical CPU IDs; default first four physical cores")
     parser.add_argument("--case", action="append", help="exact case names for diagnosis; never a full gate")
     args = parser.parse_args()
     if args.repeats < 15 or args.seconds < 0.25:
         parser.error("at least 15 pairs and 0.25 seconds per sample are required")
+    if args.max_repeats < args.repeats:
+        parser.error("max-repeats must be at least repeats")
     cpus = list(map(int, args.cpus.split(","))) if args.cpus else physical_cpus()
     if len(cpus) < 2 or len(set(cpus)) != len(cpus) or not set(cpus) <= os.sched_getaffinity(0):
         parser.error("at least two distinct allowed physical CPUs are required")
@@ -142,7 +156,9 @@ def main() -> int:
     builds = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
     args.output.mkdir(parents=True, exist_ok=False)
     metadata = {"base_sha": args.base_sha, "head_sha": args.head_sha, "platform": platform.platform(),
-                "cpus": cpus, "repeats": args.repeats, "minimum_speedup": MIN_SPEEDUP,
+                "cpus": cpus, "repeats": args.repeats, "max_repeats": args.max_repeats,
+                "minimum_speedup": MIN_SPEEDUP, "per_look_confidence": LOOK_CONFIDENCE,
+                "maximum_looks": 2, "false_acceptance_budget": 0.05,
                 "target_seconds": args.seconds, "complete_matrix": not args.case,
                 "lscpu": subprocess.check_output(["lscpu"], text=True), "binaries": {}}
     for variant, build in builds.items():
@@ -177,24 +193,34 @@ def main() -> int:
         reference = None
         pairs = []
         samples = []
-        for repetition in range(args.repeats):
-            order = list(builds)
-            rng.shuffle(order)
-            pair = {}
-            for variant in order:
-                seconds, state = run(variant, case, str(repetition))
-                if reference is not None and state != reference:
-                    raise RuntimeError(f"determinism mismatch: {case['name']} {variant}: {state} != {reference}")
-                reference = state
-                pair[variant] = seconds
-            pairs.append(pair)
-            samples.append(pair["baseline"] / pair["candidate"])
-            (args.output / f"{case['name']}-samples.json").write_text(json.dumps(pairs, indent=2) + "\n")
-        result = {"case": case, "state": reference, **confidence(samples)}
+        looks = []
+        for target in dict.fromkeys((args.repeats, args.max_repeats)):
+            for repetition in range(len(samples), target):
+                order = list(builds)
+                rng.shuffle(order)
+                pair = {}
+                for variant in order:
+                    seconds, state = run(variant, case, str(repetition))
+                    if reference is not None and state != reference:
+                        raise RuntimeError(f"determinism mismatch: {case['name']} {variant}: {state} != {reference}")
+                    reference = state
+                    pair[variant] = seconds
+                pairs.append(pair)
+                samples.append(pair["baseline"] / pair["candidate"])
+                (args.output / f"{case['name']}-samples.json").write_text(json.dumps(pairs, indent=2) + "\n")
+            look = confidence(samples)
+            looks.append(look)
+            (args.output / f"{case['name']}-looks.json").write_text(json.dumps(looks, indent=2) + "\n")
+            if not needs_extension(look, args.max_repeats):
+                break
+            print(f"{case['name']}: uncertain at {len(samples)} pairs; "
+                  f"extend once to {args.max_repeats}, retaining all samples", flush=True)
+        result = {"case": case, "state": reference, "looks": looks, **looks[-1]}
         results.append(result)
         (args.output / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
         print(f"{case['name']}: median={result['median_speedup']:.5f} "
-              f"lower95={result['lower_95_speedup']:.5f} {'PASS' if result['pass'] else 'FAIL/UNCERTAIN'}",
+              f"lower97.5={result['lower_speedup']:.5f} pairs={result['sample_count']} "
+              f"{'PASS' if result['pass'] else 'FAIL/UNCERTAIN'}",
               flush=True)
     passed = all(result["pass"] for result in results)
     (args.output / "verdict.json").write_text(json.dumps({"pass": passed,

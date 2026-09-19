@@ -39,7 +39,7 @@ TickSimulation::~TickSimulation() {
         observation.releaseSession(this);
     } catch (...) {
     }
-    observation.unregisterSimulation(this);
+    if (observation_registered_) observation.unregisterSimulation();
     freeThreadProgressArray();
 }
 

@@ -37,6 +37,7 @@ void TickSimulation::initialize() {
         throw std::logic_error("simulation initialization already started or failed");
     initialization_started_ = true;
     observe::ObservationManager::instance().registerSimulation(this);
+    observation_registered_ = true;
 
     if (clock_mode_) {
         // Clock topology already validates zero-delay cycles and fixes the

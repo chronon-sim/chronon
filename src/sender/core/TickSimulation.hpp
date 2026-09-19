@@ -437,7 +437,9 @@ private:
     std::string epochFreeVetoReason_() const;
     void warnParallelFallbackIfNeeded_();
 
-    bool executeUnitCycle_(TickableUnit* unit, uint64_t cycle) {
+    // Preserve the specialized tick path at the call site: an outlined helper
+    // adds a dispatch call for every unit and cycle, even without activity scheduling.
+    [[gnu::always_inline]] inline bool executeUnitCycle_(TickableUnit* unit, uint64_t cycle) {
         if (!any_activity_scheduling_.enabled.load(std::memory_order_acquire)) {
             unit->executeTickAlwaysActive();
             return true;
@@ -977,6 +979,7 @@ private:
     // Cold lifecycle metadata stays after runtime state to preserve hot layout.
     bool initialization_started_ = false;
     bool finalized_ = false;
+    bool observation_registered_ = false;
     mutable std::unique_ptr<PortDirectory> port_directory_;
 };
 

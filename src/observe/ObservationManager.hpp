@@ -60,14 +60,6 @@ public:
      */
     void initialize(const ObservationYAMLConfig& config);
 
-    /// Exclusive process backend lease used by TickSimulation/SimulationApp.
-    /// A second observed session is rejected before existing contexts are changed.
-    void acquireSession(const ObservationYAMLConfig& config, const void* owner);
-    void releaseSession(const void* owner);
-    bool ownsSession(const void* owner) const noexcept { return session_owner_ == owner; }
-    void registerSimulation(const void* simulation);
-    void unregisterSimulation(const void* simulation) noexcept;
-
     bool isEnabled() const noexcept { return enabled_; }
     bool isInitialized() const noexcept { return initialized_; }
 
@@ -185,6 +177,14 @@ public:
     size_t contextCount() const noexcept;
 
 private:
+    friend class chronon::sender::TickSimulation;
+    // TickSimulation owns the backend lease; model code cannot replace it.
+    void acquireSession(const ObservationYAMLConfig& config, const void* owner);
+    void releaseSession(const void* owner);
+    bool ownsSession(const void* owner) const noexcept { return session_owner_ == owner; }
+    void registerSimulation(const void* simulation);
+    void unregisterSimulation() noexcept;
+
     ObservationManager();
     ~ObservationManager();
 
@@ -213,7 +213,9 @@ private:
 
     mutable std::mutex mutex_;
     const void* session_owner_ = nullptr;
-    std::vector<const void*> simulations_;
+    // Only exclusivity needs tracking. Avoid allocating a process-wide registry
+    // on the otherwise observation-free simulation initialization path.
+    size_t initialized_simulation_count_ = 0;
 };
 
 }  // namespace chronon::observe

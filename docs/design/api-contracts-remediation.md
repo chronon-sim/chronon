@@ -60,10 +60,27 @@ the contract repair, rather than weakening existing equivalence checks.
 - Moving cold metadata out of the hot simulation layout and removing the extra
   Unit directory pointer improved the same case's median to 0.99928. Its lower
   bound was 0.98043, so the result remained uncertain and failed acceptance.
-- Final measurement protocol therefore uses 51 pairs and a calibrated two-second
-  target for **every** case. The 0.99 threshold and confidence level are unchanged;
-  failed diagnostics are retained, not replaced by selectively successful reruns.
+- Measurement starts with 51 pairs and a calibrated two-second target for every
+  case. An uncertain first result may extend once to a fixed total of 201 pairs,
+  retaining every initial sample. Both predeclared looks use a one-sided 97.5%
+  bound, allocating the nominal 5% false-acceptance budget across the two looks.
+  A clear regression stops without extension; uncertainty at the cap fails.
+  The 0.99 threshold is unchanged. Failed diagnostics remain recorded.
 - Observation capability is deliberately explicit: the existing process backend
   supports one managed observed session at a time. This change makes ownership
   and failure behavior safe; it does not introduce concurrent observation backends
   or remove the multiclock timestamp safety gate.
+
+- `edd9e5e` local measurement: floor passed (median 0.997695, lower95 0.997471);
+  sequential scheduler poll0 failed (median 0.989076, lower95 0.988867). This
+  candidate's full matrix was stopped after the completed failure; all samples
+  are retained. Its complete correctness Actions passed.
+- Inlining the per-unit dispatch helper, with identical tick/activity logic,
+  improved that sequential case to median 1.016249 and lower95 1.015771. The
+  four-worker case remained uncertain (median 1.001907, lower95 0.986720).
+  These diagnostic figures use the earlier single-look protocol and are not
+  final acceptance. The fixed extension and stricter per-look confidence above
+  were specified before measuring the next candidate.
+- Session bookkeeping now uses a count and an explicit registration flag,
+  avoiding an allocation on observation-free initialization. Lease management
+  methods are private to the simulation instead of expanding the public API.

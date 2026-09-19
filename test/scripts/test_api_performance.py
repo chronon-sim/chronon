@@ -32,6 +32,28 @@ class PerformanceAcceptance(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gate.confidence(samples)
 
+    def test_only_uncertainty_extends_once(self):
+        uncertain = gate.confidence([0.97] * 25 + [1.02] * 26)
+        self.assertTrue(gate.needs_extension(uncertain, 201))
+        self.assertFalse(gate.needs_extension(uncertain, 51))
+        self.assertFalse(gate.needs_extension(gate.confidence([0.98] * 51), 201))
+        self.assertFalse(gate.needs_extension(gate.confidence([1.01] * 51), 201))
+
+    def test_second_look_keeps_bad_initial_samples(self):
+        # Discarding the initial batch would pass. The cumulative decision must fail.
+        initial = [0.97] * 51
+        additional = [0.97] * 55 + [1.02] * 95
+        self.assertTrue(gate.confidence(additional)["pass"])
+        cumulative = gate.confidence(initial + additional)
+        self.assertFalse(cumulative["pass"])
+        self.assertEqual(cumulative["sample_count"], 201)
+        self.assertFalse(gate.needs_extension(cumulative, 201))
+
+    def test_two_looks_share_false_acceptance_budget(self):
+        result = gate.confidence([1.0] * 51)
+        self.assertGreaterEqual(result["confidence_level"], 0.975)
+        self.assertLessEqual(2 * (1 - result["confidence_level"]), 0.05 + 1e-12)
+
     def test_overflow_rejected(self):
         with self.assertRaises(ValueError):
             gate.parse({"kind": "scheduler"}, "overflow\n1\n")
