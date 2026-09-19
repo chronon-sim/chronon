@@ -8,6 +8,7 @@ const sidebars: SidebarsConfig = {
       label: 'Core Framework',
       items: [
         'guides/architecture',
+        'guides/api-contracts',
         'guides/units-and-simulation',
         'guides/port-system',
         'guides/pipeline-registers',

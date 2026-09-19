@@ -267,13 +267,13 @@ public:
     }
 
     /// Triggers registration of all pending ports to PortDirectory.
-    void setTreeNode(tree::TreeNode* node) {
+    void setTreeNode(tree::TreeNode* node, PortDirectory& directory = PortDirectory::instance()) {
         if (state_ != UnitState::Created)
             throw std::logic_error("cannot rebind unit tree after initialization");
         if (tree_node_ && tree_node_ != node)
             throw std::logic_error("unit tree binding is immutable");
         tree_node_ = node;
-        registerAllPendingPorts();
+        registerAllPendingPorts(directory);
     }
 
     tree::TreeNode* treeNode() const noexcept { return tree_node_; }
@@ -285,13 +285,13 @@ public:
      * Add a port registration callback to be invoked when setTreeNode() runs.
      * Called automatically by Port constructors for YAML-driven discovery.
      */
-    void addPendingPortRegistration(std::function<void(const std::string&)> registration) {
+    void addPendingPortRegistration(
+        std::function<void(const std::string&, PortDirectory&)> registration) {
         pending_port_registrations_.push_back(std::move(registration));
     }
 
 protected:
     friend class TickSimulation;
-    friend PortDirectory& portDirectoryForUnit(Unit* unit);
 
     void setId(uint32_t id) { id_ = id; }
 
@@ -428,10 +428,10 @@ private:
         }
     }
 
-    void registerAllPendingPorts() {
+    void registerAllPendingPorts(PortDirectory& directory) {
         std::string prefix = fullPath();
         for (auto& reg : pending_port_registrations_) {
-            reg(prefix);
+            reg(prefix, directory);
         }
         pending_port_registrations_.clear();
     }
@@ -464,9 +464,9 @@ private:
     std::vector<PortBase*> ports_;
     /// Lazily allocated: the common Unit has no receiver cycle hook.
     std::unique_ptr<std::vector<PortBase*>> cycle_prepared_ports_;
-    PortDirectory* port_directory_ = nullptr;
     tree::TreeNode* tree_node_ = nullptr;
-    std::vector<std::function<void(const std::string&)>> pending_port_registrations_;
+    std::vector<std::function<void(const std::string&, PortDirectory&)>>
+        pending_port_registrations_;
 };
 
 template <typename T>
@@ -502,14 +502,10 @@ inline std::string Unit::fullPath() const {
     return name_;
 }
 
-inline PortDirectory& portDirectoryForUnit(Unit* unit) {
-    return unit && unit->port_directory_ ? *unit->port_directory_ : PortDirectory::instance();
-}
-
 /// Defined here (free function) to avoid the Port.hpp → Unit.hpp circular
 /// dependency: Port constructors only see a forward-declared Unit.
-inline void addPortRegistrationToUnit(Unit* unit,
-                                      std::function<void(const std::string&)> registration) {
+inline void addPortRegistrationToUnit(
+    Unit* unit, std::function<void(const std::string&, PortDirectory&)> registration) {
     if (unit) {
         unit->addPendingPortRegistration(std::move(registration));
     }

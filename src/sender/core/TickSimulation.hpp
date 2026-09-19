@@ -12,7 +12,7 @@
 
 #pragma once
 
-#include "../../observe/ObservationManager.hpp"
+#include "../../observe/ObservableUnit.hpp"
 #include "../../params/ParameterSet.hpp"
 #include "../port/AsyncFifo.hpp"
 #include "../port/Connection.hpp"
@@ -26,6 +26,7 @@
 #include "TerminationRequest.hpp"
 #include "TickSimulationConfig.hpp"
 #include "TickSimulationCycleUtils.hpp"
+#include "TickSimulationDescriptors.hpp"
 #include "TickableUnit.hpp"
 
 #pragma GCC diagnostic push
@@ -52,6 +53,10 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+namespace chronon::observe {
+struct ObservationYAMLConfig;
+}
 
 namespace chronon::sender {
 
@@ -107,7 +112,6 @@ public:
         }
 
         ptr->clock_ = &default_clock_;
-        ptr->port_directory_ = &port_directory_;
 
         ptr->setId(static_cast<uint32_t>(units_.size()));
         ptr->bindActivitySchedulingState_(&any_activity_scheduling_);
@@ -164,20 +168,13 @@ public:
         return conn;
     }
 
-    /// For YAML-driven builders that create connections via type-erased port
-    /// handles rather than the templated connect() above.
-    void registerConnection(ConnectionBase* conn) {
-        if (initialization_started_ || finalized_)
-            throw std::logic_error("runtime connection registration is unsupported");
-        if (conn) {
-            validateClockOwner_(conn->source());
-            validateClockOwner_(conn->destination());
-            conn->setConnId(static_cast<uint32_t>(connections_.size()));
-            connections_.push_back(conn);
-        }
-    }
+    /// Type-erased connection registration used by configuration builders.
+    void registerConnection(ConnectionBase* connection);
 
     void initialize();
+    /// Own the process observation backend for this session. Configure before initialize().
+    /// Observed sessions are exclusive; multiclock uses configureClockTrace instead.
+    void configureObservation(const observe::ObservationYAMLConfig& config);
 
     /// End this session. Calls every successfully initialized unit's finalize()
     /// once, in creation order, even if another finalizer throws. Idempotent.
@@ -185,8 +182,9 @@ public:
     /// Host-only, between runs. A finalized simulation cannot be run again.
     void finalize();
     bool isFinalized() const noexcept { return finalized_; }
-    PortDirectory& portDirectory() noexcept { return port_directory_; }
-    const PortDirectory& portDirectory() const noexcept { return port_directory_; }
+    PortDirectory& portDirectory();
+    const PortDirectory& portDirectory() const;
+    void bindTreeNode(Unit& unit, tree::TreeNode& node);
 
     /// Assign the factory instance identity before initialization. Host-only.
     void setUnitName(Unit& unit, std::string name);
@@ -242,10 +240,6 @@ public:
     void configureClockTrace(observe::ClockTraceRecorder::Config config);
     observe::ClockTraceRecorder* clockTraceRecorder() noexcept { return clock_trace_.get(); }
     void closeClockTrace();
-
-    /// Resolve one producer-cluster completed-cycle atomic for each direct
-    /// MPSC lane. Complete coverage is required by epoch-free lookahead.
-    void installMultiProducerProgress_();
 
     /// Run for the specified cycles. Internally dispatches to parallel or
     /// sequential execution based on cluster analysis.
@@ -383,6 +377,8 @@ public:
     void forceStableConnectionQueues() noexcept { force_stable_connection_queues_ = true; }
 
 private:
+    /// Resolve per-lane progress only after topology and transport selection.
+    void installMultiProducerProgress_();
     template <bool ClockMode, typename Predicate>
     uint64_t runUntilImpl_(Predicate& should_stop, uint64_t max_cycles) {
         uint64_t executed = 0;
@@ -792,8 +788,6 @@ private:
     [[noreturn]] [[gnu::cold]] [[gnu::noinline]] static void throwTickException();
 
     TickSimulationConfig config_;
-    bool initialization_started_ = false;
-    bool finalized_ = false;
     ClockDomain default_clock_;
     std::deque<ClockDomain> clock_domains_;
     bool clock_mode_ = false;
@@ -837,7 +831,6 @@ private:
     ::exec::static_thread_pool pool_;
 
     // Reverse member destruction keeps parameters valid through unit teardown.
-    PortDirectory port_directory_;
     std::vector<std::unique_ptr<params::ParameterSet>> unit_parameters_;
     std::vector<std::unique_ptr<TickableUnit>> units_;
     std::vector<TickableUnit*> unit_ptrs_;
@@ -980,6 +973,11 @@ private:
 
     uint64_t cycles_since_last_actual_rebalance_ = 0;
     uint64_t rebalance_count_ = 0;
+
+    // Cold lifecycle metadata stays after runtime state to preserve hot layout.
+    bool initialization_started_ = false;
+    bool finalized_ = false;
+    mutable std::unique_ptr<PortDirectory> port_directory_;
 };
 
 }  // namespace chronon::sender

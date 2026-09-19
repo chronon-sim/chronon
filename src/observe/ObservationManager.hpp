@@ -60,6 +60,14 @@ public:
      */
     void initialize(const ObservationYAMLConfig& config);
 
+    /// Exclusive process backend lease used by TickSimulation/SimulationApp.
+    /// A second observed session is rejected before existing contexts are changed.
+    void acquireSession(const ObservationYAMLConfig& config, const void* owner);
+    void releaseSession(const void* owner);
+    bool ownsSession(const void* owner) const noexcept { return session_owner_ == owner; }
+    void registerSimulation(const void* simulation);
+    void unregisterSimulation(const void* simulation) noexcept;
+
     bool isEnabled() const noexcept { return enabled_; }
     bool isInitialized() const noexcept { return initialized_; }
 
@@ -189,6 +197,7 @@ private:
 
     /// PRECONDITION: mutex_ held.
     void shutdownLocked_();
+    void initializeLocked_(const ObservationYAMLConfig& config);
 
     bool enabled_ = false;
     bool initialized_ = false;
@@ -203,6 +212,8 @@ private:
     SourceNameRegistry source_registry_;
 
     mutable std::mutex mutex_;
+    const void* session_owner_ = nullptr;
+    std::vector<const void*> simulations_;
 };
 
 }  // namespace chronon::observe

@@ -85,6 +85,9 @@ public:
         installAutoRegistration_();
     }
 
+    InPort(Unit* owner, std::string name, QueueDepth depth)
+        : InPort(owner, std::move(name), depth.entries) {}
+
     /// Convenience constructor: specify policy without setting capacity.
     InPort(Unit* owner, std::string name, PortPolicy policy)
         : PortBase(owner, std::move(name)),
@@ -110,11 +113,12 @@ private:
 
     void installAutoRegistration_() {
         if (owner_) {
-            addPortRegistrationToUnit(owner_, [this](const std::string& prefix) {
-                std::string full_path = prefix + "." + name_;
-                portDirectoryForUnit(owner_).registerPort(
-                    full_path, std::make_unique<InPortHandle<T>>(this, owner_, name_, full_path));
-            });
+            addPortRegistrationToUnit(
+                owner_, [this](const std::string& prefix, PortDirectory& directory) {
+                    std::string full_path = prefix + "." + name_;
+                    directory.registerPort(full_path, std::make_unique<InPortHandle<T>>(
+                                                          this, owner_, name_, full_path));
+                });
         }
     }
 
@@ -379,6 +383,7 @@ public:
     size_t capacity() const { return queue_->capacity(); }
     size_t storageCapacity() const noexcept { return queue_->storageCapacity(); }
     size_t configuredCapacity() const noexcept { return capacity_; }
+    QueueDepth queueDepth() const noexcept { return {capacity_}; }
     size_t available() const { return queue_->available(); }
     size_t admissionOccupancy(uint64_t send_cycle) const {
         return queue_->admissionOccupancy(send_cycle);
@@ -728,6 +733,7 @@ public:
      * scoped, and retire automatically; clearing live state could resurrect a
      * message canceled by an overlapping flush.
      */
+    /// Compatibility no-op: receiver-owned selective cancellation retires automatically.
     void resetSelectiveCancellation() noexcept {}
 
 private:

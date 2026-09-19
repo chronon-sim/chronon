@@ -5,6 +5,7 @@
 #include <set>
 #include <tuple>
 
+#include "../../observe/ObservationManager.hpp"
 #include "TickSimulation.hpp"
 
 namespace chronon::sender {

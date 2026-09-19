@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 // Host-side construction, lifecycle and inspection. No per-tick dispatch here.
+#include "../../observe/ObservationManager.hpp"
 #include "TickSimulation.hpp"
 
 namespace chronon::sender {
@@ -24,7 +25,58 @@ TickSimulation::~TickSimulation() {
         // Explicit finalize() reports failures. Destruction still releases all
         // resources and never retries a hook that already ran.
     }
+    auto& observation = observe::ObservationManager::instance();
+    if (observation.ownsSession(this)) {
+        try {
+            observation.stopBackend();
+        } catch (...) {
+        }
+    }
+    // Port handles remain valid throughout model destruction. The directory is
+    // deliberately outside the scheduler's hot member layout.
+    units_.clear();
+    try {
+        observation.releaseSession(this);
+    } catch (...) {
+    }
+    observation.unregisterSimulation(this);
     freeThreadProgressArray();
+}
+
+void TickSimulation::configureObservation(const observe::ObservationYAMLConfig& config) {
+    if (initialization_started_ || finalized_)
+        throw std::logic_error("configure observation before simulation initialization");
+    if (clock_mode_) throw std::logic_error("multiclock observation requires configureClockTrace");
+    observe::ObservationManager::instance().acquireSession(config, this);
+}
+
+PortDirectory& TickSimulation::portDirectory() {
+    if (!port_directory_) port_directory_ = std::make_unique<PortDirectory>();
+    return *port_directory_;
+}
+
+const PortDirectory& TickSimulation::portDirectory() const {
+    if (!port_directory_) port_directory_ = std::make_unique<PortDirectory>();
+    return *port_directory_;
+}
+
+void TickSimulation::bindTreeNode(Unit& unit, tree::TreeNode& node) {
+    if (initialization_started_ || finalized_)
+        throw std::logic_error("cannot bind unit tree after initialization has started");
+    validateClockOwner_(&unit);
+    unit.setTreeNode(&node, portDirectory());
+}
+
+void TickSimulation::registerConnection(ConnectionBase* connection) {
+    if (initialization_started_ || finalized_)
+        throw std::logic_error("runtime connection registration is unsupported");
+    if (!connection) return;
+    validateClockOwner_(connection->source());
+    validateClockOwner_(connection->destination());
+    if (std::find(connections_.begin(), connections_.end(), connection) != connections_.end())
+        throw std::invalid_argument("connection is already registered");
+    connection->setConnId(static_cast<uint32_t>(connections_.size()));
+    connections_.push_back(connection);
 }
 
 void TickSimulation::finalize() {

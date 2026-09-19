@@ -204,6 +204,112 @@ simulation:
           first_producer);
 }
 
+void configurationContracts() {
+    TickSimulationConfig runtime;
+    runtime.setExecutionPolicy(ExecutionPolicy::Sequential);
+    CHECK(runtime.executionPolicy() == ExecutionPolicy::Sequential);
+    runtime.setExecutionPolicy(ExecutionPolicy::Auto);
+    CHECK(runtime.enable_parallel && runtime.enable_lookahead &&
+          runtime.enable_epoch_free_lookahead);
+    runtime.setPollingIntervalCycles(0);
+    CHECK(runtime.epoch_size == 0 && runtime.pollingIntervalCycles() == 0);
+    chronon::sender::config::SenderConfigLoader loader;
+    const auto canonical = loader.loadFromString(
+        "simulation: {num_workers: 4, execution_policy: sequential, polling_interval_cycles: 7}");
+    const auto legacy = loader.loadFromString(
+        "simulation: {num_workers: 4, enable_lookahead: false, epoch_size: 7}");
+    CHECK(canonical.toRuntimeConfig().executionPolicy() ==
+          legacy.toRuntimeConfig().executionPolicy());
+    CHECK(canonical.toRuntimeConfig().pollingIntervalCycles() ==
+          legacy.toRuntimeConfig().pollingIntervalCycles());
+    rejects([&] { loader.loadFromString("simulation: {execution_policy: unknown}"); });
+    rejects([&] {
+        loader.loadFromString("simulation: {execution_policy: auto, enable_parallel: false}");
+    });
+    rejects(
+        [&] { loader.loadFromString("simulation: {polling_interval_cycles: 7, epoch_size: 8}"); });
+    auto manual = canonical;
+    manual.units["z"].instance_name = "z";
+    manual.units["a"].instance_name = "a";
+    CHECK(manual.unitNames() == (std::vector<std::string>{"a", "z"}));
+    manual.unit_order = {"z"};
+    CHECK(manual.unitNames() == (std::vector<std::string>{"z", "a"}));
+}
+
+void portCapacityContracts() {
+    OutPort<int> standalone_out{nullptr, "out", SendRate{3}};
+    InPort<int> standalone_in{nullptr, "in", QueueDepth{8}};
+    CHECK(standalone_out.sendRate().entries_per_cycle == 3);
+    CHECK(standalone_in.queueDepth().entries == 8);
+    for (bool reverse : {false, true}) {
+        TickSimulation sim(config());
+        auto* a = sim.createUnit<NamedUnit>(nullptr);
+        auto* b = sim.createUnit<NamedUnit>(nullptr);
+        auto* c = sim.createUnit<NamedUnit>(nullptr);
+        auto* first = sim.connect(a->out, c->in);
+        auto* second = sim.connect(b->out, c->in);
+        first->configureRegisteredEdge(reverse ? 8 : 4, {});
+        second->configureRegisteredEdge(reverse ? 4 : 8, {});
+        rejects([&] { sim.registerConnection(first); });
+        rejects([&] { sim.initialize(); });
+        CHECK(c->in.queueDepth().entries == InPort<int>::UNLIMITED_CAPACITY);
+    }
+    TickSimulation sim(config());
+    auto* a = sim.createUnit<NamedUnit>(nullptr);
+    auto* b = sim.createUnit<NamedUnit>(nullptr);
+    auto* c = sim.createUnit<NamedUnit>(nullptr);
+    sim.connect(a->out, c->in)->configureRegisteredEdge(8, {});
+    sim.connect(b->out, c->in)->configureRegisteredEdge(8, {});
+    sim.run(4);
+    CHECK(c->in.queueDepth().entries == 8);
+}
+
+void observationSessionLifetime() {
+    auto& manager = chronon::observe::ObservationManager::instance();
+    chronon::observe::ObservationYAMLConfig observation;
+    observation.enabled = true;
+    observation.output_dir = "/tmp/chronon-api-session-test";
+    for (int iteration = 0; iteration != 2; ++iteration) {
+        {
+            TickSimulation owner(config());
+            owner.configureObservation(observation);
+            const auto* queue = manager.sharedQueue();
+            {
+                TickSimulation other(config());
+                rejects([&] { other.configureObservation(observation); });
+                rejects([&] { other.initialize(); });
+                rejects([&] { manager.initialize(observation); });
+                rejects([&] { manager.reset(); });
+            }
+            CHECK(manager.sharedQueue() == queue);
+            auto* unit = owner.createUnit<NamedUnit>(nullptr);
+            unit->setObservationContext(
+                manager.createContextForUnit("named", [unit] { return unit->localCycle(); }));
+            owner.run(3);
+            CHECK(unit->getObserveCycle() == 3);
+            owner.finalize();
+        }
+        CHECK(!manager.isInitialized());
+    }
+    {
+        TickSimulation running(config());
+        running.initialize();
+        TickSimulation other(config());
+        rejects([&] { other.configureObservation(observation); });
+    }
+    SenderSimulationBuilder builder;
+    rejects([&] {
+        builder.buildFromYAMLString(R"yaml(
+simulation:
+  num_workers: 1
+  observation: {enabled: true}
+  unit:
+    invalid: {type: ThisFactoryDoesNotExist}
+)yaml");
+    });
+    CHECK(!manager.isInitialized());
+}
+
 }  // namespace
 
 int main() {
@@ -212,5 +318,8 @@ int main() {
     lifecycleFailures();
     identityAndReceive();
     independentPortDirectories();
+    configurationContracts();
+    portCapacityContracts();
+    observationSessionLifetime();
     std::cout << "API contracts passed\n";
 }

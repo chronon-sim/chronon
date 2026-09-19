@@ -92,48 +92,17 @@ public:
     }
 
 private:
-    static TickSimulationConfig::PartitionSolverType parsePartitionSolverType_(
-        const std::string& solver_name) {
-        std::string normalized = solver_name;
-        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-        if (normalized == "weighted") {
-            return TickSimulationConfig::PartitionSolverType::Weighted;
-        }
-        if (normalized == "sa") {
-            return TickSimulationConfig::PartitionSolverType::SA;
-        }
-        throw BuildError("building", "unknown partition_solver '" + solver_name +
-                                         "' (expected 'Weighted' or 'SA')");
-    }
-
     void phaseBuild(Result& result) {
-        TickSimulationConfig sim_config;
-        sim_config.num_threads = result.config.num_workers;
-        sim_config.enable_parallel = result.config.enable_parallel && result.config.num_workers > 1;
-        sim_config.enable_lookahead = result.config.enable_lookahead;
-        sim_config.trace_execution = result.config.trace_execution;
-        sim_config.max_lookahead_cycles = result.config.max_lookahead_cycles;
-        sim_config.epoch_size = result.config.epoch_size;
-        sim_config.enable_epoch_free_lookahead = result.config.enable_epoch_free_lookahead;
-        sim_config.enable_weighted_partitioning = result.config.enable_weighted_partitioning;
-        sim_config.enable_dynamic_rebalance = result.config.enable_dynamic_rebalance;
-        sim_config.rebalance_imbalance_threshold = result.config.rebalance_imbalance_threshold;
-        sim_config.rebalance_check_interval_cycles = result.config.rebalance_check_interval_cycles;
-        sim_config.rebalance_min_gain = result.config.rebalance_min_gain;
-        sim_config.rebalance_cooldown_cycles = result.config.rebalance_cooldown_cycles;
-        sim_config.partition_solver = parsePartitionSolverType_(result.config.partition_solver);
-        sim_config.sa_critical_path_weight = result.config.sa_critical_path_weight;
-        sim_config.initial_partition_sync_cost_ns = result.config.initial_partition_sync_cost_ns;
-        sim_config.tick_frequency_hz = result.config.tick_frequency_hz;
-        sim_config.timeline_trace = result.config.timeline_trace;
-
-        result.simulation = std::make_unique<TickSimulation>(sim_config);
+        try {
+            result.simulation = std::make_unique<TickSimulation>(result.config.toRuntimeConfig());
+        } catch (const std::invalid_argument& error) {
+            throw BuildError("building", error.what());
+        }
 
         result.root_node = std::make_unique<tree::TreeNode>(result.config.name);
 
         if (result.config.observation && result.config.observation->enabled) {
-            observe::ObservationManager::instance().initialize(*result.config.observation);
+            result.simulation->configureObservation(*result.config.observation);
             result.observation_enabled = true;
         }
     }
@@ -167,7 +136,7 @@ private:
             auto unit_node = std::make_unique<tree::TreeNode>(name, result.root_node.get());
             tree::TreeNode* unit_node_ptr = unit_node.get();
             result.root_node->addChild(name, std::move(unit_node));
-            unit->setTreeNode(unit_node_ptr);
+            result.simulation->bindTreeNode(*unit, *unit_node_ptr);
 
             result.unit_map[name] = unit;
             result.units_created++;

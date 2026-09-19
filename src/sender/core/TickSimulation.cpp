@@ -21,6 +21,7 @@
 #include <unordered_map>
 
 #include "../../observe/ObservableUnit.hpp"
+#include "../../observe/ObservationManager.hpp"
 #include "TickSimulationCycleUtils.hpp"
 
 namespace chronon::sender {
@@ -35,6 +36,7 @@ void TickSimulation::initialize() {
     if (initialization_started_)
         throw std::logic_error("simulation initialization already started or failed");
     initialization_started_ = true;
+    observe::ObservationManager::instance().registerSimulation(this);
 
     if (clock_mode_) {
         // Clock topology already validates zero-delay cycles and fixes the
@@ -89,6 +91,17 @@ void TickSimulation::initialize() {
         unit->state_ = UnitState::Initialized;
     }
 
+    // Validate all explicit fan-in depths before applying any override. A
+    // connection's capacity configures the shared destination, not a private lane.
+    std::unordered_map<void*, size_t> destination_depths;
+    for (auto* connection : connections_) {
+        if (auto depth = connection->destinationDepthOverride()) {
+            auto [entry, inserted] = destination_depths.emplace(connection->destPortPtr(), *depth);
+            if (!inserted && entry->second != *depth)
+                throw std::invalid_argument("conflicting destination depths for input port " +
+                                            std::string(connection->destinationPortName()));
+        }
+    }
     for (auto* connection : connections_) connection->prepareRegisteredCapacity();
 
     // Unit::initialize() may finalize Port capacities. Discover transparent

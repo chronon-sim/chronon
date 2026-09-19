@@ -39,7 +39,41 @@ ObservationManager::~ObservationManager() {
 
 void ObservationManager::initialize(const ObservationYAMLConfig& config) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (session_owner_)
+        throw std::logic_error("observation backend belongs to a simulation session");
+    initializeLocked_(config);
+}
 
+void ObservationManager::acquireSession(const ObservationYAMLConfig& config, const void* owner) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!owner || session_owner_ || initialized_ || !simulations_.empty())
+        throw std::logic_error(
+            "observation requires an exclusive simulation session; destroy the previous session "
+            "first");
+    initializeLocked_(config);
+    session_owner_ = owner;
+}
+
+void ObservationManager::releaseSession(const void* owner) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (session_owner_ != owner) return;
+    session_owner_ = nullptr;
+    shutdownLocked_();
+}
+
+void ObservationManager::registerSimulation(const void* simulation) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (session_owner_ && session_owner_ != simulation)
+        throw std::logic_error("another simulation owns the process observation backend");
+    simulations_.push_back(simulation);
+}
+
+void ObservationManager::unregisterSimulation(const void* simulation) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::erase(simulations_, simulation);
+}
+
+void ObservationManager::initializeLocked_(const ObservationYAMLConfig& config) {
     if (initialized_) {
         shutdownLocked_();
     }
@@ -254,6 +288,8 @@ bool ObservationManager::submitTimeline(TimelineStreamData&& data) {
 
 void ObservationManager::shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (session_owner_)
+        throw std::logic_error("destroy the owning simulation before shutting down observation");
     shutdownLocked_();
 }
 
@@ -281,6 +317,8 @@ void ObservationManager::shutdownLocked_() {
 
 void ObservationManager::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (session_owner_)
+        throw std::logic_error("destroy the owning simulation before resetting observation");
     config_ = ObservationYAMLConfig{};
     shutdownLocked_();
 }

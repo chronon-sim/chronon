@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "../../chronon/CpuPause.hpp"
+#include "../../observe/ObservationManager.hpp"
 #include "DynamicWaitPolicy.hpp"
 #include "TickSimulation.hpp"
 #include "TickSimulationCycleUtils.hpp"

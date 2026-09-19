@@ -11,14 +11,16 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "../../observe/ObservationYAMLConfig.hpp"
-#include "../schedule/SchedulerTimelineTrace.hpp"
+#include "../core/TickSimulationConfig.hpp"
 
 namespace chronon::sender::config {
 
@@ -65,33 +67,39 @@ struct PortConnectionSpec {
  * @endcode
  */
 struct SimulationYAMLConfig {
+    /// Legacy YAML default; C++ defaults to hardware_concurrency(). Set explicitly for parity.
     uint32_t num_workers = 4;
-    bool enable_parallel = true;
+    bool enable_parallel = TickSimulationConfig{}.enable_parallel;
     /// Compatibility switch. False forces Sequential; Barrier was removed.
-    bool enable_lookahead = true;
-    bool trace_execution = false;  ///< Print execution policy details.
-    uint32_t max_lookahead_cycles = 100;
+    bool enable_lookahead = TickSimulationConfig{}.enable_lookahead;
+    bool trace_execution =
+        TickSimulationConfig{}.trace_execution;  ///< Print execution policy details.
+    uint32_t max_lookahead_cycles = TickSimulationConfig{}.max_lookahead_cycles;
     /// Host predicate and Sequential termination polling interval.
-    uint64_t epoch_size = 64;
+    uint64_t epoch_size = TickSimulationConfig{}.epoch_size;
     /// Compatibility switch for epoch-free execution. False forces Sequential;
     /// no epoch-boundary fallback remains.
-    bool enable_epoch_free_lookahead = true;
+    bool enable_epoch_free_lookahead = TickSimulationConfig{}.enable_epoch_free_lookahead;
     uint64_t run_cycles = 0;  ///< 0 = run until completion.
     std::string name = "simulation";
-    uint64_t tick_frequency_hz = 1'000'000'000;  ///< Default 1 GHz.
+    uint64_t tick_frequency_hz = TickSimulationConfig{}.tick_frequency_hz;  ///< Default 1 GHz.
 
     /// Enables cluster-aware partitioning. False keeps the legacy topology-only path.
-    bool enable_weighted_partitioning = true;
-    bool enable_dynamic_rebalance = true;
-    double rebalance_imbalance_threshold = 1.03;
-    uint64_t rebalance_check_interval_cycles = 2048;
-    double rebalance_min_gain = 0.01;
-    uint64_t rebalance_cooldown_cycles = 0;
+    bool enable_weighted_partitioning = TickSimulationConfig{}.enable_weighted_partitioning;
+    bool enable_dynamic_rebalance = TickSimulationConfig{}.enable_dynamic_rebalance;
+    double rebalance_imbalance_threshold = TickSimulationConfig{}.rebalance_imbalance_threshold;
+    uint64_t rebalance_check_interval_cycles =
+        TickSimulationConfig{}.rebalance_check_interval_cycles;
+    double rebalance_min_gain = TickSimulationConfig{}.rebalance_min_gain;
+    uint64_t rebalance_cooldown_cycles = TickSimulationConfig{}.rebalance_cooldown_cycles;
     /// Initial cluster-aware partition solver: "SA" (default) or "Weighted".
     std::string partition_solver = "SA";
-    double sa_critical_path_weight = 0.0;  ///< 0 disables the SA critical-path term.
+    double sa_critical_path_weight =
+        TickSimulationConfig{}.sa_critical_path_weight;  ///< 0 disables the SA critical-path term.
     double initial_partition_sync_cost_ns =
-        8.0;  ///< Locality weight for the initial partition; 0 = pure load balance.
+        TickSimulationConfig{}
+            .initial_partition_sync_cost_ns;  ///< Locality weight for the initial partition; 0 =
+                                              ///< pure load balance.
     SchedulerTimelineTraceConfig timeline_trace;
 
     /// Builder auto-creates observation contexts when present and enabled.
@@ -103,6 +111,40 @@ struct SimulationYAMLConfig {
     std::vector<std::string> unit_order;
 
     std::vector<PortConnectionSpec> connections;
+
+    /// One translation boundary for YAML compatibility names and runtime settings.
+    TickSimulationConfig toRuntimeConfig() const {
+        TickSimulationConfig result;
+        result.num_threads = num_workers;
+        result.enable_parallel = enable_parallel;
+        result.enable_lookahead = enable_lookahead;
+        result.trace_execution = trace_execution;
+        result.max_lookahead_cycles = max_lookahead_cycles;
+        result.epoch_size = epoch_size;
+        result.enable_epoch_free_lookahead = enable_epoch_free_lookahead;
+        result.tick_frequency_hz = tick_frequency_hz;
+        result.enable_weighted_partitioning = enable_weighted_partitioning;
+        result.enable_dynamic_rebalance = enable_dynamic_rebalance;
+        result.rebalance_imbalance_threshold = rebalance_imbalance_threshold;
+        result.rebalance_check_interval_cycles = rebalance_check_interval_cycles;
+        result.rebalance_min_gain = rebalance_min_gain;
+        result.rebalance_cooldown_cycles = rebalance_cooldown_cycles;
+        result.sa_critical_path_weight = sa_critical_path_weight;
+        result.initial_partition_sync_cost_ns = initial_partition_sync_cost_ns;
+        result.enable_parallel = enable_parallel && num_workers > 1;
+        result.timeline_trace = timeline_trace;
+        std::string solver = partition_solver;
+        std::transform(solver.begin(), solver.end(), solver.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (solver == "sa")
+            result.partition_solver = TickSimulationConfig::PartitionSolverType::SA;
+        else if (solver == "weighted")
+            result.partition_solver = TickSimulationConfig::PartitionSolverType::Weighted;
+        else
+            throw std::invalid_argument("unknown partition_solver '" + partition_solver +
+                                        "' (expected 'Weighted' or 'SA')");
+        return result;
+    }
 
     size_t unitCount() const { return units.size(); }
     size_t connectionCount() const { return connections.size(); }
@@ -124,11 +166,14 @@ struct SimulationYAMLConfig {
             }
         }
 
+        std::vector<std::string> remaining;
         for (const auto& [name, _] : units) {
             if (std::find(names.begin(), names.end(), name) == names.end()) {
-                names.push_back(name);
+                remaining.push_back(name);
             }
         }
+        std::sort(remaining.begin(), remaining.end());
+        names.insert(names.end(), remaining.begin(), remaining.end());
         return names;
     }
 };

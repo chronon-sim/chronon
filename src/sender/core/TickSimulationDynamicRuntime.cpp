@@ -17,6 +17,7 @@
 #include <memory>
 #include <vector>
 
+#include "../../observe/ObservationManager.hpp"
 #include "TickSimulation.hpp"
 #include "TickSimulationClockRuntime.hpp"
 

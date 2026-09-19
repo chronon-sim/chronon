@@ -29,6 +29,7 @@
 #endif
 
 #include "../../chronon/CpuPause.hpp"
+#include "../../observe/ObservationManager.hpp"
 #include "TickSimulation.hpp"
 #include "TickSimulationCycleUtils.hpp"
 #include "sender/schedule/SchedulerTimelineStyle.hpp"
