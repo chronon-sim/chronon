@@ -60,8 +60,8 @@ struct SchedulerScratchTestAccess {
         for (size_t worker = 0; worker < sim.thread_clusters_.size(); ++worker) {
             const auto& observed =
                 sim.schedulerScratch_().workers[worker].predecessor.observed_cycles;
-            // Small dynamic invocations use stack slots, which do not survive
-            // the join. Larger graphs and static workers retain their storage.
+            // Small invocations use stack slots, which do not survive the join.
+            // Larger graphs retain their storage.
             if (observed.empty()) continue;
             for (size_t cluster : sim.thread_clusters_[worker])
                 assert(observed[cluster] ==

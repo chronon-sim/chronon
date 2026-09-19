@@ -19,7 +19,6 @@
 #include <limits>
 #include <new>
 #include <string>
-#include <type_traits>
 #include <unordered_map>
 
 #if defined(__linux__)
@@ -81,12 +80,6 @@ void TickSimulation::installMultiProducerProgress_() {
 // Progress-sync allocation
 // ---------------------------------------------------------------------------
 
-TickSimulation::InvocationRetainedPredecessorCache::InvocationRetainedPredecessorCache(
-    WorkerPredecessorCycleCache* retained, size_t num_clusters)
-    : observed_cycles(std::move(retained->observed_cycles)), return_to(retained) {
-    observed_cycles.assign(num_clusters + 1, 0);
-}
-
 // Keep vector growth and small-buffer setup out of the worker's scheduling loop.
 // This also keeps register allocation independent of the cache initialization paths.
 TickSimulation::InvocationPredecessorCache::InvocationPredecessorCache(
@@ -123,8 +116,8 @@ void TickSimulation::initProgressSync() {
     const size_t num_threads = thread_units_.size();
     const size_t num_clusters = clusters_.numClusters();
     if (num_clusters == 0) return;
-    // Ordinary workers keep the original invocation-local cache header and
-    // retain its allocation. Small static clock graphs need no worker metadata.
+    // Ordinary worker metadata covers every logical worker. Small static clock
+    // graphs need no worker metadata.
     const size_t scratch_workers = !clock_mode_ || config_.enable_dynamic_rebalance ||
                                            num_clusters >= InvocationPredecessorCache::kInlineSlots
                                        ? num_threads
@@ -361,7 +354,7 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
 // Per-thread run driver
 // ---------------------------------------------------------------------------
 
-template <bool PushPeriodicCounters, bool LocalCacheHeader>
+template <bool PushPeriodicCounters>
 void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle,
                                            uint64_t run_start, uint64_t period,
                                            stdexec::inplace_stop_token token) {
@@ -374,10 +367,11 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     };
     // This cache spans the worker invocation (the entire run in EpochFree mode),
     // allowing all locally-owned clusters to reuse acquired predecessor progress.
-    using Cache = std::conditional_t<LocalCacheHeader, InvocationRetainedPredecessorCache,
-                                     InvocationPredecessorCache>;
-    Cache predecessor_cache(&schedulerScratch_().workers[thread_idx].predecessor,
-                            thread_progress_count_);
+    // Use the same invocation-local small buffer as dynamic and clock workers.
+    // Short static runs need neither transfer retained ownership nor touch a
+    // heap buffer that may have last been used on another pool thread.
+    InvocationPredecessorCache predecessor_cache(
+        &schedulerScratch_().workers[thread_idx].predecessor, thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;
@@ -538,19 +532,13 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
 
 void TickSimulation::executeThreadRun_(size_t thread_idx, uint64_t end_cycle,
                                        stdexec::inplace_stop_token token) {
-    if (thread_progress_count_ < InvocationPredecessorCache::kInlineSlots)
-        executeThreadRunImpl_<false, true>(thread_idx, end_cycle, 0, 0, token);
-    else
-        executeThreadRunImpl_<false, false>(thread_idx, end_cycle, 0, 0, token);
+    executeThreadRunImpl_<false>(thread_idx, end_cycle, 0, 0, token);
 }
 
 void TickSimulation::executeThreadRunWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
                                                            uint64_t run_start, uint64_t period,
                                                            stdexec::inplace_stop_token token) {
-    if (thread_progress_count_ < InvocationPredecessorCache::kInlineSlots)
-        executeThreadRunImpl_<true, true>(thread_idx, end_cycle, run_start, period, token);
-    else
-        executeThreadRunImpl_<true, false>(thread_idx, end_cycle, run_start, period, token);
+    executeThreadRunImpl_<true>(thread_idx, end_cycle, run_start, period, token);
 }
 
 // ---------------------------------------------------------------------------

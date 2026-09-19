@@ -117,10 +117,11 @@ def cases(workers: int) -> list[dict]:
                            "profile": profile, "threads": threads, "cycles": 1000})
     # Exercise the previously failing paths first. Every case and acceptance
     # rule is unchanged; a negative decision can now provide feedback sooner.
-    priority = {f"clock0-threads{workers}-dynamic0-poll0": 0,
-                f"clock0-threads{workers}-dynamic1-poll1": 1,
-                f"clock0-threads{workers}-dynamic0-poll1": 2}
-    return sorted(result, key=lambda case: priority.get(case["name"], 3))
+    priority = {f"clock0-threads{workers}-dynamic0-poll64": 0,
+                f"clock0-threads{workers}-dynamic0-poll0": 1,
+                f"clock0-threads{workers}-dynamic1-poll1": 2,
+                f"clock0-threads{workers}-dynamic0-poll1": 3}
+    return sorted(result, key=lambda case: priority.get(case["name"], 4))
 
 
 def executable(case: dict) -> str:

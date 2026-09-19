@@ -594,7 +594,7 @@ private:
     void executeThreadRunWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
                                                uint64_t run_start, uint64_t period,
                                                stdexec::inplace_stop_token token);
-    template <bool PushPeriodicCounters, bool LocalCacheHeader>
+    template <bool PushPeriodicCounters>
     void executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle, uint64_t run_start,
                                uint64_t period, stdexec::inplace_stop_token token);
     void executeThreadRunDynamic_(size_t thread_idx, uint64_t end_cycle,
@@ -647,21 +647,6 @@ private:
 
         std::vector<uint64_t> observed_cycles;
     };
-
-    // Small ordinary static workers keep the original compact local vector
-    // header. Its allocation returns to the logical worker on every exit.
-    struct alignas(64) InvocationRetainedPredecessorCache {
-        std::vector<uint64_t> observed_cycles;
-        WorkerPredecessorCycleCache* return_to;
-        [[gnu::noinline]] InvocationRetainedPredecessorCache(WorkerPredecessorCycleCache* retained,
-                                                             size_t num_clusters);
-        ~InvocationRetainedPredecessorCache() { observed_cycles.swap(return_to->observed_cycles); }
-        InvocationRetainedPredecessorCache(const InvocationRetainedPredecessorCache&) = delete;
-        InvocationRetainedPredecessorCache& operator=(const InvocationRetainedPredecessorCache&) =
-            delete;
-        uint64_t* data() noexcept { return observed_cycles.data(); }
-    };
-    static_assert(sizeof(InvocationRetainedPredecessorCache) == 64);
 
     // Small graphs use invocation-local slots so task stealing cannot bounce a
     // retained cache line between cores. Large graphs reuse a retained vector.

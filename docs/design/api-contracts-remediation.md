@@ -244,3 +244,20 @@ the contract repair, rather than weakening existing equivalence checks.
   byte-identical before/after this spelling change. The interrupted local matrix
   retains two passing cases and partial samples; fresh final-head validation is
   still required, with no observed performance failure discarded.
+- `61c1073` passed all correctness/documentation Actions, but CI static
+  two-worker poll64 failed at the fixed 201-pair endpoint on AMD EPYC 9V74:
+  median 0.984037, lower97.5 0.980185, upper97.5 0.987005. Seven preceding CI
+  cases passed, including the previous static poll0 and dynamic poll1 failures.
+  Every state matched. Its local matrix was stopped after twelve passes;
+  dynamic four-worker poll0 required 201 pairs and passed with lower 0.992809.
+  Both incomplete matrices and all raw samples are retained.
+- Small static worker invocations now use the existing invocation-local
+  predecessor buffer, as dynamic and clock workers already do. This removes
+  retained vector transfer/reset/return work and one cache-selection template
+  axis. Large graphs retain their existing reusable storage. Every invocation
+  still clears the same predecessor slots, including the synthetic floor slot;
+  dependency checks, unit order and progress publication are unchanged.
+  All 135 regressions pass, including boundary/poisoned-scratch equivalence, and
+  all 18 gate tests pass. Fresh performance measurements are still required.
+  Static poll64 now runs first to expose the latest failure promptly; all 29
+  workload definitions and acceptance rules remain unchanged.
