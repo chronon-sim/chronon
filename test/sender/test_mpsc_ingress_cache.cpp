@@ -1,6 +1,7 @@
 // Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
 // SPDX-License-Identifier: MPL-2.0
 
+#include <atomic>
 #include <cassert>
 #include <iostream>
 #include <memory>
@@ -157,6 +158,87 @@ void testMoveOnly() {
     assert(destroyed == 41);
 }
 
+void testConcurrentCancellation() {
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+    class ManualUnit final : public Unit {
+    public:
+        explicit ManualUnit(std::string name) : Unit(std::move(name)) {}
+        void setCycle(uint64_t cycle) { setLocalCycle(cycle); }
+    };
+    ManualUnit producer0("cancel_producer"), producer1("other_producer"), consumer("consumer");
+    OutPort<int> out0{&producer0, "out", 1}, out1{&producer1, "out", 1};
+    InPort<int> in{&consumer, "in", 8};
+    auto* conn0 = out0.connect(&in, 1);
+    auto* conn1 = out1.connect(&in, 1);
+    for (auto* conn : {conn0, conn1}) conn->optimizeForMPSC();
+    size_t lane = 0;
+    for (auto* conn : {conn0, conn1}) {
+        conn->setConnId(lane);
+        conn->setThreadQueueId(conn->registerProducerThread(lane++));
+        assert(conn->registerOnDestMPSC());
+    }
+    std::atomic<uint64_t> progress{1};
+    in.setProducerProgress({{&producer0, &progress}, {&producer1, &progress}});
+    producer0.setCycle(0);
+    producer1.setCycle(0);
+    assert(out0.send(10));
+    assert(out1.send(20));
+
+    consumer.setCycle(1);
+    {
+        // Emulate a certified tick after both positive-delay producers have
+        // completed cycle 0. Only the consumer may touch the shared FIFO.
+        detail::TickContextGuard tick(&consumer, 1, "consumer", 8, "tick");
+        assert(InPortIngressTestAccess::certified(in, 1));
+        in.prepareConsumerCycle(1);
+        assert(in.queuedMessageCount() == 2);
+        std::atomic<bool> canceled{false}, resume{false};
+        std::thread producer([&] {
+            out0.cancelInFlight();
+            canceled.store(true, std::memory_order_release);
+            while (!resume.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int i = 0; i < 10000; ++i) out0.cancelInFlight();
+        });
+        while (!canceled.load(std::memory_order_acquire)) std::this_thread::yield();
+        // Canceling one producer still filters its staged payload, and leaves
+        // the other producer's payload intact, even with certified ingress.
+        assert(in.tryReceive(1) == 20);
+        assert(!in.tryReceive(1));
+        bool remained_certified = InPortIngressTestAccess::certified(in, 1);
+        resume.store(true, std::memory_order_release);
+        for (int i = 0; i < 10000; ++i) {
+            // Deliberately overlap certificate reads with producer-side
+            // cancellation so TSan covers ownership of the eligibility flag.
+            remained_certified = InPortIngressTestAccess::certified(in, 1) && remained_certified;
+            assert(!in.tryReceive(1));
+        }
+        producer.join();
+        assert(remained_certified);
+    }
+
+    // The new cancellation epoch must still deliver subsequent publications.
+    producer0.setCycle(1);
+    assert(out0.send(30));
+    consumer.setCycle(2);
+    {
+        detail::TickContextGuard tick(&consumer, 2, "consumer", 8, "tick");
+        in.prepareConsumerCycle(2);
+        assert(InPortIngressTestAccess::certified(in, 2));
+        assert(in.tryReceive(2) == 30);
+        assert(!in.tryReceive(2));
+
+        // Configuration changes must still clear eligibility until producer
+        // coverage is resolved again, both through InPort and Connection.
+        in.setCapacity(16);
+        assert(!InPortIngressTestAccess::certified(in, 2));
+        in.setProducerProgress({{&producer0, &progress}, {&producer1, &progress}});
+        assert(InPortIngressTestAccess::certified(in, 2));
+        conn0->setThreadQueueId(in.getQueueIdForThread(0));
+        assert(!InPortIngressTestAccess::certified(in, 2));
+    }
+#endif
+}
+
 class OwnedProducer final : public TickableUnit {
 public:
     explicit OwnedProducer(uint64_t id) : TickableUnit("owned" + std::to_string(id)), id_(id) {}
@@ -290,6 +372,7 @@ int main() {
         testDifferential(lanes);
     }
     testMoveOnly();
+    testConcurrentCancellation();
     testOwnedTransport();
     testScheduledFallback(false);
     testScheduledFallback(true);

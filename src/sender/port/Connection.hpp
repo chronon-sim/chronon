@@ -524,7 +524,7 @@ public:
         if (enabled) {
             thread_queue_id_ = SIZE_MAX;
         }
-        if (to_) to_->invalidatePortTransactions_();
+        if (to_) to_->invalidatePortConfiguration_();
     }
 
     bool dependencyOnlyTransport() const noexcept override { return dependency_only_transport_; }
@@ -578,7 +578,7 @@ public:
         if (capacity.has_value()) registered_capacity_ = *capacity;
         if (rate.has_value()) registered_rate_ = *rate;
         admission_.invalidateOccupancy();
-        if (to_) to_->invalidatePortTransactions_();
+        if (to_) to_->invalidatePortConfiguration_();
     }
 
     bool ensureEpochFreeHeadroom(uint32_t max_lookahead_cycles) override {
@@ -612,7 +612,7 @@ public:
     void setThreadQueueId(size_t queue_id) override {
         if (!dependency_only_transport_) {
             thread_queue_id_ = queue_id;
-            if (to_) to_->invalidatePortTransactions_();
+            if (to_) to_->invalidatePortConfiguration_();
         }
     }
 
@@ -659,7 +659,7 @@ public:
     void setConnId(uint32_t conn_id) noexcept override {
         if (conn_id_ != conn_id) {
             conn_id_ = conn_id;
-            if (to_) to_->invalidatePortTransactions_();
+            if (to_) to_->invalidatePortConfiguration_();
         }
     }
     uint32_t connId() const noexcept override { return conn_id_; }

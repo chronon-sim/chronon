@@ -143,7 +143,7 @@ public:
         lock_free_queue_ = false;
         queue_ = std::make_unique<SingleThreadQueueAdapter<StoredMessage>>(capacity_,
                                                                            cycle_strict_admission);
-        invalidatePortTransactions_();
+        invalidatePortConfiguration_();
     }
 
     /// True when this port drains a bounded lock-free SPSC ring (cross-thread,
@@ -170,13 +170,13 @@ public:
                 capacity_, min_usable_capacity);
             direct_spsc_queue_raw_ = direct.get();
             queue_ = std::move(direct);
-            invalidatePortTransactions_();
+            invalidatePortConfiguration_();
             return;
         }
         direct_spsc_queue_raw_ = nullptr;
         queue_ =
             std::make_unique<LockFreeQueueAdapter<StoredMessage>>(capacity_, min_usable_capacity);
-        invalidatePortTransactions_();
+        invalidatePortConfiguration_();
     }
 
     /**
@@ -193,7 +193,7 @@ public:
         if (multi_producer_queue_raw_) {
             multi_producer_queue_raw_->ensurePerThreadUsableCapacity(
                 min_per_thread_usable_capacity);
-            invalidatePortTransactions_();
+            invalidatePortConfiguration_();
             registerCyclePreparationIfBounded_();
             return;
         }
@@ -206,7 +206,7 @@ public:
             capacity_, min_per_thread_usable_capacity);
         multi_producer_queue_raw_ = mpq.get();
         queue_ = std::move(mpq);
-        invalidatePortTransactions_();
+        invalidatePortConfiguration_();
         registerCyclePreparationIfBounded_();
     }
 
@@ -241,7 +241,7 @@ public:
         }
         const size_t queue_id =
             multi_producer_queue_raw_->addProducerThread(thread_id, track_admission);
-        invalidatePortTransactions_();
+        invalidatePortConfiguration_();
         return queue_id;
     }
 
@@ -388,7 +388,7 @@ public:
         // can be silently displaced.
         queue_->setCapacity(capacity);
         capacity_ = capacity;
-        invalidatePortTransactions_();
+        invalidatePortConfiguration_();
         registerCyclePreparationIfBounded_();
     }
 
@@ -464,7 +464,7 @@ public:
                 queue_ = std::move(adapter);
             }
             shared_broadcast_queue_raw_->registerConnection(conn);
-            invalidatePortTransactions_();
+            invalidatePortConfiguration_();
         }
     }
 
@@ -798,8 +798,16 @@ private:
     }
 
     void invalidatePortTransactions_() noexcept {
-        mpsc_ingress_cache_eligible_ = false;
+        // Runtime cancellation can arrive from any producer worker. It only
+        // invalidates claims; it cannot change topology or publish a payload.
         port_transaction_epoch_.fetch_add(1, std::memory_order_release);
+    }
+
+    void invalidatePortConfiguration_() noexcept {
+        // Configuration changes run with workers stopped and may invalidate
+        // the scheduler's coverage of every ingress lane.
+        mpsc_ingress_cache_eligible_ = false;
+        invalidatePortTransactions_();
     }
 
     void registerCyclePreparationIfBounded_() {
@@ -1024,6 +1032,7 @@ private:
         nullptr;                    ///< Non-owning ptr for MPSC access
     bool lock_free_queue_ = false;  ///< True iff queue_ is the lock-free SPSC ring
     bool cycle_preparation_registered_ = false;
+    // Written only during configuration; immutable while workers execute.
     bool mpsc_ingress_cache_eligible_ = false;
     // Public, explicitly timestamped injection does not obey Connection delay
     // bounds. Once used, retain uncached ingress for this port, including when
