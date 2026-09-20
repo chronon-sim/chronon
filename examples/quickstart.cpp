@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 // [quickstart]
-#include "chronon/Simulation.hpp"
+#include "chronon/Chronon.hpp"
 
 using namespace chronon;
 

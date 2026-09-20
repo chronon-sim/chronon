@@ -5,7 +5,8 @@ sidebar_position: "1"
 
 # API Reference
 
-Choose an entry header by task. Names below are available in `chronon`.
+Use `chronon/Chronon.hpp` as the standard entry point. The focused headers expose
+subsets of the same API; names below are available in `chronon`.
 
 | Header | Primary interfaces |
 |---|---|

@@ -23,7 +23,7 @@ New documentation and examples use the canonical names. Removing old spellings
 requires a separately announced compatibility change; this release does not emit
 compiler deprecation warnings or change their behavior.
 
-For YAML applications, include `chronon/Application.hpp`; it supplies parameters,
+For YAML applications, include `chronon/Chronon.hpp`; it supplies parameters,
 factories, `SimulationBuilder` and `SimulationApp` in `chronon`.
 
 ## Parameter System
@@ -117,7 +117,7 @@ who must keep the parameters alive through unit destruction.
 Unified entry point with CLI support:
 
 ```cpp
-#include "chronon/Application.hpp"
+#include "chronon/Chronon.hpp"
 
 int main(int argc, char* argv[]) {
     return chronon::SimulationApp("CPU Simulator")

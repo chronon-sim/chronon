@@ -73,10 +73,10 @@ private:
 
 The simulation driver using stdexec for parallel execution.
 
-Use the model header and the canonical execution settings:
+Use the standard umbrella header and the canonical execution settings:
 
 ```cpp
-#include "chronon/Simulation.hpp"
+#include "chronon/Chronon.hpp"
 using namespace chronon;
 
 TickSimulationConfig config;

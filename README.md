@@ -22,7 +22,7 @@ Written in C++20; stdexec powers parallel execution. See the [performance guide]
 
 <!-- quickstart:begin -->
 ```cpp
-#include "chronon/Simulation.hpp"
+#include "chronon/Chronon.hpp"
 
 using namespace chronon;
 
@@ -71,8 +71,8 @@ int main() {
 <!-- quickstart:end -->
 
 The example is maintained in [`examples/quickstart.cpp`](examples/quickstart.cpp) and checked by CTest.
-Use `chronon/Simulation.hpp` for model code, `chronon/Observation.hpp` for counters and traces,
-and `chronon/Application.hpp` for YAML applications. `chronon/Chronon.hpp` remains the full umbrella.
+Use `chronon/Chronon.hpp` as the standard entry point for model and application code.
+The [API reference](website/docs/api/index.md) describes the focused headers.
 
 ## Quick Start
 
@@ -149,7 +149,7 @@ threads) must also be available to the consumer.
 For YAML-driven simulations, use `SimulationApp` for a minimal entry point with full CLI support:
 
 ```cpp
-#include "chronon/Application.hpp"
+#include "chronon/Chronon.hpp"
 
 int main(int argc, char* argv[]) {
     return chronon::SimulationApp("CPU Pipeline Simulator")

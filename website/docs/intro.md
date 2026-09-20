@@ -30,7 +30,7 @@ Only a successful send advances producer state. The return value checks the sum.
 
 <!-- quickstart:begin -->
 ```cpp
-#include "chronon/Simulation.hpp"
+#include "chronon/Chronon.hpp"
 
 using namespace chronon;
 
@@ -84,6 +84,9 @@ and reports finalizer errors. See [API contracts](guides/api-contracts) for owne
 and failure behavior.
 
 ## Choose an entry point
+
+Use `chronon/Chronon.hpp` as the standard entry point, as in the example above.
+The focused headers expose the following subsets of the same API:
 
 | Header | Use |
 |---|---|
