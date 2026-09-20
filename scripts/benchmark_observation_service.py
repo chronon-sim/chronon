@@ -5,6 +5,9 @@ The manifest contains cases with name, cwd, thread_command, service_command,
 and optionally scenario (a SAGE YAML template), workers, and expected_crc.
 Command arguments may contain {run_dir} and {scenario}. All outputs and exact
 commands are retained. Compile and run correctness tests BEFORE this script.
+Executable paths are relative to each case's cwd; bare names use PATH with
+relative or empty PATH entries interpreted from that cwd. Both modes' binaries
+are hashed under their resolved absolute paths in metadata.json.
 Requires PyYAML only for SAGE scenario templates.
 """
 import argparse
@@ -14,6 +17,7 @@ import os
 from pathlib import Path
 import random
 import re
+import shutil
 import statistics
 import subprocess
 import threading
@@ -23,6 +27,20 @@ import time
 def digest(path):
     with Path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def resolve_executable(command, cwd):
+    """Match executable lookup after Popen changes to the case directory."""
+    directory = Path(cwd).resolve()
+    if os.path.dirname(command):
+        return (directory / command).resolve()
+    # shutil.which otherwise interprets relative PATH entries from this process,
+    # whereas the benchmark child searches them after changing its directory.
+    search_path = os.pathsep.join(str(directory / entry) for entry in os.get_exec_path())
+    executable = shutil.which(command, path=search_path)
+    if executable is None:
+        raise FileNotFoundError(f"Executable {command!r} not found in PATH for cwd {directory}")
+    return Path(executable).resolve()
 
 
 def run_case(case, mode, repetition, output, cpus):
@@ -107,10 +125,12 @@ def main():
     cases = [case for case in manifest["cases"] if not args.only or case["name"] in args.only]
     if not cases:
         parser.error("no matching cases")
+    binaries = {resolve_executable(case[f"{mode}_command"][0], case["cwd"])
+                for case in cases for mode in ("thread", "service")}
     metadata = dict(manifest=manifest, cpus=args.cpus,
                     platform=subprocess.check_output(["lscpu"], text=True),
-                    binary_sha256={case["thread_command"][0]: digest(case["thread_command"][0])
-                                   for case in cases}, started=time.time())
+                    binary_sha256={str(path): digest(path) for path in sorted(binaries)},
+                    started=time.time())
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     rng = random.Random(20260920)
     rows = []

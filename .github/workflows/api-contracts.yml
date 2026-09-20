@@ -78,8 +78,8 @@ jobs:
           cmake --build candidate/build-perf --parallel 16
       - name: Run Release correctness and deterministic equivalence tests
         run: ctest --test-dir candidate/build-perf --output-on-failure --parallel 16
-      - name: Validate measurement and reporting logic
-        run: python3 -m unittest discover -s candidate/test/scripts -p 'test_api_performance*.py'
+      - name: Validate benchmark scripts, measurement and reporting logic
+        run: python3 -m unittest discover -s candidate/test/scripts -p 'test_*.py'
       - name: Measure all scenarios on disjoint physical CPU sets
         timeout-minutes: 11
         env:
