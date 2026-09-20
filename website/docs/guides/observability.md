@@ -581,6 +581,9 @@ is acknowledged only after all those heads reach the I/O lane. Queue
 publication, progress and I/O completion signal readiness; no dedicated
 drain thread is created. Sorting, arena allocation,
 encoding, compression and file output run on the scheduler I/O lane.
+Serial native-clock recording signals readiness after every completed clock batch,
+including sparse batches and small lossy queues. This ingress notification does
+not advance the Perfetto watermark or close the current timestamp bucket.
 While I/O owns the only handoff batch, the registration rejects new claims before
 taking its consumer lock or reading the timing clock. Publications still record
 readiness, and I/O completion restores eligibility without losing notifications.

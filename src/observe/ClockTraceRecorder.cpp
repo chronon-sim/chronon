@@ -153,8 +153,8 @@ void ClockTraceStream::record(uint64_t cycle, ClockEventKind kind, uint64_t tran
     head_.store(head + 1, std::memory_order_release);
     // Independent producers may pause after any record, even before filling a
     // small lossy ring. Signal every publication: a cached empty/nonempty test
-    // could miss a concurrent drain. Coordinated streams also signal progress
-    // boundaries, so they retain batched notifications on this hot path.
+    // could miss a concurrent drain. Coordinated streams also signal completed
+    // clock batches, so they retain batched notifications on this hot path.
     if (service_ && ((!coordinator_ && !parallel_) || ((head + 1) & 63u) == 0))
         service_->ready.store(true, std::memory_order_release);
 }
@@ -877,6 +877,11 @@ void ClockTraceRecorder::endClockBatch() {
         p.batches = 0;
     }
     p.batch_active = false;
+    // Ingress must progress even before the periodic watermark advance. A small
+    // lossy ring can fill before its accepted head reaches a 64-record boundary;
+    // rejected records cannot trigger that notification. This only wakes ingress
+    // and does not close the current Perfetto bucket or wait for I/O.
+    if (p.service) p.service->ready.store(true, std::memory_order_release);
 }
 
 void ClockTraceRecorder::close() {

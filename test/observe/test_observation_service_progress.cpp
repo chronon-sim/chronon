@@ -188,6 +188,56 @@ void clockWakeup(const std::filesystem::path& root) {
     }
 }
 
+struct ClockProducer : TickableUnit {
+    size_t burst = 0;
+    explicit ClockProducer(std::string name) : TickableUnit(std::move(name)) {}
+    void tick() override {
+        for (size_t n = 0; n < burst; ++n)
+            clockTraceStream()->record(localCycle(), ClockEventKind::User);
+    }
+};
+
+void coordinatedClockWakeup(const std::filesystem::path& root, size_t capacity) {
+    TickSimulationConfig config;
+    config.num_threads = 1;
+    config.enable_parallel = false;
+    TickSimulation sim(config);
+    sim.addClockDomain(ClockDomain::fromHz(1, "fast", 1'000'000'000));
+    sim.addClockDomain(ClockDomain::fromHz(2, "slow", 500'000'000));
+    auto* producer = sim.createUnitInDomain<ClockProducer>(1, "producer");
+    sim.createUnitInDomain<ClockProducer>(2, "quiet");
+    ClockTraceRecorder::Config output;
+    output.output_dir = root;
+    output.lossless = false;
+    output.stream_capacity = output.drain_batch = capacity;
+    output.perfetto_options.compress = capacity == 32;
+    sim.configureClockTrace(output);
+    sim.initialize();
+    CHECK(!sim.useParallelExecution());
+    auto& service = ClockTraceStreamTestAccess::service(*producer->clockTraceStream());
+    const auto idle = [&](uint64_t calls, uint64_t records) {
+        const auto stats = service.stats();
+        return stats.calls >= calls && stats.records == records && !service.ready.load();
+    };
+    size_t cursor = 0;
+    const auto poll = [&] { sim.hostServices().poll(cursor); };
+    awaitProgress([&] { return idle(1, 0); }, poll);
+    uint64_t expected = 0;
+    for (size_t batch = 0; batch < 8; ++batch) {
+        const auto calls = service.stats().calls;
+        producer->burst = batch % 2 ? capacity : 1;
+        expected += producer->burst;
+        CHECK(sim.runClockEvents(1) == 1);
+        // Stay below the 64-batch watermark boundary. Ordinary scheduler polls
+        // must drain both sparse records and full bursts before the next batch,
+        // without advance(), close() or full-queue producer assistance.
+        awaitProgress([&] { return idle(calls + 2, expected); }, poll);
+    }
+    sim.closeClockTrace();
+    CHECK(sim.clockTraceRecorder()->stats().events == expected);
+    CHECK(sim.clockTraceRecorder()->stats().dropped == 0);
+}
+
 int main(int argc, char** argv) {
     CHECK(argc == 2);
     const std::string mode = argv[1];
@@ -196,6 +246,8 @@ int main(int argc, char** argv) {
                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     if (mode == "clock-wakeup")
         clockWakeup(root);
+    else if (mode.starts_with("clock-coordinated-"))
+        coordinatedClockWakeup(root, std::stoull(mode.substr(mode.find_last_of('-') + 1)));
     else if (mode == "started-backend")
         startedBackend(root);
     else
