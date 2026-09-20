@@ -343,7 +343,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     }
                     uint64_t seen_generation = 0;
                     auto* services = host_services_.get();
-                    size_t service_cursor = 0;
+                    // Short runs must also give later registrations a first-sweep visit.
+                    size_t service_cursor = worker + epoch_free_run_count_;
                     uint64_t service_sequence = 0;
                     uint64_t idle_sweeps = 0;
                     uint64_t wait_sequence = 0;
@@ -369,7 +370,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     while (!failed.load(std::memory_order_acquire) &&
                            !done.load(std::memory_order_acquire) &&
                            (settling || !token.stop_requested())) {
-                        if (services && (++service_sequence & 63u) == 0)
+                        if (services && (service_sequence++ & 63u) == 0)
                             services->poll(service_cursor);
                         auto* profile =
                             config_.profile_clock_scheduler && (profile_sequence++ & 63) == 0

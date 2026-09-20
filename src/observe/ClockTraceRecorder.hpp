@@ -56,6 +56,7 @@ public:
 
 private:
     friend class ClockTraceRecorder;
+    friend struct ClockTraceStreamTestAccess;
     ClockTraceRecorder* coordinator_ = nullptr;
     HostServiceRegistration* service_ = nullptr;
     size_t record_base_bytes_ = 0;

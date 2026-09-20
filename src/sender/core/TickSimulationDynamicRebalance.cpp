@@ -222,7 +222,8 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     uint64_t priority_refresh = 0;
     uint64_t wait_sample_sequence = 0;
     auto* services = host_services_.get();
-    size_t service_cursor = 0;
+    // Rotate the first service across workers/runs, including repeated run(1).
+    size_t service_cursor = thread_idx + epoch_free_run_count_;
     uint64_t service_sequence = 0;
     observe::ThreadContext* counter_producer = nullptr;
     if constexpr (PushPeriodicCounters) {
@@ -336,7 +337,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     };
 
     while (!token.stop_requested()) {
-        if (services && (++service_sequence & 63u) == 0) services->poll(service_cursor);
+        if (services && (service_sequence++ & 63u) == 0) services->poll(service_cursor);
         bool ownership_refreshed = false;
         const bool stable_sweep = prepare_stable_sweep(ownership_refreshed);
         if (ownership_refreshed) {

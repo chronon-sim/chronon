@@ -396,7 +396,8 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     }
     std::fill_n(ready_through, thread_progress_count_, 0);
     auto* services = host_services_.get();
-    size_t service_cursor = 0;
+    // Rotate the first service across workers/runs, including repeated run(1).
+    size_t service_cursor = thread_idx + epoch_free_run_count_;
     uint64_t service_sequence = 0;
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;
@@ -406,7 +407,7 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     }
 
     while (true) {
-        if (services && (++service_sequence & 63u) == 0) services->poll(service_cursor);
+        if (services && (service_sequence++ & 63u) == 0) services->poll(service_cursor);
         bool all_done = true;
         bool made_progress = false;
         BlockedClusterInfo blocker{};

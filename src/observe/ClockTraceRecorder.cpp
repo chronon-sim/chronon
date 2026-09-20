@@ -98,7 +98,7 @@ void ClockTraceStream::endEdge() {
     dropped_run_.value = 0;
     peak_ = std::max(peak_, head - tail + 1);
     head_.store(head + 1, std::memory_order_release);
-    if (service_ && ((head + 1) & 63u) == 0) service_->ready.store(true, std::memory_order_release);
+    if (service_) service_->ready.store(true, std::memory_order_release);
 }
 
 void ClockTraceStream::record(uint64_t cycle, ClockEventKind kind, uint64_t transaction,
@@ -152,7 +152,12 @@ void ClockTraceStream::record(uint64_t cycle, ClockEventKind kind, uint64_t tran
     ring_[head & (ring_.size() - 1)] = {cycle, transaction, value, ordinal, fifo, kind, phase};
     peak_ = std::max(peak_, head - tail + 1);
     head_.store(head + 1, std::memory_order_release);
-    if (service_ && ((head + 1) & 63u) == 0) service_->ready.store(true, std::memory_order_release);
+    // Independent producers may pause after any record, even before filling a
+    // small lossy ring. Signal every publication: a cached empty/nonempty test
+    // could miss a concurrent drain. Coordinated streams also signal progress
+    // boundaries, so they retain batched notifications on this hot path.
+    if (service_ && ((!coordinator_ && !parallel_) || ((head + 1) & 63u) == 0))
+        service_->ready.store(true, std::memory_order_release);
 }
 
 namespace {

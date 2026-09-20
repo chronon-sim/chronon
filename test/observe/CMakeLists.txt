@@ -21,6 +21,15 @@ foreach(workers 1 4)
     endforeach()
 endforeach()
 
+add_executable(test_observation_service_progress test_observation_service_progress.cpp)
+target_link_libraries(test_observation_service_progress PRIVATE chronon::core chronon_compile_options)
+add_dependencies(regress test_observation_service_progress)
+foreach(mode static dynamic clock-static clock-dynamic clock-wakeup)
+    add_test(NAME observation_service_progress_${mode}
+        COMMAND test_observation_service_progress ${mode})
+    set_tests_properties(observation_service_progress_${mode} PROPERTIES TIMEOUT 30)
+endforeach()
+
 add_executable(test_clock_trace test_clock_trace.cpp)
 target_link_libraries(test_clock_trace PRIVATE chronon::observe)
 target_compile_options(test_clock_trace PRIVATE -UNDEBUG)
