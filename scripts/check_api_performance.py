@@ -224,6 +224,8 @@ def main() -> int:
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--force-measurement", action="store_true",
                         help="measure even identical runtime bytes (e.g. validating CI sharding)")
+    parser.add_argument("--defer-measurement", action="store_true",
+                        help="return 3 without results when timing needs separate runners")
     args = parser.parse_args()
     if args.repeats < 15 or args.seconds < 0.25:
         parser.error("at least 15 pairs and 0.25 seconds per sample are required")
@@ -249,7 +251,6 @@ def main() -> int:
         if {case["name"] for case in matrix} != requested:
             parser.error("unknown case name")
     builds = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
-    args.output.mkdir(parents=True, exist_ok=False)
     metadata = {"base_sha": args.base_sha, "head_sha": args.head_sha, "platform": platform.platform(),
                 "cpus": cpus, "repeats": args.repeats, "max_repeats": args.max_repeats,
                 "minimum_speedup": MIN_SPEEDUP, "per_look_confidence": LOOK_CONFIDENCE,
@@ -269,8 +270,12 @@ def main() -> int:
             metadata["binaries"][variant][name] = hashlib.sha256(binary.read_bytes()).hexdigest()
         metadata[variant + "_cache"] = (build / "CMakeCache.txt").read_text()
     identity = None if args.force_measurement else runtime_identity(builds, metadata["binaries"])
+    if args.defer_measurement and not identity:
+        print("Runtime identity not established or timing forced; defer to measurement runners")
+        return 3
     method = "binary-identity" if identity else "paired-bootstrap"
     metadata.update(acceptance_method=method, runtime_identity=identity)
+    args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "cases.json").write_text(json.dumps(matrix, indent=2) + "\n")
     (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     env = os.environ.copy()

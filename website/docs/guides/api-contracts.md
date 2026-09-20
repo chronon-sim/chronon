@@ -143,12 +143,15 @@ remain specialized on the existing tick path. The core still links observation
 support and exposes some adapter types for compatibility; these are not a
 promise of interchangeable backends or a stable binary layout.
 
-PR validation builds immutable baseline and candidate commits once, then divides
-all 29 scenarios across six independent runners. Each runner uses two physical
-CPUs and compares baseline/candidate on that same machine; measurements never
-compete with another shard. The final `differential-performance` check requires
-every job to succeed and every scenario exactly once. A missing, cancelled,
-incomplete or failed shard cannot become a successful aggregate.
+PR validation builds immutable baseline and candidate commits once. When runtime
+identity is established, `prepare` checks all 29 scenarios on its existing runner;
+no `measure` runners or executable transfers are needed. Otherwise, timing is
+divided across six independent runners. Each uses two physical CPUs and compares
+baseline/candidate on that same machine; measurements never compete with another
+shard. The final `differential-performance` check requires the selected path to
+succeed and every scenario exactly once. Only a successful identity path permits
+skipped measurement jobs; missing, cancelled, incomplete or failed checks cannot
+become a successful aggregate.
 
 Byte-identical executables with identical resolved dynamic-library paths and
 hashes establish unchanged benchmark code. These scenarios still run two pairs

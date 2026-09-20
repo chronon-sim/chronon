@@ -37,6 +37,7 @@ jobs:
     outputs:
       base: ${{ steps.commits.outputs.base }}
       head: ${{ steps.commits.outputs.head }}
+      shards: ${{ steps.identity.outputs.shards }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -87,7 +88,35 @@ jobs:
         run: ctest --test-dir candidate/build-perf --output-on-failure --parallel 4
       - name: Validate performance gate logic
         run: python3 -m unittest discover -s candidate/test/scripts -p 'test_api_performance*.py'
+      - name: Validate identical runtimes here; defer timing to independent runners
+        id: identity
+        env:
+          BASE_SHA: ${{ steps.commits.outputs.base }}
+          HEAD_SHA: ${{ steps.commits.outputs.head }}
+          FORCE_MEASUREMENT: ${{ inputs.force_measurement }}
+        run: |
+          extra=()
+          if [[ "$FORCE_MEASUREMENT" == "true" ]]; then extra+=(--force-measurement); fi
+          status=0
+          python3 candidate/scripts/check_api_performance.py \
+            baseline/build-perf candidate/build-perf performance-results \
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            --workers 2 --defer-measurement "${extra[@]}" || status=$?
+          case "$status" in
+            0) echo "shards=1" >> "$GITHUB_OUTPUT" ;;
+            3) echo "shards=6" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$status" ;;
+          esac
+      - name: Retain identity evidence, including failed checks
+        if: always() && steps.identity.outputs.shards != '6'
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-performance-0
+          path: performance-results/
+          if-no-files-found: ignore
+          retention-days: 30
       - name: Package the measured executables once
+        if: steps.identity.outputs.shards == '6'
         run: |
           files=()
           for variant in baseline candidate; do
@@ -99,6 +128,7 @@ jobs:
           done
           tar -czf performance-builds.tar.gz "${files[@]}"
       - uses: actions/upload-artifact@v4
+        if: steps.identity.outputs.shards == '6'
         with:
           name: performance-builds
           path: performance-builds.tar.gz
@@ -114,6 +144,7 @@ jobs:
 
   measure:
     needs: prepare
+    if: needs.prepare.outputs.shards == '6'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
@@ -160,11 +191,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Require every build and measurement job to succeed
+      - name: Require the selected validation path to succeed
         env:
           PREPARE_RESULT: ${{ needs.prepare.result }}
           MEASURE_RESULT: ${{ needs.measure.result }}
-        run: test "$PREPARE_RESULT" = success && test "$MEASURE_RESULT" = success
+          SHARDS: ${{ needs.prepare.outputs.shards }}
+        run: |
+          test "$PREPARE_RESULT" = success
+          case "$SHARDS" in
+            1) test "$MEASURE_RESULT" = skipped ;;
+            6) test "$MEASURE_RESULT" = success ;;
+            *) exit 1 ;;
+          esac
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.head }}
@@ -176,10 +214,11 @@ jobs:
         env:
           BASE_SHA: ${{ needs.prepare.outputs.base }}
           HEAD_SHA: ${{ needs.prepare.outputs.head }}
+          SHARDS: ${{ needs.prepare.outputs.shards }}
         run: |
           python3 scripts/collect_api_performance.py \
             performance-results/shards performance-results \
-            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --shards 6 --workers 2
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --shards "$SHARDS" --workers 2
       - uses: actions/upload-artifact@v4
         with:
           name: api-contracts-validation

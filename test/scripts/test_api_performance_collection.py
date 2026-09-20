@@ -18,15 +18,15 @@ class ShardAcceptance(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.make_shards()
 
-    def make_shards(self, identity=False):
+    def make_shards(self, identity=False, count=6):
         method = "binary-identity" if identity else "paired-bootstrap"
-        for i in range(6):
-            group = cases(2)[i::6]
+        for i in range(count):
+            group = cases(2)[i::count]
             folder = self.root / f"api-performance-{i}"
             folder.mkdir(exist_ok=True)
             binaries = {executable(case): "binary-hash" for case in group}
             libraries = {name: {"/lib/library.so": "library-hash"} for name in binaries}
-            meta = {"base_sha": "base", "head_sha": "head", "shard_index": i, "shard_count": 6,
+            meta = {"base_sha": "base", "head_sha": "head", "shard_index": i, "shard_count": count,
                     "workers": 2, "case_order": [case["name"] for case in group],
                     "repeats": 51, "max_repeats": 201, "minimum_speedup": 0.99,
                     "per_look_confidence": 0.975, "maximum_looks": 2,
@@ -73,6 +73,15 @@ class ShardAcceptance(unittest.TestCase):
         (self.root / "api-performance-5" / "verdict.json").unlink()
         with self.assertRaises(FileNotFoundError):
             self.collect()
+
+    def test_prepare_identity_artifact_must_cover_the_entire_matrix(self):
+        self.make_shards(identity=True, count=1)
+        results, metadata = collector.collect(self.root, "base", "head", 1, 2)
+        self.assertEqual(len(results), 29)
+        self.assertEqual(len(metadata), 1)
+        self.change("summary", lambda rows: rows.pop())
+        with self.assertRaisesRegex(ValueError, "missing, duplicate"):
+            collector.collect(self.root, "base", "head", 1, 2)
 
     def test_incomplete_or_failed_shard_rejected(self):
         for key in ("pass", "complete_shard"):

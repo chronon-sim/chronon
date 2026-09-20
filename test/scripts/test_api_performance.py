@@ -19,7 +19,8 @@ SPEC.loader.exec_module(gate)
 
 
 class PerformanceAcceptance(unittest.TestCase):
-    def run_synthetic_matrix(self, speedups, selected=None, shard=None, identity=False, force=False, mismatch=False):
+    def run_synthetic_matrix(self, speedups, selected=None, shard=None, identity=False, force=False,
+                             mismatch=False, defer=False):
         """Exercise CLI sampling, artifacts and exit status without real timing."""
         cases = [{"name": f"case-{i}", "kind": "floor", "cycles": 100 + i}
                  for i in range(len(speedups))]
@@ -39,6 +40,8 @@ class PerformanceAcceptance(unittest.TestCase):
                 argv += ["--shard-index", str(shard[0]), "--shard-count", str(shard[1])]
             if force:
                 argv += ["--force-measurement"]
+            if defer:
+                argv += ["--defer-measurement"]
             if selected is not None:
                 argv += ["--case", f"case-{selected}"]
 
@@ -83,6 +86,20 @@ class PerformanceAcceptance(unittest.TestCase):
         status, calls, artifacts = self.run_synthetic_matrix([[1.0] * 51], identity=True, force=True)
         self.assertEqual((status, calls), (0, [102]))
         self.assertEqual(artifacts["metadata.json"]["acceptance_method"], "paired-bootstrap")
+
+    def test_deferred_timing_produces_no_runs_or_acceptance_artifacts(self):
+        for identity, force in ((False, False), (True, True)):
+            with self.subTest(identity=identity, force=force):
+                status, calls, artifacts = self.run_synthetic_matrix(
+                    [[1.0] * 51], identity=identity, force=force, defer=True)
+                self.assertEqual((status, calls, artifacts), (3, [0], {}))
+
+    def test_prepare_checks_every_identical_case_and_rejects_state_changes(self):
+        status, calls, artifacts = self.run_synthetic_matrix([[1.0] * 2] * 3, identity=True, defer=True)
+        self.assertEqual((status, calls), (0, [4, 4, 4]))
+        self.assertTrue(artifacts["verdict.json"]["complete_matrix"])
+        with self.assertRaisesRegex(RuntimeError, "determinism mismatch"):
+            self.run_synthetic_matrix([[1.0] * 2], identity=True, mismatch=True, defer=True)
 
     def test_shard_only_measures_assigned_cases_and_is_not_full_acceptance(self):
         status, calls, artifacts = self.run_synthetic_matrix([[1.02] * 51] * 7, shard=(2, 3))
