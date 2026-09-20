@@ -334,3 +334,13 @@ the contract repair, rather than weakening existing equivalence checks.
   burst limits and progress publication retain their existing semantics.
   Dynamic poll1 now runs first; all workload definitions and acceptance rules
   remain unchanged. Fresh final-head validation is required.
+- `916ff64` passed all correctness/documentation Actions. Its CI matrix on
+  EPYC 7763 passed every scheduler configuration and sequential Nucleus, then
+  clearly failed two-worker Nucleus at 51 pairs: median 0.969743, lower97.5
+  0.965669, upper97.5 0.972263. All states matched. The local matrix was stopped
+  and retained after 23 passes; it remains incomplete and cannot replace CI.
+- Manual CPU diagnostics now accept an exact gate scenario, including the
+  representative workloads. They compare unchanged sources, archive the chosen
+  executable and record fixed workload arguments, hashes, events and states.
+  This workflow-only change does not retry throughput acceptance on the failed
+  runtime; normal acceptance still requires a subsequent fix and full matrices.

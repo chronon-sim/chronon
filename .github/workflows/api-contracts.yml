@@ -25,6 +25,9 @@ on:
       profile_head:
         description: Exact candidate SHA for diagnostic profiles (empty uses this ref)
         required: false
+      profile_case:
+        description: One gate scenario to profile (empty uses the scheduler diagnostics)
+        required: false
 
 permissions:
   contents: read
@@ -119,21 +122,29 @@ jobs:
       - uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: api-contracts-gcc12-release
-      - name: Build unchanged scheduler workload for both commits
+      - name: Build unchanged profiling workloads for both commits
         env:
           CXX: g++-12
           CPM_SOURCE_CACHE: ${{ github.workspace }}/dependencies
         run: |
-          for file in scheduler_invocation_benchmark.cpp SchedulerInvocationModel.hpp BenchmarkThreadAffinity.hpp; do
+          for file in single_clock_regression.cpp scheduler_invocation_benchmark.cpp \
+              SchedulerInvocationModel.hpp BenchmarkThreadAffinity.hpp \
+              representative_workload_benchmark.cpp RepresentativeWorkload.hpp \
+              RepresentativeWorkloadCalibration.hpp RepresentativeWorkloadOptions.hpp \
+              RepresentativeWorkloadReporting.hpp; do
             cmp "baseline/benchmark/$file" "candidate/benchmark/$file"
           done
           for variant in baseline candidate; do
             cmake -S "$variant" -B "$variant/build-perf" -G Ninja \
               -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
               -DCHRONON_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-            cmake --build "$variant/build-perf" --parallel 4 --target chronon_scheduler_invocation_benchmark
+            cmake --build "$variant/build-perf" --parallel 4 --target \
+              chronon_single_clock_regression_benchmark \
+              chronon_scheduler_invocation_benchmark chronon_representative_workload_benchmark
           done
       - name: Profile fixed workloads (diagnostic only, never acceptance)
+        env:
+          PROFILE_CASE: ${{ inputs.profile_case }}
         run: |
           python3 - <<'PY'
           import hashlib, json, os, pathlib, re, shutil, subprocess, sys
@@ -144,20 +155,37 @@ jobs:
           cpus = gate.physical_cpus()[:2]
           if len(cpus) != 2:
               raise RuntimeError('two physical CPUs required for the failed scenarios')
+          selected = os.environ.get('PROFILE_CASE', '')
+          if selected:
+              profiles = [case for case in gate.cases(2) if case['name'] == selected]
+              if len(profiles) != 1:
+                  raise RuntimeError('unknown diagnostic scenario: ' + selected)
+              case = profiles[0]
+              case['cycles'] = (10000000 if case['kind'] == 'representative' else
+                                100000000 if case['kind'] == 'floor' else
+                                500000 if case['args'][-1] == 1 else 20000000)
+          else:
+              profiles = [{'name': f'dynamic{dynamic}-poll{interval}', 'kind': 'scheduler',
+                           'args': [0, 2, 4, 64, 1, dynamic, interval], 'cycles': cycles}
+                          for dynamic, interval, cycles in
+                          [(0, 64, 20000000), (0, 0, 20000000), (0, 1, 500000), (1, 1, 500000)]]
           perf = sorted(pathlib.Path('/usr/lib/linux-tools').glob('*/perf'))[-1]
           metadata = {'purpose': 'CPU profiling only, not throughput acceptance',
                       'complete_matrix': False, 'cpus': cpus, 'binaries': {},
+                      'cases': profiles, 'states': {},
                       'benchmark_env': {'CHRONON_BENCH_PIN_WORKERS': '1',
                                         'CHRONON_BENCH_WARM_CPUS': '1'},
                       'lscpu': subprocess.check_output(['lscpu'], text=True)}
           for variant in ('baseline', 'candidate'):
               metadata[variant + '_sha'] = subprocess.check_output(
                   ['git', '-C', variant, 'rev-parse', 'HEAD'], text=True).strip()
-              binary = pathlib.Path(variant, 'build-perf/benchmark/chronon_scheduler_invocation_benchmark')
-              metadata['binaries'][variant] = hashlib.sha256(binary.read_bytes()).hexdigest()
-              archived = out / 'symfs' / str(binary.resolve()).lstrip('/')
-              archived.parent.mkdir(parents=True, exist_ok=True)
-              shutil.copy2(binary, archived)
+              metadata['binaries'][variant] = {}
+              for executable in sorted({gate.executable(case) for case in profiles}):
+                  binary = pathlib.Path(variant, 'build-perf/benchmark', executable)
+                  metadata['binaries'][variant][executable] = hashlib.sha256(binary.read_bytes()).hexdigest()
+                  archived = out / 'symfs' / str(binary.resolve()).lstrip('/')
+                  archived.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(binary, archived)
               (out / (variant + '-CMakeCache.txt')).write_text(
                   pathlib.Path(variant, 'build-perf/CMakeCache.txt').read_text())
           # Hardware sampling avoids timer undersampling of short worker tasks
@@ -172,13 +200,10 @@ jobs:
           metadata['profile_frequency'] = 1999
           metadata['recorded_events'] = {}
           (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
-          profiles = [(0, 64, 20000000), (0, 0, 20000000), (0, 1, 500000), (1, 1, 500000)]
-          for dynamic, interval, cycles in profiles:
-              case = {'kind': 'scheduler', 'args': [0, 2, 4, 64, 1, dynamic, interval],
-                      'cycles': cycles}
+          for case in profiles:
               states = []
               for variant in ('baseline', 'candidate'):
-                  name = f'dynamic{dynamic}-poll{interval}-{variant}'
+                  name = case['name'] + '-' + variant
                   data = out / (name + '.data')
                   # sudo resets the environment; pass benchmark controls to the
                   # profiled child explicitly, matching normal gate invocations.
@@ -205,7 +230,7 @@ jobs:
                   # Select the executable instead of guessing exact symbol names.
                   annotation = subprocess.run(
                       [str(perf), 'annotate', '--stdio', '--no-source',
-                       '--dsos', 'chronon_scheduler_invocation_benchmark', '-i', str(data)],
+                       '--dsos', gate.executable(case), '-i', str(data)],
                       text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                   (out / (name + '-annotate.txt')).write_text(annotation.stdout)
                   annotation.check_returncode()
@@ -213,6 +238,8 @@ jobs:
                       raise RuntimeError('no annotated instructions: ' + name)
               if states[0] != states[1]:
                   raise RuntimeError('profile workload states differ: ' + str(case))
+              metadata['states'][case['name']] = states[0]
+              (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
           (out / 'PROFILE_ONLY').write_text('State comparisons matched. No performance acceptance was attempted.\n')
           PY
       - name: Retain diagnostic CPU samples and exact build metadata
