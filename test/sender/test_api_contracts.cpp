@@ -373,6 +373,8 @@ void observationSessionLifetime() {
             auto* unit = owner.createUnit<NamedUnit>(nullptr);
             unit->setObservationContext(
                 manager.createContextForUnit("named", [unit] { return unit->localCycle(); }));
+            owner.initialize();
+            manager.startBackend();
             owner.run(3);
             CHECK(unit->getObserveCycle() == 3);
             owner.finalize();

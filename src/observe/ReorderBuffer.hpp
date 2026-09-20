@@ -119,6 +119,8 @@ public:
         return sorted_start_ == sorted_buffer_.size() && unsorted_batch_.empty();
     }
 
+    size_t arenaBytesUsed() const noexcept { return arena_write_pos_; }
+
     uint64_t minCycle() const noexcept { return min_cycle_; }
 
     const Config& config() const noexcept { return config_; }

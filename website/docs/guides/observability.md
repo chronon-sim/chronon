@@ -521,6 +521,91 @@ discards records. `activeThreadCount()` reports currently attached producers;
 Emission attempted by another TLS destructor after the observation producer has
 retired is rejected instead of creating an attachment that cannot be retired.
 
+## Scheduler service
+
+Both observation backends use simulation worker time for bounded ingress
+draining when owned by `TickSimulation`. For a YAML-driven
+single-clock simulation, the corresponding settings are:
+
+```yaml
+simulation:
+  observation:
+    enabled: true
+    service_buffer_bytes: 16777216
+```
+
+For an independently owned `ObservationBackend`, call
+`backend.attachScheduler(sim.hostServices())` before `backend.start()`.
+Native-clock simulations attach automatically through
+`sim.configureClockTrace(config)`. Both sorted and immediate output use this
+pipeline. The old `scheduler_service` C++ mode switch is removed; remove the
+corresponding YAML key (`false` is rejected with a migration error, while `true`
+is accepted for existing configurations).
+
+`HostServices` owns one shared I/O lane for its outputs. Each backend registers
+one reusable `HostIOJob`, with at most one outstanding batch. The executor visits
+pending jobs round-robin and resumes ingress only after that job's slot becomes
+reusable. Opening files, sorting, encoding, compression, writing, final flush and
+closing all run there. Standalone scheduler timeline export also uses this lane.
+A blocked file write keeps other I/O jobs pending and
+applies the configured bounded producer backpressure; it does not execute in a
+model worker. This lane cannot preempt an operating-system file write.
+
+A standalone backend creates a small `HostServices` driver that polls the same
+ingress on its I/O lane. There is no separate backend consumer implementation or
+private backend thread pool. Its idle readiness scan sleeps up to 50 microseconds.
+
+The scheduler visits ready host services between model sweeps and during
+dependency waits. Services have no simulated clock, dependency edges or
+lookahead frontier. A registration serializes consumers with a nonblocking
+claim; producer assistance uses the same registration when a synchronous tick
+fills its queue. Records remain owned copies, including after worker migration.
+
+Each ordinary-backend poll copies at most 256 records / 256 KiB into a preallocated
+handoff buffer. A native-clock poll copies at most 256 fixed-size records and
+preserves a snapshot of all producer heads across partial polls. Its frontier
+is acknowledged only after all those heads reach the I/O lane. Queue
+publication, progress and I/O completion signal readiness; no dedicated
+drain thread is created. Sorting, arena allocation,
+encoding, compression and file output run on the scheduler I/O lane.
+While I/O owns the only handoff batch, the registration rejects new claims before
+taking its consumer lock or reading the timing clock. Publications still record
+readiness, and I/O completion restores eligibility without losing notifications.
+
+The ordinary reorder arena admits at most `service_buffer_bytes` live/retained
+bytes (64 KiB–1 GiB), then flushes the sorted retained records before admitting
+more. Its allocation may round up by less than 2×; record descriptors are
+separately bounded by `reorder_max_events + 1`. Together with the fixed handoff
+buffer and existing bounded producer queues, a slow sink cannot grow an
+unbounded raw-record backlog. Native mode accounts its handoff and head snapshot
+storage within the existing ingress/staging budget. Sink dictionaries, interned
+strings, compression buffers and scheduler timeline capture retain their own
+existing allocation policies; this is not a bound on whole-process memory.
+
+As with the existing count-based forced flush, the additional ordinary-backend byte limit
+can flush before the reorder watermark. Ordinary-backend ordering remains best effort
+under forced flushing; native-clock frontier ordering is exact. Existing
+`drop`, `bounded_wait` and `spin_wait` policies are unchanged. A lossless producer
+can still spend host time waiting for a slow sink, while assisting bounded
+ingress work. No file I/O executes inside the model callback.
+
+Stop producers and finish scheduler calls before stopping/reconfiguring a
+backend. Final snapshots and scheduler timelines precede detach, final drain,
+in-flight I/O completion and close. Detached registrations safely ignore cached
+assistance calls. Register custom host services only between runs and detach
+their registration before destroying the service object. I/O jobs retain the
+executor until their final completion, so an observer can close after the
+simulation has been destroyed. Detach ingress and wait for I/O before destroying
+its callback owner. Registering a job does not add model dependencies or advance
+simulated time.
+
+Service statistics report poll count, records, total host elapsed nanoseconds
+and maximum poll duration. These are wall times (including preemption), not CPU
+time or hard latency deadlines. Dynamic model-cost samples exclude time spent
+executing service polls. Native `clock-stats.json` contains the same service
+statistics. Performance depends on CPU availability and the observation mix;
+compare identical worker counts, CPU affinity, outputs and loss policies.
+
 ## ReorderBuffer
 
 The backend can reorder events by cycle for deterministic output:

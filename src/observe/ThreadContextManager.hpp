@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 
+#include "../chronon/HostServices.hpp"
 #include "ThreadContext.hpp"
 #include "Types.hpp"
 
@@ -33,6 +34,29 @@ public:
     static ThreadContextManager& instance() {
         static ThreadContextManager manager;
         return manager;
+    }
+
+    /// Lifecycle control: event writers must be quiescent. Pool locking also
+    /// serializes publication by a retiring TLS producer.
+    void setService(std::shared_ptr<HostServiceRegistration> service) {
+        std::lock_guard lock(pool_mutex_);
+        service_ = std::move(service);
+        forEachContext([&](ThreadContext* ctx) {
+            ctx->queue().setPublicationSignal(service_ ? &service_->ready : nullptr);
+        });
+        assistance_.store(service_, std::memory_order_release);
+    }
+
+    void helpService() noexcept {
+        if (auto service = assistance_.load(std::memory_order_acquire)) service->poll(true);
+    }
+
+    template <typename Fn>
+    void forEachContextFrom(size_t first, Fn&& fn) {
+        const size_t count = allocated_count_.load(std::memory_order_acquire);
+        for (size_t n = 0; n < count; ++n) {
+            if (auto* ctx = contexts_[(first + n) % count].load(std::memory_order_acquire)) fn(ctx);
+        }
     }
 
     /**
@@ -189,6 +213,8 @@ private:
             if (count == MAX_THREADS) return nullptr;
             try {
                 owned_contexts_[id] = std::make_unique<ThreadContext>(id, queue_capacity_);
+                owned_contexts_[id]->queue().setPublicationSignal(service_ ? &service_->ready
+                                                                           : nullptr);
             } catch (...) {
                 // Failed allocations do not consume a slot.
                 return nullptr;
@@ -241,6 +267,8 @@ private:
     static inline thread_local ContextLease tls_lease_{};
 
     std::mutex pool_mutex_;
+    std::shared_ptr<HostServiceRegistration> service_;
+    std::atomic<std::shared_ptr<HostServiceRegistration>> assistance_;
     std::array<bool, MAX_THREADS> producer_attached_{};  // protected by pool_mutex_
     std::array<std::unique_ptr<ThreadContext>, MAX_THREADS> owned_contexts_;
     std::array<std::atomic<ThreadContext*>, MAX_THREADS> contexts_{};

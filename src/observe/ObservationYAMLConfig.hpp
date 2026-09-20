@@ -186,6 +186,7 @@ struct ObservationYAMLConfig {
 
     std::string output_dir = "out";
     size_t queue_capacity = 256 * 1024;
+    size_t service_buffer_bytes = 16 * 1024 * 1024;
 
     BackpressurePolicy backpressure = BackpressurePolicy::BoundedWait;
     uint32_t backpressure_max_spins = 4096;

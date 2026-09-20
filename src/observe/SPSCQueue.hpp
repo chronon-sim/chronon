@@ -63,6 +63,9 @@ public:
     SPSCQueue(SPSCQueue&&) = delete;
     SPSCQueue& operator=(SPSCQueue&&) = delete;
 
+    /// Set only while producers are quiescent; flag outlives the registration.
+    void setPublicationSignal(std::atomic<bool>* signal) noexcept { signal_ = signal; }
+
     /**
      * @brief Reserve n bytes for the producer.
      * @return Pointer to write location, or nullptr if full.
@@ -100,6 +103,7 @@ public:
     [[gnu::always_inline]] void commitWrite() noexcept {
         if (uncommitted_bytes_ >= bytes_per_batch_) {
             atomic_writer_pos_.store(writer_pos_, std::memory_order_release);
+            if (signal_) signal_->store(true, std::memory_order_release);
             uncommitted_bytes_ = 0;
         }
     }
@@ -107,6 +111,7 @@ public:
     /// Publish unconditionally; use for shutdown or explicit flush.
     void forceCommitWrite() noexcept {
         atomic_writer_pos_.store(writer_pos_, std::memory_order_release);
+        if (signal_) signal_->store(true, std::memory_order_release);
         uncommitted_bytes_ = 0;
     }
 
@@ -192,6 +197,7 @@ public:
     }
 
 private:
+    std::atomic<bool>* signal_ = nullptr;
     static size_t roundUpToPowerOf2(size_t n) {
         if (n == 0) return 1;
         n--;

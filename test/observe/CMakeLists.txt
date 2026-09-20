@@ -2,10 +2,31 @@
 # Author: Haomeng Wang <chang_yun@outlook.com>
 # SPDX-License-Identifier: MPL-2.0
 
+add_executable(test_host_services test_host_services.cpp)
+target_link_libraries(test_host_services PRIVATE chronon::observe chronon_compile_options)
+add_dependencies(regress test_host_services)
+add_test(NAME host_services_io_test COMMAND test_host_services)
+set_tests_properties(host_services_io_test PROPERTIES TIMEOUT 30)
+
+add_executable(test_observation_service test_observation_service.cpp)
+target_link_libraries(test_observation_service PRIVATE chronon::core chronon_compile_options)
+add_dependencies(regress test_observation_service)
+foreach(workers 1 4)
+    foreach(scheduler static dynamic)
+        foreach(mode burst slow sparse large immediate)
+            add_test(NAME observation_service_${workers}_${scheduler}_${mode}
+                COMMAND test_observation_service ${workers} ${scheduler} ${mode})
+            set_tests_properties(observation_service_${workers}_${scheduler}_${mode} PROPERTIES TIMEOUT 45)
+        endforeach()
+    endforeach()
+endforeach()
+
 add_executable(test_clock_trace test_clock_trace.cpp)
 target_link_libraries(test_clock_trace PRIVATE chronon::observe)
 target_compile_options(test_clock_trace PRIVATE -UNDEBUG)
 add_test(NAME clock_trace_test COMMAND test_clock_trace)
+add_test(NAME clock_trace_service_test COMMAND test_clock_trace --service)
+set_tests_properties(clock_trace_service_test PROPERTIES TIMEOUT 120)
 
 add_executable(test_timeline_registry_lifecycle test_timeline_registry_lifecycle.cpp)
 target_link_libraries(test_timeline_registry_lifecycle
@@ -18,6 +39,7 @@ add_executable(test_timeline_registry_backend test_timeline_registry_backend.cpp
 target_link_libraries(test_timeline_registry_backend
     PRIVATE chronon::observe chronon_compile_options ZLIB::ZLIB)
 add_test(NAME timeline_registry_backend_test COMMAND test_timeline_registry_backend)
+add_test(NAME timeline_registry_backend_service_test COMMAND test_timeline_registry_backend "${CMAKE_CURRENT_BINARY_DIR}/registry-service" service)
 set_tests_properties(timeline_registry_backend_test PROPERTIES TIMEOUT 45)
 add_dependencies(regress test_timeline_registry_lifecycle test_timeline_registry_backend)
 
@@ -39,7 +61,7 @@ if(UNIX)
     target_link_libraries(test_trace_output_failure
         PRIVATE chronon::core chronon_compile_options ZLIB::ZLIB)
     add_dependencies(regress test_trace_output_failure)
-    foreach(mode raw compressed immediate async final_flush manager_stop manager_shutdown app app_crash parallel_clock)
+    foreach(mode raw compressed immediate async final_flush service service_final_flush manager_stop manager_shutdown app app_crash parallel_clock)
         add_test(NAME trace_output_failure_${mode}_test COMMAND test_trace_output_failure ${mode})
         set_tests_properties(trace_output_failure_${mode}_test PROPERTIES TIMEOUT 45)
     endforeach()

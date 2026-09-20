@@ -188,6 +188,10 @@ private:
         LOAD_IF_PRESENT(obs_node, obs_config, enabled);
         LOAD_IF_PRESENT(obs_node, obs_config, output_dir);
         LOAD_IF_PRESENT(obs_node, obs_config, queue_capacity);
+        if (obs_node["scheduler_service"] && !obs_node["scheduler_service"].as<bool>())
+            throw std::invalid_argument(
+                "observation.scheduler_service=false was removed; remove this setting");
+        LOAD_IF_PRESENT(obs_node, obs_config, service_buffer_bytes);
         LOAD_IF_PRESENT(obs_node, obs_config, backpressure_max_spins);
 
 #undef LOAD_IF_PRESENT

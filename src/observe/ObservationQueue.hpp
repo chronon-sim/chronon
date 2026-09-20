@@ -61,6 +61,9 @@ public:
     ObservationQueue(ObservationQueue&&) = delete;
     ObservationQueue& operator=(ObservationQueue&&) = delete;
 
+    /// Set only while producers are quiescent.
+    void setPublicationSignal(std::atomic<bool>* signal) noexcept { signal_ = signal; }
+
     /**
      * @brief Reserve n bytes and acquire the writer lock.
      * @return Pointer to write location, or nullptr if full (lock released on failure).
@@ -96,6 +99,7 @@ public:
     /// Publishes the write and releases the writer lock.
     void commitWrite() noexcept {
         atomic_writer_pos_.store(writer_pos_, std::memory_order_release);
+        if (signal_) signal_->store(true, std::memory_order_release);
         writer_mutex_.unlock();
     }
 
@@ -162,6 +166,7 @@ public:
     }
 
 private:
+    std::atomic<bool>* signal_ = nullptr;
     static size_t roundUpToPowerOf2(size_t n) {
         if (n == 0) return 1;
         n--;

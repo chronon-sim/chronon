@@ -186,7 +186,8 @@ void testParallelClock(const std::filesystem::path& root) {
     CHECK(rejected);
 }
 
-void testBackend(const std::filesystem::path& root, bool reorder, bool pressure) {
+void testBackend(const std::filesystem::path& root, bool reorder, bool pressure,
+                 bool service = false) {
     auto& threads = ThreadContextManager::instance();
     threads.setQueueCapacity(4096);
     threads.setBackpressurePolicy(BackpressurePolicy::SpinWait);
@@ -198,7 +199,9 @@ void testBackend(const std::filesystem::path& root, bool reorder, bool pressure)
     config.reorder_watermark_cycles = 0;
     config.reorder_max_events = 64;
     config.timeline_compress = reorder;
+    chronon::HostServices scheduler;
     ObservationBackend backend(queue, config);
+    if (service) backend.attachScheduler(scheduler);
     ObservationContext context(&queue, [] { return 0ULL; }, 0, "producer", 1);
     context.enableCategory(category::TRACE);
     const auto track = TimelineTrackRegistry::instance().registerTrack(
@@ -228,6 +231,7 @@ void testBackend(const std::filesystem::path& root, bool reorder, bool pressure)
                 } catch (const std::runtime_error&) {
                     failed = true;
                 }
+                if (service) threads.helpService();
                 std::this_thread::yield();
             }
             for (uint64_t i = 100'000; i < 104'096; ++i) (void)emit(i, name);
@@ -349,6 +353,8 @@ int main(int argc, char** argv) {
         testFullDevice();
     } else if (mode == "parallel_clock") {
         testParallelClock(root);
+    } else if (mode == "service" || mode == "service_final_flush") {
+        testBackend(root, true, mode == "service", true);
     } else if (mode == "immediate" || mode == "async" || mode == "final_flush") {
         testBackend(root, mode != "immediate", mode != "final_flush");
     } else if (mode == "manager_stop" || mode == "manager_shutdown") {

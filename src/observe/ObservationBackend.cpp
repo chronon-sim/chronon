@@ -15,11 +15,8 @@
 #include <fmt/format.h>
 
 #include <iostream>
-#include <thread>
 
-#include "../chronon/CpuPause.hpp"
 #include "FormatRegistry.hpp"
-#include "SIMDOps.hpp"
 
 namespace chronon::observe {
 
@@ -28,71 +25,56 @@ ObservationBackend::ObservationBackend(ObservationQueue& queue) : queue_(queue),
 ObservationBackend::ObservationBackend(ObservationQueue& queue, const Config& config)
     : queue_(queue), config_(config) {}
 
-ObservationBackend::~ObservationBackend() { stop(); }
+ObservationBackend::~ObservationBackend() {
+    stop();
+    if (service_) service_->detach();
+}
 
-void ObservationBackend::start() {
-    if (running_.load(std::memory_order_relaxed)) {
-        return;
-    }
-
-    io_in_flight_.store(false, std::memory_order_relaxed);
-    {
-        std::lock_guard<std::mutex> lock(io_wait_mutex_);
-        output_error_ = nullptr;
-        io_wait_timeout_count_ = 0;
-    }
-    {
-        std::lock_guard<std::mutex> lock(io_dispatch_mutex_);
-        io_work_ready_ = false;
-        io_worker_stop_ = false;
-    }
-
-    initializeOutputDir_();
-    prepareCounterSnapshotPlans_();
-
-    if (config_.enable_reordering) {
-        ReorderBuffer::Config rb_config;
-        rb_config.watermark_cycles = config_.reorder_watermark_cycles;
-        rb_config.max_buffer_events = config_.reorder_max_events;
-        reorder_buffer_ = std::make_unique<ReorderBuffer>(rb_config);
-        // +1 for shared queue (counter snapshots, index MAX_THREADS)
-        per_queue_max_cycle_.resize(ThreadContextManager::MAX_THREADS + 1, 0);
-    }
-
-    counter_buffer_.reserve(COUNTER_BUFFER_FLUSH_SIZE * 2);
-
-    ThreadContextManager::instance().setBackendWakeup(
-        [](void* self) { static_cast<ObservationBackend*>(self)->wakeUp(); }, this);
-
-    should_stop_.store(false, std::memory_order_relaxed);
-    running_.store(true, std::memory_order_release);
-
-    // Dedicated I/O thread is optional; if creation fails, fall back to
-    // synchronous processing in processReorderBuffer_().
-    if (config_.enable_reordering) {
-        try {
-            io_worker_thread_ = std::thread([this]() { ioWorkerLoop_(); });
-        } catch (const std::exception& e) {
-            std::cerr << "[observe] failed to start dedicated I/O thread: " << e.what()
-                      << " (falling back to synchronous output)\n";
-        } catch (...) {
-            std::cerr << "[observe] failed to start dedicated I/O thread "
-                         "(falling back to synchronous output)\n";
-        }
-    }
-    // Publish the optional I/O thread before the drain thread reads joinable().
+void ObservationBackend::attachScheduler(HostServices& scheduler) {
+    if (isRunning()) throw std::logic_error("attach observation scheduler before start");
+    if (service_) service_->detach();
+    io_job_.reset();
+    service_ = scheduler.add(*this);
+    service_->detach();
     try {
-        worker_thread_ = std::thread([this]() {
-            try {
-                run_();
-            } catch (...) {
-                recordFailure_(std::current_exception());
-            }
+        io_job_ = scheduler.addIO(service_, this, [](void* self) noexcept {
+            static_cast<ObservationBackend*>(self)->runIO_();
         });
     } catch (...) {
-        stop();
+        service_.reset();
         throw;
     }
+}
+
+void ObservationBackend::start() {
+    if (isRunning()) return;
+    if (config_.service_buffer_bytes < 65536 || config_.service_buffer_bytes > (1u << 30))
+        throw std::invalid_argument(
+            "observation service_buffer_bytes must be in [65536,1073741824]");
+    if (!service_) {
+        standalone_scheduler_ = std::make_unique<HostServices>(true);
+        attachScheduler(*standalone_scheduler_);
+    }
+    service_batch_.resize(SERVICE_BATCH_BYTES);
+    service_batch_size_ = service_queue_cursor_ = 0;
+    per_queue_max_cycle_.assign(ThreadContextManager::MAX_THREADS + 1, 0);
+    io_in_flight_.store(false, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(error_mutex_);
+        output_error_ = nullptr;
+    }
+    should_stop_.store(false, std::memory_order_relaxed);
+    // Opening, encoding and closing all run on the scheduler's I/O lane.
+    io_phase_ = IOPhase::Open;
+    io_job_->submit();
+    io_job_->wait();
+    rethrowIfFailed();
+    ThreadContextManager::instance().setBackendWakeup(
+        [](void* self) { static_cast<ObservationBackend*>(self)->wakeUp(); }, this);
+    ThreadContextManager::instance().setService(service_);
+    queue_.setPublicationSignal(&service_->ready);
+    running_.store(true, std::memory_order_release);
+    service_->activate(*this);
 }
 
 void ObservationBackend::stop() noexcept {
@@ -101,36 +83,29 @@ void ObservationBackend::stop() noexcept {
     }
 
     should_stop_.store(true, std::memory_order_release);
-    // Unregister wakeup callback before join so producers stop spin-waiting
+    if (service_) {
+        service_->detach();
+        ThreadContextManager::instance().setService(nullptr);
+        queue_.setPublicationSignal(nullptr);
+    }
+    // Unregister wakeup callback before final drain so producers stop spin-waiting
     // and fall back to drop while backend is shutting down.
     ThreadContextManager::instance().setBackendWakeup(nullptr, nullptr);
-    wakeUp();
-
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(io_dispatch_mutex_);
-        io_worker_stop_ = true;
-    }
-    io_dispatch_cv_.notify_one();
-    if (io_worker_thread_.joinable()) {
-        io_worker_thread_.join();
-    }
-
-    // Both consumers are joined before touching their output state.
     try {
-        if (perfetto_writer_) perfetto_writer_->close();
+        waitForAsyncIO_();
+        ThreadContextManager::instance().flushAll();
+        while (drainServiceBatch_(256)) {
+            processEventsAsync_();
+            waitForAsyncIO_();
+        }
     } catch (...) {
         recordFailure_(std::current_exception());
     }
-    timeline_sink_open_.store(false, std::memory_order_release);
-    if (counter_file_.is_open()) counter_file_.close();
-    if (default_sink_ && default_sink_->file.is_open()) default_sink_->file.close();
-    for (auto& [name, sink] : custom_sinks_) {
-        if (sink->file.is_open()) sink->file.close();
-    }
+    // Finalize on the same I/O lane even after failure (to close every sink).
+    io_job_->wait();
+    io_phase_ = IOPhase::Close;
+    io_job_->submit();
+    io_job_->wait();
     if (output_error_) {
         // The caller has quiesced producers, as for a normal final drain.
         // Discard unread records so a later run cannot replay stale source IDs.
@@ -146,8 +121,6 @@ void ObservationBackend::stop() noexcept {
         queue_.forceCommitRead();
         reorder_buffer_.reset();
         ready_buffer_.clear();
-        io_buffer_.clear();
-        io_arena_ = {};
         std::lock_guard<std::mutex> lock(timeline_submit_mutex_);
         submitted_timelines_.clear();
     }
@@ -155,13 +128,13 @@ void ObservationBackend::stop() noexcept {
 }
 
 void ObservationBackend::rethrowIfFailed() {
-    std::lock_guard<std::mutex> lock(io_wait_mutex_);
+    std::lock_guard<std::mutex> lock(error_mutex_);
     if (output_error_) std::rethrow_exception(output_error_);
 }
 
 void ObservationBackend::recordFailure_(std::exception_ptr error) noexcept {
     {
-        std::lock_guard<std::mutex> lock(io_wait_mutex_);
+        std::lock_guard<std::mutex> lock(error_mutex_);
         if (!output_error_) {
             output_error_ = error;
             try {
@@ -181,15 +154,7 @@ void ObservationBackend::recordFailure_(std::exception_ptr error) noexcept {
 }
 
 void ObservationBackend::wakeUp() noexcept {
-    // Set atomic flag first (Phase 1/2 check this lock-free).
-    wake_flag_.store(true, std::memory_order_release);
-    // Signal condvar for Phase 3 blocking wait.
-    // Lock+unlock serializes with the condvar::wait predicate check,
-    // preventing lost wakeups where notify fires between the predicate
-    // returning false and the actual futex sleep inside wait().
-    wake_mutex_.lock();
-    wake_mutex_.unlock();
-    wake_cv_.notify_one();
+    if (service_) service_->ready.store(true, std::memory_order_release);
 }
 
 void ObservationBackend::predeclareTimelineSourceTracks_() {
@@ -204,106 +169,7 @@ void ObservationBackend::predeclareTimelineSourceTracks_() {
     }
 }
 
-void ObservationBackend::run_() {
-    // The optional token is an observation-lifetime token, not the simulation
-    // worker token.  Simulation termination must not stop this consumer: the
-    // application still has to enqueue its final partial counter interval and
-    // scheduler timeline before stop() requests the final drain.
-    auto stop_fn = [this]() noexcept {
-        should_stop_.store(true, std::memory_order_release);
-        wakeUp();
-    };
-    stdexec::inplace_stop_callback<decltype(stop_fn)> wake_on_stop(stop_token_, std::move(stop_fn));
-
-    while (!should_stop_.load(std::memory_order_acquire)) {
-        size_t events = 0;
-
-        if (reorder_buffer_) {
-            // Reordering enabled: buffer events then flush sorted
-            events = drainToReorderBuffer_();
-            processReorderBuffer_(false);  // Flush events below watermark
-            // Drain again after flush processing to prevent backpressure.
-            // processReorderBuffer_ may take significant time (sort/merge/
-            // arena snapshot), during which producer queues fill up.
-            // This extra drain keeps queues drained even under heavy load.
-            events += drainToReorderBuffer_();
-        } else {
-            // Original behavior: process events immediately
-            events = drainAllQueues_();
-        }
-
-        // Flush if we processed events
-        if (events > 0) {
-            // Reorder mode flushes in processReorderBuffer_ (sync) or ioWorkerLoop_ (async).
-            // Immediate mode flushes here.
-            if (!reorder_buffer_) {
-                flush_();
-            }
-            // Skip spin-wait when events are pending — immediately loop
-            // back to drain more. Only spin-wait when queues are empty.
-            continue;
-        }
-
-        // Adaptive spin-wait: hot spin → yield → condvar wait
-        // Phase 1: Hot spin with CPU pause hint (lowest latency)
-        bool woken = false;
-        for (int i = 0; i < SPIN_HOT_ITERS; ++i) {
-            if (wake_flag_.load(std::memory_order_acquire) ||
-                should_stop_.load(std::memory_order_acquire)) {
-                woken = true;
-                break;
-            }
-            cpuPause();
-        }
-
-        // Phase 2: Yield to OS scheduler (medium latency)
-        if (!woken) {
-            for (int i = 0; i < SPIN_YIELD_ITERS; ++i) {
-                if (wake_flag_.load(std::memory_order_acquire) ||
-                    should_stop_.load(std::memory_order_acquire)) {
-                    woken = true;
-                    break;
-                }
-                std::this_thread::yield();
-            }
-        }
-
-        // Phase 3: Condition variable wait (zero CPU, instant wakeup).
-        // Uses mutex+condvar instead of atomic::wait because GCC 12's
-        // std::atomic<bool>::wait uses a shared 16-bucket proxy pool
-        // (sizeof(bool) != sizeof(int)), which causes missed wakeups
-        // when other atomics (stdexec run_loop, progress counters) hash
-        // to the same bucket.
-        if (!woken) {
-            std::unique_lock<std::mutex> lk(wake_mutex_);
-            wake_cv_.wait(lk, [this] {
-                return wake_flag_.load(std::memory_order_relaxed) ||
-                       should_stop_.load(std::memory_order_relaxed);
-            });
-        }
-
-        wake_flag_.store(false, std::memory_order_relaxed);
-    }
-
-    // An asynchronous failure can stop us while producers are still running.
-    // Do not force-publish their private write positions in that case: stop()
-    // discards the failed run's queues once the caller has quiesced producers.
-    rethrowIfFailed();
-
-    // Flush all per-thread queues before final drain
-    ThreadContextManager::instance().flushAll();
-
-    // Final drain on shutdown
-    if (reorder_buffer_) {
-        drainToReorderBuffer_();
-        processReorderBuffer_(true);  // flush_all = true for shutdown
-    } else {
-        drainAllQueues_();
-    }
-
-    // Wait for any in-flight async I/O to complete before closing files
-    waitForAsyncIO_();
-
+void ObservationBackend::finalizeOutput_() {
     // Force OS flush on shutdown by resetting the timer
     last_os_flush_time_ = std::chrono::steady_clock::time_point{};
     flush_();
@@ -324,327 +190,72 @@ void ObservationBackend::submitTimeline(TimelineStreamData&& data) {
     submitted_timelines_.push_back(std::move(data));
 }
 
-size_t ObservationBackend::drainQueue_() {
-    size_t events_read = 0;
-
-    while (auto* ptr = queue_.prepareRead()) {
-        auto* header = reinterpret_cast<const ObservationQueue::RecordHeader*>(ptr);
-        const std::byte* data = ptr + sizeof(ObservationQueue::RecordHeader);
-
-        processEvent_(header, data);
-
-        auto event_type = header->type;
-        queue_.finishRead(header->total_size);
-        events_read++;
-
-        // Check for shutdown signal
-        if (event_type == ObservationQueue::EventType::SHUTDOWN) {
-            should_stop_.store(true, std::memory_order_release);
-            break;
-        }
-    }
-
-    queue_.forceCommitRead();
-
-    if (events_read > 0) {
-        events_processed_.fetch_add(events_read, std::memory_order_relaxed);
-    }
-
-    return events_read;
-}
-
-size_t ObservationBackend::drainPerThreadQueues_() {
-    size_t total_events = 0;
-
-    ThreadContextManager::instance().forEachContext([&](ThreadContext* ctx) {
-        SPSCQueue& q = ctx->queue();
-        size_t batch = 0;
-        size_t queue_events = 0;
-
-        while (auto* ptr = q.prepareRead()) {
-            auto* header = reinterpret_cast<const ObservationQueue::RecordHeader*>(ptr);
-            const std::byte* data = ptr + sizeof(ObservationQueue::RecordHeader);
-
-            processEvent_(header, data);
-
-            // Cache event type before finishRead — once reader_pos_ is
-            // published via eagerCommitRead, the producer may immediately
-            // overwrite this buffer region, making header->type a UAF read.
-            auto event_type = header->type;
-            q.finishRead(header->total_size);
-            queue_events++;
-
-            // Publish freed space incrementally so producers unblock sooner.
-            // Without this, the producer is blocked for the entire drain cycle
-            // (~2500 events) because eagerCommitRead was only called at the end.
-            if (++batch >= 64) {
-                q.eagerCommitRead();
-                batch = 0;
-            }
-
-            // Check for shutdown signal
-            if (event_type == ObservationQueue::EventType::SHUTDOWN) {
-                should_stop_.store(true, std::memory_order_release);
-                break;
-            }
-        }
-
-        q.eagerCommitRead();
-        total_events += queue_events;
-    });
-
-    if (total_events > 0) {
-        events_processed_.fetch_add(total_events, std::memory_order_relaxed);
-    }
-
-    return total_events;
-}
-
-size_t ObservationBackend::drainAllQueues_() {
-    size_t total = 0;
-
-    total += drainPerThreadQueues_();
-    total += drainQueue_();
-
-    return total;
-}
-
-size_t ObservationBackend::drainToReorderBuffer_() {
-    size_t total_events = 0;
-
-    ThreadContextManager::instance().forEachContext([&](ThreadContext* ctx) {
-        SPSCQueue& q = ctx->queue();
-        const size_t qid = ctx->id();
-        uint64_t queue_max = per_queue_max_cycle_[qid];
-        size_t batch = 0;
-        size_t queue_events = 0;
-
-        while (auto* ptr = q.prepareRead()) {
-            auto* header = reinterpret_cast<const ObservationQueue::RecordHeader*>(ptr);
-            const std::byte* data = ptr + sizeof(ObservationQueue::RecordHeader);
-            size_t data_size = header->total_size - sizeof(ObservationQueue::RecordHeader);
-
-            // Check for shutdown signal before buffering
-            if (header->type == ObservationQueue::EventType::SHUTDOWN) {
-                should_stop_.store(true, std::memory_order_release);
-                q.finishRead(header->total_size);
-                break;
-            }
-
-            if (data_size >= sizeof(uint64_t)) {
-                uint64_t cycle = 0;
-                std::memcpy(&cycle, data, sizeof(uint64_t));
-                queue_max = std::max(queue_max, cycle);
-            }
-
-            reorder_buffer_->bufferEvent(header, data, data_size);
-
-            q.finishRead(header->total_size);
-            queue_events++;
-
-            // Publish freed space incrementally
-            if (++batch >= 64) {
-                q.eagerCommitRead();
-                batch = 0;
-            }
-        }
-
-        per_queue_max_cycle_[qid] = queue_max;
-        q.eagerCommitRead();
-        total_events += queue_events;
-    });
-
-    {
-        constexpr size_t legacy_idx = ThreadContextManager::MAX_THREADS;
-        uint64_t queue_max = per_queue_max_cycle_[legacy_idx];
-        size_t legacy_events = 0;
-
-        while (auto* ptr = queue_.prepareRead()) {
-            auto* header = reinterpret_cast<const ObservationQueue::RecordHeader*>(ptr);
-            const std::byte* data = ptr + sizeof(ObservationQueue::RecordHeader);
-            size_t data_size = header->total_size - sizeof(ObservationQueue::RecordHeader);
-
-            // Check for shutdown signal
-            if (header->type == ObservationQueue::EventType::SHUTDOWN) {
-                should_stop_.store(true, std::memory_order_release);
-                queue_.finishRead(header->total_size);
-                break;
-            }
-
-            if (data_size >= sizeof(uint64_t)) {
-                uint64_t cycle = 0;
-                std::memcpy(&cycle, data, sizeof(uint64_t));
-                queue_max = std::max(queue_max, cycle);
-            }
-
-            reorder_buffer_->bufferEvent(header, data, data_size);
-
-            queue_.finishRead(header->total_size);
-            legacy_events++;
-        }
-
-        per_queue_max_cycle_[legacy_idx] = queue_max;
-        total_events += legacy_events;
-    }
-
-    queue_.forceCommitRead();
-
-    if (total_events > 0) {
-        events_processed_.fetch_add(total_events, std::memory_order_relaxed);
-    }
-
-    uint64_t global_min =
-        simd::minNonZero(per_queue_max_cycle_.data(), per_queue_max_cycle_.size());
-
-    if (global_min != UINT64_MAX) {
-        reorder_buffer_->updateMinCycle(global_min);
-    }
-
-    return total_events;
-}
-
-void ObservationBackend::processReorderBuffer_(bool flush_all) {
-    if (!reorder_buffer_) {
-        return;
-    }
-
-    // Non-blocking path: if previous async I/O batch is still in-flight,
-    // skip flushing and return immediately so the drain thread can keep
-    // draining producer queues.  This prevents deadlock when producers
-    // use spin_wait backpressure — the drain thread must never block while
-    // queues could be filling up.  Events stay in the reorder buffer and
-    // will be flushed on a subsequent call once I/O completes.
-    // On shutdown (flush_all), we must block to ensure all events are written.
-    if (!flush_all && io_in_flight_.load(std::memory_order_acquire)) {
-        return;
-    }
-
-    // Wait for previous async I/O batch to complete before reusing buffers.
-    // This only blocks on shutdown (flush_all) or when I/O just finished
-    // (io_in_flight_ is already false, so waitForAsyncIO_ returns immediately).
-    waitForAsyncIO_();
-
-    if (flush_all) {
-        reorder_buffer_->flushAll(ready_buffer_);
-    } else {
-        reorder_buffer_->flushReady(ready_buffer_);
-    }
-
-    if (ready_buffer_.empty()) {
-        return;
-    }
-
-    // Drain queues between flush and I/O dispatch.  flushReady() does an
-    // expensive sort/merge that may have allowed producer queues to fill.
-    // This mid-flush drain keeps queues responsive under heavy load.
-    if (!flush_all) {
-        drainToReorderBuffer_();
-    }
-
-    if (io_worker_thread_.joinable()) {
-        io_arena_ = reorder_buffer_->snapshotArena(ready_buffer_);
-        std::swap(ready_buffer_, io_buffer_);
-        reorder_buffer_->compactArena();
-        processEventsAsync_();
-    } else {
-        // Fallback: synchronous processing (dedicated I/O thread unavailable)
-        for (const auto& record : ready_buffer_) {
-            if (record.data_size < sizeof(ObservationQueue::RecordHeader)) {
-                continue;
-            }
-
-            const std::byte* arena_ptr = reorder_buffer_->arenaData(record.data_offset);
-            const auto* header = reinterpret_cast<const ObservationQueue::RecordHeader*>(arena_ptr);
-            const std::byte* data = arena_ptr + sizeof(ObservationQueue::RecordHeader);
-
-            processEvent_(header, data);
-        }
-
-        // Compact the arena now that all flushed records have been consumed.
-        reorder_buffer_->compactArena();
-        flush_();
-    }
-}
-
 void ObservationBackend::waitForAsyncIO_() {
-    std::unique_lock<std::mutex> lock(io_wait_mutex_);
-    while (io_in_flight_.load(std::memory_order_acquire)) {
-        bool done = io_wait_cv_.wait_for(lock, ASYNC_IO_WAIT_TIMEOUT, [this]() {
-            return !io_in_flight_.load(std::memory_order_acquire);
-        });
-        if (done) {
-            break;
-        }
-
-        ++io_wait_timeout_count_;
-        if (io_wait_timeout_count_ == 1 || (io_wait_timeout_count_ % 8) == 0) {
-            std::cerr << "[observe] async I/O batch still in-flight after "
-                      << (io_wait_timeout_count_ * ASYNC_IO_WAIT_TIMEOUT.count()) << "ms";
-            if (should_stop_.load(std::memory_order_acquire)) {
-                std::cerr << " (stop requested)";
-            }
-            std::cerr << "\n";
-        }
-    }
-
-    if (output_error_) std::rethrow_exception(output_error_);
-
-    io_wait_timeout_count_ = 0;
+    io_job_->wait();
+    rethrowIfFailed();
 }
 
 void ObservationBackend::processEventsAsync_() {
-    {
-        std::lock_guard<std::mutex> lock(io_wait_mutex_);
-        io_in_flight_.store(true, std::memory_order_release);
-    }
-    {
-        std::lock_guard<std::mutex> lock(io_dispatch_mutex_);
-        io_work_ready_ = true;
-    }
-    io_dispatch_cv_.notify_one();
+    io_phase_ = IOPhase::Batch;
+    io_in_flight_.store(true, std::memory_order_release);
+    io_job_->submit();
 }
 
-void ObservationBackend::ioWorkerLoop_() {
-    for (;;) {
-        {
-            std::unique_lock<std::mutex> lock(io_dispatch_mutex_);
-            io_dispatch_cv_.wait(lock, [this]() { return io_work_ready_ || io_worker_stop_; });
-            if (io_worker_stop_ && !io_work_ready_) {
+void ObservationBackend::runIO_() noexcept {
+    try {
+        switch (io_phase_) {
+            case IOPhase::Open: {
+                initializeOutputDir_();
+                prepareCounterSnapshotPlans_();
+                reorder_buffer_.reset();
+                if (config_.enable_reordering) {
+                    ReorderBuffer::Config cfg;
+                    cfg.watermark_cycles = config_.reorder_watermark_cycles;
+                    cfg.max_buffer_events = config_.reorder_max_events;
+                    cfg.initial_arena_size =
+                        std::min(cfg.initial_arena_size, config_.service_buffer_bytes);
+                    reorder_buffer_ = std::make_unique<ReorderBuffer>(cfg);
+                }
+                counter_buffer_.reserve(COUNTER_BUFFER_FLUSH_SIZE * 2);
                 break;
             }
-            io_work_ready_ = false;
+            case IOPhase::Batch:
+                processServiceBatch_();
+                break;
+            case IOPhase::Close:
+                rethrowIfFailed();
+                if (reorder_buffer_) flushServiceReorder_(true);
+                finalizeOutput_();
+                break;
         }
-
-        struct CompletionGuard {
-            ObservationBackend* self;
-            ~CompletionGuard() {
-                {
-                    std::lock_guard<std::mutex> lock(self->io_wait_mutex_);
-                    self->io_in_flight_.store(false, std::memory_order_release);
-                }
-                self->io_wait_cv_.notify_all();
-            }
-        } done{this};
-
-        try {
-            for (const auto& record : io_buffer_) {
-                if (record.data_size < sizeof(ObservationQueue::RecordHeader)) {
-                    continue;
-                }
-
-                const std::byte* arena_ptr =
-                    io_arena_.data.data() + (record.data_offset - io_arena_.base_offset);
-                const auto* header =
-                    reinterpret_cast<const ObservationQueue::RecordHeader*>(arena_ptr);
-                const std::byte* data = arena_ptr + sizeof(ObservationQueue::RecordHeader);
-
-                processEvent_(header, data);
-            }
-            flush_();
-        } catch (...) {
-            recordFailure_(std::current_exception());
-        }
+    } catch (...) {
+        recordFailure_(std::current_exception());
     }
+    if (io_phase_ == IOPhase::Close || (io_phase_ == IOPhase::Open && output_error_)) {
+        // A failure in one sink must not prevent the others from closing.
+        const auto close = [this](auto&& action) {
+            try {
+                action();
+            } catch (...) {
+                recordFailure_(std::current_exception());
+            }
+        };
+        close([&] {
+            if (perfetto_writer_) perfetto_writer_->close();
+        });
+        timeline_sink_open_.store(false, std::memory_order_release);
+        close([&] {
+            if (counter_file_.is_open()) counter_file_.close();
+        });
+        close([&] {
+            if (default_sink_ && default_sink_->file.is_open()) default_sink_->file.close();
+        });
+        for (auto& [name, sink] : custom_sinks_)
+            close([&] {
+                if (sink->file.is_open()) sink->file.close();
+            });
+    }
+    io_in_flight_.store(false, std::memory_order_release);
 }
 
 void ObservationBackend::processEvent_(const ObservationQueue::RecordHeader* header,

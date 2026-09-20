@@ -515,6 +515,7 @@ private:
         if (!ThreadContextManager::instance().wakeBackend()) {
             return nullptr;
         }
+        ThreadContextManager::instance().helpService();
         const uint32_t max_spins = (policy == BackpressurePolicy::SpinWait)
                                        ? UINT32_MAX
                                        : ThreadContextManager::instance().backpressureMaxSpins(Ch);
@@ -533,6 +534,7 @@ private:
             if ((spins & 0xFFu) == 0u && !ThreadContextManager::instance().wakeBackend()) {
                 break;
             }
+            if ((spins & 0xFFu) == 0u) ThreadContextManager::instance().helpService();
         } while (spins < max_spins);
         return ptr;
     }
