@@ -185,10 +185,7 @@ void TickSimulation::requireClockRun_() {
 }
 
 bool TickSimulation::executeClockBatch_() {
-    if (host_services_) {
-        size_t cursor = static_cast<size_t>(current_cycle_);
-        host_services_->poll(cursor);
-    }
+    if (host_services_) host_services_->poll(sequential_service_cursor_);
     if (clock_calendar_->empty() || wasTerminationRequested()) return false;
     if (current_cycle_ == UINT64_MAX) throw std::overflow_error("scheduler progress overflow");
     try {

@@ -55,8 +55,18 @@ the saved binaries with their recorded hashes.
 
 `backend.attachScheduler(sim.hostServices())` remains available for independently
 owned ordinary backends. Simulation-owned ordinary and native recorders attach
-automatically. `HostIOJob` callbacks are noexcept and own error publication;
+automatically before startup. A manager backend started before simulation
+initialization retains its existing scheduler and continues through the same
+standalone service pipeline. Initialize the simulation before `startBackend()`
+to share the simulation scheduler; `SimulationApp` already does so.
+`HostIOJob` callbacks are noexcept and own error publication;
 callers must detach ingress and fence I/O before destroying callback state.
+
+`ObservationYAMLConfig::service_buffer_bytes` is appended after the existing
+fields to preserve positional aggregate initialization. The legacy
+`ObservationBackend::Config::poll_interval` member remains for source compatibility
+and has no effect. Class layouts changed, so downstream binaries must be rebuilt;
+this does not preserve binary ABI compatibility.
 
 ## Validation
 

@@ -8,7 +8,6 @@
 #include <array>
 #include <bit>
 #include <chrono>
-#include <condition_variable>
 #include <exception>
 #include <fstream>
 #include <iomanip>

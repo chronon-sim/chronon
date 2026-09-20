@@ -356,7 +356,7 @@ public:
 
     uint64_t totalStagingOverflowEvents() const noexcept { return totalTransportOverflowEvents(); }
 
-    /// Used by observation async I/O.
+    /// Simulation worker pool. Blocking observation I/O belongs to hostServices().
     exec::static_thread_pool& pool() noexcept { return pool_; }
     /// Register host services between runs; never while worker loops execute.
     HostServices& hostServices() {
@@ -1003,6 +1003,7 @@ private:
     bool finalized_ = false;
     bool observation_registered_ = false;
     std::unique_ptr<HostServices> host_services_;
+    size_t sequential_service_cursor_ = 0;  // Retain rotation across short runs of any length.
     mutable std::unique_ptr<PortDirectory> port_directory_;
 };
 

@@ -46,11 +46,11 @@
 namespace chronon::observe {
 
 /**
- * @brief Background worker that drains observability queues and writes output files.
+ * @brief Scheduler service that drains observability queues and submits output jobs.
  *
  * Drains per-thread SPSC queues (traces/logs) and the shared queue (counter
  * snapshots, lookahead commits), then routes each event to the text and/or
- * Perfetto timeline sinks.
+ * Perfetto timeline sinks on the scheduler's shared I/O lane.
  *
  * Output files:
  * - events.log       — text output (debug/info/warn/error, optional trace mirror).
@@ -65,6 +65,7 @@ public:
 
     struct Config {
         std::string output_dir = "out";
+        /// Legacy source-compatibility field; ignored. HostServices controls polling.
         std::chrono::microseconds poll_interval{100};
         bool enable_counter_csv = true;
         CounterCsvFormat counter_csv_format = CounterCsvFormat::Pivoted;
@@ -138,7 +139,7 @@ public:
      * @brief Submit recorded timeline streams for inclusion in timeline.pftrace.
      *
      * Thread-safe; intended for end-of-run handoff (e.g. the scheduler execution
-     * timeline). The data is written by the worker thread during stop(), after
+     * timeline). The data is written on the scheduler I/O lane during stop(), after
      * the final event drain, so callers must submit before stopping the backend.
      */
     void submitTimeline(TimelineStreamData&& data);

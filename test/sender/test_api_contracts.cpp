@@ -354,9 +354,14 @@ void portCapacityContracts() {
 
 void observationSessionLifetime() {
     auto& manager = chronon::observe::ObservationManager::instance();
-    chronon::observe::ObservationYAMLConfig observation;
-    observation.enabled = true;
-    observation.output_dir = "/tmp/chronon-api-session-test";
+    // Preserve the public aggregate field order from before host services.
+    chronon::observe::ObservationYAMLConfig observation{
+        true,       "/tmp/chronon-api-session-test",
+        256 * 1024, chronon::observe::BackpressurePolicy::BoundedWait,
+        4096,       {},
+        {},         {},
+        {}};
+    CHECK(observation.service_buffer_bytes == 16 * 1024 * 1024);
     for (int iteration = 0; iteration != 2; ++iteration) {
         {
             TickSimulation owner(config());
