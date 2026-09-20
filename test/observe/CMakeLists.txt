@@ -31,7 +31,7 @@ foreach(mode static dynamic clock-static clock-dynamic clock-wakeup)
 endforeach()
 
 add_executable(test_clock_trace test_clock_trace.cpp)
-target_link_libraries(test_clock_trace PRIVATE chronon::observe)
+target_link_libraries(test_clock_trace PRIVATE chronon::observe chronon_compile_options)
 target_compile_options(test_clock_trace PRIVATE -UNDEBUG)
 add_test(NAME clock_trace_test COMMAND test_clock_trace)
 add_test(NAME clock_trace_service_test COMMAND test_clock_trace --service)
