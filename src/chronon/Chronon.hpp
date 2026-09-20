@@ -11,8 +11,33 @@
 
 #pragma once
 
-// Full compatibility umbrella. Prefer a focused header in new model code.
+// Preserve the full umbrella include order for existing clients.
+// --- Subsystem includes ---
+#include "../observe/Observe.hpp"
+#include "../params/Param.hpp"
+#include "../params/ParameterSet.hpp"
+#include "../params/UnitConstructorMacros.hpp"
+#include "../params/YAMLSerialization.hpp"
 #include "../sender/Sender.hpp"
+#include "../sender/app/SimulationApp.hpp"
+#include "../sender/config/SenderSimulationBuilder.hpp"
+#include "../sender/core/PhasedTickableUnit.hpp"
+#include "../sender/core/TerminationRequest.hpp"
+#include "../sender/core/TickSimulation.hpp"
+#include "../sender/core/TickableUnit.hpp"
+#include "../sender/core/Unit.hpp"
+#include "../sender/factory/SenderFactory.hpp"
+#include "../sender/port/Connection.hpp"
+#include "../sender/port/DelayOneBroadcastFabric.hpp"
+#include "../sender/port/Port.hpp"
+#include "../sender/port/PortDirectory.hpp"
+#include "../sender/util/PipelinePhase.hpp"
+#include "../sender/util/PriorityArbiter.hpp"
+#include "../sender/util/StageForward.hpp"
+#include "../sender/util/StagePipeline.hpp"
+#include "../sender/util/StageReg.hpp"
+#include "../sender/util/VersionedRegister.hpp"
+#include "../tree/TreeNode.hpp"
 #include "Application.hpp"
 #include "Observation.hpp"
 #include "Simulation.hpp"

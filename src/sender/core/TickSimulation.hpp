@@ -104,10 +104,29 @@ public:
         static_assert(std::is_base_of_v<TickableUnit, UnitT>,
                       "UnitT must derive from TickableUnit");
 
-        requireConfigurable_("cannot create units after initialization has started");
+        if (initialization_started_ || finalized_)
+            throw std::logic_error("cannot create units after initialization has started");
         auto unit = std::make_unique<UnitT>(std::forward<Args>(args)...);
         auto* ptr = unit.get();
-        adoptUnit_(std::move(unit));
+
+        if (auto* observable = dynamic_cast<observe::ObservableUnit*>(ptr)) {
+            observable->observe_cycle_ = &static_cast<Unit*>(ptr)->local_cycle_;
+        }
+
+        ptr->clock_ = &default_clock_;
+
+        ptr->setId(static_cast<uint32_t>(units_.size()));
+        ptr->bindActivitySchedulingState_(&any_activity_scheduling_);
+
+        units_.push_back(std::move(unit));
+        try {
+            unit_ptrs_.push_back(ptr);
+        } catch (...) {
+            // Registration must not leave a live unit behind on failure: its
+            // constructor arguments may belong to the caller's unwind scope.
+            units_.pop_back();
+            throw;
+        }
 
         return ptr;
     }
@@ -136,9 +155,10 @@ public:
 
     template <typename T>
     Connection<T>* connect(OutPort<T>& from, InPort<T>& to, uint32_t delay = 1) {
-        requireConfigurable_("cannot connect after initialization has started");
-        validateUnitOwner_(from.owner());
-        validateUnitOwner_(to.owner());
+        if (initialization_started_ || finalized_)
+            throw std::logic_error("cannot connect after initialization has started");
+        validateClockOwner_(from.owner());
+        validateClockOwner_(to.owner());
         if (from.owner() && to.owner() &&
             from.owner()->clockDomainId() != to.owner()->clockDomainId()) {
             throw std::invalid_argument(
@@ -191,9 +211,10 @@ public:
     template <typename T>
     AsyncFifo<T>* connectAsyncFifo(uint32_t id, AsyncWritePort<T>& write, AsyncReadPort<T>& read,
                                    AsyncFifoConfig config = {}) {
-        requireConfigurable_("cannot add CDC after initialization has started");
-        validateUnitOwner_(write.owner());
-        validateUnitOwner_(read.owner());
+        if (initialization_started_ || finalized_)
+            throw std::logic_error("cannot add CDC after initialization has started");
+        validateClockOwner_(write.owner());
+        validateClockOwner_(read.owner());
         for (const auto& fifo : cdc_) {
             if (fifo->id() == id) throw std::invalid_argument("duplicate CDC component ID");
         }
@@ -366,10 +387,6 @@ public:
     /// @}
 
 private:
-    // Construction and ownership: implemented with session lifetime operations.
-    void requireConfigurable_(const char* message) const;
-    void adoptUnit_(std::unique_ptr<TickableUnit> unit);
-
     /// Resolve per-lane progress only after topology and transport selection.
     void installMultiProducerProgress_();
     // Shared advancement after the caller checks initialization and clock mode.
@@ -402,7 +419,7 @@ private:
         return executed;
     }
 
-    void validateUnitOwner_(const Unit* unit) const;
+    void validateClockOwner_(const Unit* unit) const;
     void prepareClockTopology_();
     void initializeClockRuntime_();
     void selectClockExecutionMode_();

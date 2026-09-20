@@ -34,10 +34,16 @@ const ClockDomain& TickSimulation::clockDomain(ClockDomainId id) const {
     throw std::invalid_argument("unknown clock domain ID");
 }
 
+void TickSimulation::validateClockOwner_(const Unit* unit) const {
+    for (const auto& owned : units_)
+        if (owned.get() == unit) return;
+    throw std::invalid_argument("clock endpoint must belong to this simulation");
+}
+
 void TickSimulation::assignClockDomain(Unit& unit, ClockDomainId id) {
     if (initialization_started_ || finalized_ || current_cycle_)
         throw std::logic_error("runtime domain rebinding is unsupported");
-    validateUnitOwner_(&unit);
+    validateClockOwner_(&unit);
     unit.clock_ = &clockDomain(id);
     clock_mode_ = true;
 }
@@ -63,8 +69,8 @@ void TickSimulation::prepareClockTopology_() {
     std::sort(connections_.begin(), connections_.end());
     connections_.erase(std::unique(connections_.begin(), connections_.end()), connections_.end());
     for (auto* connection : connections_) {
-        validateUnitOwner_(connection->source());
-        validateUnitOwner_(connection->destination());
+        validateClockOwner_(connection->source());
+        validateClockOwner_(connection->destination());
         if (connection->source()->clockDomainId() != connection->destination()->clockDomainId()) {
             throw std::invalid_argument("ordinary connection crosses hardware clock domains: " +
                                         connection->source()->fullPath() + " -> " +

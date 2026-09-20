@@ -76,94 +76,44 @@ boundary, ownership rules and capability matrix.
                    stdexec::static_thread_pool  ◄───────┘
 ```
 
-## Directory Structure
+## Source map
 
-```
-src/
-├── chronon/                             # Unified namespace headers
-│   └── Chronon.hpp                      # Master include (all you need!)
-│
-├── sender/                              # Framework root
-│   ├── core/                            # Core abstractions
-│   │   ├── Unit.hpp                     # Unit base class
-│   │   ├── TickableUnit.hpp             # Tick-based unit interface
-│   │   ├── PhasedTickableUnit.hpp       # Phase-based tick dispatch
-│   │   ├── TickSimulation.hpp           # Simulation driver with stdexec
-│   │   ├── TickSimulationConfig.hpp     # Model configuration and execution policy
-│   │   ├── TickSimulationLifecycle.cpp  # Cold lifetime, ownership and lookup
-│   │   ├── TickSimulationDescriptors.hpp # Internal progress descriptors
-│   │   ├── TerminationRequest.hpp       # Termination conditions
-│   │   ├── CrashHandler.hpp             # Signal handler + emergency flush
-│   │   └── CrashHandler.cpp             # Crash handler implementation
-│   │
-│   ├── port/                            # Port system
-│   │   ├── Port.hpp                     # Combined InPort/OutPort header
-│   │   ├── InPort.hpp                   # InPort<T>
-│   │   ├── OutPort.hpp                  # OutPort<T>
-│   │   ├── Connection.hpp               # Connection with delay
-│   │   ├── MessageQueue.hpp             # Thread-safe timestamped queue
-│   │   └── PortDirectory.hpp            # Port lookup by path
-│   │
-│   ├── schedule/                        # Scheduling infrastructure
-│   │   ├── DependencyGraph.hpp          # Graph construction + Floyd-Warshall
-│   │   ├── CycleAnalyzer.hpp            # Tarjan SCC + Johnson's cycle detection
-│   │   ├── WeightedPartitioner.hpp      # Cost-aware graph partitioner
-│   │   ├── TickCostProfiler.hpp         # Per-unit tick cost measurement
-│   │   ├── PlatformBenchmark.hpp        # Atomic sync cost measurement
-│   │   ├── CostProfileCache.hpp         # Cached profiling results
-│   │   ├── SimulatedAnnealingPartitioner.hpp  # SA-based partitioner
-│   │   └── SchedulerTimelineTrace.hpp   # Scheduler timeline recording (Perfetto)
-│   │
-│   ├── util/                            # Utilities
-│   │   ├── Graph.hpp                    # Graph algorithms
-│   │   ├── StageReg.hpp                 # Stage register (multi-pipe)
-│   │   ├── SingleStageReg.hpp           # Stage register (single entry)
-│   │   ├── StagePipeline.hpp            # Multi-stage pipeline abstraction
-│   │   ├── StageForward.hpp             # Stage forwarding utilities
-│   │   ├── PipelinePhase.hpp            # Phase tag types
-│   │   ├── PriorityArbiter.hpp          # N-pipe priority arbiter
-│   │   └── VersionedRegister.hpp        # Lock-free temporal register
-│   │
-│   ├── config/                          # Configuration
-│   │   ├── SenderConfigLoader.hpp       # YAML parsing
-│   │   ├── SenderSimulationBuilder.hpp  # Build orchestration
-│   │   ├── SenderUnitConfig.hpp         # Per-unit YAML config structs
-│   │   └── YAMLOverride.hpp             # CLI -p override support
-│   │
-│   ├── factory/                         # Factory system
-│   │   └── SenderFactory.hpp            # Unit factories + auto-registration
-│   │
-│   └── app/                             # Application support
-│       ├── SimulationApp.hpp            # Unified entry point
-│       └── SimulationApp.cpp
-│
-├── observe/                             # Observability system
-│   ├── Observation.hpp                  # Preferred include
-│   ├── Counter.hpp                      # Counter storage
-│   ├── LocalCounter.hpp                 # Per-unit Counter class
-│   ├── DerivedCounter.hpp               # Computed counters (hit rate, IPC)
-│   ├── FormatRegistry.hpp               # Pre-registered format strings
-│   ├── ObservableUnit.hpp               # Mixin for units
-│   ├── ObservationContext.hpp           # Per-unit observation context
-│   ├── ObservationManager.hpp           # Central coordinator
-│   ├── ObservationBackend.hpp           # Backend thread + output
-│   ├── ObservationQueue.hpp             # Lock-free SPSC queue
-│   ├── ObservationFilter.hpp            # Category + temporal filtering
-│   ├── PerfettoTraceWriter.hpp          # Minimal Perfetto protobuf writer (.pftrace)
-│   ├── TimelineData.hpp                 # Recorded timeline slice storage
-│   ├── ReorderBuffer.hpp                # Cycle-ordered event reordering
-│   ├── SPSCQueue.hpp                    # SPSC ring buffer
-│   ├── ThreadContext.hpp                # Per-thread observation state
-│   └── ThreadContextManager.hpp         # Thread context registry
-│
-├── tree/                                # TreeNode hierarchy
-│   └── TreeNode.hpp                     # Tree structure
-│
-└── params/                              # Parameter system
-    ├── Param.hpp                        # Self-registering parameters
-    ├── ParameterSet.hpp                 # Parameter collections
-    └── UnitConstructorMacros.hpp        # CHRONON_UNIT_CONSTRUCTOR macro
-```
+Start model code with the [public entry headers](../api/). Follow this map when
+working on the framework; paths are relative to `src/`.
+
+| Responsibility | Location |
+|---|---|
+| Model, observation and application entry points | `chronon/` |
+| Unit lifecycle and simulation execution | `sender/core/` |
+| Typed ports, connections, queues and CDC | `sender/port/` |
+| Dependency analysis, partitioning and profiling | `sender/schedule/` |
+| Pipeline registers, phases and arbitration | `sender/util/` |
+| YAML loading, unit factories and CLI entry | `sender/config/`, `sender/factory/`, `sender/app/` |
+| Counters, timeline events, logs and output | `observe/` |
+| Unit hierarchy and parameter declarations | `tree/`, `params/` |
+
+### Reading TickSimulation
+
+`TickSimulation` owns the simulation session. Its public reference groups
+construction/topology, execution/termination, and inspection/adapter integration.
+The implementation files below share that owner; they are not separate public
+scheduler or lifecycle objects. Paths are relative to `src/sender/core/`.
+
+| Concern | Start here |
+|---|---|
+| Model options and execution policy | `TickSimulationConfig.hpp` |
+| Unit construction and typed connections | `TickSimulation.hpp` |
+| Session lifetime, finalization and tree bindings | `TickSimulationLifecycle.cpp` |
+| Initialization, execution selection and sequential ticks | `TickSimulation.cpp` |
+| Single-clock progress and parallel workers | `TickSimulationParallel.cpp` |
+| Clock topology, sequential clock events and CDC draining | `TickSimulationClocks.cpp` |
+| Parallel clock execution and migration | `TickSimulationClockParallel.cpp`, `TickSimulationClockMigration.cpp` |
+| Placement and dependency preparation | `TickSimulationPartition.cpp`, `TickSimulationClusters.cpp`, `TickSimulationDependencies.cpp` |
+| Dynamic placement planning, sampling and worker coordination | `TickSimulationPlanning.cpp`, `TickSimulationDynamicSampling.cpp`, `TickSimulationDynamicRuntime.cpp`, `TickSimulationDynamicRebalance.cpp` |
+| Internal progress and clock state | `TickSimulationDescriptors.hpp`, `TickSimulationClockRuntime.hpp` |
+
+See [scheduling](scheduling.md) for execution semantics and
+[API contracts](api-contracts.md) for lifecycle and ownership constraints.
 
 ## Key Components
 
