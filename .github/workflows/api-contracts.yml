@@ -18,27 +18,16 @@ on:
         description: Immutable baseline commit SHA
         required: true
         default: '8563cea58fb0d84306c3252be1fd68044c07afbc'
-      profile_only:
-        description: Collect diagnostic CPU profiles without running acceptance
-        type: boolean
-        default: false
-      profile_head:
-        description: Exact candidate SHA for diagnostic profiles (empty uses this ref)
-        required: false
-      profile_case:
-        description: One gate scenario to profile (empty uses the scheduler diagnostics)
-        required: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: api-contracts-${{ github.event.pull_request.number || github.ref }}-${{ inputs.profile_only || false }}
+  group: api-contracts-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   differential-performance:
-    if: ${{ !inputs.profile_only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -100,152 +89,4 @@ jobs:
           path: |
             performance-results/
             candidate/build-perf/Testing/Temporary/
-          retention-days: 30
-
-  diagnostic-profiles:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile_only }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: candidate
-          ref: ${{ inputs.profile_head || github.sha }}
-      - uses: actions/checkout@v4
-        with:
-          path: baseline
-          ref: ${{ inputs.base }}
-      - name: Install identical build and profiling dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build ccache g++-12 libyaml-cpp-dev libfmt-dev zlib1g-dev linux-tools-generic
-      - uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          key: api-contracts-gcc12-release
-      - name: Build unchanged profiling workloads for both commits
-        env:
-          CXX: g++-12
-          CPM_SOURCE_CACHE: ${{ github.workspace }}/dependencies
-        run: |
-          for file in single_clock_regression.cpp scheduler_invocation_benchmark.cpp \
-              SchedulerInvocationModel.hpp BenchmarkThreadAffinity.hpp \
-              representative_workload_benchmark.cpp RepresentativeWorkload.hpp \
-              RepresentativeWorkloadCalibration.hpp RepresentativeWorkloadOptions.hpp \
-              RepresentativeWorkloadReporting.hpp; do
-            cmp "baseline/benchmark/$file" "candidate/benchmark/$file"
-          done
-          for variant in baseline candidate; do
-            cmake -S "$variant" -B "$variant/build-perf" -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
-              -DCHRONON_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-            cmake --build "$variant/build-perf" --parallel 4 --target \
-              chronon_single_clock_regression_benchmark \
-              chronon_scheduler_invocation_benchmark chronon_representative_workload_benchmark
-          done
-      - name: Profile fixed workloads (diagnostic only, never acceptance)
-        env:
-          PROFILE_CASE: ${{ inputs.profile_case }}
-        run: |
-          python3 - <<'PY'
-          import hashlib, json, os, pathlib, re, shutil, subprocess, sys
-          sys.path.insert(0, 'candidate/scripts')
-          import check_api_performance as gate
-          out = pathlib.Path('diagnostic-profiles')
-          out.mkdir()
-          cpus = gate.physical_cpus()[:2]
-          if len(cpus) != 2:
-              raise RuntimeError('two physical CPUs required for the failed scenarios')
-          selected = os.environ.get('PROFILE_CASE', '')
-          if selected:
-              profiles = [case for case in gate.cases(2) if case['name'] == selected]
-              if len(profiles) != 1:
-                  raise RuntimeError('unknown diagnostic scenario: ' + selected)
-              case = profiles[0]
-              case['cycles'] = (10000000 if case['kind'] == 'representative' else
-                                100000000 if case['kind'] == 'floor' else
-                                500000 if case['args'][-1] == 1 else 20000000)
-          else:
-              profiles = [{'name': f'dynamic{dynamic}-poll{interval}', 'kind': 'scheduler',
-                           'args': [0, 2, 4, 64, 1, dynamic, interval], 'cycles': cycles}
-                          for dynamic, interval, cycles in
-                          [(0, 64, 20000000), (0, 0, 20000000), (0, 1, 500000), (1, 1, 500000)]]
-          perf = sorted(pathlib.Path('/usr/lib/linux-tools').glob('*/perf'))[-1]
-          metadata = {'purpose': 'CPU profiling only, not throughput acceptance',
-                      'complete_matrix': False, 'cpus': cpus, 'binaries': {},
-                      'cases': profiles, 'states': {},
-                      'benchmark_env': {'CHRONON_BENCH_PIN_WORKERS': '1',
-                                        'CHRONON_BENCH_WARM_CPUS': '1'},
-                      'lscpu': subprocess.check_output(['lscpu'], text=True)}
-          for variant in ('baseline', 'candidate'):
-              metadata[variant + '_sha'] = subprocess.check_output(
-                  ['git', '-C', variant, 'rev-parse', 'HEAD'], text=True).strip()
-              metadata['binaries'][variant] = {}
-              for executable in sorted({gate.executable(case) for case in profiles}):
-                  binary = pathlib.Path(variant, 'build-perf/benchmark', executable)
-                  metadata['binaries'][variant][executable] = hashlib.sha256(binary.read_bytes()).hexdigest()
-                  archived = out / 'symfs' / str(binary.resolve()).lstrip('/')
-                  archived.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copy2(binary, archived)
-              (out / (variant + '-CMakeCache.txt')).write_text(
-                  pathlib.Path(variant, 'build-perf/CMakeCache.txt').read_text())
-          # Hardware sampling avoids timer undersampling of short worker tasks
-          # when the runner exposes a PMU. Retain the probe and explicit fallback.
-          probe = subprocess.run(['sudo', str(perf), 'stat', '-e', 'cycles:u', '--', '/bin/true'],
-                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-          (out / 'hardware-event-probe.txt').write_text(probe.stdout)
-          hardware_supported = (probe.returncode == 0 and
-                                not re.search(r'<not (?:supported|counted)>', probe.stdout))
-          event = 'cycles:u' if hardware_supported else 'cpu-clock'
-          metadata['profile_event'] = event
-          metadata['profile_frequency'] = 1999
-          metadata['recorded_events'] = {}
-          (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
-          for case in profiles:
-              states = []
-              for variant in ('baseline', 'candidate'):
-                  name = case['name'] + '-' + variant
-                  data = out / (name + '.data')
-                  # sudo resets the environment; pass benchmark controls to the
-                  # profiled child explicitly, matching normal gate invocations.
-                  command = ['env', 'CHRONON_BENCH_PIN_WORKERS=1', 'CHRONON_BENCH_WARM_CPUS=1',
-                             *gate.command(pathlib.Path(variant, 'build-perf'), case, cpus)]
-                  result = subprocess.run(['sudo', str(perf), 'record', '-e', event,
-                                           '-F', '1999', '-g', '-o', str(data), '--', *command],
-                                          text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                  (out / (name + '.log')).write_text(result.stdout + result.stderr)
-                  subprocess.run(['sudo', 'chown', str(os.getuid()) + ':' + str(os.getgid()), str(data)], check=True)
-                  result.check_returncode()
-                  states.append(gate.parse(case, result.stdout)[1])
-                  with (out / (name + '-report.txt')).open('w') as stream:
-                      subprocess.run([str(perf), 'report', '--stdio', '--no-children',
-                                      '--call-graph', 'none', '--percent-limit', '0.1', '-i', str(data)],
-                                     stdout=stream, stderr=subprocess.STDOUT, check=True)
-                  report = (out / (name + '-report.txt')).read_text()
-                  recorded = re.findall(r"(?m)^# Samples:.* of event '([^']+)'", report)
-                  if not recorded:
-                      raise RuntimeError('no sampled event in report: ' + name)
-                  metadata['recorded_events'][name] = recorded
-                  (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
-                  # Demangled template spellings differ across perf versions.
-                  # Select the executable instead of guessing exact symbol names.
-                  annotation = subprocess.run(
-                      [str(perf), 'annotate', '--stdio', '--no-source',
-                       '--dsos', gate.executable(case), '-i', str(data)],
-                      text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                  (out / (name + '-annotate.txt')).write_text(annotation.stdout)
-                  annotation.check_returncode()
-                  if not re.search(r'(?m)^\s*\d+\.\d+\s*:', annotation.stdout):
-                      raise RuntimeError('no annotated instructions: ' + name)
-              if states[0] != states[1]:
-                  raise RuntimeError('profile workload states differ: ' + str(case))
-              metadata['states'][case['name']] = states[0]
-              (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
-          (out / 'PROFILE_ONLY').write_text('State comparisons matched. No performance acceptance was attempted.\n')
-          PY
-      - name: Retain diagnostic CPU samples and exact build metadata
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: api-contracts-profiles
-          path: diagnostic-profiles/
           retention-days: 30
