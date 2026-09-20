@@ -469,6 +469,14 @@ private:
         }
     }
 
+    [[gnu::always_inline]] inline bool executeClockUnitCycle_(TickableUnit* unit, uint64_t cycle) {
+        unit->clock_edge_executing_ = true;
+        const bool active = executeUnitCycle_(unit, cycle);
+        unit->clock_edge_executing_ = false;
+        if (auto* stream = unit->clockTraceStream()) stream->endEdge();
+        return active;
+    }
+
     void buildDependencyGraph(bool calculate_lookahead = true);
     void validateNoZeroDelayCycles_() const;
 

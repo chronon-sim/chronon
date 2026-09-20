@@ -303,3 +303,18 @@ the contract repair, rather than weakening existing equivalence checks.
   boundary regressions. Performance improvement still requires measurement.
   Parallel backpressure runs first; all 29 workload definitions and acceptance
   rules remain unchanged.
+- `b551eab` passed correctness/documentation Actions, but its CI matrix on
+  Xeon 8370C passed 15 cases and clearly failed two-worker multiclock static
+  poll1 at 51 pairs: median 0.973342, lower97.5 0.969182, upper97.5 0.976456.
+  Every state matched. The local matrix was stopped and retained after 14
+  passes, including single-clock dynamic poll0 at its fixed 201-pair endpoint
+  (lower97.5 0.992482). Neither incomplete matrix establishes acceptance.
+- Local hardware-cycle profiles of static multiclock short invocations identify
+  the general cluster dispatcher among the sampled functions. Static clock
+  workers now reuse a shared inline clock-unit operation directly, preserving
+  activity checks, edge markers, trace edge completion and exception behavior.
+  Dynamic workers retain per-unit sampling through the general dispatcher;
+  coordinator admission, bridge operations and progress stores are unchanged.
+  The previously failing static multiclock poll1 case runs first for feedback;
+  all 29 workloads and statistical acceptance rules are unchanged. Fresh
+  final-head measurements are required; profiles are not throughput acceptance.

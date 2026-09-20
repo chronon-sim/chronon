@@ -443,8 +443,16 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             {
                                 detail::ClockProfileScope ticks_profile(profile ? &profile->tick_ns
                                                                                 : nullptr);
-                                executeClusterOneCycle_(worker, c, cycle, false, Dynamic,
-                                                        state.sample_interval);
+                                if constexpr (Dynamic) {
+                                    executeClusterOneCycle_(worker, c, cycle, false, true,
+                                                            state.sample_interval);
+                                } else {
+                                    // Static clock actors need no per-unit migration samples.
+                                    // Reuse the same edge/activity operation without the
+                                    // general dispatcher's trace and sampling call frame.
+                                    for (auto* unit : cluster_unit_ptrs_[c])
+                                        executeClockUnitCycle_(unit, cycle);
+                                }
                             }
                             if (profile) ++profile->cluster_ticks;
                             published.store(cycle + 1, std::memory_order_release);

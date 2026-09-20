@@ -773,11 +773,7 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
     // lambda and reintroduce an extra call for every unit and cycle.
     const auto execute = [&](auto* unit) __attribute__((always_inline)) {
         if (!clock_mode_) return executeUnitCycle_(unit, cycle);
-        unit->clock_edge_executing_ = true;
-        const bool active = executeUnitCycle_(unit, cycle);
-        unit->clock_edge_executing_ = false;
-        if (auto* stream = unit->clockTraceStream()) stream->endEdge();
-        return active;
+        return executeClockUnitCycle_(unit, cycle);
     };
     auto unit_index = [&](size_t offset) {
         return cluster < clusters_.clusters.size() && offset < clusters_.clusters[cluster].size()
