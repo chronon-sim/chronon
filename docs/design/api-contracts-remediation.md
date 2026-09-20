@@ -286,3 +286,20 @@ the contract repair, rather than weakening existing equivalence checks.
   This differs from the earlier rejected per-cluster conditional experiment by
   specializing the immutable trace choice outside the worker loop. No measured
   improvement is claimed before fresh regression and performance validation.
+- `47b3552` passed all correctness/documentation Actions and the complete CI
+  29-case performance matrix on Xeon 8573C (minimum lower97.5 0.990387).
+  Its local matrix passed 26 cases, then failed four-worker backpressure at the
+  fixed 201-pair endpoint: median 0.990282, lower97.5 0.987602, upper97.5
+  0.992464. All states matched. The CI pass does not replace that local failure;
+  both raw artifacts are retained and final acceptance remains incomplete.
+- Local hardware-cycle profiling of the failing backpressure workload places
+  substantial time in dependency checks and predecessor refreshes. Static
+  workers now reuse a readiness bound derived from already-acquired predecessor
+  progress, as dynamic workers do. The bound includes the synthetic floor,
+  saturates on addition and resets every invocation; a missing proof takes the
+  original dependency check. Cluster order, idle behavior and progress stores
+  are unchanged. The final cycle avoids constructing an unused bound. Small
+  graphs use local slots and larger graphs retain storage covered by poisoned
+  boundary regressions. Performance improvement still requires measurement.
+  Parallel backpressure runs first; all 29 workload definitions and acceptance
+  rules remain unchanged.

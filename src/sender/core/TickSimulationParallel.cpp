@@ -10,6 +10,7 @@
 /// TickSimulation parallel runtime: epoch-free execution, cross-thread
 /// dependency spin-waits, and progress-sync initialization.
 
+#include <array>
 #include <bit>
 #include <cassert>
 #include <chrono>
@@ -374,6 +375,18 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     InvocationPredecessorCache predecessor_cache(
         &schedulerScratch_().workers[thread_idx].predecessor, thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
+    // A successful dependency check proves every cycle below the minimum
+    // acquired predecessor frontier plus its delay. Reuse that lower bound,
+    // as dynamic workers do, without changing the order of cluster execution.
+    constexpr size_t inline_slots = InvocationPredecessorCache::kInlineSlots;
+    alignas(64) std::array<uint64_t, inline_slots> inline_ready;
+    auto* ready_through = inline_ready.data();
+    if (thread_progress_count_ > inline_slots) {
+        auto& retained = schedulerScratch_().workers[thread_idx].ready_through;
+        retained.resize(thread_progress_count_);
+        ready_through = retained.data();
+    }
+    std::fill_n(ready_through, thread_progress_count_, 0);
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;
     if constexpr (PushPeriodicCounters) {
@@ -392,13 +405,25 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
             if (cycle >= end_cycle) continue;
             all_done = false;
 
-            BlockedClusterInfo candidate{};
-            if (!clusterCanAdvance_(cluster, cycle, candidate, predecessor_cycles,
-                                    stop_on_first_blocker)) {
-                if (candidate.deficit > blocker.deficit) {
-                    blocker = candidate;
+            if (cycle >= ready_through[cluster]) {
+                BlockedClusterInfo candidate{};
+                if (!clusterCanAdvance_(cluster, cycle, candidate, predecessor_cycles,
+                                        stop_on_first_blocker)) {
+                    if (candidate.deficit > blocker.deficit) {
+                        blocker = candidate;
+                    }
+                    continue;
                 }
-                continue;
+                // No subsequent tick can reuse a bound on the final cycle of
+                // this invocation, including the common one-cycle polling case.
+                if (cycle + 1 < end_cycle) {
+                    uint64_t bound = std::numeric_limits<uint64_t>::max();
+                    for (const auto& dep : thread_resolved_deps_[cluster]) {
+                        bound = std::min(bound, saturatingCycleAdd(predecessor_cycles[dep.pred_id],
+                                                                   dep.min_delay));
+                    }
+                    ready_through[cluster] = bound;
+                }
             }
 
             uint64_t idle_target = cycle;
