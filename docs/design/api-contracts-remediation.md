@@ -318,3 +318,19 @@ the contract repair, rather than weakening existing equivalence checks.
   The previously failing static multiclock poll1 case runs first for feedback;
   all 29 workloads and statistical acceptance rules are unchanged. Fresh
   final-head measurements are required; profiles are not throughput acceptance.
+- `174a3e4` passed correctness/documentation Actions. Its CI matrix on EPYC
+  9V74 passed multiclock static poll1 and three more cases, then failed
+  single-clock two-worker dynamic poll1 at the fixed 201-pair endpoint: median
+  0.989735, lower97.5 0.986019, upper97.5 0.992293. All states matched. The local
+  matrix was stopped and retained after seven passes, including four-worker
+  backpressure at 201 pairs (lower97.5 0.990807). Acceptance remains incomplete.
+- Local hardware-cycle profiling of the dynamic short-call workload includes
+  worker sweeps and runtime cost estimation among the hot functions. Dynamic
+  workers now skip cost estimation/sorting only when all currently owned
+  clusters have reached the invocation limit. The sweep still performs periodic
+  counter, migration and global completion handling. The final eligible tick
+  also bounds its cached readiness at the invocation limit without calculating
+  an unused later dependency frontier. Eligibility checks, active tick order,
+  burst limits and progress publication retain their existing semantics.
+  Dynamic poll1 now runs first; all workload definitions and acceptance rules
+  remain unchanged. Fresh final-head validation is required.

@@ -243,6 +243,14 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
 
     auto prioritize_owned_clusters = [&]() {
         if (owned_clusters.size() < 2) return;
+        // A final sweep still performs migration/counter/completion handling,
+        // but no owned actor at the invocation limit can execute another tick.
+        // Avoid estimating and sorting costs for that already-completed work.
+        if (std::none_of(owned_clusters.begin(), owned_clusters.end(), [&](size_t cluster) {
+                return thread_progress_array_[cluster].completed_cycle.load(
+                           std::memory_order_relaxed) < end_cycle;
+            }))
+            return;
         for (size_t cluster : owned_clusters) {
             priority_blocker_ns[cluster] =
                 dynamic_cluster_blocker_wait_ns_
@@ -284,6 +292,13 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
         if (!clusterCanAdvance_(cluster, cycle, blocker, predecessor_cycles,
                                 !trace_cycle(trace_waits_enabled, cycle))) {
             return false;
+        }
+
+        // Eligibility for the final tick is already proven. No burst can cross
+        // this invocation's limit, so a later dependency frontier is unused.
+        if (cycle + 1 == end_cycle) {
+            ready_through_cycle[cluster] = end_cycle;
+            return true;
         }
 
         uint64_t ready_through = std::numeric_limits<uint64_t>::max();
