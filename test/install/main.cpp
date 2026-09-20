@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-#include "chronon/Chronon.hpp"
-#include "observe/ClockTraceRecorder.hpp"
-#include "sender/core/TickSimulation.hpp"
-#include "time/ClockDomain.hpp"
+#include "chronon/Simulation.hpp"
 
 using namespace chronon;
 
@@ -28,7 +25,7 @@ struct Sink : TickableUnit {
 };
 int main() {
     TickSimulationConfig config;
-    config.enable_parallel = false;
+    config.setExecutionPolicy(ExecutionPolicy::Sequential);
     config.num_threads = 1;
     TickSimulation sim(config);
     sim.addClockDomain(ClockDomain::fromHz(1, "sm", 914'000'000));

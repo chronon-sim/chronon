@@ -2,7 +2,7 @@
 # Author: Haomeng Wang <chang_yun@outlook.com>
 # SPDX-License-Identifier: MPL-2.0
 
-# Chronon - High-Performance Event-Driven Simulation Framework
+# Chronon - High-Performance Tick-Based Simulation Framework
 # A fast, multithreaded simulation framework for CPU microarchitecture modeling
 
 cmake_minimum_required(VERSION 3.25)

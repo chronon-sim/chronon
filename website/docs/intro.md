@@ -6,99 +6,64 @@ slug: /intro
 
 # Getting Started with Chronon
 
-Chronon is a high-performance tick-based simulation framework for CPU microarchitecture modeling, written in C++20 with stdexec-powered automatic parallelization.
+Chronon is a C++20 framework for cycle-accurate CPU microarchitecture simulation.
+Define units with `tick()`, connect typed ports, then let the simulation advance time.
+Chronon selects sequential or dependency-driven parallel execution from the configuration and topology.
 
-## Key Features
+## Build and run
 
-| Feature | Description |
-|---------|-------------|
-| **Tick-Based Architecture** | State machine `tick()` execution model |
-| **Port Communication** | Type-safe `send()` / `tryReceive()` with automatic mode selection |
-| **Auto Parallelization** | Dependency-driven scheduling with stdexec thread pool |
-| **Performance** | ~90+ Mcycles/sec throughput |
-| **YAML Configuration** | Factory-driven unit instantiation |
-| **Observability** | Counters, traces, logs with macro-free API |
-
-## Quick Start
-
-### Build
+Requirements: GCC 12+ or Clang 20+, CMake 3.25+, and the system dependencies
+listed in the repository README. CMake downloads stdexec and the Perfetto SDK.
 
 ```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-ctest --output-on-failure
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/examples/chronon_quickstart
+ctest --test-dir build --output-on-failure
 ```
 
-### Minimal Example
+## A complete model
 
+This is the compiled `examples/quickstart.cpp` example. The producer sends values
+0 through 99; the consumer receives them after a one-cycle connection delay.
+Only a successful send advances producer state. The return value checks the sum.
+
+<!-- quickstart:begin -->
 ```cpp
 #include "chronon/Chronon.hpp"
+
 using namespace chronon;
 
-class MyUnit : public TickableUnit {
-    OutPort<int> out{this, "out"};
-    int count_ = 0;
+class Producer : public TickableUnit {
 public:
-    MyUnit() : TickableUnit("my_unit") {}
+    OutPort<int> out{this, "out", SendRate{1}};
 
-    void tick() override {
-        if (out.canSend()) out.send(count_++);
-    }
-
-    bool isCompleted() const override { return count_ >= 100; }
-};
-
-int main() {
-    TickSimulation sim;
-    sim.createUnit<MyUnit>();
-    sim.initialize();
-    sim.run(1000);
-}
-```
-
-### Producer-Consumer with Observability
-
-```cpp
-#include "chronon/Chronon.hpp"
-using namespace chronon;
-
-inline const auto DATA_FLOW = Category<"data_flow", "Data flow events">{};
-
-class Producer : public TickableUnit, public ObservableUnit {
-    OutPort<int> out{this, "out"};
-    EventCounter produced_{this, "produced", "Items produced"};
-    int value_ = 0;
-public:
     Producer() : TickableUnit("producer") {}
-    bool isCompleted() const override { return value_ >= 1000; }
 
     void tick() override {
-        if (out.canSend()) {
-            out.send(value_++);
-            ++produced_;
-            event<"produced">(DATA_FLOW, arg<"value">(value_));
-        }
+        if (next_ < 100 && out.send(next_)) ++next_;
     }
+
+private:
+    int next_ = 0;
 };
 
-class Consumer : public TickableUnit, public ObservableUnit {
-    InPort<int> in{this, "in"};
-    EventCounter consumed_{this, "consumed", "Items consumed"};
+class Consumer : public TickableUnit {
 public:
+    InPort<int> in{this, "in", QueueDepth{16}};
+    int sum = 0;
+
     Consumer() : TickableUnit("consumer") {}
 
     void tick() override {
-        if (auto value = in.tryReceive(localCycle())) {
-            ++consumed_;
-        }
+        if (auto value = in.tryReceive()) sum += *value;
     }
 };
 
 int main() {
     TickSimulationConfig config;
-    config.num_threads = 8;
-    config.enable_parallel = true;
+    config.num_threads = 2;
+    config.setExecutionPolicy(ExecutionPolicy::Auto);
 
     TickSimulation sim(config);
     auto* producer = sim.createUnit<Producer>();
@@ -106,32 +71,33 @@ int main() {
     sim.connect(producer->out, consumer->in, 1);
 
     sim.initialize();
-    sim.run(2000);
+    sim.run(101);
+    sim.finalize();
+    return consumer->sum == 4950 ? 0 : 1;
 }
 ```
+<!-- quickstart:end -->
 
-### YAML-Driven Simulation
+`SendRate` bounds sends per unit cycle; `QueueDepth` bounds the destination FIFO.
+`run()` advances time and can be called repeatedly. `finalize()` ends the session
+and reports finalizer errors. See [API contracts](guides/api-contracts) for ownership
+and failure behavior.
 
-```cpp
-#include "chronon/Chronon.hpp"
+## Choose an entry point
 
-int main(int argc, char* argv[]) {
-    return chronon::SimulationApp("My Simulator")
-        .setDefaultConfig("config.yaml")
-        .run(argc, argv);
-}
-```
+Use `chronon/Chronon.hpp` as the standard entry point, as in the example above.
+The focused headers expose the following subsets of the same API:
 
-## Requirements
+| Header | Use |
+|---|---|
+| `chronon/Simulation.hpp` | Units, ports, connections, clocks and simulation |
+| `chronon/Observation.hpp` | Counters, logs and timeline events |
+| `chronon/Application.hpp` | Parameters, factories and YAML/CLI applications |
+| `chronon/Chronon.hpp` | Full umbrella, including existing aliases and modeling utilities |
 
-- C++20 compiler (GCC 12+, Clang 20+)
-- CMake 3.25+
-- stdexec and the Perfetto SDK (downloaded via CPM during CMake configuration)
-- yaml-cpp (provided by your system/package manager)
-
-## Next Steps
-
-- [Architecture Overview](guides/architecture) — understand the component structure
-- [Units and Simulation](guides/units-and-simulation) — deep dive into the execution model
-- [Port System](guides/port-system) — learn about inter-unit communication
-- [API Reference](/docs/api/) — browse the C++ API documentation
+Start with [units and simulation](guides/units-and-simulation), then add
+[observability](guides/observability) or [YAML configuration](guides/configuration)
+when the model needs them. [Explicit clock domains](guides/multiclock-cdc) cover
+multiclock models and clock-domain crossings. See the
+[performance guide](guides/performance) for measurements with workload conditions,
+and the [API reference](/docs/api/) for supported interfaces.

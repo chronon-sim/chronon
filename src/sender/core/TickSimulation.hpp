@@ -79,6 +79,8 @@ namespace chronon::sender {
  */
 class TickSimulation {
 public:
+    /// @name Session, topology and clock domains
+    /// @{
     static size_t normalizeThreadCount(size_t requested) noexcept {
         if (requested == 0) {
             requested = std::thread::hardware_concurrency();
@@ -241,6 +243,9 @@ public:
     observe::ClockTraceRecorder* clockTraceRecorder() noexcept { return clock_trace_.get(); }
     void closeClockTrace();
 
+    /// @}
+    /// @name Execution and termination
+    /// @{
     /// Run for the specified cycles. Internally dispatches to parallel or
     /// sequential execution based on cluster analysis.
     uint64_t run(uint64_t num_cycles);
@@ -310,6 +315,9 @@ public:
         return stop_source_->get_token();
     }
 
+    /// @}
+    /// @name Inspection and adapter integration
+    /// @{
     uint64_t currentCycle() const noexcept { return current_cycle_; }
     uint64_t tickFrequencyHz() const noexcept { return config_.tick_frequency_hz; }
     size_t unitCount() const noexcept { return units_.size(); }
@@ -376,6 +384,7 @@ public:
     /// thread assignment. Configure before initialize() when an out-of-band
     /// transport replaces physical connection fanout.
     void forceStableConnectionQueues() noexcept { force_stable_connection_queues_ = true; }
+    /// @}
 
 private:
     /// Resolve per-lane progress only after topology and transport selection.

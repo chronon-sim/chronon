@@ -6,10 +6,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-/// @file Umbrella header exposing the full Chronon API in the chronon:: namespace.
+/// @file
+/// Full Chronon umbrella, including compatibility names and modeling utilities.
 
 #pragma once
 
+// Preserve the full umbrella include order for existing clients.
 // --- Subsystem includes ---
 #include "../observe/Observe.hpp"
 #include "../params/Param.hpp"
@@ -36,58 +38,28 @@
 #include "../sender/util/StageReg.hpp"
 #include "../sender/util/VersionedRegister.hpp"
 #include "../tree/TreeNode.hpp"
+#include "Application.hpp"
+#include "Observation.hpp"
+#include "Simulation.hpp"
 
 namespace chronon {
 
-// --- Tree ---
-using tree::TreeNode;
-
-// --- Unit ---
-using sender::Unit;
-using sender::UnitState;
-
 // --- Tick Simulation ---
-using sender::ExecutionPolicy;
-using sender::QueueDepth;
-using sender::SendRate;
-using sender::TerminationController;
-using sender::TerminationReason;
-using sender::TerminationRequest;
-using sender::TickableUnit;
-using sender::TickSimulation;
-using sender::TickSimulationConfig;
 
 using Simulation = sender::TickSimulation;
 using SimulationConfig = sender::TickSimulationConfig;
 
 // --- Factory ---
-using sender::PhasedTickableUnit;
-using sender::factory::AutoRegisteredUnit;
 using sender::factory::ISenderFactory;
-using sender::factory::PhasedAutoRegisteredUnit;
 using sender::factory::SenderFactoryRegistry;
 
 using sender::config::SenderSimulationBuilder;
 
-using SimulationBuilder = sender::config::SenderSimulationBuilder;
 using FactoryRegistry = sender::factory::SenderFactoryRegistry;
 
 // --- Port ---
-using observe::ClockEventKind;
-using observe::ClockEventPhase;
-using observe::ClockTraceRecorder;
-using sender::AsyncFifo;
-using sender::AsyncFifoCircuit;
-using sender::AsyncFifoConfig;
-using sender::AsyncReadPort;
-using sender::AsyncWritePort;
-using sender::CdcPacket;
-using sender::CdcPayloadTraits;
-using sender::Connection;
 using sender::DelayOneBroadcastFabric;
 using sender::FlushRange;
-using sender::InPort;
-using sender::OutPort;
 using sender::PortBase;
 using sender::PortBindingRegistry;
 using sender::PortDirectory;
@@ -97,39 +69,7 @@ using sender::ReliablePortSender;
 using sender::reserve;
 
 // --- Params ---
-using params::Param;
 using params::ParamBase;
-using params::ParameterSet;
-
-// --- Observe ---
-using observe::Category;
-using observe::CategoryRegistry;
-using observe::ComputeFn;
-using observe::CounterId;
-using observe::DerivedCounter;
-using observe::DerivedCounterDef;
-using observe::EventCounter;
-using observe::LogLevel;
-using observe::ObservableUnit;
-using observe::ObservationChannel;
-using observe::ObservationChannelStats;
-using observe::ObservationContext;
-using observe::ObservationStats;
-using observe::toIndex;
-namespace DerivedFormula = observe::DerivedFormula;
-
-// Timeline lanes: spans/instants with flows and typed args.
-using observe::arg;
-using observe::EventNameRef;
-using observe::Flow;
-using observe::flow;
-using observe::pipe;
-using observe::PipelinePipe;
-using observe::pipeStage;
-using observe::pipeStageHex;
-using observe::TimelineLane;
-using observe::TimelineSpan;
-using observe::operator""_ev;
 
 // --- Util ---
 using sender::Phase0;

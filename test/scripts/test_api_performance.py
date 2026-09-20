@@ -19,7 +19,8 @@ SPEC.loader.exec_module(gate)
 
 
 class PerformanceAcceptance(unittest.TestCase):
-    def run_synthetic_matrix(self, speedups, selected=None):
+    def run_synthetic_matrix(self, speedups, selected=None, shard=None, identity=False, force=False,
+                             mismatch=False, defer=False):
         """Exercise CLI sampling, artifacts and exit status without real timing."""
         cases = [{"name": f"case-{i}", "kind": "floor", "cycles": 100 + i}
                  for i in range(len(speedups))]
@@ -35,6 +36,12 @@ class PerformanceAcceptance(unittest.TestCase):
             output = root / "results"
             argv = ["check_api_performance.py", *map(str, builds), str(output),
                     "--base-sha", "baseline", "--head-sha", "candidate", "--cpus", "0,2"]
+            if shard is not None:
+                argv += ["--shard-index", str(shard[0]), "--shard-count", str(shard[1])]
+            if force:
+                argv += ["--force-measurement"]
+            if defer:
+                argv += ["--defer-measurement"]
             if selected is not None:
                 argv += ["--case", f"case-{selected}"]
 
@@ -44,19 +51,87 @@ class PerformanceAcceptance(unittest.TestCase):
                 calls[index] += 1
                 candidate = Path(command[3]).is_relative_to(builds[1])
                 seconds = 1 / speedups[index][repetition] if candidate else 1
-                text = f"cycles,wall_s,digest\n{100 + index},{seconds},42\n"
+                digest = 43 if mismatch and candidate else 42
+                text = f"cycles,wall_s,digest\n{100 + index},{seconds},{digest}\n"
                 return subprocess.CompletedProcess(command, 0, stdout=text)
 
             with (patch.object(gate.sys, "argv", argv),
                   patch.object(gate.os, "sched_getaffinity", return_value={0, 2}),
                   patch.object(gate, "cases", return_value=cases),
                   patch.object(gate, "calibrate"),
+                  patch.object(gate, "runtime_identity", return_value={"verified": True} if identity else None),
                   patch.object(gate.subprocess, "check_output", return_value="synthetic CPU"),
                   patch.object(gate.subprocess, "run", side_effect=run),
                   redirect_stdout(io.StringIO())):
                 status = gate.main()
             artifacts = {path.name: json.loads(path.read_text()) for path in output.glob("*.json")}
         return status, calls, artifacts
+
+    def test_identical_runtime_checks_state_without_fake_statistics(self):
+        with patch.object(gate, "confidence", side_effect=AssertionError("must not time identical code")):
+            status, calls, artifacts = self.run_synthetic_matrix([[1.0] * 2], identity=True)
+        self.assertEqual((status, calls), (0, [4]))
+        self.assertTrue(artifacts["verdict.json"]["complete_matrix"])
+        result = artifacts["summary.json"][0]
+        self.assertEqual(result["sample_count"], 0)
+        self.assertEqual(result["looks"], [])
+        self.assertNotIn("lower_speedup", result)
+        self.assertEqual(len(artifacts["case-0-identity-checks.json"]), 2)
+
+    def test_identical_runtime_still_rejects_state_changes(self):
+        with self.assertRaisesRegex(RuntimeError, "determinism mismatch"):
+            self.run_synthetic_matrix([[1.0] * 2], identity=True, mismatch=True)
+
+    def test_forced_measurement_keeps_the_original_sample_budget(self):
+        status, calls, artifacts = self.run_synthetic_matrix([[1.0] * 51], identity=True, force=True)
+        self.assertEqual((status, calls), (0, [102]))
+        self.assertEqual(artifacts["metadata.json"]["acceptance_method"], "paired-bootstrap")
+
+    def test_deferred_timing_produces_no_runs_or_acceptance_artifacts(self):
+        for identity, force in ((False, False), (True, True)):
+            with self.subTest(identity=identity, force=force):
+                status, calls, artifacts = self.run_synthetic_matrix(
+                    [[1.0] * 51], identity=identity, force=force, defer=True)
+                self.assertEqual((status, calls, artifacts), (3, [0], {}))
+
+    def test_prepare_checks_every_identical_case_and_rejects_state_changes(self):
+        status, calls, artifacts = self.run_synthetic_matrix([[1.0] * 2] * 3, identity=True, defer=True)
+        self.assertEqual((status, calls), (0, [4, 4, 4]))
+        self.assertTrue(artifacts["verdict.json"]["complete_matrix"])
+        with self.assertRaisesRegex(RuntimeError, "determinism mismatch"):
+            self.run_synthetic_matrix([[1.0] * 2], identity=True, mismatch=True, defer=True)
+
+    def test_shard_only_measures_assigned_cases_and_is_not_full_acceptance(self):
+        status, calls, artifacts = self.run_synthetic_matrix([[1.02] * 51] * 7, shard=(2, 3))
+        self.assertEqual((status, calls), (0, [0, 0, 102, 0, 0, 102, 0]))
+        self.assertTrue(artifacts["verdict.json"]["complete_shard"])
+        self.assertFalse(artifacts["verdict.json"]["complete_matrix"])
+
+    def test_binary_difference_never_uses_identity(self):
+        with patch.object(gate.subprocess, "check_output") as ldd:
+            self.assertIsNone(gate.runtime_identity({}, {"baseline": {"exe": "a"},
+                                                        "candidate": {"exe": "b"}}))
+            ldd.assert_not_called()
+
+    def test_identity_requires_resolved_unchanged_libraries(self):
+        builds = {key: Path(key) for key in ("baseline", "candidate")}
+        binaries = {key: {"exe": "same"} for key in builds}
+        with tempfile.TemporaryDirectory() as temporary:
+            library = Path(temporary) / "library.so"
+            library.write_bytes(b"library")
+            output = f"linux-vdso.so.1 (0x123)\nlib => {library} (0x123)\n"
+            with patch.object(gate.subprocess, "check_output", return_value=output):
+                self.assertIsNotNone(gate.runtime_identity(builds, binaries))
+            with patch.object(gate.subprocess, "check_output", return_value="lib => not found"):
+                self.assertIsNone(gate.runtime_identity(builds, binaries))
+            def changing_library(*args, **kwargs):
+                if "candidate" in str(args[0][1]):
+                    library.write_bytes(b"changed")
+                return output
+            with patch.object(gate.subprocess, "check_output", side_effect=changing_library):
+                self.assertIsNone(gate.runtime_identity(builds, binaries))
+            with patch.dict(gate.os.environ, {"LD_AUDIT": "hook.so"}):
+                self.assertIsNone(gate.runtime_identity(builds, binaries))
 
     def test_final_failure_stops_and_records_incomplete_matrix(self):
         status, calls, artifacts = self.run_synthetic_matrix([[0.98] * 51, [1.1] * 51])

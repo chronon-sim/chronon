@@ -4,6 +4,28 @@ sidebar_label: "Configuration Guide"
 
 # Configuration Guide
 
+## Execution settings
+
+Use one spelling for each setting in new models:
+
+| Concept | C++ | YAML / CLI |
+|---|---|---|
+| Execution policy | `config.setExecutionPolicy(ExecutionPolicy::Auto)` | `execution_policy: auto` |
+| Forced sequential execution | `ExecutionPolicy::Sequential` | `execution_policy: sequential` |
+| Polling interval | `config.setPollingIntervalCycles(64)` | `polling_interval_cycles: 64` / `--polling-interval-cycles 64` |
+| Worker count | `config.num_threads = 4` | `num_workers: 4` / `--threads 4` |
+
+C++ and YAML retain their historical worker defaults (hardware concurrency and
+four workers respectively). Explicit counts make the intent portable. Legacy
+execution booleans, `epoch_size` and `--epoch-size` remain accepted for existing
+models; their conflict rules live in [the compatibility reference](api-contracts#compatibility-names).
+New documentation and examples use the canonical names. Removing old spellings
+requires a separately announced compatibility change; this release does not emit
+compiler deprecation warnings or change their behavior.
+
+For YAML applications, include `chronon/Chronon.hpp`; it supplies parameters,
+factories, `SimulationBuilder` and `SimulationApp` in `chronon`.
+
 ## Parameter System
 
 ### ParameterSet

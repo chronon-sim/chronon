@@ -7,9 +7,9 @@
 
 cmake_minimum_required(VERSION 3.17)
 
-# Framework core library (header-only sender framework with minimal source)
+# Compiled simulation runtime; model-facing ports and units also use templates.
 add_library(chronon STATIC
-    # Tree hierarchy system (still used)
+    # Tree hierarchy system
     tree/TreeNode.cpp
 
     # Crash handler for simulation tick exceptions and fatal signals

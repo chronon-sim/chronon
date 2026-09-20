@@ -39,15 +39,18 @@ struct TickSimulationConfig {
     /// - !enable_parallel                         → Sequential
     /// - all epoch-free safety gates are satisfied → Epoch-free lookahead
     /// - otherwise                                → Sequential fallback
+    /// @deprecated Prefer setExecutionPolicy(). Retained for source compatibility.
     bool enable_parallel = true;
     /// Compatibility switch. False now forces Sequential; the removed
     /// per-cycle barrier scheduler is no longer selectable.
+    /// @deprecated Prefer setExecutionPolicy().
     bool enable_lookahead = true;
 
     /// In explicit clock mode, bounds the rolling physical-time batch window.
     uint32_t max_lookahead_cycles = 100;
     /// Host predicate and Sequential termination polling interval. Epoch-free
     /// runUntilTermination ignores this value because stop propagates directly.
+    /// @deprecated Prefer setPollingIntervalCycles().
     uint64_t epoch_size = 64;
 
     /// Epoch-free lookahead uses one persistent-worker, run-spanning window.
@@ -60,6 +63,7 @@ struct TickSimulationConfig {
     /// has fully resolved per-connection progress and queue headroom. A failed
     /// safety gate selects Sequential; no barrier-based fallback remains.
     /// Setting this compatibility switch to false also forces Sequential.
+    /// @deprecated Prefer setExecutionPolicy().
     bool enable_epoch_free_lookahead = true;
 
     uint64_t tick_frequency_hz = 1'000'000'000;  ///< 1 GHz default.
