@@ -271,3 +271,18 @@ the contract repair, rather than weakening existing equivalence checks.
   runner does not expose a PMU, software CPU-clock sampling remains explicitly
   labeled with its short-task sampling limitation. This profiling-only update
   does not change runtime code or retry performance acceptance on failed code.
+- The pinned/warmed CI diagnostic of `1e35ba5` used the same Xeon 8573C model
+  and preserved all states. Its PMU probe printed `<not supported>` but returned
+  success; perf silently sampled `task-clock:uH`. The retained reports identify
+  the actual software event. The workflow now rejects unsupported/countless
+  probe output and records the event reported for every profile, rather than
+  claiming the requested event was sampled.
+- Local hardware-cycle and CI software profiles both include the generic
+  cluster dispatcher among the hot functions. Generated code gives it a larger
+  call frame after tick-guard inlining. Ordinary static workers now select unit
+  tracing once per invocation and directly reuse `executeUnitCycle_` when unit
+  tracing is off. The traced path retains the generic dispatcher, and all tick
+  activity checks, unit order, idle handling and progress stores are unchanged.
+  This differs from the earlier rejected per-cluster conditional experiment by
+  specializing the immutable trace choice outside the worker loop. No measured
+  improvement is claimed before fresh regression and performance validation.

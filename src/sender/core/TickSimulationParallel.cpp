@@ -278,6 +278,7 @@ size_t TickSimulation::crossThreadHeadroomLimit_() const noexcept {
 }
 
 uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
+    assert(!clock_mode_);
     const size_t nthreads = thread_units_.size();
     if (nthreads == 0 || total_cycles == 0) return 0;
 
@@ -354,12 +355,12 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
 // Per-thread run driver
 // ---------------------------------------------------------------------------
 
-template <bool PushPeriodicCounters>
+template <bool PushPeriodicCounters, bool TraceUnits>
 void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle,
                                            uint64_t run_start, uint64_t period,
                                            stdexec::inplace_stop_token token) {
     const auto& clusters = thread_clusters_[thread_idx];
-    const bool trace_units = timeline_trace_.traceUnits();
+    constexpr bool trace_units = TraceUnits;
     const bool trace_waits_enabled = timeline_trace_.traceWaits();
     const bool stop_on_first_blocker = !trace_waits_enabled;
     const auto trace_cycle = [&](bool enabled, uint64_t cycle) {
@@ -432,7 +433,17 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
                 progress.store(reached_cycle, std::memory_order_release);
                 predecessor_cycles[cluster] = reached_cycle;
             } else {
-                executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units);
+                if constexpr (TraceUnits) {
+                    executeClusterOneCycle_(thread_idx, cluster, cycle, true);
+                } else {
+                    // This driver only runs ordinary single-clock clusters.
+                    // Keep the shared tick/activity logic in this invocation;
+                    // the general clock/trace/sample dispatcher needs a large
+                    // call frame even when all those optional features are off.
+                    for (auto* unit : cluster_unit_ptrs_[cluster]) {
+                        executeUnitCycle_(unit, cycle);
+                    }
+                }
                 progress.store(cycle + 1, std::memory_order_release);
                 predecessor_cycles[cluster] = cycle + 1;
             }
@@ -532,13 +543,19 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
 
 void TickSimulation::executeThreadRun_(size_t thread_idx, uint64_t end_cycle,
                                        stdexec::inplace_stop_token token) {
-    executeThreadRunImpl_<false>(thread_idx, end_cycle, 0, 0, token);
+    if (timeline_trace_.traceUnits())
+        executeThreadRunImpl_<false, true>(thread_idx, end_cycle, 0, 0, token);
+    else
+        executeThreadRunImpl_<false, false>(thread_idx, end_cycle, 0, 0, token);
 }
 
 void TickSimulation::executeThreadRunWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
                                                            uint64_t run_start, uint64_t period,
                                                            stdexec::inplace_stop_token token) {
-    executeThreadRunImpl_<true>(thread_idx, end_cycle, run_start, period, token);
+    if (timeline_trace_.traceUnits())
+        executeThreadRunImpl_<true, true>(thread_idx, end_cycle, run_start, period, token);
+    else
+        executeThreadRunImpl_<true, false>(thread_idx, end_cycle, run_start, period, token);
 }
 
 // ---------------------------------------------------------------------------

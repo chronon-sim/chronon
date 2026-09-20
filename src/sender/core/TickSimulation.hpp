@@ -594,7 +594,7 @@ private:
     void executeThreadRunWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
                                                uint64_t run_start, uint64_t period,
                                                stdexec::inplace_stop_token token);
-    template <bool PushPeriodicCounters>
+    template <bool PushPeriodicCounters, bool TraceUnits>
     void executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle, uint64_t run_start,
                                uint64_t period, stdexec::inplace_stop_token token);
     void executeThreadRunDynamic_(size_t thread_idx, uint64_t end_cycle,

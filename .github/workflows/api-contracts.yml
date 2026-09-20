@@ -165,9 +165,12 @@ jobs:
           probe = subprocess.run(['sudo', str(perf), 'stat', '-e', 'cycles:u', '--', '/bin/true'],
                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
           (out / 'hardware-event-probe.txt').write_text(probe.stdout)
-          event = 'cycles:u' if probe.returncode == 0 else 'cpu-clock'
+          hardware_supported = (probe.returncode == 0 and
+                                not re.search(r'<not (?:supported|counted)>', probe.stdout))
+          event = 'cycles:u' if hardware_supported else 'cpu-clock'
           metadata['profile_event'] = event
           metadata['profile_frequency'] = 1999
+          metadata['recorded_events'] = {}
           (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
           profiles = [(0, 64, 20000000), (0, 0, 20000000), (0, 1, 500000), (1, 1, 500000)]
           for dynamic, interval, cycles in profiles:
@@ -192,6 +195,12 @@ jobs:
                       subprocess.run([str(perf), 'report', '--stdio', '--no-children',
                                       '--call-graph', 'none', '--percent-limit', '0.1', '-i', str(data)],
                                      stdout=stream, stderr=subprocess.STDOUT, check=True)
+                  report = (out / (name + '-report.txt')).read_text()
+                  recorded = re.findall(r"(?m)^# Samples:.* of event '([^']+)'", report)
+                  if not recorded:
+                      raise RuntimeError('no sampled event in report: ' + name)
+                  metadata['recorded_events'][name] = recorded
+                  (out / 'metadata.json').write_text(json.dumps(metadata, indent=2))
                   # Demangled template spellings differ across perf versions.
                   # Select the executable instead of guessing exact symbol names.
                   annotation = subprocess.run(
