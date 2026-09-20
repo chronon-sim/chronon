@@ -36,8 +36,9 @@ public:
     };
 
     static CategoryRegistry& instance() {
-        static CategoryRegistry registry;
-        return registry;
+        // Interned IDs remain valid through process teardown.
+        static auto* registry = new CategoryRegistry;
+        return *registry;
     }
 
     CategoryMask registerCategory(std::string_view name, std::string_view description) {

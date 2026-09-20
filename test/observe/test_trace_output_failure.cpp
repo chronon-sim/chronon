@@ -320,7 +320,18 @@ void testApp(const std::filesystem::path& root, bool crash) {
     if (crash) CHECK(errors.str().find("original simulation error") != std::string::npos);
     auto& manager = ObservationManager::instance();
     CHECK(!manager.isBackendRunning());
-    expectFailure([&] { manager.shutdown(); }, root);
+    // App has already reported both the output failure and the original crash.
+    // Its owned session must now release contexts, including on the error path.
+    CHECK(!manager.isInitialized());
+    manager.shutdown();
+    chronon::SimulationApp recovered("trace recovery test");
+    recovered.setDefaultConfig(config_path.string()).onPostBuild([](auto& result) {
+        result.simulation->template createUnit<AppUnit>(false);
+    });
+    char arg[] = "trace_recovery_test";
+    char* argv[] = {arg};
+    CHECK(recovered.run(1, argv) == 0);
+    CHECK(!manager.isInitialized());
 }
 
 }  // namespace

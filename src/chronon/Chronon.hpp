@@ -47,6 +47,9 @@ using sender::Unit;
 using sender::UnitState;
 
 // --- Tick Simulation ---
+using sender::ExecutionPolicy;
+using sender::QueueDepth;
+using sender::SendRate;
 using sender::TerminationController;
 using sender::TerminationReason;
 using sender::TerminationRequest;

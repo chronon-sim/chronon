@@ -119,7 +119,8 @@ int main(int argc, char* argv[]) {
 | `-o, --output-dir <path>` | Override output directory |
 | `-n, --run-cycles <N>` | Override run cycles |
 | `-t, --threads <N>` | Override thread count |
-| `--epoch-size <N>` | Set host/Sequential polling interval (compatibility name) |
+| `--polling-interval-cycles <N>` | Set host/Sequential polling interval |
+| `--epoch-size <N>` | Compatibility alias for the polling interval |
 | `--no-observe` | Disable observation |
 | `-v, --verbose` | Verbose output |
 
@@ -134,6 +135,9 @@ int main(int argc, char* argv[]) {
          -p simulation.observation.timeline.scheduler.end_cycle=2000
 ```
 
+See [API Contracts and Migration](api-contracts.md) for configuration aliases,
+instance ownership and observation capability limits.
+
 ## YAML Configuration
 
 ### Basic Structure
@@ -142,10 +146,8 @@ int main(int argc, char* argv[]) {
 simulation:
   name: my_simulation
   num_workers: 4
-  enable_parallel: true    # Enable parallel execution (requires num_workers > 1)
-  enable_lookahead: true   # Compatibility switch; false forces Sequential
-  enable_epoch_free_lookahead: true   # Compatibility switch; false forces Sequential
-  epoch_size: 64           # Host predicate / Sequential polling interval
+  execution_policy: auto  # Sequential fallback when parallel execution is unsafe or unhelpful
+  polling_interval_cycles: 64 # Host predicate / Sequential polling interval
   run_cycles: 1000000
 
   unit:

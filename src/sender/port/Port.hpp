@@ -34,6 +34,7 @@
 #include "Connection.hpp"
 #include "MessageQueue.hpp"
 #include "PortDirectory.hpp"
+#include "PortLimits.hpp"
 
 namespace chronon::sender {
 
@@ -305,7 +306,8 @@ class Unit;
 
 /// Defined in Unit.hpp; declared here so port constructors can register
 /// auto-registration callbacks without including Unit.hpp.
-void addPortRegistrationToUnit(Unit* unit, std::function<void(const std::string&)> registration);
+void addPortRegistrationToUnit(
+    Unit* unit, std::function<void(const std::string&, PortDirectory&)> registration);
 class PortBase;
 void recordPortOnOwnerUnit(Unit* unit, PortBase* port);
 void recordCyclePreparedPortOnOwnerUnit(Unit* unit, PortBase* port);

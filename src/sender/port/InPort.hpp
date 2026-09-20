@@ -85,6 +85,9 @@ public:
         installAutoRegistration_();
     }
 
+    InPort(Unit* owner, std::string name, QueueDepth depth)
+        : InPort(owner, std::move(name), depth.entries) {}
+
     /// Convenience constructor: specify policy without setting capacity.
     InPort(Unit* owner, std::string name, PortPolicy policy)
         : PortBase(owner, std::move(name)),
@@ -110,11 +113,12 @@ private:
 
     void installAutoRegistration_() {
         if (owner_) {
-            addPortRegistrationToUnit(owner_, [this](const std::string& prefix) {
-                std::string full_path = prefix + "." + name_;
-                PortDirectory::instance().registerPort(
-                    full_path, std::make_unique<InPortHandle<T>>(this, owner_, name_, full_path));
-            });
+            addPortRegistrationToUnit(
+                owner_, [this](const std::string& prefix, PortDirectory& directory) {
+                    std::string full_path = prefix + "." + name_;
+                    directory.registerPort(full_path, std::make_unique<InPortHandle<T>>(
+                                                          this, owner_, name_, full_path));
+                });
         }
     }
 
@@ -379,6 +383,7 @@ public:
     size_t capacity() const { return queue_->capacity(); }
     size_t storageCapacity() const noexcept { return queue_->storageCapacity(); }
     size_t configuredCapacity() const noexcept { return capacity_; }
+    QueueDepth queueDepth() const noexcept { return {capacity_}; }
     size_t available() const { return queue_->available(); }
     size_t admissionOccupancy(uint64_t send_cycle) const {
         return queue_->admissionOccupancy(send_cycle);
@@ -560,6 +565,9 @@ public:
         return tryReceiveFiltered(current_cycle, [](const T&) noexcept { return true; });
     }
 
+    /// Receive at the owning unit's current local cycle, just as send() does.
+    std::optional<T> tryReceive() { return tryReceive(getCurrentCycle()); }
+
     /**
      * Receive the first ready message accepted by @p filter.
      *
@@ -725,6 +733,7 @@ public:
      * scoped, and retire automatically; clearing live state could resurrect a
      * message canceled by an overlapping flush.
      */
+    /// Compatibility no-op: receiver-owned selective cancellation retires automatically.
     void resetSelectiveCancellation() noexcept {}
 
 private:
@@ -978,23 +987,6 @@ private:
     std::unique_ptr<ProducerTransactionStates> producer_transaction_states_;
 };
 
-template <typename T>
-IMultiProducerPort* Connection<T>::registerOnDestMPSC() {
-    if (thread_queue_id_ == SIZE_MAX || !to_) {
-        return nullptr;
-    }
-    to_->registerMPSCConnection(this);
-    return static_cast<IMultiProducerPort*>(to_);
-}
-
-template <typename T>
-bool Connection<T>::finalizeTransparentBroadcastForDestination(size_t producer_count) {
-    return to_ && to_->finalizeTransparentBroadcastReplay(producer_count);
-}
-
-template <typename T>
-PortBase* InPortHandle<T>::portBase() const {
-    return port_;
-}
-
 }  // namespace chronon::sender
+
+#include "detail/InPortBindings.hpp"

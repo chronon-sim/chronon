@@ -17,6 +17,7 @@
 #include <memory>
 #include <vector>
 
+#include "../../observe/ObservationManager.hpp"
 #include "TickSimulation.hpp"
 #include "TickSimulationClockRuntime.hpp"
 
@@ -47,9 +48,17 @@ void TickSimulation::refreshDynamicOwnedActors_(size_t worker, std::vector<size_
     for (;;) {
         const uint64_t before = cluster_assignment_generation_.load(std::memory_order_acquire);
         scratch.clear();
-        for (size_t c = 0; c < dynamic_runtime_cluster_count_; ++c)
-            if (cluster_runtime_owner_[c].load(std::memory_order_acquire) == worker)
-                scratch.push_back(c);
+        // Joined runs publish immutable unit lists for this exact generation.
+        // Reuse that snapshot until a migration requires the atomic owner scan.
+        // Clock actors also include bridges, which are absent from these lists.
+        if (!clock_mode_ && schedulerScratch_().assignment_lists_generation == before) {
+            const auto& clusters = thread_clusters_[worker];
+            scratch.assign(clusters.begin(), clusters.end());
+        } else {
+            for (size_t c = 0; c < dynamic_runtime_cluster_count_; ++c)
+                if (cluster_runtime_owner_[c].load(std::memory_order_acquire) == worker)
+                    scratch.push_back(c);
+        }
         const uint64_t after = cluster_assignment_generation_.load(std::memory_order_acquire);
         if (before == after) {
             owned.swap(scratch);
@@ -116,13 +125,18 @@ void TickSimulation::initDynamicMigrationRuntime_() {
         dynamic_runtime_unit_count_ = num_units;
     }
 
-    for (size_t c = 0; c < num_clusters && c < clusters_.clusters.size(); ++c) {
-        if (clock_mode_) dynamic_cluster_unit_sampling_[c] = 1;
-        for (size_t unit_idx : clusters_.clusters[c]) {
-            if (unit_idx < unit_ptrs_.size() && (unit_ptrs_[unit_idx]->tickInterval() > 1 ||
-                                                 unit_ptrs_[unit_idx]->usesActivityScheduling())) {
-                dynamic_cluster_unit_sampling_[c] = 1;
-                break;
+    // Binding publishes constructor opt-in; interval/sleep setters publish later
+    // opt-in. With no activity control, scanning every unit cannot enable sampling.
+    if (clock_mode_ || any_activity_scheduling_.enabled.load(std::memory_order_acquire)) {
+        for (size_t c = 0; c < num_clusters && c < clusters_.clusters.size(); ++c) {
+            if (clock_mode_) dynamic_cluster_unit_sampling_[c] = 1;
+            for (size_t unit_idx : clusters_.clusters[c]) {
+                if (unit_idx < unit_ptrs_.size() &&
+                    (unit_ptrs_[unit_idx]->tickInterval() > 1 ||
+                     unit_ptrs_[unit_idx]->usesActivityScheduling())) {
+                    dynamic_cluster_unit_sampling_[c] = 1;
+                    break;
+                }
             }
         }
     }
@@ -203,24 +217,27 @@ uint64_t TickSimulation::executeRunEpochFreeDynamic_(uint64_t total_cycles) {
     std::exception_ptr captured;
     std::atomic_flag captured_set = ATOMIC_FLAG_INIT;
 
+    // Connect bulk work on the caller before scheduling. Worker failures are
+    // captured here and rethrown after the join, so this callback is noexcept.
     auto work =
-        stdexec::bulk(stdexec::just(), stdexec::par, nthreads, [&, token](std::size_t thread_idx) {
-            try {
-                if (push_periodic_counters) {
-                    executeThreadRunDynamicWithPeriodicCounters_(thread_idx, run_target, run_start,
-                                                                 counter_period, token);
-                } else {
-                    executeThreadRunDynamic_(thread_idx, run_target, token);
-                }
-            } catch (...) {
-                if (!captured_set.test_and_set(std::memory_order_relaxed)) {
-                    captured = std::current_exception();
-                }
-                stop_source_->request_stop();
-            }
-        });
+        stdexec::bulk(stdexec::schedule(sched), stdexec::par, nthreads,
+                      [&, token](std::size_t thread_idx) noexcept {
+                          try {
+                              if (push_periodic_counters) {
+                                  executeThreadRunDynamicWithPeriodicCounters_(
+                                      thread_idx, run_target, run_start, counter_period, token);
+                              } else {
+                                  executeThreadRunDynamic_(thread_idx, run_target, token);
+                              }
+                          } catch (...) {
+                              if (!captured_set.test_and_set(std::memory_order_relaxed)) {
+                                  captured = std::current_exception();
+                              }
+                              stop_source_->request_stop();
+                          }
+                      });
 
-    stdexec::sync_wait(stdexec::starts_on(sched, std::move(work)));
+    stdexec::sync_wait(std::move(work));
 
     epoch_free_dynamic_runtime_active_.store(false, std::memory_order_release);
 

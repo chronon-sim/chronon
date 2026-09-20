@@ -53,6 +53,8 @@ public:
     virtual Unit* destination() const noexcept = 0;
     virtual void* sourcePortPtr() const noexcept { return nullptr; }
     virtual void* destPortPtr() const noexcept = 0;
+    /// Explicit destination depth requested by this edge; fan-in requests must agree.
+    virtual std::optional<size_t> destinationDepthOverride() const noexcept { return {}; }
     virtual std::string_view sourcePortName() const noexcept { return {}; }
     virtual std::string_view destinationPortName() const noexcept { return {}; }
 
@@ -621,6 +623,10 @@ public:
     void prepareRegisteredCapacity() override {
         if (!dependency_only_transport_ && registered_capacity_)
             to_->setCapacity(*registered_capacity_);
+    }
+
+    std::optional<size_t> destinationDepthOverride() const noexcept override {
+        return dependency_only_transport_ ? std::nullopt : registered_capacity_;
     }
 
     size_t modelHeadroom() const noexcept override {

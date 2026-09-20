@@ -10,6 +10,7 @@
 /// TickSimulation parallel runtime: epoch-free execution, cross-thread
 /// dependency spin-waits, and progress-sync initialization.
 
+#include <array>
 #include <bit>
 #include <cassert>
 #include <chrono>
@@ -19,7 +20,6 @@
 #include <limits>
 #include <new>
 #include <string>
-#include <type_traits>
 #include <unordered_map>
 
 #if defined(__linux__)
@@ -29,6 +29,7 @@
 #endif
 
 #include "../../chronon/CpuPause.hpp"
+#include "../../observe/ObservationManager.hpp"
 #include "TickSimulation.hpp"
 #include "TickSimulationCycleUtils.hpp"
 #include "sender/schedule/SchedulerTimelineStyle.hpp"
@@ -80,12 +81,6 @@ void TickSimulation::installMultiProducerProgress_() {
 // Progress-sync allocation
 // ---------------------------------------------------------------------------
 
-TickSimulation::InvocationRetainedPredecessorCache::InvocationRetainedPredecessorCache(
-    WorkerPredecessorCycleCache* retained, size_t num_clusters)
-    : observed_cycles(std::move(retained->observed_cycles)), return_to(retained) {
-    observed_cycles.assign(num_clusters + 1, 0);
-}
-
 // Keep vector growth and small-buffer setup out of the worker's scheduling loop.
 // This also keeps register allocation independent of the cache initialization paths.
 TickSimulation::InvocationPredecessorCache::InvocationPredecessorCache(
@@ -122,8 +117,8 @@ void TickSimulation::initProgressSync() {
     const size_t num_threads = thread_units_.size();
     const size_t num_clusters = clusters_.numClusters();
     if (num_clusters == 0) return;
-    // Ordinary workers keep the original invocation-local cache header and
-    // retain its allocation. Small static clock graphs need no worker metadata.
+    // Ordinary worker metadata covers every logical worker. Small static clock
+    // graphs need no worker metadata.
     const size_t scratch_workers = !clock_mode_ || config_.enable_dynamic_rebalance ||
                                            num_clusters >= InvocationPredecessorCache::kInlineSlots
                                        ? num_threads
@@ -284,6 +279,7 @@ size_t TickSimulation::crossThreadHeadroomLimit_() const noexcept {
 }
 
 uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
+    assert(!clock_mode_);
     const size_t nthreads = thread_units_.size();
     if (nthreads == 0 || total_cycles == 0) return 0;
 
@@ -315,27 +311,30 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
     std::exception_ptr captured;
     std::atomic_flag captured_set = ATOMIC_FLAG_INIT;
 
+    // Connect bulk work on the caller before scheduling. Worker failures are
+    // captured here and rethrown after the join, so this callback is noexcept.
     auto work =
-        stdexec::bulk(stdexec::just(), stdexec::par, nthreads, [&, token](std::size_t thread_idx) {
-            // Drive this worker's clusters straight to run_target. The try-catch
-            // captures the first exception and requests stop so peers leave their
-            // dependency spin-waits; sync_wait below is the sole join.
-            try {
-                if (push_periodic_counters) {
-                    executeThreadRunWithPeriodicCounters_(thread_idx, run_target, run_start,
-                                                          counter_period, token);
-                } else {
-                    executeThreadRun_(thread_idx, run_target, token);
-                }
-            } catch (...) {
-                if (!captured_set.test_and_set(std::memory_order_relaxed)) {
-                    captured = std::current_exception();
-                }
-                stop_source_->request_stop();
-            }
-        });
+        stdexec::bulk(stdexec::schedule(sched), stdexec::par, nthreads,
+                      [&, token](std::size_t thread_idx) noexcept {
+                          // Drive this worker's clusters straight to run_target. The try-catch
+                          // captures the first exception and requests stop so peers leave their
+                          // dependency spin-waits; sync_wait below is the sole join.
+                          try {
+                              if (push_periodic_counters) {
+                                  executeThreadRunWithPeriodicCounters_(
+                                      thread_idx, run_target, run_start, counter_period, token);
+                              } else {
+                                  executeThreadRun_(thread_idx, run_target, token);
+                              }
+                          } catch (...) {
+                              if (!captured_set.test_and_set(std::memory_order_relaxed)) {
+                                  captured = std::current_exception();
+                              }
+                              stop_source_->request_stop();
+                          }
+                      });
 
-    stdexec::sync_wait(stdexec::starts_on(sched, std::move(work)));
+    stdexec::sync_wait(std::move(work));
 
     if (captured) std::rethrow_exception(captured);
 
@@ -357,12 +356,12 @@ uint64_t TickSimulation::executeRunEpochFree_(uint64_t total_cycles) {
 // Per-thread run driver
 // ---------------------------------------------------------------------------
 
-template <bool PushPeriodicCounters, bool LocalCacheHeader>
+template <bool PushPeriodicCounters, bool TraceUnits>
 void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle,
                                            uint64_t run_start, uint64_t period,
                                            stdexec::inplace_stop_token token) {
     const auto& clusters = thread_clusters_[thread_idx];
-    const bool trace_units = timeline_trace_.traceUnits();
+    constexpr bool trace_units = TraceUnits;
     const bool trace_waits_enabled = timeline_trace_.traceWaits();
     const bool stop_on_first_blocker = !trace_waits_enabled;
     const auto trace_cycle = [&](bool enabled, uint64_t cycle) {
@@ -370,11 +369,32 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     };
     // This cache spans the worker invocation (the entire run in EpochFree mode),
     // allowing all locally-owned clusters to reuse acquired predecessor progress.
-    using Cache = std::conditional_t<LocalCacheHeader, InvocationRetainedPredecessorCache,
-                                     InvocationPredecessorCache>;
-    Cache predecessor_cache(&schedulerScratch_().workers[thread_idx].predecessor,
-                            thread_progress_count_);
+    // Use the same invocation-local small buffer as dynamic and clock workers.
+    // Short static runs need neither transfer retained ownership nor touch a
+    // heap buffer that may have last been used on another pool thread.
+    InvocationPredecessorCache predecessor_cache(
+        &schedulerScratch_().workers[thread_idx].predecessor, thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
+    // Static ownership cannot change during this invocation. Seed our exact
+    // frontiers once, after the preceding invocation joined. Every advance
+    // below updates both the published atomic and this private copy; peers can
+    // only read our progress, so rereading that shared line is unnecessary.
+    for (size_t cluster : clusters) {
+        predecessor_cycles[cluster] =
+            thread_progress_array_[cluster].completed_cycle.load(std::memory_order_relaxed);
+    }
+    // A successful dependency check proves every cycle below the minimum
+    // acquired predecessor frontier plus its delay. Reuse that lower bound,
+    // as dynamic workers do, without changing the order of cluster execution.
+    constexpr size_t inline_slots = InvocationPredecessorCache::kInlineSlots;
+    alignas(64) std::array<uint64_t, inline_slots> inline_ready;
+    auto* ready_through = inline_ready.data();
+    if (thread_progress_count_ > inline_slots) {
+        auto& retained = schedulerScratch_().workers[thread_idx].ready_through;
+        retained.resize(thread_progress_count_);
+        ready_through = retained.data();
+    }
+    std::fill_n(ready_through, thread_progress_count_, 0);
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;
     if constexpr (PushPeriodicCounters) {
@@ -389,17 +409,29 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
 
         for (size_t cluster : clusters) {
             auto& progress = thread_progress_array_[cluster].completed_cycle;
-            uint64_t cycle = progress.load(std::memory_order_relaxed);
+            const uint64_t cycle = predecessor_cycles[cluster];
             if (cycle >= end_cycle) continue;
             all_done = false;
 
-            BlockedClusterInfo candidate{};
-            if (!clusterCanAdvance_(cluster, cycle, candidate, predecessor_cycles,
-                                    stop_on_first_blocker)) {
-                if (candidate.deficit > blocker.deficit) {
-                    blocker = candidate;
+            if (cycle >= ready_through[cluster]) {
+                BlockedClusterInfo candidate{};
+                if (!clusterCanAdvance_(cluster, cycle, candidate, predecessor_cycles,
+                                        stop_on_first_blocker)) {
+                    if (candidate.deficit > blocker.deficit) {
+                        blocker = candidate;
+                    }
+                    continue;
                 }
-                continue;
+                // No subsequent tick can reuse a bound on the final cycle of
+                // this invocation, including the common one-cycle polling case.
+                if (cycle + 1 < end_cycle) {
+                    uint64_t bound = std::numeric_limits<uint64_t>::max();
+                    for (const auto& dep : thread_resolved_deps_[cluster]) {
+                        bound = std::min(bound, saturatingCycleAdd(predecessor_cycles[dep.pred_id],
+                                                                   dep.min_delay));
+                    }
+                    ready_through[cluster] = bound;
+                }
             }
 
             uint64_t idle_target = cycle;
@@ -434,7 +466,17 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
                 progress.store(reached_cycle, std::memory_order_release);
                 predecessor_cycles[cluster] = reached_cycle;
             } else {
-                executeClusterOneCycle_(thread_idx, cluster, cycle, trace_units);
+                if constexpr (TraceUnits) {
+                    executeClusterOneCycle_(thread_idx, cluster, cycle, true);
+                } else {
+                    // This driver only runs ordinary single-clock clusters.
+                    // Keep the shared tick/activity logic in this invocation;
+                    // the general clock/trace/sample dispatcher needs a large
+                    // call frame even when all those optional features are off.
+                    for (auto* unit : cluster_unit_ptrs_[cluster]) {
+                        executeUnitCycle_(unit, cycle);
+                    }
+                }
                 progress.store(cycle + 1, std::memory_order_release);
                 predecessor_cycles[cluster] = cycle + 1;
             }
@@ -502,8 +544,7 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
             }
             bool any_ready = false;
             for (size_t cluster : clusters) {
-                uint64_t cycle =
-                    thread_progress_array_[cluster].completed_cycle.load(std::memory_order_relaxed);
+                const uint64_t cycle = predecessor_cycles[cluster];
                 if (cycle >= end_cycle) continue;
                 BlockedClusterInfo ignored{};
                 if (clusterCanAdvance_(cluster, cycle, ignored, predecessor_cycles,
@@ -534,7 +575,7 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
 
 void TickSimulation::executeThreadRun_(size_t thread_idx, uint64_t end_cycle,
                                        stdexec::inplace_stop_token token) {
-    if (thread_progress_count_ < InvocationPredecessorCache::kInlineSlots)
+    if (timeline_trace_.traceUnits())
         executeThreadRunImpl_<false, true>(thread_idx, end_cycle, 0, 0, token);
     else
         executeThreadRunImpl_<false, false>(thread_idx, end_cycle, 0, 0, token);
@@ -543,7 +584,7 @@ void TickSimulation::executeThreadRun_(size_t thread_idx, uint64_t end_cycle,
 void TickSimulation::executeThreadRunWithPeriodicCounters_(size_t thread_idx, uint64_t end_cycle,
                                                            uint64_t run_start, uint64_t period,
                                                            stdexec::inplace_stop_token token) {
-    if (thread_progress_count_ < InvocationPredecessorCache::kInlineSlots)
+    if (timeline_trace_.traceUnits())
         executeThreadRunImpl_<true, true>(thread_idx, end_cycle, run_start, period, token);
     else
         executeThreadRunImpl_<true, false>(thread_idx, end_cycle, run_start, period, token);
@@ -734,13 +775,12 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
     auto* const* units = cluster_unit_ptrs_[cluster].data();
     const size_t num_units = cluster_unit_ptrs_[cluster].size();
 
-    const auto execute = [&](TickableUnit* unit) {
+    // Keep per-unit dispatch in this call frame, including traced/clocked paths.
+    // Otherwise the expanded tick guard can cause the compiler to outline this
+    // lambda and reintroduce an extra call for every unit and cycle.
+    const auto execute = [&](auto* unit) __attribute__((always_inline)) {
         if (!clock_mode_) return executeUnitCycle_(unit, cycle);
-        unit->clock_edge_executing_ = true;
-        const bool active = executeUnitCycle_(unit, cycle);
-        unit->clock_edge_executing_ = false;
-        if (auto* stream = unit->clockTraceStream()) stream->endEdge();
-        return active;
+        return executeClockUnitCycle_(unit, cycle);
     };
     auto unit_index = [&](size_t offset) {
         return cluster < clusters_.clusters.size() && offset < clusters_.clusters[cluster].size()

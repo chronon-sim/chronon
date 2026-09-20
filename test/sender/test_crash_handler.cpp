@@ -73,6 +73,7 @@ private:
 
 class FatalSignalUnit : public TickableUnit {
 public:
+    using TickableUnit::executeTick;  // Standalone crash-context test.
     FatalSignalUnit() : TickableUnit("fatal_tick_unit") {}
 
     void tick() override { raise(SIGABRT); }

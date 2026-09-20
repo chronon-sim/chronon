@@ -33,7 +33,7 @@ namespace chronon::sender {
 
 class TickSimulation;
 
-enum class UnitState { Created, Initialized };
+enum class UnitState { Created, Initialized, Finalized };
 
 namespace detail {
 
@@ -96,7 +96,8 @@ public:
     /// Called after all connections are made, before run() starts.
     virtual void initialize() {}
 
-    /// Called after run() completes or simulation is stopped.
+    /// Called once by TickSimulation::finalize(), after successful initialize().
+    /// A run() segment does not end the simulation's lifetime.
     virtual void finalize() {}
 
     const std::string& name() const noexcept { return name_; }
@@ -266,9 +267,13 @@ public:
     }
 
     /// Triggers registration of all pending ports to PortDirectory.
-    void setTreeNode(tree::TreeNode* node) {
+    void setTreeNode(tree::TreeNode* node, PortDirectory& directory = PortDirectory::instance()) {
+        if (state_ != UnitState::Created)
+            throw std::logic_error("cannot rebind unit tree after initialization");
+        if (tree_node_ && tree_node_ != node)
+            throw std::logic_error("unit tree binding is immutable");
         tree_node_ = node;
-        registerAllPendingPorts();
+        registerAllPendingPorts(directory);
     }
 
     tree::TreeNode* treeNode() const noexcept { return tree_node_; }
@@ -280,7 +285,8 @@ public:
      * Add a port registration callback to be invoked when setTreeNode() runs.
      * Called automatically by Port constructors for YAML-driven discovery.
      */
-    void addPendingPortRegistration(std::function<void(const std::string&)> registration) {
+    void addPendingPortRegistration(
+        std::function<void(const std::string&, PortDirectory&)> registration) {
         pending_port_registrations_.push_back(std::move(registration));
     }
 
@@ -288,6 +294,13 @@ protected:
     friend class TickSimulation;
 
     void setId(uint32_t id) { id_ = id; }
+
+    void setInstanceName_(std::string name) {
+        name_ = std::move(name);
+        crash_name_len_ = static_cast<uint8_t>(std::min(name_.size(), sizeof(crash_name_) - 1));
+        std::memcpy(crash_name_, name_.c_str(), crash_name_len_);
+        crash_name_[crash_name_len_] = '\0';
+    }
 
     void setLocalCycle(uint64_t cycle) {
         local_cycle_ = cycle;
@@ -415,10 +428,10 @@ private:
         }
     }
 
-    void registerAllPendingPorts() {
+    void registerAllPendingPorts(PortDirectory& directory) {
         std::string prefix = fullPath();
         for (auto& reg : pending_port_registrations_) {
-            reg(prefix);
+            reg(prefix, directory);
         }
         pending_port_registrations_.clear();
     }
@@ -452,7 +465,8 @@ private:
     /// Lazily allocated: the common Unit has no receiver cycle hook.
     std::unique_ptr<std::vector<PortBase*>> cycle_prepared_ports_;
     tree::TreeNode* tree_node_ = nullptr;
-    std::vector<std::function<void(const std::string&)>> pending_port_registrations_;
+    std::vector<std::function<void(const std::string&, PortDirectory&)>>
+        pending_port_registrations_;
 };
 
 template <typename T>
@@ -490,8 +504,8 @@ inline std::string Unit::fullPath() const {
 
 /// Defined here (free function) to avoid the Port.hpp → Unit.hpp circular
 /// dependency: Port constructors only see a forward-declared Unit.
-inline void addPortRegistrationToUnit(Unit* unit,
-                                      std::function<void(const std::string&)> registration) {
+inline void addPortRegistrationToUnit(
+    Unit* unit, std::function<void(const std::string&, PortDirectory&)> registration) {
     if (unit) {
         unit->addPendingPortRegistration(std::move(registration));
     }

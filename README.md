@@ -100,17 +100,17 @@ inline const auto DATA_FLOW = Category<"data_flow", "Data flow events">{};
 
 class Producer : public TickableUnit, public ObservableUnit {
 public:
-    OutPort<int> out{this, "out"};
+    OutPort<int> out{this, "out", SendRate{1}};
 
     Producer() : TickableUnit("producer") {}
 
     bool isCompleted() const override { return value_ >= 1000; }
 
     void tick() override {
-        if (out.canSend()) {
-            out.send(value_++);
+        if (out.send(value_)) {
             ++produced_;
             event<"produced">(DATA_FLOW, arg<"value">(value_));
+            ++value_;
         }
     }
 
@@ -121,14 +121,14 @@ private:
 
 class Consumer : public TickableUnit, public ObservableUnit {
 public:
-    InPort<int> in{this, "in"};
+    InPort<int> in{this, "in", QueueDepth{16}};
 
     Consumer() : TickableUnit("consumer") {}
 
     void tick() override {
-        if (auto value = in.tryReceive(localCycle())) {
+        if (auto value = in.tryReceive()) {
             ++consumed_;
-            debug<"Consumed: {}">(value);
+            debug<"Consumed: {}">(*value);
         }
     }
 
@@ -139,7 +139,7 @@ private:
 int main() {
     TickSimulationConfig config;
     config.num_threads = 8;
-    config.enable_parallel = true;
+    config.setExecutionPolicy(ExecutionPolicy::Auto);
 
     TickSimulation sim(config);
     auto* producer = sim.createUnit<Producer>();
@@ -147,7 +147,8 @@ int main() {
     sim.connect(producer->out, consumer->in, 1);
 
     sim.initialize();
-    sim.run(2000);  // ~90+ Mcycles/sec
+    sim.run(2000);
+    sim.finalize();
 }
 ```
 

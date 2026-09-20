@@ -15,6 +15,7 @@ struct ModeConfig {
     const char* name;
     bool enable_parallel;
     bool enable_lookahead;
+    bool enable_dynamic_rebalance = false;
 };
 
 constexpr int PARALLEL_TEST_UNIT_COUNT = 10;
@@ -26,7 +27,7 @@ TickSimulationConfig makeConfig(const ModeConfig& mode) {
     config.enable_lookahead = mode.enable_lookahead;
     config.enable_epoch_free_lookahead = true;
     config.enable_weighted_partitioning = false;
-    config.enable_dynamic_rebalance = false;
+    config.enable_dynamic_rebalance = mode.enable_dynamic_rebalance;
     config.epoch_size = 8;
     config.max_lookahead_cycles = 4;
     return config;
@@ -317,6 +318,38 @@ void test_initial_sleep_until_defers_first_tick(const ModeConfig& mode) {
     assert(unit->localCycle() == 8);
 }
 
+void test_activity_opt_in_between_runs(const ModeConfig& mode) {
+    class BoundaryUnit : public TickableUnit {
+    public:
+        BoundaryUnit() : TickableUnit("boundary_opt_in") {}
+        void tick() override { cycles.push_back(localCycle()); }
+        std::vector<uint64_t> cycles;
+    };
+    TickSimulation sim(makeConfig(mode));
+    auto* unit = sim.createUnit<BoundaryUnit>();
+    std::vector<PassiveUnit*> passive;
+    for (int i = 0; i < PARALLEL_TEST_UNIT_COUNT - 1; ++i)
+        passive.push_back(sim.createUnit<PassiveUnit>("passive_" + std::to_string(i)));
+
+    sim.run(5);  // Every unit starts on the always-active path.
+    unit->setTickInterval(3);
+    sim.run(7);
+    assert((unit->cycles == std::vector<uint64_t>{0, 1, 2, 3, 4, 6, 9}));
+    unit->setTickInterval(1);
+    sim.run(3);
+    unit->sleepForever();
+    sim.run(3);
+    unit->wakeAt(20);
+    sim.run(5);
+    assert((unit->cycles == std::vector<uint64_t>{0, 1, 2, 3, 4, 6, 9, 12, 13, 14, 20, 21, 22}));
+    assert(unit->localCycle() == 23);
+    for (const auto* filler : passive) {
+        assert(filler->ticks == 23);
+        assert(filler->localCycle() == 23);
+    }
+    if (mode.enable_parallel && mode.enable_lookahead) assert(sim.epochFreeRunCount() > 0);
+}
+
 void test_tick_interval_preserves_constructor_sleep_target(const ModeConfig& mode) {
     TickSimulation sim(makeConfig(mode));
     auto* unit = sim.createUnit<InitiallyDeferredUnit>();
@@ -484,6 +517,7 @@ int main() {
     const ModeConfig modes[] = {
         {"sequential", false, false},
         {"epoch-free", true, true},
+        {"epoch-free dynamic", true, true, true},
     };
 
     for (const auto& mode : modes) {
@@ -497,6 +531,10 @@ int main() {
 
         std::cout << "Testing runtime activity opt-in (" << mode.name << ")... ";
         test_runtime_opt_in_leaves_always_active_fast_path(mode);
+        std::cout << "PASSED\n";
+
+        std::cout << "Testing activity opt-in between runs (" << mode.name << ")... ";
+        test_activity_opt_in_between_runs(mode);
         std::cout << "PASSED\n";
 
         std::cout << "Testing lazy wakeup initial sleepUntil (" << mode.name << ")... ";

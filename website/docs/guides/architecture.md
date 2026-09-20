@@ -43,6 +43,9 @@ sidebar_label: "Architecture Overview"
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
+See [API Contracts and Migration](api-contracts.md) for the public/internal
+boundary, ownership rules and capability matrix.
+
 ## Component Relationships
 
 ```
@@ -86,7 +89,9 @@ src/
 │   │   ├── TickableUnit.hpp             # Tick-based unit interface
 │   │   ├── PhasedTickableUnit.hpp       # Phase-based tick dispatch
 │   │   ├── TickSimulation.hpp           # Simulation driver with stdexec
-│   │   ├── TickSimulationConfig.hpp     # Configuration structure
+│   │   ├── TickSimulationConfig.hpp     # Model configuration and execution policy
+│   │   ├── TickSimulationLifecycle.cpp  # Cold lifetime, ownership and lookup
+│   │   ├── TickSimulationDescriptors.hpp # Internal progress descriptors
 │   │   ├── TerminationRequest.hpp       # Termination conditions
 │   │   ├── CrashHandler.hpp             # Signal handler + emergency flush
 │   │   └── CrashHandler.cpp             # Crash handler implementation

@@ -164,8 +164,10 @@ public:
     static constexpr size_t MAX_FORMATS = 4096;
 
     static FormatRegistry& instance() {
-        static FormatRegistry registry;
-        return registry;
+        // Format IDs are cached in static call sites. Keep their intern table
+        // alive through static model finalizers and the backend's final drain.
+        static auto* registry = new FormatRegistry;
+        return *registry;
     }
 
     /**

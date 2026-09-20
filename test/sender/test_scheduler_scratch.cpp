@@ -60,8 +60,8 @@ struct SchedulerScratchTestAccess {
         for (size_t worker = 0; worker < sim.thread_clusters_.size(); ++worker) {
             const auto& observed =
                 sim.schedulerScratch_().workers[worker].predecessor.observed_cycles;
-            // Small dynamic invocations use stack slots, which do not survive
-            // the join. Larger graphs and static workers retain their storage.
+            // Small invocations use stack slots, which do not survive the join.
+            // Larger graphs retain their storage.
             if (observed.empty()) continue;
             for (size_t cluster : sim.thread_clusters_[worker])
                 assert(observed[cluster] ==
@@ -202,11 +202,12 @@ int main() {
         assert(sim.dependencyGraph().lookahead(unit, unit) == 0);
     }
     for (bool clock : {false, true}) {
-        for (size_t pairs : {4, 12}) {
+        for (size_t pairs : {4, 8, 9, 12}) {
             const auto serial = exercise(clock, false, 1, 1, pairs);
-            for (bool dynamic : {false, true})
-                for (uint64_t interval : {1, 7, 64})
-                    assert(exercise(clock, dynamic, 4, interval, pairs) == serial);
+            for (size_t workers : {2, 4})
+                for (bool dynamic : {false, true})
+                    for (uint64_t interval : {1, 7, 64})
+                        assert(exercise(clock, dynamic, workers, interval, pairs) == serial);
         }
     }
     std::cout << "Repeated runs reset scratch and preserve state across migration\n";
