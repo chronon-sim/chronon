@@ -14,10 +14,10 @@
 simulation:
     name: cpu_pipeline_4wide
     num_workers: 2
-    enable_lookahead: true
+    execution_policy: auto
     max_lookahead_cycles: 256
-    epoch_size: 1024 # Host predicate / Sequential polling interval
-    run_cycles: 0 # 0 = run until completion
+    polling_interval_cycles: 1024 # Host predicate / Sequential polling interval
+    run_cycles: 0 # Use the application cycle limit; units may request earlier termination
 
     # Observation configuration (automatic setup)
     observation:

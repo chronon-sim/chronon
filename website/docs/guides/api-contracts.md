@@ -7,7 +7,8 @@ sidebar_label: "API Contracts and Migration"
 Model code defines synchronous `tick()` behavior, sends through `OutPort`, and
 receives through `InPort`. `TickSimulation` owns time advancement, topology,
 transport selection, and the lifetime of managed units. Use
-`#include "chronon/Chronon.hpp"` for the supported umbrella API.
+`#include "chronon/Simulation.hpp"` for model code; `chronon/Chronon.hpp` remains
+the full compatible umbrella. See the [entry headers](/docs/api/).
 
 ## Lifecycle and ownership
 

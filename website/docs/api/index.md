@@ -5,42 +5,44 @@ sidebar_position: "1"
 
 # API Reference
 
-Auto-generated C++ API documentation from source code using Doxygen.
+Choose an entry header by task. Names below are available in `chronon`.
 
-## Namespaces
+| Header | Primary interfaces |
+|---|---|
+| `chronon/Simulation.hpp` | `TickableUnit`, `TickSimulation`, `TickSimulationConfig`, `ExecutionPolicy`, `OutPort<T>`, `InPort<T>`, `Connection<T>`, `SendRate`, `QueueDepth`; explicit clocks and CDC |
+| `chronon/Observation.hpp` | `ObservableUnit`, `EventCounter`, `DerivedCounter`, `Category`, `TimelineLane`, `TimelineSpan` and structured event arguments |
+| `chronon/Application.hpp` | `Param<T>`, `ParameterSet`, `AutoRegisteredUnit`, `SimulationBuilder`, `SimulationApp` |
+| `chronon/Chronon.hpp` | Full umbrella, including pipeline utilities, adapter interfaces and historical aliases |
 
-| Namespace | Description |
-|-----------|-------------|
-| `chronon` | Main public API — all commonly-used types |
-| `chronon::sender` | Core simulation engine internals |
-| `chronon::observe` | Observability system (counters, traces, logs) |
-| `chronon::params` | Parameter and configuration system |
+The focused headers are conveniences over the same types, not alternate APIs or
+independent link libraries. Continue linking `chronon::core`; current template and
+class layouts still require internal headers and observation dependencies.
+Existing umbrella includes and qualified subnamespace names remain valid.
 
-## Core Classes
+## Model, extension and implementation boundaries
 
-| Class | Header | Description |
-|-------|--------|-------------|
-| `TickableUnit` | `chronon/Unit.hpp` | Base class for tick-driven simulation units |
-| `TickSimulation` | `chronon/Simulation.hpp` | Main simulation engine with parallel execution |
-| `OutPort<T>` | `chronon/Port.hpp` | Output port for sending data |
-| `InPort<T>` | `chronon/Port.hpp` | Input port for receiving data |
-| `Connection<T>` | `chronon/Port.hpp` | Port-to-port connection with configurable delay |
-| `EventCounter` | `chronon/Observe.hpp` | Per-unit aggregate counter with optional timeline marks |
-| `DerivedCounter` | `chronon/Observe.hpp` | Backend-computed metric derived from `EventCounter` snapshots |
-| `ObservableUnit` | `chronon/Observe.hpp` | Mixin for units with observability |
-| `TimelineLane` / `TimelineSpan` | `chronon/Observe.hpp` | Perfetto instants and occupancy spans |
-| Pipeline trace primitives | `chronon/Observe.hpp` | Typed one-cycle pipeline slices for model-level `observe::pipeline` wrappers |
-| `Param<T>` | `chronon/Params.hpp` | Self-registering parameter wrapper |
-| `SimulationApp` | `chronon/SimulationApp.hpp` | Unified CLI entry point |
+**Model code** defines `tick()`, sends and receives through ports, configures the
+simulation, and advances or finalizes it. Start with the [quickstart](../intro).
+Use `TickSimulation` and `TickSimulationConfig` consistently in new model code;
+`Simulation` and `SimulationConfig` remain umbrella aliases for existing clients.
 
-## Browse
+**Extension code** can integrate factories, tree bindings, custom transport
+adapters and placement inspection. `PortDirectory`, `PortBindingRegistry`,
+`registerConnection()` and the queue-installation methods serve that layer;
+they are not required to build an ordinary model. Their ownership and phase
+constraints are described in [API contracts](../guides/api-contracts).
 
-- [**Namespaces**](Namespaces/Namespaces) — `chronon`, `chronon::sender`, `chronon::observe`, `chronon::params`
-- [**Classes**](Classes/Classes) — all documented classes and structs
+**Implementation code** includes scheduler progress records, invocation scratch,
+clock-runtime records and wait policies. Installed internal headers support C++
+templates and class definitions; installation alone does not promise a stable
+extension API or binary layout. These implementation files are excluded from the
+default generated reference.
 
-## Single Include
+## Browse generated declarations
 
-```cpp
-#include "chronon/Chronon.hpp"
-using namespace chronon;
-```
+The API sidebar lists namespaces and classes when documentation is generated
+from the current source revision.
+
+The generated reference includes advanced interfaces; the entry table above
+identifies the recommended starting points. Legacy option behavior is documented
+in [Compatibility names](../guides/api-contracts#compatibility-names).

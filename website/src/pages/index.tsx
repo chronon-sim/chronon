@@ -55,7 +55,7 @@ const FeatureList: FeatureItem[] = [
     description: (
       <>
         Dependency-driven lookahead scheduling powered by <code>stdexec</code>.
-        Achieve ~90+ Mcycles/sec with zero manual thread management.
+        Advance independent units in parallel without manual thread management.
       </>
     ),
   },
@@ -64,7 +64,7 @@ const FeatureList: FeatureItem[] = [
     description: (
       <>
         Communicate between units with <code>OutPort&lt;T&gt;</code> and <code>InPort&lt;T&gt;</code>.
-        Delay-based mode selection: inline (0-cycle) or SPSC queue (N-cycle).
+        Connection delays define delivery timing; topology selects same-thread, SPSC or MPSC queues.
       </>
     ),
   },

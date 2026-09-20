@@ -9,6 +9,8 @@ if(NOT TARGET regress)
     add_custom_target(regress COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure)
 endif()
 
+include(public_headers.cmake)
+
 # ==============================================================================
 # TreeNode Unit Tests (Core Infrastructure - still used)
 # ==============================================================================

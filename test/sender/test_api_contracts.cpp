@@ -91,6 +91,24 @@ void lifecycle(size_t threads) {
     CHECK(events == (std::vector<std::string>{"init:a", "init:b", "finish:a", "finish:b"}));
 }
 
+// Type-erased ownership must preserve the original derived pointer and the
+// observation cross-cast, including a virtual TickableUnit base.
+void virtualUnitRegistration() {
+    class VirtualUnit : public virtual TickableUnit, public ObservableUnit {
+    public:
+        VirtualUnit() : TickableUnit("virtual") {}
+        void tick() override { CHECK(getObserveCycle() == localCycle()); }
+    };
+    TickSimulation sim(config());
+    auto* unit = sim.createUnit<VirtualUnit>();
+    CHECK(sim.getUnit<VirtualUnit>("virtual") == unit);
+    CHECK(unit->id() == 0);
+    sim.run(3);
+    CHECK(unit->getObserveCycle() == 3);
+    sim.finalize();
+    CHECK(unit->state() == UnitState::Finalized);
+}
+
 void lifecycleFailures() {
     std::vector<std::string> events;
     {
@@ -401,6 +419,7 @@ simulation:
 }  // namespace
 
 int main() {
+    virtualUnitRegistration();
     lifecycle(1);
     lifecycle(4);
     lifecycleFailures();

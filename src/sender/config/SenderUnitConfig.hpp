@@ -39,7 +39,7 @@ struct UnitConfig {
  * @brief Directional connection from an OutPort to an InPort.
  *
  * Paths use dot notation ("unit_name.port_name" or "parent.child.port_name").
- * delay=0 means tight coupling / INLINE.
+ * delay=0 permits same-cycle delivery; queue selection depends on topology.
  */
 struct PortConnectionSpec {
     std::string source_path;
@@ -58,7 +58,8 @@ struct PortConnectionSpec {
  * @code{.yaml}
  * simulation:
  *   num_workers: 4
- *   epoch_size: 64
+ *   execution_policy: auto
+ *   polling_interval_cycles: 64
  *   unit:
  *     fetch:
  *       type: FetchUnit
@@ -116,7 +117,6 @@ struct SimulationYAMLConfig {
     TickSimulationConfig toRuntimeConfig() const {
         TickSimulationConfig result;
         result.num_threads = num_workers;
-        result.enable_parallel = enable_parallel;
         result.enable_lookahead = enable_lookahead;
         result.trace_execution = trace_execution;
         result.max_lookahead_cycles = max_lookahead_cycles;

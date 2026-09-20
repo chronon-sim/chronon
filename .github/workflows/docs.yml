@@ -5,12 +5,18 @@ on:
     branches: [main]
     paths:
       - 'website/**'
+      - 'README.md'
+      - 'examples/quickstart.cpp'
+      - 'scripts/sync_quickstart.py'
       - 'src/**/*.hpp'
       - 'Doxyfile'
       - '.github/workflows/docs.yml'
   pull_request:
     paths:
       - 'website/**'
+      - 'README.md'
+      - 'examples/quickstart.cpp'
+      - 'scripts/sync_quickstart.py'
       - 'src/**/*.hpp'
       - 'Doxyfile'
       - '.github/workflows/docs.yml'
@@ -26,6 +32,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify shared quickstart
+        run: python3 scripts/sync_quickstart.py --check
 
       - name: Install Doxygen
         run: |

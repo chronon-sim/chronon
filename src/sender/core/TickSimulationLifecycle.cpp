@@ -46,9 +46,37 @@ TickSimulation::~TickSimulation() {
     freeThreadProgressArray();
 }
 
+void TickSimulation::requireConfigurable_(const char* message) const {
+    if (initialization_started_ || finalized_) throw std::logic_error(message);
+}
+
+void TickSimulation::validateUnitOwner_(const Unit* unit) const {
+    for (const auto& owned : units_)
+        if (owned.get() == unit) return;
+    throw std::invalid_argument("clock endpoint must belong to this simulation");
+}
+
+void TickSimulation::adoptUnit_(std::unique_ptr<TickableUnit> unit) {
+    auto* ptr = unit.get();
+    if (auto* observable = dynamic_cast<observe::ObservableUnit*>(ptr)) {
+        observable->observe_cycle_ = &ptr->local_cycle_;
+    }
+    ptr->clock_ = &default_clock_;
+    ptr->setId(static_cast<uint32_t>(units_.size()));
+    ptr->bindActivitySchedulingState_(&any_activity_scheduling_);
+    units_.push_back(std::move(unit));
+    try {
+        unit_ptrs_.push_back(ptr);
+    } catch (...) {
+        // The caller may own constructor arguments; do not retain a unit if
+        // registration fails and the caller's scope unwinds.
+        units_.pop_back();
+        throw;
+    }
+}
+
 void TickSimulation::configureObservation(const observe::ObservationYAMLConfig& config) {
-    if (initialization_started_ || finalized_)
-        throw std::logic_error("configure observation before simulation initialization");
+    requireConfigurable_("configure observation before simulation initialization");
     if (clock_mode_) throw std::logic_error("multiclock observation requires configureClockTrace");
     observe::ObservationManager::instance().acquireSession(config, this);
 }
@@ -64,18 +92,16 @@ const PortDirectory& TickSimulation::portDirectory() const {
 }
 
 void TickSimulation::bindTreeNode(Unit& unit, tree::TreeNode& node) {
-    if (initialization_started_ || finalized_)
-        throw std::logic_error("cannot bind unit tree after initialization has started");
-    validateClockOwner_(&unit);
+    requireConfigurable_("cannot bind unit tree after initialization has started");
+    validateUnitOwner_(&unit);
     unit.setTreeNode(&node, portDirectory());
 }
 
 void TickSimulation::registerConnection(ConnectionBase* connection) {
-    if (initialization_started_ || finalized_)
-        throw std::logic_error("runtime connection registration is unsupported");
+    requireConfigurable_("runtime connection registration is unsupported");
     if (!connection) return;
-    validateClockOwner_(connection->source());
-    validateClockOwner_(connection->destination());
+    validateUnitOwner_(connection->source());
+    validateUnitOwner_(connection->destination());
     if (std::find(connections_.begin(), connections_.end(), connection) != connections_.end())
         throw std::invalid_argument("connection is already registered");
     connection->setConnId(static_cast<uint32_t>(connections_.size()));
@@ -100,9 +126,8 @@ void TickSimulation::finalize() {
 }
 
 void TickSimulation::setUnitName(Unit& unit, std::string name) {
-    if (initialization_started_ || finalized_)
-        throw std::logic_error("cannot rename units after initialization has started");
-    validateClockOwner_(&unit);
+    requireConfigurable_("cannot rename units after initialization has started");
+    validateUnitOwner_(&unit);
     if (name.empty()) throw std::invalid_argument("unit instance name must not be empty");
     if (unit.treeNode()) throw std::logic_error("cannot rename a unit after tree binding");
     unit.setInstanceName_(std::move(name));

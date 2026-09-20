@@ -5,7 +5,7 @@ PROJECT_BRIEF          = "High-Performance Tick-Based Simulation Framework"
 PROJECT_NUMBER         = ""
 OUTPUT_DIRECTORY       = build/doxygen
 
-# Input sources: public API + key internals
+# Public model and extension interfaces; implementation headers remain installed.
 INPUT                  = src/chronon \
                          src/sender/core \
                          src/sender/port \
@@ -18,7 +18,12 @@ INPUT                  = src/chronon \
                          src/tree
 RECURSIVE              = NO
 FILE_PATTERNS          = *.hpp
-EXCLUDE_PATTERNS       = */detail/* */internal/*
+EXCLUDE_PATTERNS       = */detail/* */internal/* \
+                         */TickSimulationClockRuntime.hpp \
+                         */TickSimulationCycleUtils.hpp \
+                         */TickSimulationDescriptors.hpp \
+                         */DynamicWaitPolicy.hpp \
+                         */Fwd.hpp
 
 # Extraction settings
 EXTRACT_ALL            = YES

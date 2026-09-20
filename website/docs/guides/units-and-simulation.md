@@ -17,7 +17,6 @@ public:
     virtual bool isCompleted() const { return false; }  // Optional completion signal
 
     uint64_t localCycle() const;                    // Current local cycle
-    void executeTick() { tick(); advanceLocalCycle(); }  // Called by simulation
 };
 ```
 
@@ -32,10 +31,7 @@ public:
     FetchUnit() : TickableUnit("fetch") {}
 
     void tick() override {
-        if (out.canSend()) {
-            Instruction inst{.pc = pc_++};
-            out.send(inst);
-        }
+        if (out.send(Instruction{.pc = pc_})) ++pc_;
     }
 
     bool isCompleted() const override { return pc_ >= 1000000; }
@@ -77,89 +73,44 @@ private:
 
 The simulation driver using stdexec for parallel execution.
 
-```cpp
-struct TickSimulationConfig {
-    size_t num_threads = std::thread::hardware_concurrency();
-    bool enable_parallel = true;
-    bool enable_lookahead = true;
-    // Lookahead uses per-cluster progress atomics and direct MPSC lanes.
-    // Placement is always cluster-aware: when there are no
-    // tight (delay=0) edges every unit becomes its own single-member cluster.
-    uint32_t max_lookahead_cycles = 100;     // Upper bound for per-unit lookahead window
-    uint64_t epoch_size = 64;                // Host predicate / Sequential poll interval
-    bool enable_epoch_free_lookahead = true; // False forces Sequential
-    bool trace_execution = false;            // Print execution policy details
-
-    // Cluster-aware partitioning
-    bool enable_weighted_partitioning = true;
-    PartitionSolverType partition_solver = PartitionSolverType::SA;
-    double initial_partition_sync_cost_ns = 8.0;  // Locality weight for placement
-
-    // Dynamic rebalancing
-    bool enable_dynamic_rebalance = true;
-    double rebalance_imbalance_threshold = 1.03;
-    uint64_t rebalance_check_interval_cycles = 2048;
-    double rebalance_min_gain = 0.01;
-    uint64_t rebalance_cooldown_cycles = 0;
-};
-
-class TickSimulation {
-public:
-    explicit TickSimulation(const TickSimulationConfig& config = {});
-
-    template<typename UnitT, typename... Args>
-    UnitT* createUnit(Args&&... args);
-
-    template<typename T>
-    void connect(OutPort<T>& from, InPort<T>& to, uint32_t delay = 1);
-
-    // Register externally-created connections (e.g. from YAML-driven builders)
-    void registerConnection(ConnectionBase* conn);
-
-    void initialize();
-    uint64_t run(uint64_t cycles);
-    uint64_t runUntilComplete(uint64_t max_cycles = UINT64_MAX);
-    uint64_t runUntilTermination(uint64_t max_cycles = UINT64_MAX);
-};
-```
-
-### Basic Usage
+Use the model header and the canonical execution settings:
 
 ```cpp
+#include "chronon/Simulation.hpp"
+using namespace chronon;
+
 TickSimulationConfig config;
 config.num_threads = 8;
-config.enable_parallel = true;
-
-TickSimulation sim(config);
-
-auto* fetch = sim.createUnit<FetchUnit>();
-auto* decode = sim.createUnit<DecodeUnit>();
-
-sim.connect(fetch->out, decode->in, 1);
-
-sim.initialize();
-sim.run(1000000);  // ~90+ Mcycles/sec
+config.setExecutionPolicy(ExecutionPolicy::Auto);
+config.setPollingIntervalCycles(64);
 ```
+
+`Auto` requests parallel execution where topology and safety allow it.
+`Sequential` forces the reference path. The polling interval controls host
+predicates and sequential termination checks; it does not create execution epochs.
+Set the worker count explicitly when comparing C++ and YAML models.
+
+| Operation | Purpose |
+|---|---|
+| `createUnit<T>(...)` and `connect(...)` | Construct the model before initialization |
+| `initialize()` | Validate topology and select the execution path |
+| `run(cycles)` | Advance a bounded number of additional cycles |
+| `runUntilComplete(limit)` | Advance until every unit reports completion |
+| `runUntilTermination(limit)` | Advance until a unit requests termination |
+| `finalize()` | End the session and report finalizer errors |
+
+See the [compiled quickstart](../intro) for a complete program and the
+[API reference](/docs/api/) for signatures. Registration, placement inspection
+and queue integration methods are advanced adapter APIs, outside the basic model
+workflow. Compatibility spellings are listed in [API contracts](api-contracts).
 
 ## Unit-Initiated Termination
 
 Units can request simulation termination with rich context.
 
-### Termination API
-
-```cpp
-class TickableUnit {
-protected:
-    // Primary API
-    void requestTermination(TerminationReason reason,
-                           int32_t exit_code = 0,
-                           std::string_view message = "");
-
-    // Convenience methods
-    void requestExitSyscall(int32_t exit_code);
-    void requestError(std::string_view message);
-};
-```
+Inside `tick()`, use `requestTermination(reason, exit_code, message)`,
+`requestExitSyscall(exit_code)` or `requestError(message)`. The simulation records
+the requesting unit and cycle; callers inspect the result after the run returns.
 
 ### Termination Reasons
 
@@ -203,7 +154,9 @@ if (sim.wasTerminationRequested()) {
 
 ### Multi-Run Scenarios
 
-For running multiple simulations in sequence, reset termination state between runs:
+To continue the same simulation after a termination request, reset its termination
+controller and stop source together. This does not reset model state or reopen a
+finalized simulation:
 
 ```cpp
 TickSimulation sim(config);
@@ -213,19 +166,15 @@ TickSimulation sim(config);
 uint64_t cycles1 = sim.runUntilTermination(1000000);
 
 // Reset termination state for next run
-sim.terminationController().reset();
+sim.resetTermination();
 
 // Second run
 uint64_t cycles2 = sim.runUntilTermination(1000000);
 ```
 
-### Performance
-
-| Path | Overhead |
-|------|----------|
-| Hot path (per epoch) | ~1-2ns (single atomic load) |
-| Per cycle (amortized) | ~0.02ns (checked every ~64 cycles) |
-| Termination request | ~80ns (mutex-protected, happens once) |
+Termination is observed at scheduler boundaries; parallel execution also
+propagates the stop token into dependency waits. Polling and multiclock boundaries
+are described in [API contracts](api-contracts).
 
 ## Crash Handling
 
@@ -283,15 +232,6 @@ chronon::sender::CrashHandler::emergencyFlush();
 ```
 
 This calls `ThreadContextManager::flushAll()` to commit per-thread queues, then `ObservationManager::stopBackend()` to drain and flush output files. `SimulationApp` calls this automatically in all exception handlers.
-
-### Performance Impact
-
-| Component | Overhead |
-|-----------|----------|
-| Thread-local context store (per tick) | ~1ns (one `fs:`-relative mov on x86-64) |
-| try-catch (sequential, non-exception path) | Zero (Itanium zero-cost exception ABI) |
-| try-catch (parallel, per lambda) | Zero per iteration (adds exception table entries only) |
-| Signal handler installation | One-time at startup |
 
 ## Lifecycle Hooks
 

@@ -4,11 +4,11 @@
 
 Chronon is a fast, multithreaded simulation framework designed for CPU microarchitecture modeling. Named after the hypothetical quantum of time, Chronon provides the building blocks for cycle-accurate simulation with automatic parallelization support.
 
-Built on C++20 and the sender/receiver pattern from C++26 stdexec (P2300).
+Written in C++20; stdexec powers parallel execution. See the [performance guide](website/docs/guides/performance.md) for workload-specific measurements.
 
 ## Features
 
-- **Tick-Based Architecture**: State machine `tick()` execution with stdexec parallel execution (~90+ Mcycles/sec)
+- **Tick-Based Architecture**: Model each unit as a synchronous `tick()` state machine
 - **Sender-Based Scheduling**: Modern sender/receiver pattern for parallel execution
 - **Hierarchical Tree Structure**: Organize simulation units in a flexible tree hierarchy
 - **Automatic Port System**: Automatic port registration with connection delays, backpressure, and queue optimization
@@ -17,6 +17,62 @@ Built on C++20 and the sender/receiver pattern from C++26 stdexec (P2300).
 - **YAML Configuration**: Factory-driven unit instantiation from configuration files
 - **SimulationApp**: Unified entry point with built-in CLI, YAML overrides, and observation lifecycle
 - **Pipeline Utilities**: StageReg, SingleStageReg, and StagePipeline for efficient pipeline modeling
+
+## Basic Usage
+
+<!-- quickstart:begin -->
+```cpp
+#include "chronon/Simulation.hpp"
+
+using namespace chronon;
+
+class Producer : public TickableUnit {
+public:
+    OutPort<int> out{this, "out", SendRate{1}};
+
+    Producer() : TickableUnit("producer") {}
+
+    void tick() override {
+        if (next_ < 100 && out.send(next_)) ++next_;
+    }
+
+private:
+    int next_ = 0;
+};
+
+class Consumer : public TickableUnit {
+public:
+    InPort<int> in{this, "in", QueueDepth{16}};
+    int sum = 0;
+
+    Consumer() : TickableUnit("consumer") {}
+
+    void tick() override {
+        if (auto value = in.tryReceive()) sum += *value;
+    }
+};
+
+int main() {
+    TickSimulationConfig config;
+    config.num_threads = 2;
+    config.setExecutionPolicy(ExecutionPolicy::Auto);
+
+    TickSimulation sim(config);
+    auto* producer = sim.createUnit<Producer>();
+    auto* consumer = sim.createUnit<Consumer>();
+    sim.connect(producer->out, consumer->in, 1);
+
+    sim.initialize();
+    sim.run(101);
+    sim.finalize();
+    return consumer->sum == 4950 ? 0 : 1;
+}
+```
+<!-- quickstart:end -->
+
+The example is maintained in [`examples/quickstart.cpp`](examples/quickstart.cpp) and checked by CTest.
+Use `chronon/Simulation.hpp` for model code, `chronon/Observation.hpp` for counters and traces,
+and `chronon/Application.hpp` for YAML applications. `chronon/Chronon.hpp` remains the full umbrella.
 
 ## Quick Start
 
@@ -88,76 +144,12 @@ does not search automatically, set `chronon_DIR` to
 `<prefix>/<libdir>/cmake/stdexec`. System dependencies (yaml-cpp, fmt, zlib and
 threads) must also be available to the consumer.
 
-## Basic Usage
-
-```cpp
-#include "chronon/Chronon.hpp"
-
-using namespace chronon;
-
-// Define observability categories (auto-assigned bit positions)
-inline const auto DATA_FLOW = Category<"data_flow", "Data flow events">{};
-
-class Producer : public TickableUnit, public ObservableUnit {
-public:
-    OutPort<int> out{this, "out", SendRate{1}};
-
-    Producer() : TickableUnit("producer") {}
-
-    bool isCompleted() const override { return value_ >= 1000; }
-
-    void tick() override {
-        if (out.send(value_)) {
-            ++produced_;
-            event<"produced">(DATA_FLOW, arg<"value">(value_));
-            ++value_;
-        }
-    }
-
-private:
-    EventCounter produced_{this, "produced", "Items produced"};
-    int value_ = 0;
-};
-
-class Consumer : public TickableUnit, public ObservableUnit {
-public:
-    InPort<int> in{this, "in", QueueDepth{16}};
-
-    Consumer() : TickableUnit("consumer") {}
-
-    void tick() override {
-        if (auto value = in.tryReceive()) {
-            ++consumed_;
-            debug<"Consumed: {}">(*value);
-        }
-    }
-
-private:
-    EventCounter consumed_{this, "consumed", "Items consumed"};
-};
-
-int main() {
-    TickSimulationConfig config;
-    config.num_threads = 8;
-    config.setExecutionPolicy(ExecutionPolicy::Auto);
-
-    TickSimulation sim(config);
-    auto* producer = sim.createUnit<Producer>();
-    auto* consumer = sim.createUnit<Consumer>();
-    sim.connect(producer->out, consumer->in, 1);
-
-    sim.initialize();
-    sim.run(2000);
-    sim.finalize();
-}
-```
-
 ## YAML-Driven Simulation with SimulationApp
 
 For YAML-driven simulations, use `SimulationApp` for a minimal entry point with full CLI support:
 
 ```cpp
-#include "chronon/Chronon.hpp"
+#include "chronon/Application.hpp"
 
 int main(int argc, char* argv[]) {
     return chronon::SimulationApp("CPU Pipeline Simulator")
@@ -178,27 +170,14 @@ This provides automatic CLI support:
 
 ## Project Structure
 
-```
-chronon/
-├── src/
-│   ├── chronon/        # Public API headers (single include point)
-│   │   └── Chronon.hpp # Master include - all you need!
-│   ├── sender/         # Core sender-based framework
-│   │   ├── core/       # Unit, TickableUnit, TickSimulation
-│   │   ├── port/       # Port system (OutPort, InPort, Connection)
-│   │   ├── schedule/   # DependencyGraph, CycleAnalyzer, partitioners, profiling
-│   │   ├── app/        # SimulationApp (unified entry point with CLI)
-│   │   ├── config/     # SenderConfigLoader, SenderSimulationBuilder
-│   │   ├── factory/    # Factory pattern for YAML-driven instantiation
-│   │   └── util/       # Utilities (Graph, StageReg, SingleStageReg, StagePipeline)
-│   ├── observe/        # Unified observability with macro-free API
-│   ├── tree/           # TreeNode hierarchy for component organization
-│   ├── params/         # Self-registering parameter system
-│   └── tools/          # Trace reader and framework tools
-├── examples/           # Example simulations
-├── test/               # Unit tests
-└── website/docs/       # Docusaurus documentation
-```
+| Location | Responsibility |
+|---|---|
+| `src/chronon/` | Supported entry headers |
+| `src/sender/` | Simulation runtime, ports, configuration and modeling utilities |
+| `src/observe/` | Counters, traces and logs |
+| `src/tree/`, `src/params/`, `src/time/` | Model hierarchy, parameters and clocks |
+| `examples/`, `test/` | Executable models and regression coverage |
+| `website/docs/` | Guides and generated API reference |
 
 ## Documentation
 

@@ -82,12 +82,15 @@ int main(int argc, char* argv[]) {
 
     TickSimulationConfig config;
     config.num_threads = (num_threads > 0) ? num_threads : std::thread::hardware_concurrency();
-    config.enable_parallel = config.num_threads > 1 && !force_sequential;
-    config.epoch_size = 1024;
+    config.setExecutionPolicy(config.num_threads > 1 && !force_sequential
+                                  ? ExecutionPolicy::Auto
+                                  : ExecutionPolicy::Sequential);
+    config.setPollingIntervalCycles(1024);
 
     std::cout << "Configuration:\n";
     std::cout << "  Threads:    " << config.num_threads << "\n";
-    std::cout << "  Scheduler:  " << (config.enable_parallel ? "epoch-free" : "sequential")
+    std::cout << "  Scheduler:  "
+              << (config.executionPolicy() == ExecutionPolicy::Auto ? "auto" : "sequential")
               << "\n\n";
 
     TickSimulation sim(config);
