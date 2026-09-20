@@ -573,6 +573,8 @@ dependency waits. Services have no simulated clock, dependency edges or
 lookahead frontier. A registration serializes consumers with a nonblocking
 claim; producer assistance uses the same registration when a synchronous tick
 fills its queue. Records remain owned copies, including after worker migration.
+Dynamic scheduling cost samples exclude time spent executing host-service polls,
+including producer assistance inside native-clock bridge begin/commit intervals.
 
 Each ordinary-backend poll copies at most 256 records / 256 KiB into a preallocated
 handoff buffer. A native-clock poll copies at most 256 fixed-size records and

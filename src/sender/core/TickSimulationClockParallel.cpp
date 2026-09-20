@@ -239,8 +239,9 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     return false;
                 }
             }
-            SchedulerTimelineTrace::TimePoint begin{};
-            if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
+            // Producer assistance may drain observations inside commit/endEdge.
+            // Use the same net host-time accounting as unit and profile samples.
+            detail::ClockProfileScope sample(bridge.sample ? &bridge.sample_ns : nullptr);
             {
                 detail::ClockProfileScope commit_profile(profile ? &profile->bridge_ns : nullptr);
                 // Commit EVERY lane before publishing completion or allowing
@@ -259,11 +260,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     endpoint.completed.store(endpoint.next, std::memory_order_release);
                 }
             }
+            sample.finish();
             if (bridge.sample) {
-                bridge.sample_ns +=
-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                              SchedulerTimelineTrace::Clock::now() - begin)
-                                              .count());
                 cluster_sample_time_ns_[actor].fetch_add(bridge.sample_ns,
                                                          std::memory_order_relaxed);
                 cluster_sample_count_[actor].fetch_add(bridge.edge_count,
@@ -295,8 +293,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         }
         bridge.sample = Dynamic && detail::shouldSampleDynamicTick(
                                        cycle, dynamic_cluster_last_tick_sample_cycle_[actor]);
-        SchedulerTimelineTrace::TimePoint begin{};
-        if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
+        if (bridge.sample) bridge.sample_ns = 0;
+        detail::ClockProfileScope sample(bridge.sample ? &bridge.sample_ns : nullptr);
         {
             detail::ClockProfileScope begin_profile(profile ? &profile->bridge_ns : nullptr);
             // All lanes snapshot old state before either endpoint cluster is
@@ -304,12 +302,9 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             for (auto& lane : bridge.lanes)
                 lane.circuit->begin(std::span(bridge.edges.data(), bridge.edge_count));
         }
+        sample.finish();
         if (bridge.sample) {
             dynamic_cluster_last_tick_sample_cycle_[actor] = cycle;
-            bridge.sample_ns =
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          SchedulerTimelineTrace::Clock::now() - begin)
-                                          .count());
         }
         for (size_t side = 0; side < 2; ++side) {
             auto& endpoint = bridge.endpoints[side];

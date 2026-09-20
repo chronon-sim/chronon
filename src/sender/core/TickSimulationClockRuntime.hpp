@@ -52,7 +52,8 @@ struct TickSimulation::ClockParallelRuntime {
         size_t edge_count = 0;
         std::atomic<uint64_t> completed{0};  // Committed merged-edge transactions.
         bool sample = false;
-        uint64_t sample_ns = 0;  // begin + commit execution time, excluding dependency waits.
+        // begin + commit execution time, excluding dependency waits and host-service polls.
+        uint64_t sample_ns = 0;
     };
     struct BatchEdge {
         Domain* domain;
