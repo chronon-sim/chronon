@@ -143,16 +143,33 @@ remain specialized on the existing tick path. The core still links observation
 support and exposes some adapter types for compatibility; these are not a
 promise of interchangeable backends or a stable binary layout.
 
-PR validation compares immutable baseline and candidate commits using identical
-workloads, compiler settings, seeds and CPU affinity. State digests must match
-on every repetition, including calibration pairs. Calibration rechecks scaled
-workloads for up to five rounds and retains each round's durations and state
-comparison. The billion-cycle measurement cap is recorded explicitly when it
-limits the two-second target. Each performance scenario must independently establish
-throughput at least 99% of baseline. There are at most two predeclared looks:
+PR validation builds immutable baseline and candidate commits once, then divides
+all 29 scenarios across six independent runners. Each runner uses two physical
+CPUs and compares baseline/candidate on that same machine; measurements never
+compete with another shard. The final `differential-performance` check requires
+every job to succeed and every scenario exactly once. A missing, cancelled,
+incomplete or failed shard cannot become a successful aggregate.
+
+Byte-identical executables with identical resolved dynamic-library paths and
+hashes establish unchanged benchmark code. These scenarios still run two pairs
+of fresh processes and compare all state digests. Artifacts label this evidence
+`binary-identity`; they contain no invented timing confidence bound. Unknown
+library resolution or loader hooks disable this optimization. Use the manual
+workflow's `force_measurement` option to exercise full timing even for identical
+runtimes.
+
+Changed runtimes use identical workloads, compiler settings, seeds and CPU
+affinity. State digests must match on every repetition, including calibration
+pairs. Calibration rechecks scaled workloads for up to five rounds and records
+when the billion-cycle cap limits the two-second target. Each performance
+scenario must independently establish throughput at least 99% of baseline:
 51 paired runs initially, and a fixed total of 201 only if the initial interval
 is uncertain. Both looks use a one-sided 97.5% lower bound, sharing a nominal
 5% false-acceptance budget. The second look retains all first-look samples;
-clear regressions and uncertainty at the cap fail. Raw samples, both decisions,
-executable hashes and test logs are retained as Actions artifacts. Passing the finite test matrix establishes the
-tested workloads' contract, not a universal performance claim for all models.
+clear regressions and uncertainty at the cap fail.
+
+Raw runs, decisions, runtime hashes and build settings are retained per shard;
+the aggregate artifact includes the complete matrix and all shard evidence.
+Correctness test logs are retained separately. Passing this finite matrix
+establishes the tested workloads' contract, not a universal performance claim
+for all models.

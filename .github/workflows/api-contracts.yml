@@ -18,6 +18,10 @@ on:
         description: Immutable baseline commit SHA
         required: true
         default: '8563cea58fb0d84306c3252be1fd68044c07afbc'
+      force_measurement:
+        description: Measure even byte-identical runtimes (validate the full timing path)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -27,9 +31,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  differential-performance:
+  prepare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 30
+    outputs:
+      base: ${{ steps.commits.outputs.base }}
+      head: ${{ steps.commits.outputs.head }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,6 +46,11 @@ jobs:
         with:
           path: baseline
           ref: ${{ github.event.pull_request.base.sha || inputs.base }}
+      - name: Record exact commits
+        id: commits
+        run: |
+          echo "base=$(git -C baseline rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "head=$(git -C candidate rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Install identical build dependencies
         run: |
           sudo apt-get update
@@ -74,19 +86,103 @@ jobs:
       - name: Run Release correctness and deterministic equivalence tests
         run: ctest --test-dir candidate/build-perf --output-on-failure --parallel 4
       - name: Validate performance gate logic
-        run: python3 -m unittest discover -s candidate/test/scripts -p 'test_api_performance.py'
-      - name: Enforce per-scenario 1 percent throughput limit
+        run: python3 -m unittest discover -s candidate/test/scripts -p 'test_api_performance*.py'
+      - name: Package the measured executables once
         run: |
-          python3 candidate/scripts/check_api_performance.py \
-            baseline/build-perf candidate/build-perf performance-results \
-            --base-sha "$(git -C baseline rev-parse HEAD)" \
-            --head-sha "$(git -C candidate rev-parse HEAD)"
-      - name: Retain exact commits, raw runs, statistics and test diagnostics
+          files=()
+          for variant in baseline candidate; do
+            files+=("$variant/build-perf/CMakeCache.txt")
+            for binary in chronon_single_clock_regression_benchmark \
+                chronon_scheduler_invocation_benchmark chronon_representative_workload_benchmark; do
+              files+=("$variant/build-perf/benchmark/$binary")
+            done
+          done
+          tar -czf performance-builds.tar.gz "${files[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: performance-builds
+          path: performance-builds.tar.gz
+          compression-level: 0
+          retention-days: 7
+      - name: Retain correctness diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
+          name: api-contracts-tests
+          path: candidate/build-perf/Testing/Temporary/
+          retention-days: 30
+
+  measure:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.head }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: performance-builds
+      - name: Restore executables and runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libyaml-cpp-dev libfmt-dev zlib1g-dev
+          tar -xzf performance-builds.tar.gz
+      - name: Enforce unchanged acceptance rules on an independent runner
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base }}
+          HEAD_SHA: ${{ needs.prepare.outputs.head }}
+          SHARD: ${{ matrix.shard }}
+          FORCE_MEASUREMENT: ${{ inputs.force_measurement }}
+        run: |
+          extra=()
+          if [[ "$FORCE_MEASUREMENT" == "true" ]]; then extra+=(--force-measurement); fi
+          python3 scripts/check_api_performance.py \
+            baseline/build-perf candidate/build-perf performance-results \
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            --workers 2 --shard-index "$SHARD" --shard-count 6 "${extra[@]}"
+      - name: Retain this shard's raw evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-performance-${{ matrix.shard }}
+          path: performance-results/
+          if-no-files-found: error
+          retention-days: 30
+
+  differential-performance:
+    if: always()
+    needs: [prepare, measure]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Require every build and measurement job to succeed
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          MEASURE_RESULT: ${{ needs.measure.result }}
+        run: test "$PREPARE_RESULT" = success && test "$MEASURE_RESULT" = success
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.head }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: api-performance-*
+          path: performance-results/shards
+      - name: Require all 29 scenarios exactly once
+        env:
+          BASE_SHA: ${{ needs.prepare.outputs.base }}
+          HEAD_SHA: ${{ needs.prepare.outputs.head }}
+        run: |
+          python3 scripts/collect_api_performance.py \
+            performance-results/shards performance-results \
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --shards 6 --workers 2
+      - uses: actions/upload-artifact@v4
+        with:
           name: api-contracts-validation
-          path: |
-            performance-results/
-            candidate/build-perf/Testing/Temporary/
+          path: performance-results/
+          if-no-files-found: error
           retention-days: 30

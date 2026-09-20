@@ -7,7 +7,9 @@ Run identical baseline/candidate binaries in interleaved fresh processes on the
 same physical CPU set. Each case has at most two predeclared looks, each with a
 one-sided 97.5% lower confidence bound >= 0.99 (a nominal 5% false acceptance budget
 across both looks). Uncertain first looks extend to a fixed maximum using ALL
-samples. Preserve outliers. Do not build or run tests concurrently.
+samples. Preserve outliers. Do not build or run tests concurrently. Byte-identical
+executables with identical resolved libraries use deterministic checks instead of
+re-measuring unchanged code. Shards run on separate machines, never competing CPUs.
 """
 
 from __future__ import annotations
@@ -168,6 +170,41 @@ def parse(case: dict, output: str) -> tuple[float, dict]:
     return seconds, state
 
 
+def runtime_identity(builds: dict, binaries: dict) -> dict | None:
+    """Prove identical executable bytes and resolved dynamic-library closure.
+
+    Unknown loader output or loader hooks disable this optimization; the ordinary
+    statistical gate remains the fallback. No source/path-based skip is allowed.
+    """
+    if binaries["baseline"] != binaries["candidate"] or any(
+            os.environ.get(key) for key in ("LD_PRELOAD", "LD_AUDIT")):
+        return None
+    libraries = {}
+    try:
+        for variant, build in builds.items():
+            libraries[variant] = {}
+            for name in binaries[variant]:
+                output = subprocess.check_output(
+                    ["ldd", str(build / "benchmark" / name)], text=True,
+                    stderr=subprocess.STDOUT)
+                closure = {}
+                for line in output.splitlines():
+                    line = line.strip()
+                    if line.startswith("linux-vdso."):
+                        continue
+                    path = line.split("=>", 1)[-1].strip().split()[0]
+                    if not path.startswith("/"):
+                        return None
+                    library = Path(path).resolve(strict=True)
+                    closure[str(library)] = hashlib.sha256(library.read_bytes()).hexdigest()
+                if not closure:
+                    return None
+                libraries[variant][name] = closure
+    except (OSError, ValueError, IndexError, subprocess.CalledProcessError):
+        return None
+    return libraries if libraries["baseline"] == libraries["candidate"] else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline", type=Path)
@@ -181,6 +218,12 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=2.0)
     parser.add_argument("--cpus", help="homogeneous physical CPU IDs; default first four physical cores")
     parser.add_argument("--case", action="append", help="exact case names for diagnosis; never a full gate")
+    parser.add_argument("--workers", type=int, choices=(2, 4),
+                        help="fix parallel coverage across runners; requires enough physical CPUs")
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--force-measurement", action="store_true",
+                        help="measure even identical runtime bytes (e.g. validating CI sharding)")
     args = parser.parse_args()
     if args.repeats < 15 or args.seconds < 0.25:
         parser.error("at least 15 pairs and 0.25 seconds per sample are required")
@@ -189,7 +232,17 @@ def main() -> int:
     cpus = list(map(int, args.cpus.split(","))) if args.cpus else physical_cpus()
     if len(cpus) < 2 or len(set(cpus)) != len(cpus) or not set(cpus) <= os.sched_getaffinity(0):
         parser.error("at least two distinct allowed physical CPUs are required")
-    matrix = cases(min(4, len(cpus)))
+    if args.workers:
+        if args.workers > len(cpus):
+            parser.error("not enough physical CPUs for requested workers")
+        cpus = cpus[:args.workers]
+    workers = min(4, len(cpus))
+    matrix = cases(workers)
+    if not 0 <= args.shard_index < args.shard_count <= len(matrix):
+        parser.error("invalid shard index/count")
+    if args.case and args.shard_count != 1:
+        parser.error("diagnostic case selection cannot be combined with sharding")
+    matrix = matrix[args.shard_index::args.shard_count]
     if args.case:
         requested = set(args.case)
         matrix = [case for case in matrix if case["name"] in requested]
@@ -201,7 +254,10 @@ def main() -> int:
                 "cpus": cpus, "repeats": args.repeats, "max_repeats": args.max_repeats,
                 "minimum_speedup": MIN_SPEEDUP, "per_look_confidence": LOOK_CONFIDENCE,
                 "maximum_looks": 2, "false_acceptance_budget": 0.05,
-                "target_seconds": args.seconds, "complete_matrix": not args.case,
+                "target_seconds": args.seconds,
+                "complete_matrix": not args.case and args.shard_count == 1,
+                "workers": workers, "shard_index": args.shard_index,
+                "shard_count": args.shard_count, "forced_measurement": args.force_measurement,
                 "case_order": [case["name"] for case in matrix],
                 "maximum_calibration_rounds": MAX_CALIBRATION_ROUNDS,
                 "calibration_cycle_cap": MAX_CYCLES,
@@ -212,6 +268,10 @@ def main() -> int:
             binary = build / "benchmark" / name
             metadata["binaries"][variant][name] = hashlib.sha256(binary.read_bytes()).hexdigest()
         metadata[variant + "_cache"] = (build / "CMakeCache.txt").read_text()
+    identity = None if args.force_measurement else runtime_identity(builds, metadata["binaries"])
+    method = "binary-identity" if identity else "paired-bootstrap"
+    metadata.update(acceptance_method=method, runtime_identity=identity)
+    (args.output / "cases.json").write_text(json.dumps(matrix, indent=2) + "\n")
     (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     env = os.environ.copy()
     env["CHRONON_BENCH_PIN_WORKERS"] = "1"
@@ -235,12 +295,14 @@ def main() -> int:
             (args.output / f"{case['name']}-calibration.json").write_text(
                 json.dumps(records, indent=2) + "\n")
             (args.output / "cases.json").write_text(json.dumps(matrix, indent=2) + "\n")
-        calibrate(case, args.seconds, run, save_calibration)
+        if not identity:
+            calibrate(case, args.seconds, run, save_calibration)
         reference = None
         pairs = []
         samples = []
         looks = []
-        for target in dict.fromkeys((args.repeats, args.max_repeats)):
+        targets = (2,) if identity else dict.fromkeys((args.repeats, args.max_repeats))
+        for target in targets:
             for repetition in range(len(samples), target):
                 order = list(builds)
                 rng.shuffle(order)
@@ -253,7 +315,11 @@ def main() -> int:
                     pair[variant] = seconds
                 pairs.append(pair)
                 samples.append(pair["baseline"] / pair["candidate"])
-                (args.output / f"{case['name']}-samples.json").write_text(json.dumps(pairs, indent=2) + "\n")
+                suffix = "identity-checks" if identity else "samples"
+                (args.output / f"{case['name']}-{suffix}.json").write_text(
+                    json.dumps(pairs, indent=2) + "\n")
+            if identity:
+                break
             look = confidence(samples)
             looks.append(look)
             (args.output / f"{case['name']}-looks.json").write_text(json.dumps(looks, indent=2) + "\n")
@@ -261,13 +327,17 @@ def main() -> int:
                 break
             print(f"{case['name']}: uncertain at {len(samples)} pairs; "
                   f"extend once to {args.max_repeats}, retaining all samples", flush=True)
-        result = {"case": case, "state": reference, "looks": looks, **looks[-1]}
+        decision = {"pass": True, "sample_count": 0, "determinism_pairs": 2} if identity else looks[-1]
+        result = {"case": case, "state": reference, "looks": looks,
+                  "acceptance_method": method, **decision}
         results.append(result)
         (args.output / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
-        print(f"{case['name']}: median={result['median_speedup']:.5f} "
-              f"lower97.5={result['lower_speedup']:.5f} pairs={result['sample_count']} "
-              f"{'PASS' if result['pass'] else 'FAIL/UNCERTAIN'}",
-              flush=True)
+        if identity:
+            print(f"{case['name']}: identical runtime, 2 deterministic pairs PASS", flush=True)
+        else:
+            print(f"{case['name']}: median={result['median_speedup']:.5f} "
+                  f"lower97.5={result['lower_speedup']:.5f} pairs={result['sample_count']} "
+                  f"{'PASS' if result['pass'] else 'FAIL/UNCERTAIN'}", flush=True)
         # A final negative result already rejects this revision. Return its raw
         # evidence to CI immediately; later cases cannot compensate for it.
         if not result["pass"]:
@@ -275,7 +345,9 @@ def main() -> int:
     complete = len(results) == len(matrix)
     passed = bool(results) and complete and all(result["pass"] for result in results)
     (args.output / "verdict.json").write_text(json.dumps({"pass": passed,
-        "complete_matrix": not args.case and complete,
+        "complete_matrix": not args.case and args.shard_count == 1 and complete,
+        "complete_shard": not args.case and complete,
+        "acceptance_method": method,
         "completed_cases": len(results), "expected_cases": len(matrix),
         "base_sha": args.base_sha, "head_sha": args.head_sha}, indent=2) + "\n")
     return 0 if passed else 1
