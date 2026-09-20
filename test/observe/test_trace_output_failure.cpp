@@ -7,7 +7,8 @@
 #include <csignal>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
+#include <mutex>
+#include <streambuf>
 #include <string>
 #include <thread>
 
@@ -287,6 +288,34 @@ struct AppUnit : chronon::sender::TickableUnit {
     }
 };
 
+// App diagnostics and the I/O lane can report failures concurrently. Redirecting
+// cerr to a plain stringbuf removes the standard stream's synchronized buffer.
+// Keep no put area, so every write goes through one of these locked overrides.
+class SynchronizedCapture : public std::streambuf {
+public:
+    std::string str() const {
+        std::lock_guard lock(mutex_);
+        return text_;
+    }
+
+protected:
+    std::streamsize xsputn(const char* data, std::streamsize count) override {
+        std::lock_guard lock(mutex_);
+        text_.append(data, static_cast<size_t>(count));
+        return count;
+    }
+    int_type overflow(int_type ch) override {
+        std::lock_guard lock(mutex_);
+        if (!traits_type::eq_int_type(ch, traits_type::eof()))
+            text_.push_back(traits_type::to_char_type(ch));
+        return traits_type::not_eof(ch);
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::string text_;
+};
+
 void testApp(const std::filesystem::path& root, bool crash) {
     const auto config_path = root / "config.yaml";
     {
@@ -298,9 +327,9 @@ void testApp(const std::filesystem::path& root, bool crash) {
                << "\n    counters:\n      enabled: false\n      csv_output: false\n"
                   "    timeline:\n      enabled: true\nunits: []\n";
     }
-    std::ostringstream output, errors;
-    auto* old_out = std::cout.rdbuf(output.rdbuf());
-    auto* old_err = std::cerr.rdbuf(errors.rdbuf());
+    SynchronizedCapture output, errors;
+    auto* old_out = std::cout.rdbuf(&output);
+    auto* old_err = std::cerr.rdbuf(&errors);
     bool built = false, completed = false;
     {
         FileSizeLimit limit(1);
