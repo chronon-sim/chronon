@@ -344,3 +344,17 @@ the contract repair, rather than weakening existing equivalence checks.
   executable and record fixed workload arguments, hashes, events and states.
   This workflow-only change does not retry throughput acceptance on the failed
   runtime; normal acceptance still requires a subsequent fix and full matrices.
+- Nucleus diagnostics preserved states and used exactly the failed CI binaries,
+  verified by SHA-256. The profile runner was EPYC 9V74 rather than the failed
+  run's EPYC 7763; its actual event was software CPU-clock. It is diagnostic,
+  not a replacement performance measurement. Local hardware-cycle and CI
+  instruction samples both concentrate near reads of owned cluster progress.
+- Static workers now seed owned progress in their existing private predecessor
+  cache once per invocation and reuse it for sweep/wait eligibility. Static
+  ownership cannot change during that call, and every tick or idle advance
+  already updates both the published atomic and the private copy. Other
+  workers' dependency acquires and all release publications remain unchanged.
+  This avoids repeatedly reading a shared cache line to recover a value only
+  this worker can change. Poisoned-cache and segmented-run regressions cover
+  invocation boundaries. Nucleus parallel now runs first, with all workload
+  definitions and acceptance rules unchanged; final-head validation is required.

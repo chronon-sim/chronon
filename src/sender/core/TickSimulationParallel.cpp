@@ -375,6 +375,14 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     InvocationPredecessorCache predecessor_cache(
         &schedulerScratch_().workers[thread_idx].predecessor, thread_progress_count_);
     uint64_t* const predecessor_cycles = predecessor_cache.data();
+    // Static ownership cannot change during this invocation. Seed our exact
+    // frontiers once, after the preceding invocation joined. Every advance
+    // below updates both the published atomic and this private copy; peers can
+    // only read our progress, so rereading that shared line is unnecessary.
+    for (size_t cluster : clusters) {
+        predecessor_cycles[cluster] =
+            thread_progress_array_[cluster].completed_cycle.load(std::memory_order_relaxed);
+    }
     // A successful dependency check proves every cycle below the minimum
     // acquired predecessor frontier plus its delay. Reuse that lower bound,
     // as dynamic workers do, without changing the order of cluster execution.
@@ -401,7 +409,7 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
 
         for (size_t cluster : clusters) {
             auto& progress = thread_progress_array_[cluster].completed_cycle;
-            uint64_t cycle = progress.load(std::memory_order_relaxed);
+            const uint64_t cycle = predecessor_cycles[cluster];
             if (cycle >= end_cycle) continue;
             all_done = false;
 
@@ -536,8 +544,7 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
             }
             bool any_ready = false;
             for (size_t cluster : clusters) {
-                uint64_t cycle =
-                    thread_progress_array_[cluster].completed_cycle.load(std::memory_order_relaxed);
+                const uint64_t cycle = predecessor_cycles[cluster];
                 if (cycle >= end_cycle) continue;
                 BlockedClusterInfo ignored{};
                 if (clusterCanAdvance_(cluster, cycle, ignored, predecessor_cycles,
