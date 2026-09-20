@@ -20,7 +20,7 @@
 
 namespace chronon::sender {
 
-class TickableUnit;
+class Unit;
 
 namespace detail {
 
@@ -31,7 +31,7 @@ namespace detail {
  * to report which unit crashed.
  */
 struct TickContext {
-    TickableUnit* unit = nullptr;
+    Unit* unit = nullptr;
     uint64_t cycle = 0;
     const char* unit_name = nullptr;  ///< points to Unit's fixed, lifetime-stable crash buffer
     const char* phase = nullptr;      ///< points to a string literal in .rodata
@@ -43,7 +43,7 @@ extern thread_local constinit TickContext current_tick_context_;
 /// exception unwind.
 class TickContextGuard {
 public:
-    TickContextGuard(TickableUnit* unit, uint64_t cycle, const char* unit_name, uint8_t name_len,
+    TickContextGuard(Unit* unit, uint64_t cycle, const char* unit_name, uint8_t name_len,
                      const char* phase) noexcept
         : context_(&current_tick_context_) {
         (void)name_len;

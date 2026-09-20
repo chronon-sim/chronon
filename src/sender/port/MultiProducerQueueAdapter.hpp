@@ -67,6 +67,7 @@ private:
             if (cycle == admission_cycle) return;
             admission_cycle = cycle;
             admitted_this_cycle = 0;
+            ingress_exhausted = false;
         }
 
         [[nodiscard]] bool canAdmit() const noexcept {
@@ -119,6 +120,7 @@ private:
         uint64_t admission_cycle = std::numeric_limits<uint64_t>::max();
         size_t admitted_this_cycle = 0;
         size_t high_water = 0;
+        bool ingress_exhausted = false;
     };
 
 public:
@@ -259,15 +261,16 @@ public:
      * place. Bounded ports visit the head of their receiver-owned shared FIFO.
      * In both cases InPort applies receiver filtering without type erasure.
      */
-    template <typename Visitor>
-    bool consumeReady(uint64_t current_cycle, Visitor&& visitor) {
+    template <typename Visitor, typename Certificate = bool>
+    bool consumeReady(uint64_t current_cycle, Visitor&& visitor,
+                      Certificate ingress_complete = false) {
         if (!shared_fifo_) [[likely]] {
             if (thread_queues_.size() < kFrontierLaneThreshold) {
                 return consumeReadyByScanDirect_(current_cycle, visitor);
             }
             return consumeReadyByFrontierDirect_(current_cycle, visitor);
         }
-        prepareSharedFifo(current_cycle);
+        prepareSharedFifo(current_cycle, ingress_complete);
         return shared_fifo_->consume(current_cycle, std::forward<Visitor>(visitor));
     }
 
@@ -277,17 +280,37 @@ public:
      * tick, while receive queries may call it again to fill slots released in
      * that tick. At most capacity entries cross the InPort boundary per cycle.
      */
-    void prepareSharedFifo(uint64_t current_cycle) {
+    // ingress_complete is an explicit caller guarantee: every publication
+    // eligible through current_cycle is visible before this call, and no
+    // additional eligible publication can occur while the guarantee is used.
+    // A noexcept callable certificate is evaluated lazily, only to record/reuse a
+    // negative result. Standalone queues retain the uncached false default.
+    template <typename Certificate = bool>
+    void prepareSharedFifo(uint64_t current_cycle, Certificate ingress_complete = false) {
         if (!shared_fifo_) return;
         shared_fifo_->beginCycle(current_cycle);
+        if (shared_fifo_->ingress_exhausted) {
+            if (ingressComplete_(ingress_complete)) return;
+            shared_fifo_->ingress_exhausted = false;
+        }
         while (shared_fifo_->canAdmit()) {
             auto admit = [this](T& data, uint64_t arrive_cycle, uint32_t) {
                 shared_fifo_->push(data, arrive_cycle);
             };
             const bool admitted = consumeReadyFromLanesWithMetadata_(current_cycle, admit);
-            if (!admitted) break;
+            if (!admitted) {
+                shared_fifo_->ingress_exhausted = ingressComplete_(ingress_complete);
+                break;
+            }
         }
     }
+
+    /// Receiver-only reset at a new tick invocation (including retry at C).
+    void resetIngressCache() noexcept {
+        if (shared_fifo_) shared_fifo_->ingress_exhausted = false;
+    }
+
+    [[nodiscard]] size_t producerCount() const noexcept { return thread_queues_.size(); }
 
     std::vector<T> popAll(uint64_t current_cycle) override {
         std::vector<T> result;
@@ -441,6 +464,7 @@ public:
     }
 
     void clear() override {
+        resetIngressCache();
         for (auto& queue : thread_queues_) queue->clear();
         if (shared_fifo_) shared_fifo_->clear();
 
@@ -458,6 +482,18 @@ public:
     }
 
 private:
+    // Evaluate a port certificate only after a failed scan or when reusing
+    // one. Dense/full/admission-limited ingress pays no tick-context checks.
+    template <typename Certificate>
+    static bool ingressComplete_(Certificate& certificate) noexcept {
+        if constexpr (std::is_same_v<Certificate, bool>) {
+            return certificate;
+        } else {
+            static_assert(std::is_nothrow_invocable_r_v<bool, Certificate&>);
+            return certificate();
+        }
+    }
+
     struct alignas(64) SignalWord {
         std::atomic<uint64_t> bits{0};
     };

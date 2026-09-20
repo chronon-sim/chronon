@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "../core/CrashHandler.hpp"
 #include "Connection.hpp"
 #include "MessageQueue.hpp"
 #include "Port.hpp"
@@ -32,6 +33,7 @@
 namespace chronon::sender {
 
 struct InPortSelectiveFlushTestAccess;
+struct InPortIngressTestAccess;
 
 namespace detail {
 
@@ -60,6 +62,7 @@ concept SelectiveCancelKeyFn = requires(const T& data) {
 template <typename T>
 class InPort : public PortBase, public IMultiProducerPort {
     friend struct InPortSelectiveFlushTestAccess;
+    friend struct InPortIngressTestAccess;
     friend class Connection<T>;
 
 public:
@@ -266,6 +269,7 @@ public:
         if (!multi_producer_queue_raw_) {
             return false;
         }
+        noteManualPublication_();
         StoredMessage msg{.data = std::move(data)};
         msg.enqueue_cycle = enqueue_cycle;
         return multi_producer_queue_raw_->pushFromThread(queue_id, std::move(msg), arrive_cycle,
@@ -277,23 +281,9 @@ public:
                                      const std::atomic<uint64_t>* cancel_epoch,
                                      uint64_t epoch_snapshot, uint64_t enqueue_cycle = 0,
                                      uint32_t sender_id = 0) {
-        if (!multi_producer_queue_raw_) {
-            return false;
-        }
-        StoredMessage msg{.data = std::move(data)};
-#if CHRONON_ENABLE_OUTPORT_CANCELLATION
-        msg.cancel_epoch = cancel_epoch;
-        msg.epoch_snapshot = epoch_snapshot;
-#else
-        (void)cancel_epoch;
-        (void)epoch_snapshot;
-#endif
-        msg.enqueue_cycle = enqueue_cycle;
-        if (detail::isCanceled(msg)) {
-            return true;
-        }
-        return multi_producer_queue_raw_->pushFromThread(queue_id, std::move(msg), arrive_cycle,
-                                                         sender_id);
+        noteManualPublication_();
+        return pushConnectionMessage_(queue_id, std::move(data), arrive_cycle, cancel_epoch,
+                                      epoch_snapshot, enqueue_cycle, sender_id);
     }
 
     /**
@@ -453,6 +443,7 @@ public:
             if ((*it)->connId() > cid) break;
         }
         mpsc_connections_.insert(it, conn);
+        mpsc_ingress_cache_eligible_ = false;
     }
 
     /** Register one source lane selected by transparent broadcast discovery. */
@@ -505,6 +496,17 @@ public:
             auto it = src_progress.find(conn->source());
             mpsc_conn_progress_.push_back(it == src_progress.end() ? nullptr : it->second);
         }
+        // Positive-delay edges cannot publish anything eligible at C during
+        // the receiver's tick at C. Cross-cluster predecessors were acquired
+        // by the scheduler; same-cluster predecessors have finished C - 1.
+        // Exclude zero-delay/local callbacks and unregistered manual lanes.
+        mpsc_ingress_cache_eligible_ =
+            multi_producer_queue_raw_ && capacity_ != UNLIMITED_CAPACITY &&
+            !mpsc_connections_.empty() &&
+            multi_producer_queue_raw_->producerCount() == mpsc_connections_.size() &&
+            producerProgressFullyResolved() &&
+            std::all_of(mpsc_connections_.begin(), mpsc_connections_.end(),
+                        [](const auto* conn) { return conn->delay() > 0; });
     }
 
     bool producerProgressFullyResolved() const noexcept override {
@@ -679,7 +681,11 @@ public:
     /** Receiver-cycle hook registered only for bounded MPSC InPorts. */
     void prepareConsumerCycle(uint64_t current_cycle) override {
         if (multi_producer_queue_raw_) {
-            multi_producer_queue_raw_->prepareSharedFifo(current_cycle);
+            multi_producer_queue_raw_->resetIngressCache();
+            multi_producer_queue_raw_->prepareSharedFifo(
+                current_cycle, [this, current_cycle]() noexcept {
+                    return ingressCompleteForTick_(current_cycle);
+                });
         }
     }
 
@@ -737,6 +743,54 @@ public:
     void resetSelectiveCancellation() noexcept {}
 
 private:
+    void noteManualPublication_() noexcept {
+        // Avoid producer/producer cache-line writes after the first manual
+        // injection. Registered Connection publication never touches this flag.
+        if (!mpsc_manual_publication_.load(std::memory_order_relaxed)) {
+            mpsc_manual_publication_.store(true, std::memory_order_release);
+        }
+    }
+
+    // Only registered Connection sends carry the scheduler's delay guarantee.
+    bool pushConnectionMessage_(size_t queue_id, T&& data, uint64_t arrive_cycle,
+                                const std::atomic<uint64_t>* cancel_epoch, uint64_t epoch_snapshot,
+                                uint64_t enqueue_cycle, uint32_t sender_id) {
+        if (!multi_producer_queue_raw_) {
+            return false;
+        }
+        StoredMessage msg{.data = std::move(data)};
+#if CHRONON_ENABLE_OUTPORT_CANCELLATION
+        msg.cancel_epoch = cancel_epoch;
+        msg.epoch_snapshot = epoch_snapshot;
+#else
+        (void)cancel_epoch;
+        (void)epoch_snapshot;
+#endif
+        msg.enqueue_cycle = enqueue_cycle;
+        if (detail::isCanceled(msg)) {
+            return true;
+        }
+        return multi_producer_queue_raw_->pushFromThread(queue_id, std::move(msg), arrive_cycle,
+                                                         sender_id);
+    }
+
+    [[nodiscard]] bool ingressCompleteForTick_(uint64_t cycle) const noexcept {
+        return mpsc_ingress_cache_eligible_ && detail::current_tick_context_.unit == owner_ &&
+               detail::current_tick_context_.cycle == cycle &&
+               !mpsc_manual_publication_.load(std::memory_order_acquire);
+    }
+
+    template <typename Queue, typename Visitor>
+    bool consumeReady_(Queue& queue, uint64_t cycle, Visitor& visitor) {
+        if constexpr (std::is_same_v<Queue, MultiProducerQueueAdapter<StoredMessage>>) {
+            return queue.consumeReady(cycle, visitor, [this, cycle]() noexcept {
+                return ingressCompleteForTick_(cycle);
+            });
+        } else {
+            return queue.consumeReady(cycle, visitor);
+        }
+    }
+
     uint64_t getCurrentCycle() const;
 
     [[nodiscard]] uint32_t portTransactionEpoch_() const noexcept {
@@ -744,6 +798,7 @@ private:
     }
 
     void invalidatePortTransactions_() noexcept {
+        mpsc_ingress_cache_eligible_ = false;
         port_transaction_epoch_.fetch_add(1, std::memory_order_release);
     }
 
@@ -778,7 +833,7 @@ private:
                 }
                 result.emplace(std::move(msg.data));
             };
-            const bool consumed = queue.consumeReady(current_cycle, visit);
+            const bool consumed = consumeReady_(queue, current_cycle, visit);
             if (!consumed) {
                 retireSelectiveFlushesAtFront_(queue, current_cycle);
                 return std::nullopt;
@@ -798,7 +853,7 @@ private:
                     result.emplace(std::move(msg.data));
                 }
             };
-            const bool consumed = queue.consumeReady(current_cycle, visit);
+            const bool consumed = consumeReady_(queue, current_cycle, visit);
             if (!consumed) return std::nullopt;
             if (result) return result;
         }
@@ -838,6 +893,13 @@ private:
                 shared_broadcast_queue_raw_->popAllInto(out, current_cycle);
                 return;
             }
+        }
+        if (multi_producer_queue_raw_) {
+            out.clear();
+            auto visit = [&out](StoredMessage& message) { out.push_back(std::move(message)); };
+            while (consumeReady_(*multi_producer_queue_raw_, current_cycle, visit)) {
+            }
+            return;
         }
         queue_->popAllInto(out, current_cycle);
     }
@@ -927,6 +989,9 @@ private:
     }
 
     bool enqueueStored_(StoredMessage msg, uint64_t arrive_cycle) {
+        if (multi_producer_queue_raw_) {
+            noteManualPublication_();
+        }
         // Sender-owned epoch cancellation may be resolved before publication.
         // Receiver selective-flush state is intentionally never consulted here.
         if (detail::isCanceled(msg)) {
@@ -959,7 +1024,12 @@ private:
         nullptr;                    ///< Non-owning ptr for MPSC access
     bool lock_free_queue_ = false;  ///< True iff queue_ is the lock-free SPSC ring
     bool cycle_preparation_registered_ = false;
-    // Lives in the six-byte alignment hole before drain_scratch_. Even a
+    bool mpsc_ingress_cache_eligible_ = false;
+    // Public, explicitly timestamped injection does not obey Connection delay
+    // bounds. Once used, retain uncached ingress for this port, including when
+    // the injection originates on a producer worker.
+    std::atomic<bool> mpsc_manual_publication_{false};
+    // Lives in the remaining alignment hole before drain_scratch_. Even a
     // continuously invalidated cycle-local claim cannot observe 2^32 control
     // mutations before commit, so wrapping cannot resurrect a live claim.
     std::atomic<uint32_t> port_transaction_epoch_{0};

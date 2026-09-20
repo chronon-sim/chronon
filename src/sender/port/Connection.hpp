@@ -417,13 +417,13 @@ public:
             if (!hasMPSCLaneAdmissionSlot_(send_cycle)) {
                 return false;
             }
-            if (!to_->pushToThreadQueueCancelable(thread_queue_id_, std::move(data), arrive_cycle,
+            if (!to_->pushConnectionMessage_(thread_queue_id_, std::move(data), arrive_cycle,
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
-                                                  &cancel_epoch_, epoch_snapshot,
+                                             &cancel_epoch_, epoch_snapshot,
 #else
-                                                  nullptr, 0,
+                                             nullptr, 0,
 #endif
-                                                  send_cycle, conn_id_)) {
+                                             send_cycle, conn_id_)) {
                 return false;
             }
             admission_.chargePush();
@@ -771,13 +771,13 @@ private:
 #endif
         bool ok = false;
         if (thread_queue_id_ != SIZE_MAX) {
-            ok = to_->pushToThreadQueueCancelable(thread_queue_id_, std::move(data), arrive_cycle,
+            ok = to_->pushConnectionMessage_(thread_queue_id_, std::move(data), arrive_cycle,
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
-                                                  &cancel_epoch_, cancel_epoch,
+                                             &cancel_epoch_, cancel_epoch,
 #else
-                                                  nullptr, 0,
+                                             nullptr, 0,
 #endif
-                                                  send_cycle, conn_id_);
+                                             send_cycle, conn_id_);
         } else {
             ok = to_->enqueueCancelable(std::move(data), arrive_cycle,
 #if CHRONON_ENABLE_OUTPORT_CANCELLATION
