@@ -95,7 +95,7 @@ working on the framework; paths are relative to `src/`.
 ### Reading TickSimulation
 
 `TickSimulation` owns the simulation session. Its public reference groups
-construction/topology, execution/termination, and inspection/adapter integration.
+session/topology/clock domains, execution/termination, and inspection/adapter integration.
 The implementation files below share that owner; they are not separate public
 scheduler or lifecycle objects. Paths are relative to `src/sender/core/`.
 

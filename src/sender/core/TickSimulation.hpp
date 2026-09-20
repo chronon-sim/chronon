@@ -79,7 +79,7 @@ namespace chronon::sender {
  */
 class TickSimulation {
 public:
-    /// @name Construction and topology
+    /// @name Session, topology and clock domains
     /// @{
     static size_t normalizeThreadCount(size_t requested) noexcept {
         if (requested == 0) {
