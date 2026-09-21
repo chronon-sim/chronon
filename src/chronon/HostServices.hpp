@@ -218,6 +218,10 @@ class HostServices {
 public:
     explicit HostServices(bool drive_services = false)
         : executor_(std::make_shared<host_services_detail::HostIOExecutor>(drive_services)) {}
+    HostServices(const HostServices&) = delete;
+    HostServices& operator=(const HostServices&) = delete;
+    HostServices(HostServices&&) = delete;
+    HostServices& operator=(HostServices&&) = delete;
     ~HostServices() {
         for (auto& entry : entries_) entry->detach();
     }

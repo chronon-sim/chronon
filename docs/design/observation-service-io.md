@@ -7,6 +7,8 @@ historical performance comparison; it predates this change.
 ## Execution and lifetime
 
 `HostServices` owns both ingress registrations and a shared blocking-I/O lane.
+The scheduler is neither copyable nor movable: its destruction detaches its
+registrations. Callers can transfer a `unique_ptr<HostServices>` when needed.
 `ObservationBackend` and `ClockTraceRecorder` no longer own threads or separate
 consumer implementations. Scheduler workers copy bounded batches (at most 256
 records; ordinary records also have a 256 KiB byte limit). A preallocated

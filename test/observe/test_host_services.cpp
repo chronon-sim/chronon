@@ -2,10 +2,18 @@
 // SPDX-License-Identifier: MPL-2.0
 #include <iostream>
 #include <stdexcept>
+#include <type_traits>
 
 #include "chronon/HostServices.hpp"
 
 using namespace chronon;
+
+// A scheduler is the unique lifetime owner of its registrations. Copying it,
+// including a move that falls back to copying, must fail at compile time.
+static_assert(!std::is_copy_constructible_v<HostServices>);
+static_assert(!std::is_copy_assignable_v<HostServices>);
+static_assert(!std::is_move_constructible_v<HostServices>);
+static_assert(!std::is_move_assignable_v<HostServices>);
 
 #define CHECK(condition)                                        \
     do {                                                        \
