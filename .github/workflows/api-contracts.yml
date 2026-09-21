@@ -18,10 +18,6 @@ on:
         description: Immutable baseline commit SHA
         required: true
         default: '8563cea58fb0d84306c3252be1fd68044c07afbc'
-      force_measurement:
-        description: Measure even byte-identical runtimes (validate the full timing path)
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -33,7 +29,7 @@ concurrency:
 jobs:
   differential-performance:
     runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 90
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -82,21 +78,24 @@ jobs:
           cmake --build candidate/build-perf --parallel 16
       - name: Run Release correctness and deterministic equivalence tests
         run: ctest --test-dir candidate/build-perf --output-on-failure --parallel 16
-      - name: Validate performance gate logic
+      - name: Validate measurement and reporting logic
         run: python3 -m unittest discover -s candidate/test/scripts -p 'test_api_performance*.py'
       - name: Measure all scenarios on disjoint physical CPU sets
-        timeout-minutes: 75
+        timeout-minutes: 11
         env:
           BASE_SHA: ${{ steps.commits.outputs.base }}
           HEAD_SHA: ${{ steps.commits.outputs.head }}
-          FORCE_MEASUREMENT: ${{ inputs.force_measurement }}
         run: |
-          extra=()
-          if [[ "$FORCE_MEASUREMENT" == "true" ]]; then extra+=(--force-measurement); fi
           python3 candidate/scripts/run_api_performance.py \
             baseline/build-perf candidate/build-perf performance-results \
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
-            --workers 2 --jobs 8 --timeout 4200 "${extra[@]}"
+            --workers 2 --jobs 8 --timeout 600
+      - name: Add wall times to the workflow summary
+        if: always()
+        run: |
+          if [[ -f performance-results/report.md ]]; then
+            cat performance-results/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Retain all performance evidence, including failed checks
         if: always()
         uses: actions/upload-artifact@v4
@@ -105,6 +104,7 @@ jobs:
           path: performance-results/
           if-no-files-found: ignore
           retention-days: 30
+
       - name: Retain correctness diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -112,3 +112,48 @@ jobs:
           name: api-contracts-tests
           path: candidate/build-perf/Testing/Temporary/
           retention-days: 30
+
+  performance-report:
+    needs: differential-performance
+    if: >-
+      always() && github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Download measured wall times
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: api-contracts-validation
+          path: performance-results
+      - name: Update PR performance comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const pr = context.payload.pull_request;
+            const repo = context.repo;
+            const current = await github.rest.pulls.get({...repo, pull_number: pr.number});
+            if (current.data.head.sha !== pr.head.sha) {
+              core.info('A newer commit is already on the PR; skip this outdated report.');
+              return;
+            }
+            const marker = '<!-- chronon-api-performance -->';
+            const file = 'performance-results/report.md';
+            const url = `${context.serverUrl}/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`;
+            let body = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') :
+              `${marker}\n## Performance wall time\n\nMeasurement did not complete for \`${pr.head.sha}\`; see the workflow logs.`;
+            body += `\n[Workflow run and raw artifacts](${url})\n`;
+            const comments = await github.paginate(github.rest.issues.listComments,
+              {...repo, issue_number: pr.number, per_page: 100});
+            const previous = comments.find(comment => comment.user?.login === 'github-actions[bot]' &&
+              comment.body?.includes(marker));
+            if (previous) {
+              await github.rest.issues.updateComment({...repo, comment_id: previous.id, body});
+            } else {
+              await github.rest.issues.createComment({...repo, issue_number: pr.number, body});
+            }

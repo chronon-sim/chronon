@@ -26,7 +26,9 @@ class LocalPerformanceRunner(unittest.TestCase):
                          [[i, i + 1] for i in range(0, 16, 2)])
         self.assertEqual(runner.cpu_groups([0, 2, 4, 6, 8], 2, 8), [[0, 2], [4, 6]])
         self.assertEqual(runner.cpu_groups(list(range(16)), 2, 2), [[0, 1], [2, 3]])
-        for cpus, workers, jobs in (([0], 2, 8), ([0, 0], 2, 8), ([0, 2], 2, 0)):
+        self.assertEqual(runner.cpu_groups(list(range(16)), 4, 8),
+                         [list(range(i, i + 4)) for i in (0, 4, 8, 12)])
+        for cpus, workers, jobs in (([0], 2, 8), ([0, 0, 2], 2, 8), ([0, 2, 4], 2, 0)):
             with self.assertRaises(ValueError):
                 runner.cpu_groups(cpus, workers, jobs)
 
@@ -98,31 +100,34 @@ time.sleep(60)
         with (patch.object(runner.sys, "argv", argv),
               patch.object(runner, "physical_cpus", return_value=list(range(16))),
               patch.object(runner, "run_tasks", side_effect=statuses) as tasks,
-              patch.object(runner, "collect", return_value=collector_result) as collect,
+              patch.object(runner, "collect", return_value=collector_result or ([], [])) as collect,
               redirect_stdout(io.StringIO())):
             status = runner.main()
         return status, tasks, collect, json.loads((output / "verdict.json").read_text())
 
-    def test_identity_path_requires_collector_and_skips_timing(self):
-        status, tasks, collect, verdict = self.invoke_main([[0]], ([{}] * 29, [{}]))
+    def test_all_29_cases_share_eight_two_core_slots(self):
+        rows = [{"case": case, "runs": {v: {"wall_seconds": 1} for v in ("baseline", "candidate")}}
+                for case in runner.cases(2)]
+        status, tasks, collect, verdict = self.invoke_main([[0] * 29], (rows, [{}] * 29))
         self.assertEqual(status, 0)
         self.assertEqual(tasks.call_count, 1)
-        self.assertEqual(collect.call_args.args[3:], (1, 2))
-        self.assertTrue(verdict["pass"])
-
-    def test_changed_runtimes_schedule_all_cases_then_collect(self):
-        status, tasks, collect, verdict = self.invoke_main([[3], [0] * 29], ([{}] * 29, [{}] * 29))
-        self.assertEqual(status, 0)
-        self.assertEqual(tasks.call_args.args[0], 29)
+        count, groups, command, timeout = tasks.call_args.args
+        self.assertEqual(count, 29)
+        self.assertEqual(groups, [[i, i + 1] for i in range(0, 16, 2)])
+        self.assertEqual(command(18, [4, 5])[-4:], ["--shard-index", "18", "--shard-count", "29"])
+        self.assertLessEqual(timeout, 600)
         self.assertEqual(collect.call_args.args[3:], (29, 2))
         self.assertTrue(verdict["complete_matrix"])
+        self.assertIn("29/29", (self.root / "results/report.md").read_text())
 
-    def test_failed_measurement_cannot_reach_collector_or_pass(self):
-        status, _, collect, verdict = self.invoke_main([[3], RuntimeError("failed scenario")])
+    def test_failed_measurement_only_collects_partial_results_and_cannot_pass(self):
+        status, _, collect, verdict = self.invoke_main([RuntimeError("failed scenario")])
         self.assertEqual(status, 1)
-        collect.assert_not_called()
+        collect.assert_called_once_with(self.root / "results/shards", "base", "head", 29, 2,
+                                        allow_incomplete=True)
         self.assertFalse(verdict["pass"])
         self.assertFalse(verdict["complete_matrix"])
+        self.assertIn("FAILED / INCOMPLETE", (self.root / "results/report.md").read_text())
 
 
 if __name__ == "__main__":

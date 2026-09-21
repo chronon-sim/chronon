@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
-"""Run the unchanged performance gate on disjoint physical CPUs on one host.
-
-Each scenario is a separate evidence shard. As soon as a CPU group becomes free,
-it takes the next scenario, so a second sampling batch cannot hold up a static
-shard's remaining cases. Baseline and candidate always share the same CPU group
-and run sequentially. Builds and correctness tests must finish before this runs.
-"""
+"""Measure all scenarios once on disjoint CPU groups; timing is informational."""
 
 import argparse
 from contextlib import suppress
@@ -20,15 +14,17 @@ import sys
 import time
 
 from check_api_performance import cases, physical_cpus
-from collect_api_performance import collect
+from collect_api_performance import collect, render_report
 
 
 def cpu_groups(cpus, workers, jobs):
     """Input contains one allowed logical CPU per physical core, never siblings."""
-    if workers < 2 or jobs < 1 or len(cpus) < workers or len(set(cpus)) != len(cpus):
-        raise ValueError("not enough distinct physical CPUs for measurement workers")
-    count = min(jobs, len(cpus) // workers)
-    return [cpus[i * workers:(i + 1) * workers] for i in range(count)]
+    # The caller shares a worker CPU, allowing eight two-core tasks on 16 cores.
+    width = workers
+    if workers < 2 or jobs < 1 or len(cpus) < width or len(set(cpus)) != len(cpus):
+        raise ValueError("not enough distinct physical CPUs for workers")
+    count = min(jobs, len(cpus) // width)
+    return [cpus[i * width:(i + 1) * width] for i in range(count)]
 
 
 def stop_processes(processes):
@@ -47,7 +43,7 @@ def stop_processes(processes):
         process.wait()
 
 
-def run_tasks(count, groups, command, timeout, accepted=(0,)):
+def run_tasks(count, groups, command, timeout):
     """Dynamically fill CPU slots; any failure/timeout stops every process tree."""
     active, results = {}, {}
     pending = iter(range(count))
@@ -62,7 +58,7 @@ def run_tasks(count, groups, command, timeout, accepted=(0,)):
                 status = process.poll()
                 if status is None:
                     continue
-                if status not in accepted:
+                if status != 0:
                     raise RuntimeError(f"measurement task {index} failed with exit {status}")
                 results[index] = status
                 del active[slot]
@@ -93,9 +89,8 @@ def main():
     parser.add_argument("--workers", type=int, choices=(2, 4), default=2)
     parser.add_argument("--jobs", type=int, default=8,
                         help="maximum concurrent scenarios, limited by physical CPU topology")
-    parser.add_argument("--timeout", type=float, default=4200,
-                        help="total wall-time budget including identity checks, in seconds")
-    parser.add_argument("--force-measurement", action="store_true")
+    parser.add_argument("--timeout", type=float, default=600,
+                        help="total measurement wall-time budget, in seconds")
     args = parser.parse_args()
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("timeout must be finite and positive")
@@ -115,49 +110,49 @@ def main():
     def write(name, value):
         (output / f"{name}.json").write_text(json.dumps(value, indent=2) + "\n")
 
-    write("execution", {"cpu_groups": groups, "concurrent_scenarios": len(groups),
-                        "workers": args.workers, "timeout_seconds": args.timeout,
-                        "case_order": [case["name"] for case in matrix]})
+    execution = {"cpu_groups": groups, "concurrent_scenarios": len(groups),
+                 "workers": args.workers, "timeout_seconds": args.timeout,
+                 "case_order": [case["name"] for case in matrix]}
+    write("execution", execution)
     write("verdict", verdict)
     print(f"Using {len(groups)} isolated CPU groups: {groups}", flush=True)
 
-    def command(index, cpus, count=1):
+    def command(index, cpus):
         return [sys.executable, str(Path(__file__).with_name("check_api_performance.py")),
                 str(args.baseline.resolve()), str(args.candidate.resolve()),
                 str(root / f"api-performance-{index}"),
                 "--base-sha", args.base_sha, "--head-sha", args.head_sha,
                 "--workers", str(args.workers), "--cpus", ",".join(map(str, cpus)),
-                "--shard-index", str(index), "--shard-count", str(count),
-                *(["--force-measurement"] if args.force_measurement else [])]
+                "--shard-index", str(index), "--shard-count", str(len(matrix))]
 
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f"received signal {signum}")
 
     handlers = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM)}
+    results = []
     try:
-        # Preserve the cheap whole-matrix identity path before scheduling timing.
-        status = run_tasks(1, groups[:1],
-                           lambda index, cpus: command(index, cpus) + ["--defer-measurement"],
-                           deadline - time.monotonic(), accepted=(0, 3))[0]
-        count = 1
-        if status == 3:
-            count = len(matrix)
-            run_tasks(count, groups, lambda index, cpus: command(index, cpus, count),
-                      deadline - time.monotonic())
+        count = len(matrix)
+        run_tasks(count, groups, command, deadline - time.monotonic())
         results, metadata = collect(root, args.base_sha, args.head_sha, count, args.workers)
         # Write success only after validating every evidence shard.
         success = {**verdict, "pass": True, "complete_matrix": True, "completed_cases": len(results)}
         write("summary", results)
         write("metadata", {**success, "shards": metadata})
-        write("verdict", success)
+        verdict = success
+        write("verdict", verdict)
         print(f"PASS: all {len(results)} scenarios across {count} evidence shards", flush=True)
         return 0
     except (RuntimeError, ValueError, OSError, KeyError, KeyboardInterrupt) as error:
-        verdict["error"] = str(error)
+        results, metadata = collect(root, args.base_sha, args.head_sha, len(matrix), args.workers,
+                                    allow_incomplete=True)
+        verdict.update(error=str(error), completed_cases=len(results))
+        write("summary", results)
+        write("metadata", {**verdict, "shards": metadata})
         write("verdict", verdict)
         print(f"FAIL: {error}; partial evidence retained in {output}", file=sys.stderr, flush=True)
         return 1
     finally:
+        (output / "report.md").write_text(render_report(results, verdict, execution))
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
 

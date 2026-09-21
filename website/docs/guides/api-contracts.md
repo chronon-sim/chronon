@@ -143,51 +143,48 @@ remain specialized on the existing tick path. The core still links observation
 support and exposes some adapter types for compatibility; these are not a
 promise of interchangeable backends or a stable binary layout.
 
-PR validation runs in one `differential-performance` job on a
-`blacksmith-16vcpu-ubuntu-2404` runner. It builds immutable baseline and candidate
-commits once and completes correctness tests before measurement. When runtime
-identity is established, it checks all 29 scenarios without timing. Otherwise,
-`scripts/run_api_performance.py` schedules one scenario per evidence shard from a
-shared queue, with at most eight concurrent scenarios. A free CPU group takes the
-next scenario immediately, including while other scenarios extend their samples.
-Executable and intermediate artifact transfers between jobs are no longer needed.
+PR validation builds immutable baseline and candidate commits once on a
+`blacksmith-16vcpu-ubuntu-2404` runner. Release correctness tests and the Python
+measurement tests finish before benchmarks run.
 
-Each group uses two distinct physical cores selected from the process's allowed
-CPU affinity. SMT siblings are excluded, and actual topology may reduce the number
-of concurrent groups below eight. The checker and its child processes are pinned
-to the group's CPUs; baseline and candidate run sequentially on that same group.
-Groups never share physical cores, though shared cache, memory bandwidth and host
-noise can still affect timing. The artifact records the CPU allocation, and the
-collector requires every scenario exactly once with the original acceptance
-settings. Missing, cancelled, incomplete or failed measurements cannot pass.
+`scripts/run_api_performance.py` schedules all 29 scenarios through one shared
+queue, including the six dynamic-scheduling scenarios. On 16 available physical
+cores it runs up to eight tasks concurrently, each assigned two distinct cores.
+The two simulation workers and calling thread share that task's CPU set. The
+scheduler benchmark pins its workers individually and puts the caller on the
+last worker's core; representative workloads can migrate within the two-core
+set. Single-thread scenarios use the first core.
+SMT siblings are excluded, and smaller machines automatically use fewer groups.
+Baseline and candidate run sequentially on the same CPU group for each scenario.
 
-Byte-identical executables with identical resolved dynamic-library paths and
-hashes establish unchanged benchmark code. These scenarios still run two pairs
-of fresh processes and compare all state digests. Artifacts label this evidence
-`binary-identity`; they contain no invented timing confidence bound. Unknown
-library resolution or loader hooks disable this optimization. Use the manual
-workflow's `force_measurement` option to exercise full timing even for identical
-runtimes.
+Each scenario runs **once per revision**, including byte-identical binaries.
+Work is fixed: 100 million cycles for the single-clock floor, 100,000 scheduler
+steps for polling interval 1 and one million for the other scheduler cases,
+and 50,000 cycles for each representative workload. Both revisions use the same
+workload, seed and warmup. Variant order is reproducible and seeded per scenario.
+There is no duration calibration, repeated sampling or confidence calculation.
 
-Changed runtimes use identical workloads, compiler settings, seeds and CPU
-affinity. State digests must match on every repetition, including calibration
-pairs. Calibration rechecks scaled workloads for up to five rounds and records
-when the billion-cycle cap limits the two-second target. Each performance
-scenario must independently establish throughput at least 99% of baseline:
-51 paired runs initially, and a fixed total of 201 only if the initial interval
-is uncertain. Both looks use a one-sided 97.5% lower bound, sharing a nominal
-5% false-acceptance budget. The second look retains all first-look samples;
-clear regressions and uncertainty at the cap fail.
+The PR comment reports baseline and candidate **process wall time** and its
+percentage change for every scenario. Process wall time covers startup,
+initialization, CPU/model warmup, simulation and shutdown. The raw artifact also
+records the benchmark's simulation-only timing, state digests, binary hashes,
+build settings and CPU allocation. Concurrent tasks share cache and memory
+bandwidth, and a single measurement is sensitive to host noise.
 
-Raw runs, decisions, runtime hashes and build settings are retained per shard;
-the aggregate artifact includes the complete matrix and all shard evidence.
-Calibration and progress every ten pairs are printed to the job log. A single
-benchmark process is limited to three minutes and a scenario (including calibration)
-to 30 minutes; the entire measurement has a 70-minute wall-time budget. These
-limits fail the check rather than accepting incomplete evidence. A failed task,
-timeout or cancellation stops the active checker process groups and their benchmark
-children. Timeouts retain partial benchmark output and failure diagnostics; the
-workflow uploads available evidence even when validation fails.
-Correctness test logs are retained separately. Passing this finite matrix
-establishes the tested workloads' contract, not a universal performance claim
-for all models.
+**Performance is informational:** slower measurements, including throughput below
+95% of baseline, do not fail the check. State mismatches, benchmark errors,
+invalid timings and incomplete measurements still fail correctness/completeness
+validation. All 29 scenarios must supply one valid baseline/candidate pair.
+Each pair has a two-minute timeout and the entire measurement a ten-minute
+budget; the job timeout is 20 minutes. A timeout or failed task stops the active
+checker process groups and benchmark children, retaining available diagnostics.
+Failure reports retain the wall-time rows and completion count of successfully
+validated shards; missing, failed or malformed shards are excluded, and the
+overall check remains failed.
+
+A separate comment job reads the artifact without executing candidate code and
+creates or updates one bot comment per PR, linking the workflow run and artifacts.
+Outdated runs cannot replace a newer revision's report. Comments are published
+for same-repository PRs; fork PRs retain the report in the workflow summary and
+artifact because their token cannot write comments. Correctness test logs are
+also retained, including on failure.

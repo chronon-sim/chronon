@@ -439,3 +439,9 @@ set_tests_properties(sender_lockfree_message_queue sender_mpsc_mixed_delay_deter
     TIMEOUT 120
     LABELS "sender"
 )
+
+add_executable(sender_test_mpsc_ingress_cache test_mpsc_ingress_cache.cpp)
+target_link_libraries(sender_test_mpsc_ingress_cache PRIVATE chronon::core chronon_compile_options)
+add_test(NAME sender_mpsc_ingress_cache COMMAND sender_test_mpsc_ingress_cache)
+set_tests_properties(sender_mpsc_ingress_cache PROPERTIES TIMEOUT 60 PROCESSORS 4 LABELS "sender")
+add_dependencies(regress sender_test_mpsc_ingress_cache)
