@@ -302,13 +302,17 @@ private:
     bool emit_;
 };
 
+enum class Injection { Lane, LaneCancelable, Queue, QueueWithCycle };
+
 class InjectionConsumer final : public TickableUnit {
 public:
-    explicit InjectionConsumer(bool zero_delay) : TickableUnit("consumer"), zero_(zero_delay) {}
+    InjectionConsumer(bool zero_delay, Injection injection)
+        : TickableUnit("consumer"), zero_(zero_delay), injection_(injection) {}
     InPort<int> in{this, "in", 16};
     size_t lane = SIZE_MAX;
     size_t ticks = 0;
     bool zero_;
+    Injection injection_;
 
     void tick() override {
         assert(in.isMultiProducerMode());
@@ -319,10 +323,21 @@ public:
         {
             // Explicit timestamped injection must invalidate the scheduler
             // certificate, even on an otherwise fully registered port.
-            if (ticks % 2 == 0)
-                assert(in.pushToThreadQueue(lane, 42, localCycle()));
-            else
-                assert(in.pushToThreadQueueCancelable(lane, 42, localCycle(), nullptr, 0));
+            switch (injection_) {
+                case Injection::Lane:
+                    assert(in.pushToThreadQueue(lane, 42, localCycle()));
+                    break;
+                case Injection::LaneCancelable:
+                    assert(in.pushToThreadQueueCancelable(lane, 42, localCycle(), nullptr, 0));
+                    break;
+                case Injection::Queue:
+                    assert(in.enqueueCancelable(42, localCycle(), nullptr, 0));
+                    break;
+                case Injection::QueueWithCycle:
+                    assert(in.enqueueCancelable(42, localCycle(), nullptr, 0, localCycle(), 0));
+                    break;
+            }
+            assert(!InPortIngressTestAccess::certified(in, localCycle()));
         }
         assert(in.tryReceive() == 42);
         assert(!in.tryReceiveFiltered([](const int&) noexcept { return true; }));
@@ -331,7 +346,7 @@ public:
     }
 };
 
-void testScheduledFallback(bool zero_delay) {
+void testScheduledFallback(bool zero_delay, Injection injection) {
     TickSimulationConfig config;
     config.num_threads = 4;
     config.enable_parallel = true;
@@ -339,7 +354,7 @@ void testScheduledFallback(bool zero_delay) {
     config.partition_solver = TickSimulationConfig::PartitionSolverType::Weighted;
     config.initial_partition_sync_cost_ns = 0;
     TickSimulation sim(config);
-    auto* consumer = sim.createUnit<InjectionConsumer>(zero_delay);
+    auto* consumer = sim.createUnit<InjectionConsumer>(zero_delay, injection);
     Connection<int>* first = nullptr;
     for (int i = 0; i < 8; ++i) {
         auto* producer =
@@ -374,7 +389,10 @@ int main() {
     testMoveOnly();
     testConcurrentCancellation();
     testOwnedTransport();
-    testScheduledFallback(false);
-    testScheduledFallback(true);
+    for (auto injection : {Injection::Lane, Injection::LaneCancelable, Injection::Queue,
+                           Injection::QueueWithCycle}) {
+        testScheduledFallback(false, injection);
+        testScheduledFallback(true, injection);
+    }
     std::cout << "Bounded MPSC ingress cache tests passed.\n";
 }

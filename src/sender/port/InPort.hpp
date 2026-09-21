@@ -269,7 +269,7 @@ public:
         if (!multi_producer_queue_raw_) {
             return false;
         }
-        noteManualPublication_();
+        multi_producer_queue_raw_->noteManualPublication();
         StoredMessage msg{.data = std::move(data)};
         msg.enqueue_cycle = enqueue_cycle;
         return multi_producer_queue_raw_->pushFromThread(queue_id, std::move(msg), arrive_cycle,
@@ -281,7 +281,7 @@ public:
                                      const std::atomic<uint64_t>* cancel_epoch,
                                      uint64_t epoch_snapshot, uint64_t enqueue_cycle = 0,
                                      uint32_t sender_id = 0) {
-        noteManualPublication_();
+        if (multi_producer_queue_raw_) multi_producer_queue_raw_->noteManualPublication();
         return pushConnectionMessage_(queue_id, std::move(data), arrive_cycle, cancel_epoch,
                                       epoch_snapshot, enqueue_cycle, sender_id);
     }
@@ -743,14 +743,6 @@ public:
     void resetSelectiveCancellation() noexcept {}
 
 private:
-    void noteManualPublication_() noexcept {
-        // Avoid producer/producer cache-line writes after the first manual
-        // injection. Registered Connection publication never touches this flag.
-        if (!mpsc_manual_publication_.load(std::memory_order_relaxed)) {
-            mpsc_manual_publication_.store(true, std::memory_order_release);
-        }
-    }
-
     // Only registered Connection sends carry the scheduler's delay guarantee.
     bool pushConnectionMessage_(size_t queue_id, T&& data, uint64_t arrive_cycle,
                                 const std::atomic<uint64_t>* cancel_epoch, uint64_t epoch_snapshot,
@@ -777,7 +769,7 @@ private:
     [[nodiscard]] bool ingressCompleteForTick_(uint64_t cycle) const noexcept {
         return mpsc_ingress_cache_eligible_ && detail::current_tick_context_.unit == owner_ &&
                detail::current_tick_context_.cycle == cycle &&
-               !mpsc_manual_publication_.load(std::memory_order_acquire);
+               !multi_producer_queue_raw_->hasManualPublication();
     }
 
     template <typename Queue, typename Visitor>
@@ -997,9 +989,6 @@ private:
     }
 
     bool enqueueStored_(StoredMessage msg, uint64_t arrive_cycle) {
-        if (multi_producer_queue_raw_) {
-            noteManualPublication_();
-        }
         // Sender-owned epoch cancellation may be resolved before publication.
         // Receiver selective-flush state is intentionally never consulted here.
         if (detail::isCanceled(msg)) {
@@ -1034,10 +1023,6 @@ private:
     bool cycle_preparation_registered_ = false;
     // Written only during configuration; immutable while workers execute.
     bool mpsc_ingress_cache_eligible_ = false;
-    // Public, explicitly timestamped injection does not obey Connection delay
-    // bounds. Once used, retain uncached ingress for this port, including when
-    // the injection originates on a producer worker.
-    std::atomic<bool> mpsc_manual_publication_{false};
     // Lives in the remaining alignment hole before drain_scratch_. Even a
     // continuously invalidated cycle-local claim cannot observe 2^32 control
     // mutations before commit, so wrapping cannot resurrect a live claim.

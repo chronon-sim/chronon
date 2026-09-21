@@ -246,7 +246,21 @@ public:
         return transport_overflow_events_.load(std::memory_order_relaxed);
     }
 
+    // Explicit timestamps do not carry a registered Connection's delay
+    // guarantee. Keep this invalidation inside the MPSC transport so ordinary
+    // single-thread/SPSC publications pay no cache-specific checks.
+    void noteManualPublication() noexcept {
+        if (!manual_publication_.load(std::memory_order_relaxed)) {
+            manual_publication_.store(true, std::memory_order_release);
+        }
+    }
+
+    [[nodiscard]] bool hasManualPublication() const noexcept {
+        return manual_publication_.load(std::memory_order_acquire);
+    }
+
     bool push(T data, uint64_t arrive_cycle) override {
+        noteManualPublication();
         return !thread_queues_.empty() && pushFromThread(0, std::move(data), arrive_cycle, 0);
     }
 
@@ -675,4 +689,5 @@ private:
     size_t user_capacity_;
     std::unique_ptr<SharedFifoState> shared_fifo_;
     std::atomic<uint64_t> transport_overflow_events_{0};
+    std::atomic<bool> manual_publication_{false};
 };
