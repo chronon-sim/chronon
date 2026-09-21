@@ -83,6 +83,15 @@ class ShardAcceptance(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing, duplicate"):
             collector.collect(self.root, "base", "head", 1, 2)
 
+    def test_one_scenario_per_shard_still_requires_all_29_scenarios(self):
+        self.make_shards(count=29)
+        results, metadata = collector.collect(self.root, "base", "head", 29, 2)
+        self.assertEqual(len(results), 29)
+        self.assertEqual(len(metadata), 29)
+        (self.root / "api-performance-28" / "verdict.json").unlink()
+        with self.assertRaises(FileNotFoundError):
+            collector.collect(self.root, "base", "head", 29, 2)
+
     def test_incomplete_or_failed_shard_rejected(self):
         for key in ("pass", "complete_shard"):
             self.make_shards()

@@ -143,15 +143,23 @@ remain specialized on the existing tick path. The core still links observation
 support and exposes some adapter types for compatibility; these are not a
 promise of interchangeable backends or a stable binary layout.
 
-PR validation builds immutable baseline and candidate commits once. When runtime
-identity is established, `prepare` checks all 29 scenarios on its existing runner;
-no `measure` runners or executable transfers are needed. Otherwise, timing is
-divided across six independent runners. Each uses two physical CPUs and compares
-baseline/candidate on that same machine; measurements never compete with another
-shard. The final `differential-performance` check requires the selected path to
-succeed and every scenario exactly once. Only a successful identity path permits
-skipped measurement jobs; missing, cancelled, incomplete or failed checks cannot
-become a successful aggregate.
+PR validation runs in one `differential-performance` job on a
+`blacksmith-16vcpu-ubuntu-2404` runner. It builds immutable baseline and candidate
+commits once and completes correctness tests before measurement. When runtime
+identity is established, it checks all 29 scenarios without timing. Otherwise,
+`scripts/run_api_performance.py` schedules one scenario per evidence shard from a
+shared queue, with at most eight concurrent scenarios. A free CPU group takes the
+next scenario immediately, including while other scenarios extend their samples.
+Executable and intermediate artifact transfers between jobs are no longer needed.
+
+Each group uses two distinct physical cores selected from the process's allowed
+CPU affinity. SMT siblings are excluded, and actual topology may reduce the number
+of concurrent groups below eight. The checker and its child processes are pinned
+to the group's CPUs; baseline and candidate run sequentially on that same group.
+Groups never share physical cores, though shared cache, memory bandwidth and host
+noise can still affect timing. The artifact records the CPU allocation, and the
+collector requires every scenario exactly once with the original acceptance
+settings. Missing, cancelled, incomplete or failed measurements cannot pass.
 
 Byte-identical executables with identical resolved dynamic-library paths and
 hashes establish unchanged benchmark code. These scenarios still run two pairs
@@ -173,6 +181,13 @@ clear regressions and uncertainty at the cap fail.
 
 Raw runs, decisions, runtime hashes and build settings are retained per shard;
 the aggregate artifact includes the complete matrix and all shard evidence.
+Calibration and progress every ten pairs are printed to the job log. A single
+benchmark process is limited to three minutes and a scenario (including calibration)
+to 30 minutes; the entire measurement has a 70-minute wall-time budget. These
+limits fail the check rather than accepting incomplete evidence. A failed task,
+timeout or cancellation stops the active checker process groups and their benchmark
+children. Timeouts retain partial benchmark output and failure diagnostics; the
+workflow uploads available evidence even when validation fails.
 Correctness test logs are retained separately. Passing this finite matrix
 establishes the tested workloads' contract, not a universal performance claim
 for all models.

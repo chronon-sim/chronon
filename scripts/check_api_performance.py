@@ -9,7 +9,7 @@ one-sided 97.5% lower confidence bound >= 0.99 (a nominal 5% false acceptance bu
 across both looks). Uncertain first looks extend to a fixed maximum using ALL
 samples. Preserve outliers. Do not build or run tests concurrently. Byte-identical
 executables with identical resolved libraries use deterministic checks instead of
-re-measuring unchanged code. Shards run on separate machines, never competing CPUs.
+re-measuring unchanged code. Concurrent shards must use disjoint physical CPUs.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import random
 import statistics
 import subprocess
 import sys
+import time
 
 
 STATE_FIELDS = ("predicates", "parallel", "ticks", "sent", "received", "checksum", "digest", "overflow")
@@ -91,7 +92,7 @@ def needs_extension(result: dict, maximum: int) -> bool:
             and result["sample_count"] < maximum)
 
 
-def physical_cpus() -> list[int]:
+def physical_cpus(limit: int | None = 4) -> list[int]:
     allowed = os.sched_getaffinity(0)
     rows = subprocess.check_output(["lscpu", "-p=CPU,CORE,SOCKET"], text=True)
     cores = {}
@@ -101,7 +102,7 @@ def physical_cpus() -> list[int]:
         cpu, core, socket = map(int, line.split(","))
         if cpu in allowed:
             cores.setdefault((socket, core), cpu)
-    return list(cores.values())[:4]
+    return list(cores.values())[:limit]
 
 
 def cases(workers: int) -> list[dict]:
@@ -205,6 +206,30 @@ def runtime_identity(builds: dict, binaries: dict) -> dict | None:
     return libraries if libraries["baseline"] == libraries["candidate"] else None
 
 
+def run_benchmark(argv: list[str], env: dict, log: Path, timeout: float):
+    """Retain partial output when a benchmark hangs, as well as normal failures."""
+    try:
+        proc = subprocess.run(argv, env=env, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        output = error.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        log.write_text(output)
+        raise RuntimeError(f"benchmark timed out after {timeout:.1f}s: {argv}; see {log}") from error
+    log.write_text(proc.stdout)
+    if proc.returncode:
+        raise RuntimeError(f"benchmark failed (exit {proc.returncode}): {argv}; see {log}")
+    return proc.stdout
+
+
+def remaining_timeout(deadline: float, maximum: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("scenario wall-time budget exhausted; no performance acceptance")
+    return min(maximum, remaining)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("baseline", type=Path)
@@ -216,6 +241,8 @@ def main() -> int:
     parser.add_argument("--max-repeats", type=int, default=201,
                         help="fixed second-look total for uncertain cases; retains first batch")
     parser.add_argument("--seconds", type=float, default=2.0)
+    parser.add_argument("--case-timeout", type=float, default=1800,
+                        help="wall-time budget per scenario, including calibration")
     parser.add_argument("--cpus", help="homogeneous physical CPU IDs; default first four physical cores")
     parser.add_argument("--case", action="append", help="exact case names for diagnosis; never a full gate")
     parser.add_argument("--workers", type=int, choices=(2, 4),
@@ -225,12 +252,14 @@ def main() -> int:
     parser.add_argument("--force-measurement", action="store_true",
                         help="measure even identical runtime bytes (e.g. validating CI sharding)")
     parser.add_argument("--defer-measurement", action="store_true",
-                        help="return 3 without results when timing needs separate runners")
+                        help="return 3 without results when timing needs measurement workers")
     args = parser.parse_args()
-    if args.repeats < 15 or args.seconds < 0.25:
+    if args.repeats < 15 or not math.isfinite(args.seconds) or args.seconds < 0.25:
         parser.error("at least 15 pairs and 0.25 seconds per sample are required")
     if args.max_repeats < args.repeats:
         parser.error("max-repeats must be at least repeats")
+    if not math.isfinite(args.case_timeout) or args.case_timeout <= 0:
+        parser.error("case-timeout must be finite and positive")
     cpus = list(map(int, args.cpus.split(","))) if args.cpus else physical_cpus()
     if len(cpus) < 2 or len(set(cpus)) != len(cpus) or not set(cpus) <= os.sched_getaffinity(0):
         parser.error("at least two distinct allowed physical CPUs are required")
@@ -252,6 +281,7 @@ def main() -> int:
             parser.error("unknown case name")
     builds = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
     metadata = {"base_sha": args.base_sha, "head_sha": args.head_sha, "platform": platform.platform(),
+                "case_timeout": args.case_timeout,
                 "cpus": cpus, "repeats": args.repeats, "max_repeats": args.max_repeats,
                 "minimum_speedup": MIN_SPEEDUP, "per_look_confidence": LOOK_CONFIDENCE,
                 "maximum_looks": 2, "false_acceptance_budget": 0.05,
@@ -271,7 +301,7 @@ def main() -> int:
         metadata[variant + "_cache"] = (build / "CMakeCache.txt").read_text()
     identity = None if args.force_measurement else runtime_identity(builds, metadata["binaries"])
     if args.defer_measurement and not identity:
-        print("Runtime identity not established or timing forced; defer to measurement runners")
+        print("Runtime identity not established or timing forced; defer to measurement workers")
         return 3
     method = "binary-identity" if identity else "paired-bootstrap"
     metadata.update(acceptance_method=method, runtime_identity=identity)
@@ -286,20 +316,29 @@ def main() -> int:
 
     def run(variant: str, case: dict, label: str) -> tuple[float, dict]:
         argv = command(builds[variant], case, cpus)
-        proc = subprocess.run(argv, env=env, text=True, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, timeout=180)
         stem = args.output / f"{case['name']}-{label}-{variant}"
-        stem.with_suffix(".log").write_text(proc.stdout)
-        if proc.returncode:
-            raise RuntimeError(f"benchmark failed: {argv}; see {stem}.log")
-        return parse(case, proc.stdout)
+        try:
+            timeout = remaining_timeout(deadline, 180)
+            return parse(case, run_benchmark(argv, env, stem.with_suffix(".log"), timeout))
+        except (RuntimeError, ValueError, OSError) as error:
+            (args.output / "failure.json").write_text(json.dumps({
+                "case": case["name"], "variant": variant, "phase": label,
+                "error": str(error)}, indent=2) + "\n")
+            raise
 
-    for case in matrix:
+    for index, case in enumerate(matrix, 1):
+        started = time.monotonic()
+        deadline = started + args.case_timeout
+        print(f"[{index}/{len(matrix)}] {case['name']}: starting {method}", flush=True)
         # Calibration fixes identical work for both variants; it is never a sample.
         def save_calibration(records):
             (args.output / f"{case['name']}-calibration.json").write_text(
                 json.dumps(records, indent=2) + "\n")
             (args.output / "cases.json").write_text(json.dumps(matrix, indent=2) + "\n")
+            latest = records[-1]
+            print(f"{case['name']}: calibration {len(records)} cycles={latest['cycles']} "
+                  f"baseline={latest['seconds']['baseline']:.3f}s "
+                  f"candidate={latest['seconds']['candidate']:.3f}s", flush=True)
         if not identity:
             calibrate(case, args.seconds, run, save_calibration)
         reference = None
@@ -323,6 +362,9 @@ def main() -> int:
                 suffix = "identity-checks" if identity else "samples"
                 (args.output / f"{case['name']}-{suffix}.json").write_text(
                     json.dumps(pairs, indent=2) + "\n")
+                if not identity and (len(samples) % 10 == 0 or len(samples) == target):
+                    print(f"{case['name']}: {len(samples)}/{target} pairs "
+                          f"({time.monotonic() - started:.0f}s elapsed)", flush=True)
             if identity:
                 break
             look = confidence(samples)
