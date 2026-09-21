@@ -1,0 +1,93 @@
+name: PR 156 isolated performance diagnosis
+
+on:
+  push:
+    branches: [diagnose/pr156-performance]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr156-isolated-diagnosis
+  cancel-in-progress: true
+
+jobs:
+  diagnostic-only:
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          ref: 3c0e43bb59418bda1d167064c039201bcb5d27e9
+      - uses: actions/checkout@v4
+        with:
+          path: baseline
+          ref: 456f67a2cbd4d22b3aef715509a32639d424febe
+      - name: Record exact commits
+        id: commits
+        run: |
+          echo "base=$(git -C baseline rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "head=$(git -C candidate rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Install identical build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ccache g++-12 libyaml-cpp-dev libfmt-dev zlib1g-dev
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: api-contracts-gcc12-release
+      - name: Configure both revisions
+        env:
+          CXX: g++-12
+          CPM_SOURCE_CACHE: ${{ github.workspace }}/dependencies
+        run: |
+          for variant in baseline candidate; do
+            cmake -S "$variant" -B "$variant/build-perf" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
+              -DCHRONON_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          done
+      - name: Verify identical benchmark sources
+        run: |
+          for file in single_clock_regression.cpp scheduler_invocation_benchmark.cpp \
+              SchedulerInvocationModel.hpp BenchmarkThreadAffinity.hpp \
+              representative_workload_benchmark.cpp RepresentativeWorkload.hpp \
+              RepresentativeWorkloadCalibration.hpp RepresentativeWorkloadOptions.hpp \
+              RepresentativeWorkloadReporting.hpp; do
+            cmp "baseline/benchmark/$file" "candidate/benchmark/$file"
+          done
+      - name: Build exact scheduler binaries
+        run: |
+          for variant in baseline candidate; do
+            cmake --build "$variant/build-perf" --parallel 16 --target chronon_scheduler_invocation_benchmark
+          done
+      - name: Serial fixed-budget diagnosis (not the PR acceptance gate)
+        env:
+          BASE_SHA: ${{ steps.commits.outputs.base }}
+          HEAD_SHA: ${{ steps.commits.outputs.head }}
+        run: |
+          mkdir performance-results
+          diagnose() {
+            label="$1"
+            candidate_build="$2"
+            candidate_sha="$3"
+            case_name="$4"
+            python3 candidate/scripts/check_api_performance.py \
+              baseline/build-perf "$candidate_build" "performance-results/$label" \
+              --base-sha "$BASE_SHA" --head-sha "$candidate_sha" \
+              --workers 2 --cpus 0,1,2 --case "$case_name" \
+              --force-measurement --repeats 51 --max-repeats 51 \
+              > "performance-results/$label.log" 2>&1 && status=0 || status=$?
+            cat "performance-results/$label.log"
+            echo "$label exit=$status" >> performance-results/status.txt
+          }
+          diagnose original-failure candidate/build-perf "$HEAD_SHA" clock1-threads2-dynamic1-poll1
+          diagnose static-failure candidate/build-perf "$HEAD_SHA" clock1-threads2-dynamic0-poll0
+          diagnose identical-control baseline/build-perf "$BASE_SHA" clock1-threads2-dynamic0-poll0
+      - name: Retain all performance evidence, including failed checks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr156-isolated-evidence
+          path: performance-results/
+          if-no-files-found: ignore
+          retention-days: 30
