@@ -29,7 +29,10 @@ jobs:
           sudo apt-get install -y cmake ninja-build ccache g++-12 libyaml-cpp-dev libfmt-dev zlib1g-dev linux-tools-generic
           mkdir -p performance-results
           sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 > performance-results/perf-access.txt 2>&1 || true
-          perf_path=$(find /usr/lib/linux-tools -type f -name perf | sort | tail -1)
+          perf_path=
+          for perf_candidate in /usr/lib/linux-tools/*/perf /usr/lib/linux-tools-*/perf; do
+            if [[ -x "$perf_candidate" ]]; then perf_path="$perf_candidate"; break; fi
+          done
           test -n "$perf_path"
           echo "PERF_BINARY=$perf_path" >> "$GITHUB_ENV"
       - uses: hendrikmuhs/ccache-action@v1.2
@@ -59,6 +62,7 @@ jobs:
             cp "$variant/build-perf/benchmark/chronon_single_clock_regression_benchmark" \
               "$variant/build-perf/benchmark/chronon_scheduler_invocation_benchmark" \
               "$variant/build-perf/CMakeCache.txt" "performance-results/$variant/"
+            cp "$variant/build-perf/src/CMakeFiles/chronon.dir/sender/core/TickSimulationClockParallel.cpp.o"               "$variant/build-perf/src/CMakeFiles/chronon.dir/sender/core/TickSimulationClockMigration.cpp.o"               "$variant/build-perf/src/CMakeFiles/chronon.dir/sender/core/TickSimulationDynamicRebalance.cpp.o"               "performance-results/$variant/"
             ldd "$variant/build-perf/benchmark/chronon_scheduler_invocation_benchmark" > "performance-results/$variant/ldd.txt"
             nm -SC "$variant/build-perf/benchmark/chronon_scheduler_invocation_benchmark" > "performance-results/$variant/symbols.txt"
           done
