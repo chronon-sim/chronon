@@ -34,6 +34,9 @@ void ObservationBackend::attachScheduler(HostServices& scheduler) {
     if (isRunning()) throw std::logic_error("attach observation scheduler before start");
     if (service_) service_->detach();
     io_job_.reset();
+    // start() also attaches the owned scheduler. When switching to an external
+    // one, release its old I/O job first, then join the standalone driver.
+    if (standalone_scheduler_.get() != &scheduler) standalone_scheduler_.reset();
     service_ = scheduler.add(*this);
     service_->detach();
     try {

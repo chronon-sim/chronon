@@ -29,6 +29,9 @@ Standalone backends create a `HostServices` driver that polls the identical
 bounded ingress on its I/O lane, sleeping up to 50 microseconds when idle. This
 supports standalone examples without retaining a second consumer algorithm.
 Ordinary output supports both `enable_reordering=true` and `false`.
+Stopping and restarting a standalone backend retains its driver. Attaching the
+stopped backend to an external scheduler joins and releases the old standalone
+driver before registering with the new scheduler.
 
 Shutdown detaches ingress, fences the outstanding job, drains bounded batches and
 submits finalization. Jobs retain the executor state, allowing observers to close

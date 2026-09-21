@@ -30,6 +30,11 @@ void awaitProgress(Predicate predicate, Pump pump) {
 }
 
 namespace chronon::observe {
+struct ObservationBackendTestAccess {
+    static HostServices* standaloneScheduler(ObservationBackend& backend) {
+        return backend.standalone_scheduler_.get();
+    }
+};
 struct ClockTraceStreamTestAccess {
     static HostServiceRegistration& service(ClockTraceStream& stream) { return *stream.service_; }
 };
@@ -157,6 +162,65 @@ void startedBackend(const std::filesystem::path& root) {
     manager.shutdown();
 }
 
+void reattachedBackend(const std::filesystem::path& root) {
+    auto& threads = ThreadContextManager::instance();
+    threads.setQueueCapacity(4096);
+    threads.setBackpressurePolicy(BackpressurePolicy::Drop);
+    std::atomic<bool> driver_exited{false};
+    std::atomic<size_t> received{0};
+    HostServices scheduler;
+    ObservationQueue queue(4096);
+    ObservationBackend::Config output;
+    output.output_dir = root.string();
+    output.enable_counter_csv = output.timeline_enabled = output.enable_reordering = false;
+    ObservationBackend backend(queue, output);
+    backend.setLogHandler([&](auto, const std::byte*, size_t) { ++received; });
+    ObservationContext context(&queue, [] { return uint64_t{0}; });
+    context.enableCategory(category::LOG_INFO);
+    const auto format = FormatRegistry::instance().registerFormat(
+        "reattached backend {}", __FILE__, __LINE__, {ArgType::UInt64}, true, LogLevel::Info);
+    backend.start();
+    auto* standalone = ObservationBackendTestAccess::standaloneScheduler(backend);
+    CHECK(standalone);
+    // A TLS destructor observes the actual driver thread exit without relying
+    // on sleeps, process-wide thread counts, or reusable thread IDs.
+    struct DriverExit {
+        std::atomic<bool>& exited;
+        ~DriverExit() { exited.store(true); }
+    };
+    auto marker = standalone->addIO(nullptr, &driver_exited, [](void* flag) noexcept {
+        thread_local DriverExit on_exit{*static_cast<std::atomic<bool>*>(flag)};
+    });
+    marker->submit();
+    marker->wait();
+    marker.reset();  // Do not keep the old executor alive through the test job.
+    backend.stop();
+    backend.rethrowIfFailed();
+    CHECK(!driver_exited);
+    // A standalone restart must retain its scheduler and still make progress.
+    backend.start();
+    CHECK(ObservationBackendTestAccess::standaloneScheduler(backend) == standalone);
+    context.log<LogLevel::Info>(format, uint64_t{0});
+    threads.flushAll();
+    awaitProgress([&] { return received == 1; }, [] {});
+    backend.stop();
+    backend.rethrowIfFailed();
+    CHECK(!driver_exited);
+    for (size_t session = 1; session <= 2; ++session) {
+        backend.attachScheduler(scheduler);
+        CHECK(driver_exited);  // Reattachment joins the retired standalone driver.
+        CHECK(!ObservationBackendTestAccess::standaloneScheduler(backend));
+        backend.start();
+        context.log<LogLevel::Info>(format, uint64_t{session});
+        threads.flushAll();
+        size_t cursor = 0;
+        awaitProgress([&] { return received == session + 1; }, [&] { scheduler.poll(cursor); });
+        backend.stop();
+        backend.rethrowIfFailed();
+    }
+    CHECK(context.observationStats().get<ObservationChannel::Info>().dropped == 0);
+}
+
 void clockWakeup(const std::filesystem::path& root) {
     for (size_t capacity : {2, 32, 128}) {
         ClockTraceRecorder::Config config;
@@ -250,6 +314,8 @@ int main(int argc, char** argv) {
         coordinatedClockWakeup(root, std::stoull(mode.substr(mode.find_last_of('-') + 1)));
     else if (mode == "started-backend")
         startedBackend(root);
+    else if (mode == "reattached-backend")
+        reattachedBackend(root);
     else
         shortRuns(root, mode.ends_with("dynamic"), mode.starts_with("clock-"),
                   mode.find("sequential") != std::string::npos ? 1 : 4,
