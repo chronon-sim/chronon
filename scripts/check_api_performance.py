@@ -92,6 +92,23 @@ def needs_extension(result: dict, maximum: int) -> bool:
             and result["sample_count"] < maximum)
 
 
+def measurement_orders(case_name: str, targets) -> list[tuple[str, str]]:
+    # Shards share a host. Reusing one seed would correlate every scenario's
+    # baseline/candidate load phases. Seed by case, independently of scheduling,
+    # and balance which variant runs first in each predeclared sampling batch.
+    rng = random.Random(f"api-performance-149:{case_name}")
+    orders = []
+    for target in targets:
+        count = target - len(orders)
+        first = ["baseline", "candidate"] * (count // 2)
+        if count % 2:
+            first.append(rng.choice(("baseline", "candidate")))
+        rng.shuffle(first)
+        orders.extend((variant, "candidate" if variant == "baseline" else "baseline")
+                      for variant in first)
+    return orders
+
+
 def physical_cpus(limit: int | None = 4) -> list[int]:
     allowed = os.sched_getaffinity(0)
     rows = subprocess.check_output(["lscpu", "-p=CPU,CORE,SOCKET"], text=True)
@@ -286,6 +303,7 @@ def main() -> int:
                 "cpus": cpus, "repeats": args.repeats, "max_repeats": args.max_repeats,
                 "minimum_speedup": MIN_SPEEDUP, "per_look_confidence": LOOK_CONFIDENCE,
                 "maximum_looks": 2, "false_acceptance_budget": 0.05,
+                "pair_order": "case-seeded-balanced-per-look-v1",
                 "target_seconds": args.seconds,
                 "complete_matrix": not args.case and args.shard_count == 1,
                 "workers": workers, "shard_index": args.shard_index,
@@ -312,7 +330,6 @@ def main() -> int:
     env = os.environ.copy()
     env["CHRONON_BENCH_PIN_WORKERS"] = "1"
     env["CHRONON_BENCH_WARM_CPUS"] = "1"
-    rng = random.Random(149)
     results = []
 
     def run(variant: str, case: dict, label: str) -> tuple[float, dict]:
@@ -347,12 +364,11 @@ def main() -> int:
         samples = []
         looks = []
         targets = (2,) if identity else dict.fromkeys((args.repeats, args.max_repeats))
+        orders = measurement_orders(case["name"], targets)
         for target in targets:
             for repetition in range(len(samples), target):
-                order = list(builds)
-                rng.shuffle(order)
                 pair = {}
-                for variant in order:
+                for variant in orders[repetition]:
                     seconds, state = run(variant, case, str(repetition))
                     if reference is not None and state != reference:
                         raise RuntimeError(f"determinism mismatch: {case['name']} {variant}: {state} != {reference}")

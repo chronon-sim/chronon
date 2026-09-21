@@ -88,6 +88,19 @@ class PerformanceAcceptance(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.run_synthetic_matrix([[1.0] * 2], identity=True, cpus="0,2,4,6", workers=4)
 
+    def test_pair_order_is_balanced_at_both_looks_and_independent_between_cases(self):
+        sequences = []
+        for case in gate.cases(2):
+            orders = gate.measurement_orders(case["name"], (51, 201))
+            self.assertEqual(orders, gate.measurement_orders(case["name"], (51, 201)))
+            self.assertEqual(len(orders), 201)
+            for batch in (orders[:51], orders[51:], orders):
+                self.assertLessEqual(abs(sum(pair[0] == "baseline" for pair in batch) * 2
+                                         - len(batch)), 1)
+                self.assertTrue(all(set(pair) == {"baseline", "candidate"} for pair in batch))
+            sequences.append(tuple(orders[:51]))
+        self.assertEqual(len(set(sequences)), len(sequences))
+
     def test_identical_runtime_checks_state_without_fake_statistics(self):
         with patch.object(gate, "confidence", side_effect=AssertionError("must not time identical code")):
             status, calls, artifacts = self.run_synthetic_matrix([[1.0] * 2], identity=True)

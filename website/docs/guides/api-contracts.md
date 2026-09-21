@@ -173,7 +173,10 @@ workflow's `force_measurement` option to exercise full timing even for identical
 runtimes.
 
 Changed runtimes use identical workloads, compiler settings, seeds and CPU
-affinity. State digests must match on every repetition, including calibration
+affinity. Each scenario has its own reproducible measurement-order seed so
+concurrent scenarios do not share the same baseline/candidate load phases.
+The number of baseline-first and candidate-first pairs differs by at most one
+within each predeclared sampling batch. State digests must match on every repetition, including calibration
 pairs. Calibration rechecks scaled workloads for up to five rounds and records
 when the billion-cycle cap limits the two-second target. Each performance
 scenario must independently establish throughput at least 99% of baseline:
