@@ -5,6 +5,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 
@@ -221,6 +222,62 @@ void reattachedBackend(const std::filesystem::path& root) {
     CHECK(context.observationStats().get<ObservationChannel::Info>().dropped == 0);
 }
 
+void reusedScheduler(const std::filesystem::path& root) {
+    auto& threads = ThreadContextManager::instance();
+    threads.setQueueCapacity(4096);
+    threads.setBackpressurePolicy(BackpressurePolicy::Drop);
+    std::atomic<size_t> received{0};
+    Witness witness;
+    std::optional<HostServices> scheduler(std::in_place);
+    auto witness_registration = scheduler->add(witness);
+    ObservationQueue queue(4096);
+    ObservationBackend::Config output;
+    output.output_dir = root.string();
+    output.enable_counter_csv = output.timeline_enabled = output.enable_reordering = false;
+    ObservationBackend backend(queue, output);
+    backend.setLogHandler([&](auto, const std::byte*, size_t) { ++received; });
+    ObservationContext context(&queue, [] { return uint64_t{0}; });
+    context.enableCategory(category::LOG_INFO);
+    const auto format = FormatRegistry::instance().registerFormat(
+        "reused scheduler {}", __FILE__, __LINE__, {ArgType::UInt64}, true, LogLevel::Info);
+    for (size_t session = 0; session < 32; ++session) {
+        backend.attachScheduler(*scheduler);
+        backend.attachScheduler(*scheduler);  // Also cover repeated attachment before start.
+        backend.start();
+        const auto records = backend.serviceStats().records;
+        context.log<LogLevel::Info>(format, uint64_t{session});
+        threads.flushAll();
+        size_t cursor = 0;
+        // One witness and one backend: a single round must reach the backend,
+        // regardless of the number of earlier attachments or stopped sessions.
+        scheduler->poll(cursor);
+        scheduler->poll(cursor);
+        CHECK(backend.serviceStats().records == records + 1);
+        awaitProgress([&] { return received == session + 1; }, [] {});
+        backend.stop();
+        backend.rethrowIfFailed();
+    }
+    // The backend's I/O job outlives its scheduler. Reuse the scheduler's exact
+    // address to catch ownership checks based only on a cached raw pointer.
+    auto* address = &*scheduler;
+    scheduler.emplace();
+    CHECK(&*scheduler == address);
+    witness_registration->poll(true);
+    CHECK(witness.calls == 1);  // Retired registrations stay detached.
+    backend.attachScheduler(*scheduler);
+    backend.start();
+    const auto records = backend.serviceStats().records;
+    context.log<LogLevel::Info>(format, uint64_t{32});
+    threads.flushAll();
+    size_t cursor = 0;
+    scheduler->poll(cursor);  // The replacement scheduler has just the backend.
+    CHECK(backend.serviceStats().records == records + 1);
+    awaitProgress([&] { return received == 33; }, [] {});
+    backend.stop();
+    backend.rethrowIfFailed();
+    CHECK(context.observationStats().get<ObservationChannel::Info>().dropped == 0);
+}
+
 void clockWakeup(const std::filesystem::path& root) {
     for (size_t capacity : {2, 32, 128}) {
         ClockTraceRecorder::Config config;
@@ -316,6 +373,8 @@ int main(int argc, char** argv) {
         startedBackend(root);
     else if (mode == "reattached-backend")
         reattachedBackend(root);
+    else if (mode == "scheduler-reuse")
+        reusedScheduler(root);
     else
         shortRuns(root, mode.ends_with("dynamic"), mode.starts_with("clock-"),
                   mode.find("sequential") != std::string::npos ? 1 : 4,

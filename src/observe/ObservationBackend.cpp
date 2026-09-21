@@ -32,6 +32,9 @@ ObservationBackend::~ObservationBackend() {
 
 void ObservationBackend::attachScheduler(HostServices& scheduler) {
     if (isRunning()) throw std::logic_error("attach observation scheduler before start");
+    // Repeated setup of a stopped backend must not accumulate detached slots
+    // and dilute its share of scheduler polls. Reuse the completed attachment.
+    if (io_job_ && scheduler.hasRegistration(service_)) return;
     if (service_) service_->detach();
     io_job_.reset();
     // start() also attaches the owned scheduler. When switching to an external

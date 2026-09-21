@@ -32,6 +32,8 @@ Ordinary output supports both `enable_reordering=true` and `false`.
 Stopping and restarting a standalone backend retains its driver. Attaching the
 stopped backend to an external scheduler joins and releases the old standalone
 driver before registering with the new scheduler.
+Repeated attachment to the same scheduler reuses the registration and I/O job,
+so stopped sessions do not add empty slots to the scheduler's polling rotation.
 
 Shutdown detaches ingress, fences the outstanding job, drains bounded batches and
 submits finalization. Jobs retain the executor state, allowing observers to close

@@ -221,6 +221,13 @@ public:
     ~HostServices() {
         for (auto& entry : entries_) entry->detach();
     }
+    /// Registration identity survives I/O handoffs and cannot alias a new
+    /// scheduler constructed at the same address as a destroyed one.
+    bool hasRegistration(const std::shared_ptr<HostServiceRegistration>& service) const noexcept {
+        for (const auto& entry : entries_)
+            if (entry == service) return true;
+        return false;
+    }
     std::shared_ptr<HostServiceRegistration> add(HostService& service) {
         auto entry = std::make_shared<HostServiceRegistration>(service);
         entries_.push_back(entry);
