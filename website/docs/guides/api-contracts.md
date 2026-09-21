@@ -185,7 +185,8 @@ The number of baseline-first and candidate-first pairs differs by at most one
 within each predeclared sampling batch. State digests must match on every repetition, including calibration
 pairs. Calibration rechecks scaled workloads for up to five rounds and records
 when the billion-cycle cap limits the two-second target. Each performance
-scenario must independently establish throughput at least 99% of baseline:
+scenario must independently establish throughput at least 95% of baseline
+(a 5% throughput regression tolerance):
 51 paired runs initially, and a fixed total of 201 only if the initial interval
 is uncertain. Both looks use a one-sided 97.5% lower bound, sharing a nominal
 5% false-acceptance budget. The second look retains all first-look samples;

@@ -28,7 +28,7 @@ class ShardAcceptance(unittest.TestCase):
             libraries = {name: {"/lib/library.so": "library-hash"} for name in binaries}
             meta = {"base_sha": "base", "head_sha": "head", "shard_index": i, "shard_count": count,
                     "workers": 2, "case_order": [case["name"] for case in group],
-                    "repeats": 51, "max_repeats": 201, "minimum_speedup": 0.99,
+                    "repeats": 51, "max_repeats": 201, "minimum_speedup": 0.95,
                     "per_look_confidence": 0.975, "maximum_looks": 2,
                     "false_acceptance_budget": 0.05, "target_seconds": 2.0,
                     "acceptance_method": method,
@@ -121,12 +121,19 @@ class ShardAcceptance(unittest.TestCase):
             self.collect()
 
     def test_changed_threshold_rejected(self):
-        self.change("metadata", lambda value: value.update(minimum_speedup=0.98))
-        with self.assertRaisesRegex(ValueError, "changed acceptance"):
-            self.collect()
+        for threshold in (0.94, 0.99):
+            with self.subTest(threshold=threshold):
+                self.change("metadata", lambda value: value.update(minimum_speedup=threshold))
+                with self.assertRaisesRegex(ValueError, "changed acceptance"):
+                    self.collect()
+
+    def test_95_percent_lower_bound_accepted(self):
+        self.change("summary", lambda rows: rows[0].update(lower_speedup=0.95))
+        results, _ = self.collect()
+        self.assertEqual(results[0]["lower_speedup"], 0.95)
 
     def test_failure_cannot_hide_behind_successful_verdict(self):
-        self.change("summary", lambda rows: rows[0].update(lower_speedup=0.989))
+        self.change("summary", lambda rows: rows[0].update(lower_speedup=0.949))
         with self.assertRaisesRegex(ValueError, "unproven non-regression"):
             self.collect()
 

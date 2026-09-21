@@ -201,7 +201,7 @@ class PerformanceAcceptance(unittest.TestCase):
                 self.assertIsNone(gate.runtime_identity(builds, binaries))
 
     def test_final_failure_stops_and_records_incomplete_matrix(self):
-        status, calls, artifacts = self.run_synthetic_matrix([[0.98] * 51, [1.1] * 51])
+        status, calls, artifacts = self.run_synthetic_matrix([[0.949] * 51, [1.1] * 51])
         self.assertEqual(status, 1)
         self.assertEqual(calls, [102, 0])
         self.assertFalse(artifacts["verdict.json"]["pass"])
@@ -210,13 +210,23 @@ class PerformanceAcceptance(unittest.TestCase):
         self.assertEqual(len(artifacts["case-0-samples.json"]), 51)
 
     def test_uncertainty_extends_before_stopping_at_cap(self):
-        samples = [0.97] * 25 + [1.02] * 26 + [0.98] * 150
+        samples = [0.93] * 25 + [1.02] * 26 + [0.94] * 150
         status, calls, artifacts = self.run_synthetic_matrix([samples, [1.1] * 51])
         self.assertEqual(status, 1)
         self.assertEqual(calls, [402, 0])
         self.assertEqual(len(artifacts["case-0-samples.json"]), 201)
         self.assertEqual(len(artifacts["case-0-looks.json"]), 2)
         self.assertFalse(artifacts["verdict.json"]["complete_matrix"])
+
+    def test_95_percent_lower_bound_passes_with_original_confidence_and_sample_budget(self):
+        status, calls, artifacts = self.run_synthetic_matrix([[0.95] * 51])
+        self.assertEqual((status, calls), (0, [102]))
+        meta = artifacts["metadata.json"]
+        self.assertEqual(meta["minimum_speedup"], 0.95)
+        self.assertEqual((meta["repeats"], meta["max_repeats"]), (51, 201))
+        self.assertEqual(meta["per_look_confidence"], 0.975)
+        self.assertAlmostEqual(artifacts["summary.json"][0]["lower_speedup"], 0.95)
+        self.assertTrue(artifacts["verdict.json"]["complete_matrix"])
 
     def test_full_pass_requires_every_requested_case(self):
         status, calls, artifacts = self.run_synthetic_matrix([[1.02] * 51, [1.03] * 51])
@@ -275,11 +285,11 @@ class PerformanceAcceptance(unittest.TestCase):
         self.assertTrue(gate.confidence([1.1] * 31)["pass"])
 
     def test_regression_is_not_hidden(self):
-        self.assertFalse(gate.confidence([0.98] * 31)["pass"])
-        self.assertFalse(gate.confidence([0.98] * 17 + [1.3] * 14)["pass"])
+        self.assertFalse(gate.confidence([0.94] * 31)["pass"])
+        self.assertFalse(gate.confidence([0.94] * 17 + [1.3] * 14)["pass"])
 
     def test_uncertainty_fails_closed(self):
-        result = gate.confidence([0.97] * 15 + [1.02] * 16)
+        result = gate.confidence([0.93] * 15 + [1.02] * 16)
         self.assertGreater(result["median_speedup"], 1.0)
         self.assertFalse(result["pass"])
 
@@ -290,16 +300,16 @@ class PerformanceAcceptance(unittest.TestCase):
                 gate.confidence(samples)
 
     def test_only_uncertainty_extends_once(self):
-        uncertain = gate.confidence([0.97] * 25 + [1.02] * 26)
+        uncertain = gate.confidence([0.93] * 25 + [1.02] * 26)
         self.assertTrue(gate.needs_extension(uncertain, 201))
         self.assertFalse(gate.needs_extension(uncertain, 51))
-        self.assertFalse(gate.needs_extension(gate.confidence([0.98] * 51), 201))
+        self.assertFalse(gate.needs_extension(gate.confidence([0.94] * 51), 201))
         self.assertFalse(gate.needs_extension(gate.confidence([1.01] * 51), 201))
 
     def test_second_look_keeps_bad_initial_samples(self):
         # Discarding the initial batch would pass. The cumulative decision must fail.
-        initial = [0.97] * 51
-        additional = [0.97] * 55 + [1.02] * 95
+        initial = [0.93] * 51
+        additional = [0.93] * 55 + [1.02] * 95
         self.assertTrue(gate.confidence(additional)["pass"])
         cumulative = gate.confidence(initial + additional)
         self.assertFalse(cumulative["pass"])

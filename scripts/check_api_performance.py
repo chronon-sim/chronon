@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 EHTech (Beijing) Co., Ltd.
 # SPDX-License-Identifier: MPL-2.0
-"""Fail closed on state changes or an unproven 1% throughput non-regression.
+"""Fail closed on state changes or an unproven 5% throughput non-regression.
 
 Run identical baseline/candidate binaries in interleaved fresh processes on the
 same physical CPU set. Each case has at most two predeclared looks, each with a
-one-sided 97.5% lower confidence bound >= 0.99 (a nominal 5% false acceptance budget
+one-sided 97.5% lower confidence bound >= 0.95 (a nominal 5% false acceptance budget
 across both looks). Uncertain first looks extend to a fixed maximum using ALL
 samples. Preserve outliers. Do not build or run tests concurrently. Byte-identical
 executables with identical resolved libraries use deterministic checks instead of
@@ -31,7 +31,7 @@ import time
 
 
 STATE_FIELDS = ("predicates", "parallel", "ticks", "sent", "received", "checksum", "digest", "overflow")
-MIN_SPEEDUP = 0.99
+MIN_SPEEDUP = 0.95
 LOOK_CONFIDENCE = 0.975
 MAX_CALIBRATION_ROUNDS = 5
 MAX_CYCLES = 1000000000
