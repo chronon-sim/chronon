@@ -84,6 +84,13 @@ class PerformanceAcceptance(unittest.TestCase):
                 self.assertEqual(command[2], cpus)
                 self.assertEqual(command[5], str(workers))
 
+    def test_sequential_cases_stay_on_one_cpu(self):
+        for case in gate.cases(2):
+            with self.subTest(case=case["name"]):
+                sequential = case["kind"] == "floor" or "threads1" in case["name"]
+                command = gate.command(Path("build"), case, [0, 2, 4])
+                self.assertEqual(command[2], "0" if sequential else "0,2,4")
+
     def test_workers_cannot_share_the_coordinator_cpu(self):
         with self.assertRaises(SystemExit):
             self.run_synthetic_matrix([[1.0] * 2], identity=True, cpus="0,2,4,6", workers=4)

@@ -154,7 +154,9 @@ def executable(case: dict) -> str:
 
 
 def command(build: Path, case: dict, cpus: list[int]) -> list[str]:
-    mask = cpus[:1] if case["kind"] == "floor" else cpus
+    threads = (case["args"][1] if case["kind"] == "scheduler"
+               else case.get("threads", 1))
+    mask = cpus[:1] if threads == 1 else cpus
     argv = ["taskset", "-c", ",".join(map(str, mask)), str(build / "benchmark" / executable(case))]
     if case["kind"] == "floor":
         return argv + [str(case["cycles"])]

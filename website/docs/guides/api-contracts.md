@@ -159,6 +159,7 @@ coverage remains two; the extra CPU does not add simulation parallelism.
 SMT siblings are excluded, and actual topology may reduce the number
 of concurrent groups below five. The checker and its child processes are pinned
 to the group's CPUs; baseline and candidate run sequentially on that same group.
+Single-thread scenarios use only the first CPU in their group to avoid migration.
 Groups never share physical cores, though shared cache, memory bandwidth and host
 noise can still affect timing. The artifact records the CPU allocation, and the
 collector requires every scenario exactly once with the original acceptance
