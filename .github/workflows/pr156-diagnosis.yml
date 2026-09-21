@@ -1,20 +1,16 @@
-name: PR 156 receiver codegen diagnosis
-
+name: PR 156 wall-time profiling
 on:
   push:
     branches: [diagnose/pr156-performance]
-
 permissions:
   contents: read
-
 concurrency:
   group: pr156-isolated-diagnosis
   cancel-in-progress: true
-
 jobs:
   diagnostic-only:
     runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 90
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,78 +18,60 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: candidate
-          ref: 893d2c5e0e12dd2ab279613b776436d3b35df05b
+          ref: 9c222a16eb509726f3ab09d7630dbf197fe107eb
       - uses: actions/checkout@v4
         with:
           path: baseline
           ref: 456f67a2cbd4d22b3aef715509a32639d424febe
-      - name: Record exact commits
-        id: commits
-        run: |
-          echo "base=$(git -C baseline rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "head=$(git -C candidate rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Install identical build dependencies
+      - name: Install build and profiling tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build ccache g++-12 libyaml-cpp-dev libfmt-dev zlib1g-dev
+          sudo apt-get install -y cmake ninja-build ccache g++-12 libyaml-cpp-dev libfmt-dev zlib1g-dev linux-tools-generic
+          mkdir -p performance-results
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 > performance-results/perf-access.txt 2>&1 || true
+          perf_path=$(find /usr/lib/linux-tools -type f -name perf | sort | tail -1)
+          test -n "$perf_path"
+          echo "PERF_BINARY=$perf_path" >> "$GITHUB_ENV"
       - uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: api-contracts-gcc12-release
-      - name: Prepare two bounded receiver prototypes
-        run: python3 probe/.github/diagnostics/pr156-probe.py prepare
-      - name: Configure all variants
+      - name: Build exact Release binaries
         env:
           CXX: g++-12
           CPM_SOURCE_CACHE: ${{ github.workspace }}/dependencies
         run: |
-          for variant in baseline candidate named outlined; do
+          for variant in baseline candidate; do
             cmake -S "$variant" -B "$variant/build-perf" -G Ninja \
               -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
               -DCHRONON_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            cmake --build "$variant/build-perf" --parallel 16 --target \
+              chronon_single_clock_regression_benchmark chronon_scheduler_invocation_benchmark \
+              chronon_representative_workload_benchmark
           done
-      - name: Verify identical benchmark sources
+      - name: Preserve exact compiler and binary evidence
         run: |
-          for file in single_clock_regression.cpp scheduler_invocation_benchmark.cpp \
-              SchedulerInvocationModel.hpp BenchmarkThreadAffinity.hpp \
-              representative_workload_benchmark.cpp RepresentativeWorkload.hpp \
-              RepresentativeWorkloadCalibration.hpp RepresentativeWorkloadOptions.hpp \
-              RepresentativeWorkloadReporting.hpp; do
-            cmp "baseline/benchmark/$file" "candidate/benchmark/$file"
-          done
-      - name: Build representative workloads and ingress correctness tests
-        run: |
-          for variant in baseline candidate named outlined; do
-            cmake --build "$variant/build-perf" --parallel 16 --target chronon_representative_workload_benchmark
-          done
-      - name: Validate prototype ingress correctness
-        run: |
-          for variant in candidate named outlined; do
-            cmake --build "$variant/build-perf" --parallel 16 --target sender_test_mpsc_ingress_cache
-            ctest --test-dir "$variant/build-perf" -R '^sender_mpsc_ingress_cache$' --output-on-failure
-          done
-      - name: Preserve compiler evidence
-        run: |
-          mkdir -p performance-results/libraries
           g++-12 --version > performance-results/compiler.txt
           lscpu > performance-results/lscpu.txt
-          for variant in baseline candidate named outlined; do
+          uname -a > performance-results/kernel.txt
+          "$PERF_BINARY" --version > performance-results/perf-version.txt
+          for variant in baseline candidate; do
             mkdir -p "performance-results/$variant"
-            cp "$variant/build-perf/benchmark/chronon_representative_workload_benchmark" "performance-results/$variant/"
-            cp "$variant/build-perf/CMakeCache.txt" "$variant/src/sender/port/InPort.hpp" "$variant/src/sender/port/MultiProducerQueueAdapter.hpp" "performance-results/$variant/"
-            nm -SC "$variant/build-perf/benchmark/chronon_representative_workload_benchmark" > "performance-results/$variant/symbols.txt"
+            cp "$variant/build-perf/benchmark/chronon_single_clock_regression_benchmark" \
+              "$variant/build-perf/benchmark/chronon_scheduler_invocation_benchmark" \
+              "$variant/build-perf/CMakeCache.txt" "performance-results/$variant/"
+            ldd "$variant/build-perf/benchmark/chronon_scheduler_invocation_benchmark" > "performance-results/$variant/ldd.txt"
+            nm -SC "$variant/build-perf/benchmark/chronon_scheduler_invocation_benchmark" > "performance-results/$variant/symbols.txt"
           done
-          ldd candidate/build-perf/benchmark/chronon_representative_workload_benchmark > performance-results/ldd.txt
-          awk '/=> \// {print $3} /^\s*\// {print $1}' performance-results/ldd.txt | while read -r library; do
-            cp -L "$library" performance-results/libraries/
-          done
-          cp -L /lib64/ld-linux-x86-64.so.2 performance-results/libraries/
-      - name: Fixed 31-block sequential diagnosis (not acceptance)
-        run: python3 probe/.github/diagnostics/pr156-probe.py measure
-      - name: Retain all performance evidence, including failed checks
+      - name: Fixed 24-block isolated comparisons with identical-binary control
+        run: python3 probe/.github/diagnostics/pr156-wall-time.py measure baseline/build-perf candidate/build-perf performance-results
+      - name: Perf counters and CPU stack profiles
+        run: python3 probe/.github/diagnostics/pr156-wall-time.py profile baseline/build-perf candidate/build-perf performance-results/profiles --perf "$PERF_BINARY"
+      - name: Eight repetitions of the unchanged concurrent PR matrix
+        run: python3 probe/.github/diagnostics/pr156-wall-time.py matrix baseline/build-perf candidate/build-perf performance-results/concurrent
+      - name: Retain diagnostic evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr156-codegen-evidence
+          name: pr156-wall-time-profiles
           path: performance-results/
-          if-no-files-found: ignore
           retention-days: 30
