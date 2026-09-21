@@ -682,10 +682,8 @@ public:
     void prepareConsumerCycle(uint64_t current_cycle) override {
         if (multi_producer_queue_raw_) {
             multi_producer_queue_raw_->resetIngressCache();
-            multi_producer_queue_raw_->prepareSharedFifo(
-                current_cycle, [this, current_cycle]() noexcept {
-                    return ingressCompleteForTick_(current_cycle);
-                });
+            multi_producer_queue_raw_->prepareSharedFifo(current_cycle,
+                                                         IngressCertificate{this, current_cycle});
         }
     }
 
@@ -772,12 +770,18 @@ private:
                !multi_producer_queue_raw_->hasManualPublication();
     }
 
+    // Both callers must use the same certificate type so their lane-fill
+    // specialization can be shared instead of duplicated inside receive paths.
+    struct IngressCertificate {
+        const InPort* port;
+        uint64_t cycle;
+        bool operator()() const noexcept { return port->ingressCompleteForTick_(cycle); }
+    };
+
     template <typename Queue, typename Visitor>
     bool consumeReady_(Queue& queue, uint64_t cycle, Visitor& visitor) {
         if constexpr (std::is_same_v<Queue, MultiProducerQueueAdapter<StoredMessage>>) {
-            return queue.consumeReady(cycle, visitor, [this, cycle]() noexcept {
-                return ingressCompleteForTick_(cycle);
-            });
+            return queue.consumeReady(cycle, visitor, IngressCertificate{this, cycle});
         } else {
             return queue.consumeReady(cycle, visitor);
         }
