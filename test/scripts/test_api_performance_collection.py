@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: MPL-2.0
 """Complete and consistent evidence is required; a slowdown is still reportable."""
 import json
+from contextlib import redirect_stdout, redirect_stderr
+import io
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 import collect_api_performance as collector
+import run_api_performance as runner
 from check_api_performance import METHOD, cases
 
 
@@ -52,6 +57,48 @@ class ShardCollection(unittest.TestCase):
         (self.root / "api-performance-28" / "verdict.json").unlink()
         with self.assertRaises(FileNotFoundError):
             self.collect()
+
+    def test_partial_collection_excludes_missing_failed_and_invalid_shards(self):
+        (self.root / "api-performance-28" / "verdict.json").unlink()
+        (self.root / "api-performance-27" / "summary.json").write_text('{"unfinished":')
+        self.change("verdict", lambda value: value.update({"pass": False, "complete_shard": False}))
+        results, metadata = collector.collect(self.root, "base", "head", 29, 2,
+                                              allow_incomplete=True)
+        self.assertEqual([row["shard_index"] for row in results], list(range(1, 27)))
+        self.assertEqual(len(metadata), 26)
+        with self.assertRaisesRegex(ValueError, "failed or incomplete"):
+            self.collect()
+
+    def test_failure_timeout_and_cancellation_reports_keep_completed_shards(self):
+        (self.root / "api-performance-28" / "verdict.json").unlink()
+        for error in (RuntimeError("late task failed"), RuntimeError("wall-time budget exhausted"),
+                      KeyboardInterrupt("cancelled")):
+            with self.subTest(error=str(error)), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / "results"
+                argv = ["run_api_performance.py", "baseline", "candidate", str(output),
+                        "--base-sha", "base", "--head-sha", "head"]
+
+                def fail_after_completed_tasks(*args):
+                    shutil.copytree(self.root, output / "shards", dirs_exist_ok=True)
+                    raise error
+
+                with (patch.object(runner.sys, "argv", argv),
+                      patch.object(runner, "physical_cpus", return_value=list(range(16))),
+                      patch.object(runner, "run_tasks", side_effect=fail_after_completed_tasks),
+                      redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                    status = runner.main()
+                self.assertEqual(status, 1)
+                verdict = json.loads((output / "verdict.json").read_text())
+                self.assertFalse(verdict["pass"])
+                self.assertFalse(verdict["complete_matrix"])
+                self.assertEqual(verdict["error"], str(error))
+                report = (output / "report.md").read_text()
+                self.assertIn("**28/29**", report)
+                self.assertIn("FAILED / INCOMPLETE", report)
+                self.assertIn("1.000000 | 2.000000 | +100.0%", report)
+                self.assertNotIn("**PASS**", report)
+                self.assertEqual(verdict["completed_cases"], 28)
+                self.assertEqual(len(json.loads((output / "summary.json").read_text())), 28)
 
     def test_failed_or_incomplete_shard_rejected(self):
         self.change("verdict", lambda v: v.update(complete_shard=False))

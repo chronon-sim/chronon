@@ -150,8 +150,10 @@ measurement tests finish before benchmarks run.
 `scripts/run_api_performance.py` schedules all 29 scenarios through one shared
 queue, including the six dynamic-scheduling scenarios. On 16 available physical
 cores it runs up to eight tasks concurrently, each assigned two distinct cores.
-The two simulation workers and calling thread share that task's CPU set; the
-caller shares the last worker's core. Single-thread scenarios use the first core.
+The two simulation workers and calling thread share that task's CPU set. The
+scheduler benchmark pins its workers individually and puts the caller on the
+last worker's core; representative workloads can migrate within the two-core
+set. Single-thread scenarios use the first core.
 SMT siblings are excluded, and smaller machines automatically use fewer groups.
 Baseline and candidate run sequentially on the same CPU group for each scenario.
 
@@ -176,6 +178,9 @@ validation. All 29 scenarios must supply one valid baseline/candidate pair.
 Each pair has a two-minute timeout and the entire measurement a ten-minute
 budget; the job timeout is 20 minutes. A timeout or failed task stops the active
 checker process groups and benchmark children, retaining available diagnostics.
+Failure reports retain the wall-time rows and completion count of successfully
+validated shards; missing, failed or malformed shards are excluded, and the
+overall check remains failed.
 
 A separate comment job reads the artifact without executing candidate code and
 creates or updates one bot comment per PR, linking the workflow run and artifacts.

@@ -143,7 +143,11 @@ def main():
         print(f"PASS: all {len(results)} scenarios across {count} evidence shards", flush=True)
         return 0
     except (RuntimeError, ValueError, OSError, KeyError, KeyboardInterrupt) as error:
-        verdict["error"] = str(error)
+        results, metadata = collect(root, args.base_sha, args.head_sha, len(matrix), args.workers,
+                                    allow_incomplete=True)
+        verdict.update(error=str(error), completed_cases=len(results))
+        write("summary", results)
+        write("metadata", {**verdict, "shards": metadata})
         write("verdict", verdict)
         print(f"FAIL: {error}; partial evidence retained in {output}", file=sys.stderr, flush=True)
         return 1

@@ -100,7 +100,7 @@ time.sleep(60)
         with (patch.object(runner.sys, "argv", argv),
               patch.object(runner, "physical_cpus", return_value=list(range(16))),
               patch.object(runner, "run_tasks", side_effect=statuses) as tasks,
-              patch.object(runner, "collect", return_value=collector_result) as collect,
+              patch.object(runner, "collect", return_value=collector_result or ([], [])) as collect,
               redirect_stdout(io.StringIO())):
             status = runner.main()
         return status, tasks, collect, json.loads((output / "verdict.json").read_text())
@@ -120,10 +120,11 @@ time.sleep(60)
         self.assertTrue(verdict["complete_matrix"])
         self.assertIn("29/29", (self.root / "results/report.md").read_text())
 
-    def test_failed_measurement_cannot_reach_collector_or_pass(self):
+    def test_failed_measurement_only_collects_partial_results_and_cannot_pass(self):
         status, _, collect, verdict = self.invoke_main([RuntimeError("failed scenario")])
         self.assertEqual(status, 1)
-        collect.assert_not_called()
+        collect.assert_called_once_with(self.root / "results/shards", "base", "head", 29, 2,
+                                        allow_incomplete=True)
         self.assertFalse(verdict["pass"])
         self.assertFalse(verdict["complete_matrix"])
         self.assertIn("FAILED / INCOMPLETE", (self.root / "results/report.md").read_text())
