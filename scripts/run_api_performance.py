@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: MPL-2.0
 """Run the unchanged performance gate on disjoint physical CPUs on one host.
 
-Each scenario is a separate evidence shard. As soon as a CPU group becomes free,
-it takes the next scenario, so a second sampling batch cannot hold up a static
-shard's remaining cases. Baseline and candidate always share the same CPU group
-and run sequentially. Builds and correctness tests must finish before this runs.
+Each scenario is a separate evidence shard. Adaptive scheduling scenarios run
+alone so other measurements cannot perturb their runtime cost estimates. The
+remaining scenarios fill free CPU groups dynamically. Baseline and candidate
+always share the same CPU group and run sequentially. Builds and correctness
+tests must finish before this runs.
 """
 
 import argparse
@@ -50,10 +51,11 @@ def stop_processes(processes):
         process.wait()
 
 
-def run_tasks(count, groups, command, timeout, accepted=(0,)):
+def run_tasks(count, groups, command, timeout, accepted=(0,), indices=None):
     """Dynamically fill CPU slots; any failure/timeout stops every process tree."""
     active, results = {}, {}
-    pending = iter(range(count))
+    selected = list(range(count)) if indices is None else list(indices)
+    pending = iter(selected)
     exhausted = False
     deadline = time.monotonic() + timeout
     try:
@@ -83,7 +85,7 @@ def run_tasks(count, groups, command, timeout, accepted=(0,)):
                 time.sleep(0.1)
     finally:
         stop_processes([process for _, process in active.values()])
-    return [results[index] for index in range(count)]
+    return [results[index] for index in selected]
 
 
 def main():
@@ -111,6 +113,9 @@ def main():
     root = output / "shards"
     root.mkdir()
     matrix = cases(args.workers)
+    adaptive = [index for index, case in enumerate(matrix)
+                if case["kind"] == "scheduler" and case["args"][5]]
+    parallel = [index for index in range(len(matrix)) if index not in adaptive]
     deadline = time.monotonic() + args.timeout
     verdict = {"pass": False, "complete_matrix": False, "base_sha": args.base_sha,
                "head_sha": args.head_sha, "expected_cases": len(matrix)}
@@ -120,7 +125,8 @@ def main():
 
     write("execution", {"cpu_groups": groups, "concurrent_scenarios": len(groups),
                         "workers": args.workers, "timeout_seconds": args.timeout,
-                        "case_order": [case["name"] for case in matrix]})
+                        "case_order": [case["name"] for case in matrix],
+                        "exclusive_cases": [matrix[index]["name"] for index in adaptive]})
     write("verdict", verdict)
     print(f"Using {len(groups)} isolated CPU groups: {groups}", flush=True)
 
@@ -145,8 +151,14 @@ def main():
         count = 1
         if status == 3:
             count = len(matrix)
+            # These cases use runtime timing to guide scheduling. Disjoint CPU
+            # masks do not isolate them from other cases' shared-cache/memory
+            # pressure, which changes while those cases switch A/B revisions.
+            # Finish all exclusive work before admitting any parallel case.
+            run_tasks(count, groups[:1], lambda index, cpus: command(index, cpus, count),
+                      deadline - time.monotonic(), indices=adaptive)
             run_tasks(count, groups, lambda index, cpus: command(index, cpus, count),
-                      deadline - time.monotonic())
+                      deadline - time.monotonic(), indices=parallel)
         results, metadata = collect(root, args.base_sha, args.head_sha, count, args.workers)
         # Write success only after validating every evidence shard.
         success = {**verdict, "pass": True, "complete_matrix": True, "completed_cases": len(results)}

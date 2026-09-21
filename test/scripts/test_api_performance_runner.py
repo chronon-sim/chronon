@@ -113,11 +113,50 @@ time.sleep(60)
         self.assertTrue(verdict["pass"])
 
     def test_changed_runtimes_schedule_all_cases_then_collect(self):
-        status, tasks, collect, verdict = self.invoke_main([[3], [0] * 29], ([{}] * 29, [{}] * 29))
+        status, tasks, collect, verdict = self.invoke_main(
+            [[3], [0] * 6, [0] * 23], ([{}] * 29, [{}] * 29))
         self.assertEqual(status, 0)
         self.assertEqual(tasks.call_args.args[0], 29)
+        exclusive, parallel = tasks.call_args_list[1:]
+        self.assertEqual(len(exclusive.args[1]), 1)
+        self.assertEqual(len(parallel.args[1]), 5)
+        first, second = exclusive.kwargs["indices"], parallel.kwargs["indices"]
+        self.assertEqual(len(first), 6)
+        self.assertEqual(sorted(first + second), list(range(29)))
+        self.assertTrue(set(first).isdisjoint(second))
+        matrix = runner.cases(2)
+        self.assertTrue(all(matrix[i]["kind"] == "scheduler" and matrix[i]["args"][5]
+                            for i in first))
+        self.assertEqual(exclusive.args[2](first[0], [0, 1, 2])[-4:],
+                         ["--shard-index", str(first[0]), "--shard-count", "29"])
         self.assertEqual(collect.call_args.args[3:], (29, 2))
         self.assertTrue(verdict["complete_matrix"])
+
+    def test_selected_shards_keep_original_indices_and_finish_before_parallel_work(self):
+        groups = runner.cpu_groups(runner.physical_cpus(limit=None), 2, 2)
+        worker = self.root / "phase.py"
+        worker.write_text('''import json, sys, time
+from pathlib import Path
+root, index = Path(sys.argv[1]), int(sys.argv[2])
+start = time.monotonic()
+time.sleep(0.05)
+(root / f"{index}.json").write_text(json.dumps([start, time.monotonic()]))
+''')
+        command = lambda index, _: [sys.executable, str(worker), str(self.root), str(index)]
+        with redirect_stdout(io.StringIO()):
+            first = runner.run_tasks(5, groups[:1], command, 5, indices=[3, 1])
+            second = runner.run_tasks(5, groups, command, 5, indices=[0, 2, 4])
+        self.assertEqual((first, second), ([0, 0], [0, 0, 0]))
+        records = {i: json.loads((self.root / f"{i}.json").read_text()) for i in range(5)}
+        self.assertLessEqual(records[3][1], records[1][0])
+        self.assertLessEqual(records[1][1], min(records[i][0] for i in (0, 2, 4)))
+
+    def test_parallel_failure_after_exclusive_phase_still_rejects_full_matrix(self):
+        status, _, collect, verdict = self.invoke_main(
+            [[3], [0] * 6, RuntimeError("parallel scenario failed")])
+        self.assertEqual(status, 1)
+        collect.assert_not_called()
+        self.assertFalse(verdict["pass"])
 
     def test_failed_measurement_cannot_reach_collector_or_pass(self):
         status, _, collect, verdict = self.invoke_main([[3], RuntimeError("failed scenario")])

@@ -147,9 +147,14 @@ PR validation runs in one `differential-performance` job on a
 `blacksmith-16vcpu-ubuntu-2404` runner. It builds immutable baseline and candidate
 commits once and completes correctness tests before measurement. When runtime
 identity is established, it checks all 29 scenarios without timing. Otherwise,
-`scripts/run_api_performance.py` schedules one scenario per evidence shard from a
-shared queue, with at most five concurrent scenarios. A free CPU group takes the
-next scenario immediately, including while other scenarios extend their samples.
+`scripts/run_api_performance.py` schedules one scenario per evidence shard. The
+six dynamic-scheduling scenarios run sequentially first, with no other benchmark
+scenario active in the job. Their runtime cost signals are sensitive to the
+shared-cache and memory pressure from concurrent measurements, even when CPU
+masks do not overlap. The remaining 23 scenarios use a shared queue with at most
+five concurrent scenarios. A free CPU group takes the next scenario immediately,
+including while other scenarios extend their samples. Both phases share the same
+overall deadline; the execution artifact identifies the exclusive scenarios.
 Executable and intermediate artifact transfers between jobs are no longer needed.
 
 Each group uses three distinct physical cores selected from the process's allowed
