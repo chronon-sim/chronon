@@ -1,4 +1,4 @@
-name: PR 156 isolated performance diagnosis
+name: PR 156 runner machine code
 
 on:
   push:
@@ -60,34 +60,29 @@ jobs:
           for variant in baseline candidate; do
             cmake --build "$variant/build-perf" --parallel 16 --target chronon_scheduler_invocation_benchmark
           done
-      - name: Serial fixed-budget diagnosis (not the PR acceptance gate)
-        env:
-          BASE_SHA: ${{ steps.commits.outputs.base }}
-          HEAD_SHA: ${{ steps.commits.outputs.head }}
+      - name: Retain exact GCC 12.4 machine code
         run: |
-          mkdir performance-results
-          diagnose() {
-            label="$1"
-            candidate_build="$2"
-            candidate_sha="$3"
-            case_name="$4"
-            python3 candidate/scripts/check_api_performance.py \
-              baseline/build-perf "$candidate_build" "performance-results/$label" \
-              --base-sha "$BASE_SHA" --head-sha "$candidate_sha" \
-              --workers 2 --cpus 0,1,2 --case "$case_name" \
-              --force-measurement --repeats 51 --max-repeats 51 \
-              > "performance-results/$label.log" 2>&1 && status=0 || status=$?
-            cat "performance-results/$label.log"
-            echo "$label exit=$status" >> performance-results/status.txt
-          }
-          diagnose original-failure candidate/build-perf "$HEAD_SHA" clock1-threads2-dynamic1-poll1
-          diagnose static-failure candidate/build-perf "$HEAD_SHA" clock1-threads2-dynamic0-poll0
-          diagnose identical-control baseline/build-perf "$BASE_SHA" clock1-threads2-dynamic0-poll0
+          for variant in baseline candidate; do
+            mkdir -p "performance-results/$variant"
+            cp "$variant/build-perf/benchmark/chronon_scheduler_invocation_benchmark" "performance-results/$variant/"
+            cp "$variant/build-perf/benchmark/CMakeFiles/chronon_scheduler_invocation_benchmark.dir/scheduler_invocation_benchmark.cpp.o" "performance-results/$variant/"
+            for object in TickSimulationClockParallel.cpp.o TickSimulationClocks.cpp.o TickSimulationDynamicRuntime.cpp.o CrashHandler.cpp.o; do
+              cp "$variant/build-perf/src/CMakeFiles/chronon.dir/sender/core/$object" "performance-results/$variant/"
+            done
+            cp "$variant/build-perf/CMakeCache.txt" "performance-results/$variant/"
+          done
+          g++-12 --version > performance-results/compiler.txt
+          mkdir performance-results/libraries
+          ldd candidate/build-perf/benchmark/chronon_scheduler_invocation_benchmark > performance-results/ldd.txt
+          awk '/=> \// {print $3} /^\s*\// {print $1}' performance-results/ldd.txt | while read -r library; do
+            cp -L "$library" performance-results/libraries/
+          done
+          cp -L /lib64/ld-linux-x86-64.so.2 performance-results/libraries/
       - name: Retain all performance evidence, including failed checks
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr156-isolated-evidence
+          name: pr156-runner-code
           path: performance-results/
           if-no-files-found: ignore
           retention-days: 30
