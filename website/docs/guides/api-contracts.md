@@ -148,13 +148,16 @@ PR validation runs in one `differential-performance` job on a
 commits once and completes correctness tests before measurement. When runtime
 identity is established, it checks all 29 scenarios without timing. Otherwise,
 `scripts/run_api_performance.py` schedules one scenario per evidence shard from a
-shared queue, with at most eight concurrent scenarios. A free CPU group takes the
+shared queue, with at most five concurrent scenarios. A free CPU group takes the
 next scenario immediately, including while other scenarios extend their samples.
 Executable and intermediate artifact transfers between jobs are no longer needed.
 
-Each group uses two distinct physical cores selected from the process's allowed
-CPU affinity. SMT siblings are excluded, and actual topology may reduce the number
-of concurrent groups below eight. The checker and its child processes are pinned
+Each group uses three distinct physical cores selected from the process's allowed
+CPU affinity: two pool workers and one calling/coordinator thread. Reserving the
+coordinator CPU avoids competing with a worker at every short run's join. Worker
+coverage remains two; the extra CPU does not add simulation parallelism.
+SMT siblings are excluded, and actual topology may reduce the number
+of concurrent groups below five. The checker and its child processes are pinned
 to the group's CPUs; baseline and candidate run sequentially on that same group.
 Groups never share physical cores, though shared cache, memory bandwidth and host
 noise can still affect timing. The artifact records the CPU allocation, and the

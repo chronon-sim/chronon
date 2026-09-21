@@ -25,10 +25,13 @@ from collect_api_performance import collect
 
 def cpu_groups(cpus, workers, jobs):
     """Input contains one allowed logical CPU per physical core, never siblings."""
-    if workers < 2 or jobs < 1 or len(cpus) < workers or len(set(cpus)) != len(cpus):
-        raise ValueError("not enough distinct physical CPUs for measurement workers")
-    count = min(jobs, len(cpus) // workers)
-    return [cpus[i * workers:(i + 1) * workers] for i in range(count)]
+    # The calling thread waits for the pool on every public run. Sharing its
+    # CPU with a worker turns short invocations into a context-switch benchmark.
+    width = workers + 1
+    if workers < 2 or jobs < 1 or len(cpus) < width or len(set(cpus)) != len(cpus):
+        raise ValueError("not enough distinct physical CPUs for workers and coordinator")
+    count = min(jobs, len(cpus) // width)
+    return [cpus[i * width:(i + 1) * width] for i in range(count)]
 
 
 def stop_processes(processes):

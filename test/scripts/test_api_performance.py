@@ -20,7 +20,7 @@ SPEC.loader.exec_module(gate)
 
 class PerformanceAcceptance(unittest.TestCase):
     def run_synthetic_matrix(self, speedups, selected=None, shard=None, identity=False, force=False,
-                             mismatch=False, defer=False):
+                             mismatch=False, defer=False, cpus="0,2,4", workers=None):
         """Exercise CLI sampling, artifacts and exit status without real timing."""
         cases = [{"name": f"case-{i}", "kind": "floor", "cycles": 100 + i}
                  for i in range(len(speedups))]
@@ -35,7 +35,9 @@ class PerformanceAcceptance(unittest.TestCase):
                 (build / "CMakeCache.txt").write_text("identical synthetic settings\n")
             output = root / "results"
             argv = ["check_api_performance.py", *map(str, builds), str(output),
-                    "--base-sha", "baseline", "--head-sha", "candidate", "--cpus", "0,2"]
+                    "--base-sha", "baseline", "--head-sha", "candidate", "--cpus", cpus]
+            if workers is not None:
+                argv += ["--workers", str(workers)]
             if shard is not None:
                 argv += ["--shard-index", str(shard[0]), "--shard-count", str(shard[1])]
             if force:
@@ -56,7 +58,7 @@ class PerformanceAcceptance(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, stdout=text)
 
             with (patch.object(gate.sys, "argv", argv),
-                  patch.object(gate.os, "sched_getaffinity", return_value={0, 2}),
+                  patch.object(gate.os, "sched_getaffinity", return_value=set(map(int, cpus.split(",")))),
                   patch.object(gate, "cases", return_value=cases),
                   patch.object(gate, "calibrate"),
                   patch.object(gate, "runtime_identity", return_value={"verified": True} if identity else None),
@@ -66,6 +68,25 @@ class PerformanceAcceptance(unittest.TestCase):
                 status = gate.main()
             artifacts = {path.name: json.loads(path.read_text()) for path in output.glob("*.json")}
         return status, calls, artifacts
+
+    def test_coordinator_cpu_survives_cli_without_changing_worker_coverage(self):
+        for workers, cpus in ((2, "0,2,4"), (4, "0,2,4,6,8")):
+            with self.subTest(workers=workers):
+                status, _, artifacts = self.run_synthetic_matrix(
+                    [[1.0] * 2], identity=True, cpus=cpus, workers=workers)
+                self.assertEqual(status, 0)
+                meta = artifacts["metadata.json"]
+                self.assertEqual(meta["workers"], workers)
+                self.assertEqual(meta["cpus"], list(map(int, cpus.split(","))))
+                case = next(c for c in gate.cases(workers)
+                            if c["name"] == f"clock1-threads{workers}-dynamic1-poll1")
+                command = gate.command(Path("build"), case, meta["cpus"])
+                self.assertEqual(command[2], cpus)
+                self.assertEqual(command[5], str(workers))
+
+    def test_workers_cannot_share_the_coordinator_cpu(self):
+        with self.assertRaises(SystemExit):
+            self.run_synthetic_matrix([[1.0] * 2], identity=True, cpus="0,2,4,6", workers=4)
 
     def test_identical_runtime_checks_state_without_fake_statistics(self):
         with patch.object(gate, "confidence", side_effect=AssertionError("must not time identical code")):

@@ -96,7 +96,7 @@ jobs:
           python3 candidate/scripts/run_api_performance.py \
             baseline/build-perf candidate/build-perf performance-results \
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
-            --workers 2 --jobs 8 --timeout 4200 "${extra[@]}"
+            --workers 2 --jobs 5 --timeout 4200 "${extra[@]}"
       - name: Retain all performance evidence, including failed checks
         if: always()
         uses: actions/upload-artifact@v4

@@ -243,7 +243,7 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=2.0)
     parser.add_argument("--case-timeout", type=float, default=1800,
                         help="wall-time budget per scenario, including calibration")
-    parser.add_argument("--cpus", help="homogeneous physical CPU IDs; default first four physical cores")
+    parser.add_argument("--cpus", help="physical CPU IDs for workers plus coordinator; default first five cores")
     parser.add_argument("--case", action="append", help="exact case names for diagnosis; never a full gate")
     parser.add_argument("--workers", type=int, choices=(2, 4),
                         help="fix parallel coverage across runners; requires enough physical CPUs")
@@ -260,14 +260,15 @@ def main() -> int:
         parser.error("max-repeats must be at least repeats")
     if not math.isfinite(args.case_timeout) or args.case_timeout <= 0:
         parser.error("case-timeout must be finite and positive")
-    cpus = list(map(int, args.cpus.split(","))) if args.cpus else physical_cpus()
-    if len(cpus) < 2 or len(set(cpus)) != len(cpus) or not set(cpus) <= os.sched_getaffinity(0):
-        parser.error("at least two distinct allowed physical CPUs are required")
-    if args.workers:
-        if args.workers > len(cpus):
-            parser.error("not enough physical CPUs for requested workers")
-        cpus = cpus[:args.workers]
-    workers = min(4, len(cpus))
+    cpus = list(map(int, args.cpus.split(","))) if args.cpus else physical_cpus(limit=5)
+    if len(cpus) < 3 or len(set(cpus)) != len(cpus) or not set(cpus) <= os.sched_getaffinity(0):
+        parser.error("at least three distinct allowed physical CPUs are required")
+    workers = args.workers or (4 if len(cpus) >= 5 else 2)
+    if len(cpus) < workers + 1:
+        parser.error("not enough physical CPUs for requested workers plus coordinator")
+    # BenchmarkThreadAffinity pins pool workers to the first CPUs and the
+    # calling thread to the last. Preserve that extra CPU without adding a worker.
+    cpus = cpus[:workers + 1]
     matrix = cases(workers)
     if not 0 <= args.shard_index < args.shard_count <= len(matrix):
         parser.error("invalid shard index/count")

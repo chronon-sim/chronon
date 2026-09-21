@@ -23,17 +23,19 @@ class LocalPerformanceRunner(unittest.TestCase):
 
     def test_groups_never_overlap_and_respect_available_physical_cores(self):
         self.assertEqual(runner.cpu_groups(list(range(16)), 2, 8),
-                         [[i, i + 1] for i in range(0, 16, 2)])
-        self.assertEqual(runner.cpu_groups([0, 2, 4, 6, 8], 2, 8), [[0, 2], [4, 6]])
-        self.assertEqual(runner.cpu_groups(list(range(16)), 2, 2), [[0, 1], [2, 3]])
-        for cpus, workers, jobs in (([0], 2, 8), ([0, 0], 2, 8), ([0, 2], 2, 0)):
+                         [[i, i + 1, i + 2] for i in range(0, 15, 3)])
+        self.assertEqual(runner.cpu_groups([0, 2, 4, 6, 8], 2, 8), [[0, 2, 4]])
+        self.assertEqual(runner.cpu_groups(list(range(16)), 2, 2), [[0, 1, 2], [3, 4, 5]])
+        self.assertEqual(runner.cpu_groups(list(range(16)), 4, 8),
+                         [list(range(i, i + 5)) for i in (0, 5, 10)])
+        for cpus, workers, jobs in (([0, 2], 2, 8), ([0, 0, 2], 2, 8), ([0, 2, 4], 2, 0)):
             with self.assertRaises(ValueError):
                 runner.cpu_groups(cpus, workers, jobs)
 
     def test_dynamic_queue_reuses_free_cpus_without_waiting_for_slow_case(self):
         cpus = runner.physical_cpus(limit=None)
-        if len(cpus) < 4:
-            self.skipTest("requires four physical CPUs")
+        if len(cpus) < 6:
+            self.skipTest("requires six physical CPUs")
         groups = runner.cpu_groups(cpus, 2, 2)
         worker = self.root / "worker.py"
         worker.write_text('''import json, os, sys, time
