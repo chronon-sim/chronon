@@ -1,4 +1,4 @@
-name: PR 156 runner machine code
+name: PR 156 receiver codegen diagnosis
 
 on:
   push:
@@ -18,8 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          path: probe
+      - uses: actions/checkout@v4
+        with:
           path: candidate
-          ref: 3c0e43bb59418bda1d167064c039201bcb5d27e9
+          ref: 893d2c5e0e12dd2ab279613b776436d3b35df05b
       - uses: actions/checkout@v4
         with:
           path: baseline
@@ -36,12 +39,14 @@ jobs:
       - uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: api-contracts-gcc12-release
-      - name: Configure both revisions
+      - name: Prepare two bounded receiver prototypes
+        run: python3 probe/.github/diagnostics/pr156-probe.py prepare
+      - name: Configure all variants
         env:
           CXX: g++-12
           CPM_SOURCE_CACHE: ${{ github.workspace }}/dependencies
         run: |
-          for variant in baseline candidate; do
+          for variant in baseline candidate named outlined; do
             cmake -S "$variant" -B "$variant/build-perf" -G Ninja \
               -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
               -DCHRONON_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
@@ -55,34 +60,40 @@ jobs:
               RepresentativeWorkloadReporting.hpp; do
             cmp "baseline/benchmark/$file" "candidate/benchmark/$file"
           done
-      - name: Build exact scheduler binaries
+      - name: Build representative workloads and ingress correctness tests
         run: |
-          for variant in baseline candidate; do
-            cmake --build "$variant/build-perf" --parallel 16 --target chronon_scheduler_invocation_benchmark
+          for variant in baseline candidate named outlined; do
+            cmake --build "$variant/build-perf" --parallel 16 --target chronon_representative_workload_benchmark
           done
-      - name: Retain exact GCC 12.4 machine code
+      - name: Validate prototype ingress correctness
         run: |
-          for variant in baseline candidate; do
-            mkdir -p "performance-results/$variant"
-            cp "$variant/build-perf/benchmark/chronon_scheduler_invocation_benchmark" "performance-results/$variant/"
-            cp "$variant/build-perf/benchmark/CMakeFiles/chronon_scheduler_invocation_benchmark.dir/scheduler_invocation_benchmark.cpp.o" "performance-results/$variant/"
-            for object in TickSimulationClockParallel.cpp.o TickSimulationClocks.cpp.o TickSimulationDynamicRuntime.cpp.o CrashHandler.cpp.o; do
-              cp "$variant/build-perf/src/CMakeFiles/chronon.dir/sender/core/$object" "performance-results/$variant/"
-            done
-            cp "$variant/build-perf/CMakeCache.txt" "performance-results/$variant/"
+          for variant in candidate named outlined; do
+            cmake --build "$variant/build-perf" --parallel 16 --target sender_test_mpsc_ingress_cache
+            ctest --test-dir "$variant/build-perf" -R '^sender_mpsc_ingress_cache$' --output-on-failure
           done
+      - name: Preserve compiler evidence
+        run: |
+          mkdir -p performance-results/libraries
           g++-12 --version > performance-results/compiler.txt
-          mkdir performance-results/libraries
-          ldd candidate/build-perf/benchmark/chronon_scheduler_invocation_benchmark > performance-results/ldd.txt
+          lscpu > performance-results/lscpu.txt
+          for variant in baseline candidate named outlined; do
+            mkdir -p "performance-results/$variant"
+            cp "$variant/build-perf/benchmark/chronon_representative_workload_benchmark" "performance-results/$variant/"
+            cp "$variant/build-perf/CMakeCache.txt" "$variant/src/sender/port/InPort.hpp" "$variant/src/sender/port/MultiProducerQueueAdapter.hpp" "performance-results/$variant/"
+            nm -SC "$variant/build-perf/benchmark/chronon_representative_workload_benchmark" > "performance-results/$variant/symbols.txt"
+          done
+          ldd candidate/build-perf/benchmark/chronon_representative_workload_benchmark > performance-results/ldd.txt
           awk '/=> \// {print $3} /^\s*\// {print $1}' performance-results/ldd.txt | while read -r library; do
             cp -L "$library" performance-results/libraries/
           done
           cp -L /lib64/ld-linux-x86-64.so.2 performance-results/libraries/
+      - name: Fixed 31-block sequential diagnosis (not acceptance)
+        run: python3 probe/.github/diagnostics/pr156-probe.py measure
       - name: Retain all performance evidence, including failed checks
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr156-runner-code
+          name: pr156-codegen-evidence
           path: performance-results/
           if-no-files-found: ignore
           retention-days: 30
