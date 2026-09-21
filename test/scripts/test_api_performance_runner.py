@@ -23,19 +23,19 @@ class LocalPerformanceRunner(unittest.TestCase):
 
     def test_groups_never_overlap_and_respect_available_physical_cores(self):
         self.assertEqual(runner.cpu_groups(list(range(16)), 2, 8),
-                         [[i, i + 1, i + 2] for i in range(0, 15, 3)])
-        self.assertEqual(runner.cpu_groups([0, 2, 4, 6, 8], 2, 8), [[0, 2, 4]])
-        self.assertEqual(runner.cpu_groups(list(range(16)), 2, 2), [[0, 1, 2], [3, 4, 5]])
+                         [[i, i + 1] for i in range(0, 16, 2)])
+        self.assertEqual(runner.cpu_groups([0, 2, 4, 6, 8], 2, 8), [[0, 2], [4, 6]])
+        self.assertEqual(runner.cpu_groups(list(range(16)), 2, 2), [[0, 1], [2, 3]])
         self.assertEqual(runner.cpu_groups(list(range(16)), 4, 8),
-                         [list(range(i, i + 5)) for i in (0, 5, 10)])
-        for cpus, workers, jobs in (([0, 2], 2, 8), ([0, 0, 2], 2, 8), ([0, 2, 4], 2, 0)):
+                         [list(range(i, i + 4)) for i in (0, 4, 8, 12)])
+        for cpus, workers, jobs in (([0], 2, 8), ([0, 0, 2], 2, 8), ([0, 2, 4], 2, 0)):
             with self.assertRaises(ValueError):
                 runner.cpu_groups(cpus, workers, jobs)
 
     def test_dynamic_queue_reuses_free_cpus_without_waiting_for_slow_case(self):
         cpus = runner.physical_cpus(limit=None)
-        if len(cpus) < 6:
-            self.skipTest("requires six physical CPUs")
+        if len(cpus) < 4:
+            self.skipTest("requires four physical CPUs")
         groups = runner.cpu_groups(cpus, 2, 2)
         worker = self.root / "worker.py"
         worker.write_text('''import json, os, sys, time
@@ -105,65 +105,28 @@ time.sleep(60)
             status = runner.main()
         return status, tasks, collect, json.loads((output / "verdict.json").read_text())
 
-    def test_identity_path_requires_collector_and_skips_timing(self):
-        status, tasks, collect, verdict = self.invoke_main([[0]], ([{}] * 29, [{}]))
+    def test_all_29_cases_share_eight_two_core_slots(self):
+        rows = [{"case": case, "runs": {v: {"wall_seconds": 1} for v in ("baseline", "candidate")}}
+                for case in runner.cases(2)]
+        status, tasks, collect, verdict = self.invoke_main([[0] * 29], (rows, [{}] * 29))
         self.assertEqual(status, 0)
         self.assertEqual(tasks.call_count, 1)
-        self.assertEqual(collect.call_args.args[3:], (1, 2))
-        self.assertTrue(verdict["pass"])
-
-    def test_changed_runtimes_schedule_all_cases_then_collect(self):
-        status, tasks, collect, verdict = self.invoke_main(
-            [[3], [0] * 6, [0] * 23], ([{}] * 29, [{}] * 29))
-        self.assertEqual(status, 0)
-        self.assertEqual(tasks.call_args.args[0], 29)
-        exclusive, parallel = tasks.call_args_list[1:]
-        self.assertEqual(len(exclusive.args[1]), 1)
-        self.assertEqual(len(parallel.args[1]), 5)
-        first, second = exclusive.kwargs["indices"], parallel.kwargs["indices"]
-        self.assertEqual(len(first), 6)
-        self.assertEqual(sorted(first + second), list(range(29)))
-        self.assertTrue(set(first).isdisjoint(second))
-        matrix = runner.cases(2)
-        self.assertTrue(all(matrix[i]["kind"] == "scheduler" and matrix[i]["args"][5]
-                            for i in first))
-        self.assertEqual(exclusive.args[2](first[0], [0, 1, 2])[-4:],
-                         ["--shard-index", str(first[0]), "--shard-count", "29"])
+        count, groups, command, timeout = tasks.call_args.args
+        self.assertEqual(count, 29)
+        self.assertEqual(groups, [[i, i + 1] for i in range(0, 16, 2)])
+        self.assertEqual(command(18, [4, 5])[-4:], ["--shard-index", "18", "--shard-count", "29"])
+        self.assertLessEqual(timeout, 600)
         self.assertEqual(collect.call_args.args[3:], (29, 2))
         self.assertTrue(verdict["complete_matrix"])
-
-    def test_selected_shards_keep_original_indices_and_finish_before_parallel_work(self):
-        groups = runner.cpu_groups(runner.physical_cpus(limit=None), 2, 2)
-        worker = self.root / "phase.py"
-        worker.write_text('''import json, sys, time
-from pathlib import Path
-root, index = Path(sys.argv[1]), int(sys.argv[2])
-start = time.monotonic()
-time.sleep(0.05)
-(root / f"{index}.json").write_text(json.dumps([start, time.monotonic()]))
-''')
-        command = lambda index, _: [sys.executable, str(worker), str(self.root), str(index)]
-        with redirect_stdout(io.StringIO()):
-            first = runner.run_tasks(5, groups[:1], command, 5, indices=[3, 1])
-            second = runner.run_tasks(5, groups, command, 5, indices=[0, 2, 4])
-        self.assertEqual((first, second), ([0, 0], [0, 0, 0]))
-        records = {i: json.loads((self.root / f"{i}.json").read_text()) for i in range(5)}
-        self.assertLessEqual(records[3][1], records[1][0])
-        self.assertLessEqual(records[1][1], min(records[i][0] for i in (0, 2, 4)))
-
-    def test_parallel_failure_after_exclusive_phase_still_rejects_full_matrix(self):
-        status, _, collect, verdict = self.invoke_main(
-            [[3], [0] * 6, RuntimeError("parallel scenario failed")])
-        self.assertEqual(status, 1)
-        collect.assert_not_called()
-        self.assertFalse(verdict["pass"])
+        self.assertIn("29/29", (self.root / "results/report.md").read_text())
 
     def test_failed_measurement_cannot_reach_collector_or_pass(self):
-        status, _, collect, verdict = self.invoke_main([[3], RuntimeError("failed scenario")])
+        status, _, collect, verdict = self.invoke_main([RuntimeError("failed scenario")])
         self.assertEqual(status, 1)
         collect.assert_not_called()
         self.assertFalse(verdict["pass"])
         self.assertFalse(verdict["complete_matrix"])
+        self.assertIn("FAILED / INCOMPLETE", (self.root / "results/report.md").read_text())
 
 
 if __name__ == "__main__":
