@@ -113,6 +113,32 @@ class PerformanceAcceptance(unittest.TestCase):
                                                         "candidate": {"exe": "b"}}))
             ldd.assert_not_called()
 
+    def test_physical_cpus_respects_affinity_and_excludes_smt_siblings(self):
+        topology = "# CPU,CORE,SOCKET\n" + "\n".join(
+            f"{cpu},{cpu // 2},0" for cpu in range(16))
+        with (patch.object(gate.os, "sched_getaffinity", return_value=set(range(1, 16))),
+              patch.object(gate.subprocess, "check_output", return_value=topology)):
+            self.assertEqual(gate.physical_cpus(), [1, 2, 4, 6])
+            self.assertEqual(gate.physical_cpus(limit=None), [1, 2, 4, 6, 8, 10, 12, 14])
+
+    def test_timeout_retains_partial_output(self):
+        for output in (b"partial output\n", "partial output\n", None):
+            with self.subTest(output=output), tempfile.TemporaryDirectory() as temporary:
+                log = Path(temporary) / "sample.log"
+                error = subprocess.TimeoutExpired(["benchmark"], 0.1, output=output)
+                with patch.object(gate.subprocess, "run", side_effect=error):
+                    with self.assertRaisesRegex(RuntimeError, "timed out.*sample.log"):
+                        gate.run_benchmark(["benchmark"], {}, log, 0.1)
+                self.assertEqual(log.read_text(), "partial output\n" if output else "")
+
+    def test_scenario_budget_caps_subprocess_timeout(self):
+        with patch.object(gate.time, "monotonic", return_value=100):
+            self.assertEqual(gate.remaining_timeout(300, 180), 180)
+            self.assertEqual(gate.remaining_timeout(110, 180), 10)
+            for deadline in (100, 99):
+                with self.assertRaisesRegex(RuntimeError, "wall-time budget exhausted"):
+                    gate.remaining_timeout(deadline, 180)
+
     def test_identity_requires_resolved_unchanged_libraries(self):
         builds = {key: Path(key) for key in ("baseline", "candidate")}
         binaries = {key: {"exe": "same"} for key in builds}
