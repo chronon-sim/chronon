@@ -164,6 +164,8 @@ void TickSimulation::initializeClockRuntime_() {
     clock_calendar_ = std::make_unique<ClockCalendar>(clocks);
     if (shouldUseParallelExecution_()) initializeClockParallel_();
     if (clock_trace_) {
+        // Only the final pre-initialization configuration needs a service slot.
+        clock_trace_->attachScheduler(hostServices());
         if (shouldUseParallelExecution_())
             clock_trace_->startParallel(config_.max_lookahead_cycles);
         else
@@ -331,7 +333,6 @@ uint64_t TickSimulation::drainCdc(uint64_t max_event_batches) {
 void TickSimulation::configureClockTrace(observe::ClockTraceRecorder::Config config) {
     if (initialized_) throw std::logic_error("configure clock tracing before initialize");
     clock_trace_ = std::make_unique<observe::ClockTraceRecorder>(std::move(config));
-    clock_trace_->attachScheduler(hostServices());
     clock_mode_ = true;
 }
 

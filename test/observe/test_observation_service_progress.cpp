@@ -318,7 +318,8 @@ struct ClockProducer : TickableUnit {
     }
 };
 
-void coordinatedClockWakeup(const std::filesystem::path& root, size_t capacity) {
+void coordinatedClockWakeup(const std::filesystem::path& root, size_t capacity,
+                            size_t configurations = 1) {
     TickSimulationConfig config;
     config.num_threads = 1;
     config.enable_parallel = false;
@@ -332,7 +333,10 @@ void coordinatedClockWakeup(const std::filesystem::path& root, size_t capacity) 
     output.lossless = false;
     output.stream_capacity = output.drain_batch = capacity;
     output.perfetto_options.compress = capacity == 32;
-    sim.configureClockTrace(output);
+    for (size_t n = 0; n < configurations; ++n) {
+        output.output_dir = root / std::to_string(n);
+        sim.configureClockTrace(output);
+    }
     sim.initialize();
     CHECK(!sim.useParallelExecution());
     auto& service = ClockTraceStreamTestAccess::service(*producer->clockTraceStream());
@@ -349,6 +353,13 @@ void coordinatedClockWakeup(const std::filesystem::path& root, size_t capacity) 
         producer->burst = batch % 2 ? capacity : 1;
         expected += producer->burst;
         CHECK(sim.runClockEvents(1) == 1);
+        if (configurations > 1) {
+            // Replaced recorders must not leave dead slots ahead of the active
+            // service. One scheduler poll must still drain this small ring.
+            cursor = 0;
+            poll();
+            CHECK(service.stats().records == expected);
+        }
         // Stay below the 64-batch watermark boundary. Ordinary scheduler polls
         // must drain both sparse records and full bursts before the next batch,
         // without advance(), close() or full-queue producer assistance.
@@ -357,6 +368,8 @@ void coordinatedClockWakeup(const std::filesystem::path& root, size_t capacity) 
     sim.closeClockTrace();
     CHECK(sim.clockTraceRecorder()->stats().events == expected);
     CHECK(sim.clockTraceRecorder()->stats().dropped == 0);
+    for (size_t n = 0; n + 1 < configurations; ++n)
+        CHECK(!std::filesystem::exists(root / std::to_string(n)));
 }
 
 int main(int argc, char** argv) {
@@ -367,6 +380,8 @@ int main(int argc, char** argv) {
                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     if (mode == "clock-wakeup")
         clockWakeup(root);
+    else if (mode == "clock-reconfigure")
+        coordinatedClockWakeup(root, 2, 33);
     else if (mode.starts_with("clock-coordinated-"))
         coordinatedClockWakeup(root, std::stoull(mode.substr(mode.find_last_of('-') + 1)));
     else if (mode == "started-backend")
