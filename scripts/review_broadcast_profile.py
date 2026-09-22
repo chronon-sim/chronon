@@ -179,7 +179,7 @@ def main() -> int:
                                 ",".join(EVENTS), "-o", str(stem) + ".stat", "--", *bench]
                     else:
                         argv = [args.perf, "record", "-o", str(stem) + ".data", "-F", "499",
-                                "-e", "cpu-clock", "--call-graph", "dwarf,8192", "--", *bench]
+                                "-e", "cpu-clock", "--sample-cpu", "--call-graph", "dwarf,8192", "--", *bench]
                     row = {"phase": phase, "block": block, "variant": variant, "order": order}
                     rows.append(row)
                     try:

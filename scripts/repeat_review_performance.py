@@ -80,6 +80,8 @@ for rep in range(args.repeats):
             row={'case':case['name'],'rep':rep,'variant':variant,'order':order.index(variant),
                  'wall_seconds':wall,'benchmark_seconds':sim,'state':state,'command':cmd,
                  'user_seconds':after.ru_utime-before.ru_utime,'system_seconds':after.ru_stime-before.ru_stime,
+                 'minor_faults':after.ru_minflt-before.ru_minflt,
+                 'major_faults':after.ru_majflt-before.ru_majflt,
                  'voluntary_switches':after.ru_nvcsw-before.ru_nvcsw,
                  'involuntary_switches':after.ru_nivcsw-before.ru_nivcsw,'timestamp':time.time()}
             if case['kind']=='scheduler':

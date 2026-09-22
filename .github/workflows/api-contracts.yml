@@ -2,10 +2,8 @@ name: PR review wall-time reproduction
 on:
   workflow_dispatch:
     inputs:
-      pr158:
-        default: efe61ccd6f07dcddd8a796dd216ab9e446788ee0
-      pr160:
-        default: 3d2c42f1b1ffe2821d0e043a956adbb00c3af2a4
+      floor:
+        required: true
 permissions:
   contents: read
 jobs:
@@ -16,18 +14,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - pr: 160
-            replica: 1
-            sha: ${{ inputs.pr160 }}
-            cases: broadcast-threads2
-          - pr: 160
-            replica: 2
-            sha: ${{ inputs.pr160 }}
-            cases: broadcast-threads2
-          - pr: 160
-            replica: 3
-            sha: ${{ inputs.pr160 }}
-            cases: broadcast-threads2
+          - label: floor-1
+            sha: ${{ inputs.floor }}
+          - label: floor-2
+            sha: ${{ inputs.floor }}
+          - label: aa-1
+            sha: 7829ac985c461c12ba7bada0c560efb850ce4823
+          - label: aa-2
+            sha: 7829ac985c461c12ba7bada0c560efb850ce4823
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,7 +35,6 @@ jobs:
           path: candidate
           ref: ${{ matrix.sha }}
       - uses: actions/checkout@v4
-        if: matrix.pr == 160
         with:
           path: original
           ref: 7829ac985c461c12ba7bada0c560efb850ce4823
@@ -78,39 +71,47 @@ jobs:
             cmake --build "$variant/build-perf" --parallel 16 --target \
               chronon_representative_workload_benchmark
           done
+      - name: Prepare same-path, hardlink and separate-inode controls
+        if: startsWith(matrix.label, 'aa-')
+        run: |
+          python3 harness/scripts/review_inode_controls.py original/build-perf results/inode-controls.json
+      - name: Choose equal-length executable paths
+        run: |
+          if [[ "${{ matrix.label }}" == aa-* ]]; then
+            echo "REVIEW_ORIGINAL_BUILD=aa-first/build-perf" >> "$GITHUB_ENV"
+            echo "REVIEW_CANDIDATE_BUILD=aa-other/build-perf" >> "$GITHUB_ENV"
+          else
+            echo "REVIEW_ORIGINAL_BUILD=original/build-perf" >> "$GITHUB_ENV"
+            echo "REVIEW_CANDIDATE_BUILD=candidate/build-perf" >> "$GITHUB_ENV"
+          fi
       - name: Uninstrumented three-way comparison
         run: |
           CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
           python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --original original/build-perf --candidate candidate/build-perf \
+            --baseline baseline/build-perf --original "$REVIEW_ORIGINAL_BUILD" --candidate "$REVIEW_CANDIDATE_BUILD" \
             --output results/uninstrumented --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
+      - name: Repeat identical original path as both labels
+        if: startsWith(matrix.label, 'aa-')
+        run: |
+          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
+          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
+            --baseline baseline/build-perf --original aa-first/build-perf --candidate aa-first/build-perf \
+            --output results/aa-samepath --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
+      - name: Repeat equal-length hardlink alias
+        if: startsWith(matrix.label, 'aa-')
+        run: |
+          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
+          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
+            --baseline baseline/build-perf --original aa-first/build-perf --candidate aa-links/build-perf \
+            --output results/aa-hardlink --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
       - name: Profile original compiler layout
         continue-on-error: true
         run: |
           python3 harness/scripts/review_broadcast_profile.py \
-            baseline/build-perf original/build-perf candidate/build-perf results/profiles --perf "$PERF_BINARY"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: review-profile-raw-${{ matrix.replica }}
-          path: results/
-          retention-days: 30
-      - name: Align functions identically in all three revisions
-        run: |
-          for variant in baseline candidate original; do
-            git -C "$variant" apply "$GITHUB_WORKSPACE/harness/scripts/review_function_alignment.patch"
-            cmake -S "$variant" -B "$variant/build-perf"
-            cmake --build "$variant/build-perf" --parallel 16 --target chronon_representative_workload_benchmark
-            nm -SC "$variant/build-perf/benchmark/chronon_representative_workload_benchmark" > "results/aligned-$variant-symbols.txt"
-          done
-      - name: Repeat with common function alignment
-        run: |
-          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
-          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --original original/build-perf --candidate candidate/build-perf \
-            --output results/aligned --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
+            baseline/build-perf "$REVIEW_ORIGINAL_BUILD" "$REVIEW_CANDIDATE_BUILD" results/profiles --perf "$PERF_BINARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: review-profile-${{ matrix.replica }}
+          name: review-experiment-${{ matrix.label }}
           path: results/
           retention-days: 30
