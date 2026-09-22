@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <stdexcept>
 #include <thread>
@@ -16,6 +18,36 @@
 #endif
 
 namespace chronon::benchmark {
+// A repeated benchmark creates a fresh pool each time. Restore the caller's
+// original mask after that pool is destroyed so the next pool inherits it.
+class BenchmarkCallerAffinity {
+public:
+    BenchmarkCallerAffinity() {
+#if defined(__linux__)
+        if (!std::getenv("CHRONON_BENCH_PIN_WORKERS")) return;
+        if (sched_getaffinity(0, sizeof(allowed_), &allowed_))
+            throw std::runtime_error("cannot save benchmark caller CPU affinity");
+        saved_ = true;
+#endif
+    }
+    ~BenchmarkCallerAffinity() {
+#if defined(__linux__)
+        if (saved_ && sched_setaffinity(0, sizeof(allowed_), &allowed_)) {
+            std::fputs("cannot restore benchmark caller CPU affinity\n", stderr);
+            std::terminate();
+        }
+#endif
+    }
+    BenchmarkCallerAffinity(const BenchmarkCallerAffinity&) = delete;
+    BenchmarkCallerAffinity& operator=(const BenchmarkCallerAffinity&) = delete;
+
+private:
+#if defined(__linux__)
+    cpu_set_t allowed_{};
+    bool saved_ = false;
+#endif
+};
+
 // Optional measurement control, applied identically to baseline and candidate
 // before model construction/timing. Pin persistent pool threads to distinct
 // CPUs from the caller's taskset mask; never change simulation configuration.
