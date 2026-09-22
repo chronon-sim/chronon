@@ -73,7 +73,23 @@ private:
         const std::string& key = path_parts[index];
 
         if (index == path_parts.size() - 1) {
-            node[key] = convertValue(value);
+            if (full_path == "simulation.run") {
+                // Explicit clock limits are a new map-valued field. Keep all
+                // existing parameter override strings literal, including braces.
+                try {
+                    node[key] = YAML::Load(value);
+                } catch (const YAML::Exception& error) {
+                    throw YAMLOverrideError(std::string("Invalid run limit override: ") +
+                                            error.what());
+                }
+            } else if (full_path.starts_with("simulation.clocks.") ||
+                       full_path.starts_with("simulation.run.")) {
+                // Exact clock numerics must keep their lexical value: do not
+                // round through double or narrow uint64 values through int64.
+                node[key] = value;
+            } else {
+                node[key] = convertValue(value);
+            }
             return;
         }
 

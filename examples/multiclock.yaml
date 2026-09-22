@@ -1,0 +1,21 @@
+simulation:
+  name: fast_slow
+  num_workers: 2
+  execution_policy: auto
+  clocks:
+    cpu: {frequency_hz: 1000000000}
+    peripheral: {period_s: 1/250000000, phase_s: 1/2000000000}
+  # Count cpu edges, including edge zero. Time limits are absolute and exclusive.
+  run: {domain_cycles: {clock: cpu, count: 2000}}
+  observation: {enabled: false}
+  unit:
+    fast:
+      type: FastUnit
+      clock: cpu
+      port:
+        requests:
+          to: peripheral.requests
+          cdc: {type: async_fifo, depth: 8, synchronizer_stages: 2}
+    peripheral:
+      type: SlowPeripheral
+      clock: peripheral

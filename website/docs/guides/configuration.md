@@ -189,7 +189,7 @@ simulation:
 
     uart:
       type: UART
-      tick_interval: 1000  # Optional: run tick() only on every 1000th global cycle
+      tick_interval: 1000  # Optional: run tick() only on every 1000th local domain cycle
       params:
         poll_interval: 1
 ```
@@ -397,3 +397,13 @@ root
 ```cpp
 node->getChild("cpu.core0.fetch")  // Traverses hierarchy
 ```
+
+
+## Multiple clock domains and CDC
+
+`SenderConfigLoader`, `SenderSimulationBuilder` and `SimulationApp` accept named
+`simulation.clocks`, per-unit `clock` bindings, explicit typed `cdc: {type:
+async_fifo}` connections and physical-time, event-batch or named-domain edge
+limits under `simulation.run`. Existing single-clock `run_cycles` configuration
+is unchanged. See [YAML and SimulationApp](./multiclock-cdc.md#yaml-and-simulationapp)
+for the exact units, defaults, validation rules and runnable fast/slow example.

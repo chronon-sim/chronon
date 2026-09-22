@@ -488,9 +488,25 @@ implemented. Explicit multi-clock execution supports epoch-free scheduling,
 clock tracing and dynamic cluster/bridge migration. Migration profitability and
 large-graph scheduling scalability still require representative benchmarks;
 clock-specific critical-wait attribution and frequency-aware initial placement
-remain follow-up work.
-Legacy observation entry points and YAML clock-domain configuration are not
-automatically migrated; use the C++ clock/CDC and native recorder APIs in the
-guide. Legacy multi-clock observation is rejected rather than mis-timestamped.
+are implemented. YAML declarations and explicit SimulationApp run limits reuse
+the same runtime; see [YAML and SimulationApp](./multiclock-cdc.md#yaml-and-simulationapp).
+Domain-aware integration of existing event/log/counter/pipeline APIs is documented
+separately in the [observability guide](./observability.md) and
+[#141](https://github.com/chronon-sim/chronon/issues/141). The YAML example disables
+unified observation; native clock recorder APIs are shown in the clock guide.
 Perfetto display is quantized to nanoseconds while simulation remains exact
 within its checked finite rational representation.
+
+
+## YAML construction acceptance
+
+`sender_multiclock_yaml` compares independently assembled C++ graphs against YAML
+factory construction with equal explicit limits. The matrix covers integer and
+rational clock ratios, nonzero phases, sequential and epoch-free execution,
+migration-enabled execution with actual cluster and bridge handoffs, same-domain
+single/multi-producer inputs, deterministic input flush, finite FIFO backpressure,
+lazy wakeup, segmented runs and final CDC drain. It compares per-unit model event
+streams and domain progress, plus native text records with matching declaration
+IDs. Invalid clock/run/CDC specifications and all three App limits are exercised
+separately. `multiclock_yaml_example` checks ordered request delivery and drain;
+these are correctness checks, not performance measurements.

@@ -57,6 +57,13 @@ foreach(clock_test clock_time async_fifo_circuit multiclock multiclock_epoch_fre
     add_test(NAME sender_${clock_test} COMMAND sender_test_${clock_test})
     add_dependencies(regress sender_test_${clock_test})
 endforeach()
+
+add_executable(sender_test_multiclock_yaml test_multiclock_yaml.cpp)
+target_link_libraries(sender_test_multiclock_yaml PRIVATE chronon::core yaml-cpp::yaml-cpp chronon_compile_options)
+add_test(NAME sender_multiclock_yaml COMMAND sender_test_multiclock_yaml)
+set_tests_properties(sender_multiclock_yaml PROPERTIES TIMEOUT 120 PROCESSORS 4)
+add_dependencies(regress sender_test_multiclock_yaml)
+
 # These tests create up to four persistent workers plus a trace backend. Account
 # for that in CTest's job budget on small CI runners; do not trim the matrix.
 set_tests_properties(sender_multiclock sender_multiclock_epoch_free sender_multiclock_migration
