@@ -192,27 +192,133 @@ struct DynamicMigrationTestAccess {
         sim.finishClockMigrationRun_();
     }
 
+    static void verifyBudget(TickSimulation& sim) {
+        auto& runtime = *sim.clock_parallel_;
+        runtime.migration_max_batches = UINT64_MAX;
+        runtime.migration_completed_batches.store(UINT64_MAX - 3);
+        runtime.migration_window = 16;
+        assert(runtime.migrationHorizon(0) == 0);
+        runtime.migration_completed_batches.store(0);
+        runtime.migration_window = 0;
+        runtime.migration_limit = 100;
+        assert(runtime.migrationHorizon(99) == 1);
+        assert(runtime.migrationHorizon(101) == 0);
+        runtime.migration_limit = UINT64_MAX;
+        runtime.resetMigrationBatchRate(2, UINT64_MAX);
+        runtime.observeMigrationBatches(UINT64_MAX - 1, 1);
+        assert(!runtime.migration_rate_started);
+        runtime.observeMigrationBatches(UINT64_MAX, 2);
+        runtime.observeMigrationBatches(UINT64_MAX, 3);
+        assert(runtime.migration_batch_rate.load() == 2);  // No zero-duration division.
+        assert(runtime.migrationHorizon(UINT64_MAX) == 0);
+    }
+
+    static void verifyBatchHorizon(std::span<const ClockDomain* const> clocks,
+                                   uint64_t skip_batches = 0, uint64_t frequency = 1'000'000'000) {
+        ClockCalendar calendar(clocks);
+        const auto reference_cycle = [frequency](SimTime time) {
+            return uint64_t(clock_detail::Wide(time.numerator()) * frequency / time.denominator());
+        };
+        double edge_rate = 0;
+        uint64_t last_phase = 0;
+        for (const auto* clock : clocks) {
+            edge_rate +=
+                double(clock->period().denominator()) / clock->period().numerator() / frequency;
+            last_phase = std::max(last_phase, reference_cycle(clock->phase()));
+        }
+        TickSimulation::ClockParallelRuntime runtime;
+        runtime.resetMigrationBatchRate(edge_rate, last_phase);
+        for (uint64_t i = 0; i < skip_batches; ++i) calendar.pop();
+        const auto start = std::max(reference_cycle(calendar.nextTime()), last_phase);
+        uint64_t completed = 0, cycle = 0;
+        do {
+            cycle = reference_cycle(calendar.pop().front().time);
+            runtime.observeMigrationBatches(cycle, ++completed);
+            if (cycle <= last_phase) assert(runtime.migration_batch_rate.load() == edge_rate);
+        } while (cycle < start + 2048);
+        runtime.migration_completed_batches.store(completed);
+        runtime.migration_window = 16;
+        runtime.migration_max_batches = completed + runtime.migration_window + 6000;
+        const double horizon = runtime.migrationHorizon(cycle);
+        uint64_t actual_end = cycle;
+        for (uint64_t i = 0; i < 6000; ++i)
+            actual_end = reference_cycle(calendar.pop().front().time);
+        // Density is a forecast. Allow bounded edge/rounding error across these
+        // periodic patterns; summed rates miss thousands of cycles when aligned.
+        assert(std::abs(horizon - double(actual_end - cycle)) < 8);
+        runtime.resetMigrationBatchRate(edge_rate, last_phase);
+        assert(runtime.migration_batch_rate.load() == edge_rate);
+        assert(!runtime.migration_rate_started);  // No rate inherited by a resumed run.
+    }
+
     static void assertCostsReady(TickSimulation& sim, bool ready) {
         for (size_t c = 0; c < sim.clusters_.numClusters(); ++c)
             assert(sim.dynamicClockActorCost_(c).ready == ready);
     }
 
-    static size_t planBridge(TickSimulation& sim) {
+    static void assertLiveSampling(const TickSimulation& sim) {
+        const auto& policy = sim.clock_parallel_->migration_benefit;
+        assert(policy.planning_calls >= 2);
+        assert(policy.windows.size() ==
+               sim.unit_ptrs_.size() + sim.clock_parallel_->bridges.size());
+        for (const auto& window : policy.windows)
+            assert(window.samples >= 4 && window.previous.cycles >= 4);
+        bool moved = false;
+        for (size_t a = 0; a < sim.dynamic_runtime_cluster_count_; ++a) moved |= owner(sim, a) != 0;
+        assert(moved == (sim.rebalanceCount() != 0));
+    }
+
+    static size_t planActor(TickSimulation& sim, bool bridge_actor,
+                            bool finite_coincident = false) {
         placeAllOnWorkerZero(sim);
-        for (size_t u = 0; u < sim.unit_ptrs_.size(); ++u) {
-            sim.dynamic_unit_active_sample_time_ns_[u].store(4);
-            sim.dynamic_unit_active_sample_count_[u].store(4);
-            sim.dynamic_unit_observed_cycles_[u].store(1024);
-            sim.dynamic_unit_observed_active_ticks_[u].store(1024);
+        const size_t unknown = sim.unit_ptrs_.size() - 1;
+        const auto publish_samples = [&](uint64_t round, bool source_ready) {
+            for (size_t u = 0; u < sim.unit_ptrs_.size(); ++u) {
+                const uint64_t samples = u == unknown && !source_ready ? 4 : 4 * round;
+                sim.dynamic_unit_active_sample_time_ns_[u].store(samples *
+                                                                 (bridge_actor ? 1 : 100'000));
+                sim.dynamic_unit_active_sample_count_[u].store(samples);
+                sim.dynamic_unit_observed_cycles_[u].store(256 * samples);
+                sim.dynamic_unit_observed_active_ticks_[u].store(256 * samples);
+            }
+            for (size_t b = sim.clusters_.numClusters(); b < sim.dynamic_runtime_cluster_count_;
+                 ++b) {
+                sim.cluster_sample_time_ns_[b].store(4 * round * (bridge_actor ? 100'000 : 1));
+                sim.cluster_sample_count_[b].store(4 * round);
+                sim.cluster_active_sample_count_[b].store(4 * round);
+            }
+        };
+        publish_samples(1, false);
+        sim.clock_parallel_->migration_max_batches = UINT64_MAX;
+        if (finite_coincident) {
+            auto& runtime = *sim.clock_parallel_;
+            // Two aligned 2 GHz domains: four edges but only two batches per
+            // reference cycle. A 3000-batch budget exceeds the 1024-cycle gate;
+            // the former summed-edge forecast incorrectly produced only 750.
+            runtime.resetMigrationBatchRate(4, 0);
+            runtime.observeMigrationBatches(1, 3);
+            runtime.observeMigrationBatches(1025, 2051);
+            runtime.migration_completed_batches.store(2051);
+            runtime.migration_max_batches = 2051 + 3000;
+            assert(runtime.migrationHorizon(1025) == 1500);
         }
-        for (size_t b = sim.clusters_.numClusters(); b < sim.dynamic_runtime_cluster_count_; ++b) {
-            sim.cluster_sample_time_ns_[b].store(400'000);
-            sim.cluster_sample_count_[b].store(4);
-            sim.cluster_active_sample_count_[b].store(4);
+        sim.clock_parallel_->migration_benefit.startRun(0, detail::MigrationBenefit::now());
+        assert(!sim.maybeRequestEpochFreeMigration_(100'000));  // First window is not confidence.
+        // The expensive candidate is ready, but one resident source actor still
+        // has unknown fresh cost. It must not be treated as a free background.
+        const auto cadence = std::max(sim.config_.rebalance_check_interval_cycles,
+                                      4 * detail::kDynamicTickSampleInterval);
+        uint64_t cycle = 200'000;
+        for (size_t attempt = 0; attempt < 6; ++attempt, cycle += cadence) {
+            publish_samples(attempt + 2, false);
+            assert(!sim.maybeRequestEpochFreeMigration_(cycle));
+            assert(sim.clock_parallel_->migration_benefit.backoff == 1);
+            assert(sim.next_dynamic_rebalance_check_cycle_.load() == cycle + cadence);
         }
-        assert(sim.maybeRequestEpochFreeMigration_(100'000));
+        publish_samples(8, true);
+        assert(sim.maybeRequestEpochFreeMigration_(cycle));  // Fresh compatible window after gap.
         const size_t actor = sim.migration_request_.cluster.load();
-        assert(actor >= sim.clusters_.numClusters());
+        assert((actor >= sim.clusters_.numClusters()) == bridge_actor);
         return actor;
     }
 };

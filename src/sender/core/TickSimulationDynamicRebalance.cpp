@@ -140,6 +140,7 @@ void TickSimulation::serviceEpochFreeMigration_(size_t worker_thread) {
         dynamic_thread_no_ready_wait_ns_[t].store(0, std::memory_order_relaxed);
     }
 
+    if (clock_mode_) recordClockMigrationHandoff_();
     ++rebalance_count_;
     cycles_since_last_actual_rebalance_ = 0;
     migration_request_.state.store(static_cast<uint8_t>(MigrationRequestState::Committed),

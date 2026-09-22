@@ -233,7 +233,7 @@ inline int runClockScaling(int argc, char** argv) {
            "allocated_ingress_bytes,peak_ingress_bytes,allocated_staging_bytes,peak_staging_"
            "records,"
            "native_buffer_peak_bytes,file_bytes";
-    const std::array<std::pair<const char*, uint64_t sender::ClockSchedulerProfile::*>, 16> fields{
+    const std::array<std::pair<const char*, uint64_t sender::ClockSchedulerProfile::*>, 21> fields{
         {{"sweeps", &sender::ClockSchedulerProfile::sweeps},
          {"idle_sweeps", &sender::ClockSchedulerProfile::idle_sweeps},
          {"retirement_ns", &sender::ClockSchedulerProfile::retirement_ns},
@@ -249,7 +249,12 @@ inline int runClockScaling(int argc, char** argv) {
          {"allowance_waits", &sender::ClockSchedulerProfile::allowance_waits},
          {"dependency_waits", &sender::ClockSchedulerProfile::dependency_waits},
          {"completion_loads", &sender::ClockSchedulerProfile::completion_loads},
-         {"coordinator_sweeps", &sender::ClockSchedulerProfile::sweeps}}};
+         {"coordinator_sweeps", &sender::ClockSchedulerProfile::sweeps},
+         {"migration_plans", &sender::ClockSchedulerProfile::migration_plans},
+         {"migration_planning_ns", &sender::ClockSchedulerProfile::migration_planning_ns},
+         {"migration_handoff_ns", &sender::ClockSchedulerProfile::migration_handoff_ns},
+         {"migration_feedback_good", &sender::ClockSchedulerProfile::migration_feedback_good},
+         {"migration_feedback_bad", &sender::ClockSchedulerProfile::migration_feedback_bad}}};
     for (const auto& [name, field] : fields) {
         (void)field;
         std::cout << ",sample_" << name;
