@@ -608,6 +608,9 @@ void TickSimulation::refreshLookaheadFloor_() {
     for (size_t c = 0; c < thread_progress_count_; ++c) {
         global_min = std::min(
             global_min, thread_progress_array_[c].completed_cycle.load(std::memory_order_relaxed));
+        // This sampled minimum cannot raise the monotonic floor, even if the
+        // remaining clusters have advanced. Avoid reading their progress lines.
+        if (global_min <= old_floor) return;
     }
     while (global_min > old_floor) {
         if (lookahead_floor_.compare_exchange_weak(old_floor, global_min,
