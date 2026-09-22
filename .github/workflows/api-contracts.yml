@@ -14,9 +14,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: fresh-1
+          - label: outliers-1
             sha: ${{ inputs.receive }}
-          - label: fresh-2
+          - label: outliers-2
             sha: ${{ inputs.receive }}
     steps:
       - uses: actions/checkout@v4
@@ -65,14 +65,17 @@ jobs:
               -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
               -DCHRONON_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
             cmake --build "$variant/build-perf" --parallel 16 --target \
-              chronon_representative_workload_benchmark
+              chronon_representative_workload_benchmark chronon_scheduler_invocation_benchmark
           done
-      - name: Compare revisions across randomized fresh executable instances
+      - name: Repeat the two new outliers and the static-clock control across fresh instances
         run: |
           CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
-          python3 harness/scripts/review_fresh_instances.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --original original/build-perf --candidate candidate/build-perf \
-            --output results/fresh-instances --instances fresh-executables --cpus "$CPUS"
+          for CASE in clock1-threads2-dynamic1-poll1 clock1-threads2-dynamic0-poll1 backpressure-threads2; do
+            python3 harness/scripts/review_fresh_instances.py --scripts baseline/scripts \
+              --baseline baseline/build-perf --original original/build-perf --candidate candidate/build-perf \
+              --output "results/$CASE" --instances "fresh-executables-$CASE" --cpus "$CPUS" \
+              --case "$CASE" --cycle-scale 1
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:

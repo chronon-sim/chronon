@@ -102,6 +102,9 @@ def main():
     for name in ('baseline', 'original', 'candidate', 'scripts', 'output', 'instances'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--cpus', default='0,1')
+    parser.add_argument('--case', help='Case name from check_api_performance.cases(2); default: broadcast-threads2')
+    parser.add_argument('--cycle-scale', type=int,
+                        help='Positive multiplier of CI cycles; default: 1 with --case, otherwise 5 (broadcast 250000)')
     args = parser.parse_args()
     cpus = list(map(int, args.cpus.split(',')))
     if len(cpus) != 2 or len(set(cpus)) != 2 or not set(cpus) <= os.sched_getaffinity(0):
@@ -112,8 +115,16 @@ def main():
     spec = importlib.util.spec_from_file_location('ci', args.scripts / 'check_api_performance.py')
     ci = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ci)
-    case = next(c.copy() for c in ci.cases(2) if c['name'] == 'broadcast-threads2')
-    case['cycles'] = 250000
+    if args.cycle_scale is None:
+        args.cycle_scale = 1 if args.case is not None else 5
+    if args.cycle_scale < 1:
+        parser.error('--cycle-scale must be a positive integer')
+    args.case = args.case or 'broadcast-threads2'
+    cases = {c['name']: c for c in ci.cases(2)}
+    if args.case not in cases:
+        parser.error(f'unknown --case {args.case!r}; available cases: {", ".join(cases)}')
+    case = cases[args.case].copy()
+    case['cycles'] *= args.cycle_scale
     name = ci.executable(case)
     sources = {label: getattr(args, 'baseline' if label == 'baseline_control' else label).resolve()
                for label in LABELS}
