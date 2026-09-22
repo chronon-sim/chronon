@@ -13,12 +13,14 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -96,6 +98,13 @@ public:
     ObservationBackend(const ObservationBackend&) = delete;
     ObservationBackend& operator=(const ObservationBackend&) = delete;
 
+    /// Immutable source clocks; configure before starting the service.
+    void configureClocks(std::vector<std::optional<ClockDomain>> clocks, ClockDomain reference,
+                         size_t lookahead);
+    bool clockMode() const noexcept { return reference_clock_.has_value(); }
+    bool tryAdmitClockTime(SimTime time);
+    void publishClockProgress(uint64_t exclusive_ns) noexcept;
+
     void start();
 
     /// Register before start(), with simulation workers quiescent.
@@ -172,6 +181,12 @@ public:
             }
             source_name_cache_.emplace_back(name);
         }
+        std::vector<uint32_t> ids(source_name_cache_.size());
+        for (uint32_t id = 0; id < ids.size(); ++id) ids[id] = id;
+        std::sort(ids.begin(), ids.end(),
+                  [&](auto a, auto b) { return source_name_cache_[a] < source_name_cache_[b]; });
+        source_order_.resize(ids.size());
+        for (uint32_t rank = 0; rank < ids.size(); ++rank) source_order_[ids[rank]] = rank + 1;
     }
 
     uint64_t eventsProcessed() const noexcept {
@@ -210,11 +225,20 @@ private:
     void runIO_() noexcept;
     void finalizeOutput_();
     size_t drainServiceBatch_(size_t record_budget);
+    size_t drainClockServiceBatch_(size_t record_budget);
+    std::pair<SimTime, uint32_t> recordTime_(const ObservationQueue::RecordHeader*,
+                                             const std::byte*, size_t) const;
+    const ClockDomain* sourceClock_(uint16_t source) const noexcept;
+    uint16_t recordSource_(const ObservationQueue::RecordHeader*, const std::byte*, size_t) const;
+    bool hostRecord_(const ObservationQueue::RecordHeader*, const std::byte*, size_t) const;
+
     void processServiceBatch_();
     void flushServiceReorder_(bool all);
     void processEventsAsync_();
     void waitForAsyncIO_();
     void processEvent_(const ObservationQueue::RecordHeader* header, const std::byte* data);
+    uint64_t counterTimeKey_(SimTime time, uint8_t phase, uint64_t sequence);
+    void formatCounterTime_(fmt::memory_buffer& buffer, uint64_t key);
     void processCounterSample_(uint64_t cycle, std::string_view unit_name,
                                std::string_view counter_name, uint64_t value, bool want_timeline,
                                size_t column_index = SIZE_MAX);
@@ -290,6 +314,17 @@ private:
 
     static constexpr size_t PIPELINE_SLICE_NAME_CACHE_MAX_ENTRIES = 65536;
 
+    std::vector<std::optional<ClockDomain>> source_clocks_;
+    std::vector<uint32_t> source_order_;
+    std::optional<ClockDomain> reference_clock_;
+    std::atomic<uint64_t> clock_frontier_{0}, clock_acknowledged_{0};
+    std::deque<uint64_t> clock_admitted_;
+    size_t clock_admission_limit_ = 0;
+    std::array<size_t, ThreadContextManager::MAX_THREADS + 1> clock_scan_heads_{};
+    bool clock_scanning_ = false, clock_scan_complete_ = false;
+    uint64_t clock_scan_frontier_ = 0;
+
+    std::optional<ClockLifecycleStamp> current_lifecycle_;
     ObservationQueue& queue_;
     Config config_;
 
@@ -398,6 +433,14 @@ private:
     std::vector<std::pair<std::string, uint64_t>> counter_first_batch_;
     uint64_t counter_first_cycle_ = UINT64_MAX;
 
+    uint64_t counter_time_key_ = 0;
+    struct CounterTime {
+        uint64_t key;
+        SimTime time;
+        uint8_t phase;
+        uint64_t sequence;
+    };
+    std::deque<CounterTime> counter_times_;
     std::vector<CounterSnapshotPlanMetadata> counter_snapshot_plans_;
     std::vector<std::vector<size_t>> counter_snapshot_column_indices_;
     std::vector<CounterSnapshotEntryMetadata> counter_column_metadata_;

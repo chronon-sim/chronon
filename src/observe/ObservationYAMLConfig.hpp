@@ -115,6 +115,8 @@ struct CountersYAMLConfig {
     /// Lookahead workers may sample within their configured run-ahead window.
     uint64_t periodic_dump_cycles = 0;
     bool dump_on_shutdown = true;
+    /// Explicit clocks interpret the interval on this reference domain.
+    std::string reference_clock = "default";
 };
 
 /** @brief Config for a single log-level channel (debug/info/warn/error). */

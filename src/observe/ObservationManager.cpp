@@ -243,6 +243,47 @@ CategoryMask ObservationManager::resolvePattern(const std::string& pattern) {
     return CategoryPatternMatcher::resolvePattern(pattern);
 }
 
+void ObservationManager::bindClockSource(ObservationContext& context, const ClockDomain& clock) {
+    if (isBackendRunning()) throw std::logic_error("bind source clocks before backend start");
+    if (context.isLookaheadMode())
+        throw std::logic_error(
+            "speculative observation epochs are unsupported with explicit hardware clocks");
+    if (clock_sources_.size() <= context.sourceId()) clock_sources_.resize(context.sourceId() + 1);
+    clock_sources_[context.sourceId()] = clock;
+    // Unit::localCycle is owner-local; a thread override from another domain
+    // must never substitute its edge index.
+    context.useThreadCycleOverride(false);
+}
+
+void ObservationManager::configureClockObservation(const ClockDomain& reference, size_t lookahead) {
+    clock_reference_ = reference;
+    backend_->configureClocks(clock_sources_, reference, lookahead);
+}
+
+void ObservationManager::sampleClockOwner(size_t owner, SimTime exclusive_limit) {
+    if (!periodicCounterSnapshotsEnabled()) return;
+    const auto period = periodicDumpCycles();
+    for (;;) {
+        const auto next = nextPeriodicCounterCycle(owner, 0, period);
+        if (next == UINT64_MAX) return;
+        const auto time = clock_reference_->edge(next);
+        if (time > exclusive_limit) return;
+        auto* producer = periodicCounterProducer();
+        if (!counter_registry_.pushOwnerSnapshots(next, std::span(&owner, 1), *producer, time))
+            throw std::runtime_error("clock counter snapshot queue exhausted");
+    }
+}
+
+uint64_t ObservationManager::clockSafeFrontier(uint64_t exclusive_ns) const {
+    if (!periodicCounterSnapshotsEnabled()) return exclusive_ns;
+    for (size_t owner = 0; owner < counter_registry_.ownerCount(); ++owner) {
+        const auto next = counter_registry_.nextPublishedSnapshotCycle(owner, periodicDumpCycles());
+        if (next != UINT64_MAX)
+            exclusive_ns = std::min(exclusive_ns, clock_reference_->edge(next).floorNanoseconds());
+    }
+    return exclusive_ns;
+}
+
 void ObservationManager::startBackend() {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -316,6 +357,14 @@ void ObservationManager::shutdownLocked_() {
 
     contexts_.clear();
     counter_registry_.clear();
+    clock_sources_.clear();
+    clock_reference_.reset();
+    clock_final_revision_.reset();
+    clock_run_revision_ = 0;
+    clock_final_sequence_ = 0;
+    clock_final_after_edge_ = false;
+    clock_finalized_ = false;
+    clock_run_boundary_ = {};
     source_registry_.clear();
     backend_.reset();
     shared_queue_.reset();
@@ -372,6 +421,22 @@ void ObservationManager::dumpFinalCounterSnapshot(uint64_t cycle) {
         return;
     }
 
+    if (clockMode()) {
+        if (clock_final_revision_ && *clock_final_revision_ == clock_run_revision_) return;
+        auto* producer = ThreadContextManager::instance().getContext();
+        if (!producer) throw std::runtime_error("clock final snapshot producer unavailable");
+        ++clock_final_sequence_;
+        for (size_t owner = 0; owner < counter_registry_.ownerCount(); ++owner) {
+            sampleClockOwner(owner, clock_run_boundary_);
+            if (!counter_registry_.pushOwnerSnapshots(clock_final_sequence_, std::span(&owner, 1),
+                                                      *producer, clock_run_boundary_, true,
+                                                      clock_final_after_edge_, clock_finalized_))
+                throw std::runtime_error("clock final snapshot queue exhausted");
+        }
+        clock_final_revision_ = clock_run_revision_;
+        backend_->publishClockProgress(clock_run_boundary_.floorNanoseconds());
+        return;
+    }
     counter_registry_.dumpFinalSnapshot(cycle, shared_queue_.get(), contexts_);
 }
 

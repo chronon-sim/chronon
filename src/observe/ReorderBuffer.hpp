@@ -12,8 +12,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <vector>
 
+#include "../time/ClockDomain.hpp"
 #include "FormatRegistry.hpp"
 #include "ObservationQueue.hpp"
 
@@ -30,6 +32,7 @@ struct BufferedRecord {
     ObservationQueue::EventType type;
     uint32_t data_offset;
     uint32_t data_size;
+    uint32_t time_index = 0;  // clock-only sidecar; occupies former tail padding
 
     BufferedRecord() = default;
 
@@ -56,6 +59,7 @@ struct ReorderBufferConfig {
     uint64_t watermark_cycles = 1000;   ///< Flush delay (cycles behind min).
     size_t max_buffer_events = 100000;  ///< Force-flush threshold.
     size_t initial_arena_size = 4 * 1024 * 1024;
+    bool strict_watermark = false;
 };
 
 /**
@@ -80,6 +84,10 @@ public:
         unsorted_batch_.reserve(config_.max_buffer_events / 4);
         arena_.resize(config_.initial_arena_size);
     }
+
+    using TimeResolver = std::function<std::pair<SimTime, uint32_t>(
+        const ObservationQueue::RecordHeader*, const std::byte*, size_t)>;
+    void setTimeResolver(TimeResolver resolver) { time_resolver_ = std::move(resolver); }
 
     /// Appends record into the arena. @return false if cycle extraction failed.
     bool bufferEvent(const ObservationQueue::RecordHeader* header, const std::byte* data,
@@ -140,6 +148,19 @@ private:
 
     void compactArenaImpl_();
 
+    struct TimeKey {
+        SimTime time;
+        uint32_t source_order;
+    };
+    bool less_(const BufferedRecord& a, const BufferedRecord& b) const noexcept {
+        if (!time_resolver_) return a.cycle < b.cycle;
+        const auto& left = time_keys_[a.time_index];
+        const auto& right = time_keys_[b.time_index];
+        return left.time != right.time ? left.time < right.time
+                                       : left.source_order < right.source_order;
+    }
+    std::vector<TimeKey> time_keys_;
+    TimeResolver time_resolver_;
     Config config_;
     std::vector<BufferedRecord> sorted_buffer_;
     /// Start index avoids erase-from-front cost.

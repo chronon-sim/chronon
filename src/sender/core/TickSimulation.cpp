@@ -78,8 +78,34 @@ void TickSimulation::initialize() {
         // Preserve their active scheduler and I/O jobs; attach only before startup.
         if (auto* backend = obs_mgr.backend(); backend && !backend->isRunning())
             backend->attachScheduler(hostServices());
-        observe_ctx_ =
-            obs_mgr.createContextForUnit("simulation", [this]() { return current_cycle_; }, 0);
+        observe_ctx_ = obs_mgr.createContextForUnit(
+            "simulation",
+            [this]() {
+                if (clock_mode_)
+                    return static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count());
+                return current_cycle_;
+            },
+            0);
+        if (clock_mode_ && observe_ctx_) observe_ctx_->useThreadCycleOverride(false);
+        if (clock_mode_) {
+            for (auto* unit : unit_ptrs_) {
+                auto* observable = dynamic_cast<observe::ObservableUnit*>(unit);
+                if (!observable) continue;
+                auto* context = observable->observationContext();
+                if (!context) {
+                    context = obs_mgr.createContextForUnit(unit->fullPath(),
+                                                           [unit] { return unit->localCycle(); });
+                    observable->setObservationContext(context);
+                }
+                if (context) {
+                    obs_mgr.bindClockSource(*context, unit->clockDomain());
+                    context->setClockLifecycle(SimTime{}, 1);
+                }
+            }
+        }
         if (observe_ctx_) {
             observe_ctx_->enableCategory(observe::category::LOG_INFO);
             observe_ctx_->enableCategory(observe::category::LOG_WARN);
@@ -93,6 +119,11 @@ void TickSimulation::initialize() {
     for (auto& unit : units_) {
         unit->setTerminationController(&termination_ctrl_);
         unit->initialize();
+        if (clock_mode_) {
+            auto* observable = dynamic_cast<observe::ObservableUnit*>(unit.get());
+            if (observable && observable->observationContext())
+                observable->observationContext()->setClockLifecycle({});
+        }
         unit->state_ = UnitState::Initialized;
     }
 
@@ -128,7 +159,8 @@ void TickSimulation::initialize() {
     for (size_t i = 0; i < unit_ptrs_.size(); ++i) {
         // Pure sequential configurations do not build scheduler clusters. All
         // their counters still have one real writer, represented by owner 0.
-        const size_t owner = i < unit_to_cluster_.size() ? unit_to_cluster_[i] : 0;
+        const size_t owner =
+            i < unit_to_cluster_.size() ? unit_to_cluster_[i] : (clock_mode_ ? i : 0);
         auto* observable = dynamic_cast<observe::ObservableUnit*>(unit_ptrs_[i]);
         if (observable && observable->observationContext()) {
             observable->observationContext()->setCounterOwnerId(owner);

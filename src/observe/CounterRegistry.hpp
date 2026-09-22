@@ -11,11 +11,13 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "../time/ClockDomain.hpp"
 #include "Counter.hpp"
 #include "CounterSnapshot.hpp"
 #include "DerivedCounter.hpp"
@@ -67,7 +69,9 @@ public:
      * path performs no allocation and writes only to the caller's SPSC queue.
      */
     bool pushOwnerSnapshots(uint64_t cycle, std::span<const size_t> owner_ids,
-                            ThreadContext& thread_context) noexcept;
+                            ThreadContext& thread_context, std::optional<SimTime> time = {},
+                            bool final = false, bool after_edge = false,
+                            bool post_finalize = false) noexcept;
 
     /**
      * Return the next nominal periodic cycle for one stable scheduler owner.
@@ -77,6 +81,18 @@ public:
      */
     uint64_t nextOwnerSnapshotCycle(size_t owner_id, uint64_t run_start,
                                     uint64_t period) const noexcept;
+
+    uint64_t nextPublishedSnapshotCycle(size_t owner, uint64_t period) const noexcept {
+        if (!period || owner >= owner_snapshot_plans_.size() ||
+            owner_snapshot_plans_[owner].total_size == 0)
+            return UINT64_MAX;
+        auto prior =
+            owner_snapshot_plans_[owner].last_published_cycle->load(std::memory_order_acquire);
+        if (prior == UINT64_MAX) prior = 0;
+        return prior / period >= UINT64_MAX / period ? UINT64_MAX : (prior / period + 1) * period;
+    }
+
+    size_t ownerCount() const noexcept { return owner_snapshot_plans_.size(); }
 
     const std::vector<DerivedCounterDef>& derivedDefs() const noexcept { return derived_defs_; }
     const std::vector<CounterSnapshotPlanMetadata>& snapshotPlans() const noexcept {
@@ -117,6 +133,8 @@ private:
         size_t total_size = 0;
         // Lock-free migration deduplication; counter storage itself remains
         // single-writer under the scheduler's cluster execution claim.
+        std::unique_ptr<std::atomic<uint64_t>> last_published_cycle =
+            std::make_unique<std::atomic<uint64_t>>(UINT64_MAX);
         std::unique_ptr<std::atomic<uint64_t>> last_pushed_cycle =
             std::make_unique<std::atomic<uint64_t>>(UINT64_MAX);
     };

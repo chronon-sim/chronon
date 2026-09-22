@@ -147,8 +147,24 @@ void TickSimulation::serviceEpochFreeMigration_(size_t worker_thread) {
                                    std::memory_order_release);
 
     if (observe_ctx_) {
-        observe::log_info<"Dynamic rebalance committed: {}">(observe_ctx_,
-                                                             last_rebalance_detail_.c_str());
+        if (clock_mode_ && cluster < clusters_.numClusters()) {
+            const auto& clock = cluster_unit_ptrs_[cluster].front()->clockDomain();
+            const auto time = clock.edge(progress);
+            observe::log_info<"Dynamic rebalance committed: {} domain={} next_edge={} time={}/{}s">(
+                observe_ctx_, last_rebalance_detail_.c_str(), clock.id(), progress,
+                time.numerator(), time.denominator());
+        } else if (clock_mode_) {
+            const auto& fifo =
+                cdc_[clock_bridge_groups_[cluster - clusters_.numClusters()].front()];
+            observe::log_info<
+                "Dynamic rebalance committed: {} cdc_domains={}->{} actor_progress={} "
+                "reference_cycle={}">(
+                observe_ctx_, last_rebalance_detail_.c_str(), fifo->writeOwner()->clockDomainId(),
+                fifo->readOwner()->clockDomainId(), progress, migration_cycle);
+        } else {
+            observe::log_info<"Dynamic rebalance committed: {}">(observe_ctx_,
+                                                                 last_rebalance_detail_.c_str());
+        }
     }
     recordDynamicSchedulerMarker_("Chronon epoch-free rebalance committed", migration_cycle,
                                   last_rebalance_detail_);

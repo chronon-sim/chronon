@@ -78,8 +78,11 @@ time.sleep(60)
                     lambda *_: [sys.executable, str(worker), str(pids)], 1)
         for pid in map(int, pids.read_text().split()):
             stat = Path(f"/proc/{pid}/stat")
-            if stat.exists():
-                self.assertEqual(stat.read_text().split()[2], "Z")
+            try:
+                state = stat.read_text().split()[2]
+            except (FileNotFoundError, ProcessLookupError):
+                continue  # A reaped child no longer has a readable proc entry.
+            self.assertEqual(state, "Z")
 
     def test_failure_stops_queue_before_starting_another_scenario(self):
         cpus = runner.physical_cpus(limit=None)

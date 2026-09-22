@@ -51,7 +51,7 @@ add_test(NAME sender_cluster_headroom_clock COMMAND sender_test_cluster_headroom
 set_tests_properties(sender_cluster_headroom_clock PROPERTIES TIMEOUT 120 PROCESSORS 4)
 add_dependencies(regress sender_test_cluster_headroom_clock)
 
-foreach(clock_test clock_time async_fifo_circuit multiclock multiclock_epoch_free multiclock_migration multiclock_scaling clock_trace_budget)
+foreach(clock_test clock_time async_fifo_circuit multiclock multiclock_epoch_free multiclock_migration multiclock_scaling clock_trace_budget multiclock_observation)
     add_executable(sender_test_${clock_test} test_${clock_test}.cpp)
     target_link_libraries(sender_test_${clock_test} PRIVATE chronon::core chronon_compile_options)
     add_test(NAME sender_${clock_test} COMMAND sender_test_${clock_test})

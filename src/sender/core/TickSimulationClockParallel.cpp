@@ -5,6 +5,7 @@
 #include <thread>
 
 #include "../../chronon/CpuPause.hpp"
+#include "../../observe/ObservationManager.hpp"
 #include "DynamicWaitPolicy.hpp"
 #include "TickSimulationClockRuntime.hpp"
 
@@ -219,12 +220,16 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         // Publish without waiting: actors sharing this worker must keep running
         // while the backend drains its bounded observation window.
         if (trace) trace->publishClockProgress(clock_calendar_->nextTime().floorNanoseconds());
+        if (clock_observation_) publishClockObservation_();
         retirement.finish();
         detail::ClockProfileScope admission(profile ? &profile->admission_ns : nullptr);
         if (!settling) {
             while (runtime.pending_size < window_limit && scheduled < max_batches &&
                    !calendar.empty() && within_limit(calendar.nextTime()) &&
                    !token.stop_requested()) {
+                if (clock_observation_ &&
+                    !clock_observation_->tryAdmitClockTime(calendar.nextTime()))
+                    break;
                 if (trace && !trace->tryAdmitClockBatch(calendar.nextTime())) break;
                 if (scheduled >= UINT64_MAX - (current_cycle_ - completed))
                     throw std::overflow_error("scheduler progress overflow");
@@ -442,6 +447,12 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                             auto& published = thread_progress_array_[c].completed_cycle;
                             const auto cycle = published.load(std::memory_order_relaxed);
                             if (Dynamic && dynamicMigrationBlocksCluster_(c, cycle)) continue;
+                            if (clock_observation_) {
+                                const auto retired = SimTime::nanoseconds(
+                                    clock_observation_retired_ns_.load(std::memory_order_acquire));
+                                observe::ObservationManager::instance().sampleClockOwner(
+                                    c, std::min(retired, state.clock->edge(cycle)));
+                            }
                             if (cycle >= state.domain->allowed.load(std::memory_order_acquire)) {
                                 if (profile) ++profile->allowance_waits;
                                 if (sample_wait) blocked(c, SIZE_MAX, state.clock->edge(cycle));
@@ -465,6 +476,13 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                                     blocked(c, blocker.pred_cluster, state.clock->edge(cycle));
                                 continue;
                             }
+                            if (clock_observation_)
+                                observe::ObservationManager::instance().sampleClockOwner(
+                                    c, state.clock->edge(cycle));
+                            const bool trace_tick = timeline_trace_.traceUnits() &&
+                                                    timeline_trace_.capturesCycle(cycle);
+                            SchedulerTimelineTrace::TimePoint tick_begin{};
+                            if (trace_tick) tick_begin = SchedulerTimelineTrace::Clock::now();
                             {
                                 detail::ClockProfileScope ticks_profile(profile ? &profile->tick_ns
                                                                                 : nullptr);
@@ -479,7 +497,16 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                                         executeClockUnitCycle_(unit, cycle);
                                 }
                             }
+                            if (trace_tick) {
+                                const auto time = state.clock->edge(cycle);
+                                timeline_trace_.recordDuration(
+                                    worker, "clock_actor", "cluster tick", cycle, tick_begin,
+                                    SchedulerTimelineTrace::Clock::now(),
+                                    "domain=" + std::to_string(state.clock->id()) + " local_edge=" +
+                                        std::to_string(cycle) + " time=" + time.str());
+                            }
                             if (profile) ++profile->cluster_ticks;
+                            if (clock_observation_) flushClockObservationProducer_();
                             published.store(cycle + 1, std::memory_order_release);
                             // This worker already sees its own actor's completed
                             // work; local dependents need no redundant acquire.
@@ -581,6 +608,7 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
     for (size_t i = 0; i < unit_ptrs_.size(); ++i)
         unit_progress_[i].store(unit_ptrs_[i]->localCycle(), std::memory_order_release);
     termination_ctrl_.setSettledTime(clock_time_);
+    finishClockObservationRun_();
     return completed;
 }
 

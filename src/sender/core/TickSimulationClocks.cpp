@@ -49,16 +49,8 @@ void TickSimulation::assignClockDomain(Unit& unit, ClockDomainId id) {
 }
 
 void TickSimulation::prepareClockTopology_() {
-    // The legacy backend reorders raw cycles and has no hardware domain metadata.
-    // Reject this combination instead of emitting plausible but incorrect timestamps.
-    if (observe::ObservationManager::instance().isEnabled()) {
-        throw std::logic_error(
-            "multiclock uses configureClockTrace; disable the legacy ObservationManager backend");
-    }
-    if (config_.timeline_trace.enabled) {
-        throw std::logic_error(
-            "scheduler wall-time tracing for multiclock is unsupported; use configureClockTrace");
-    }
+    if (observe::ObservationManager::instance().isBackendRunning())
+        throw std::logic_error("initialize clock simulation before starting observation backend");
     std::map<std::string, TickableUnit*> names;
     for (auto* unit : unit_ptrs_) {
         if (!names.emplace(unit->fullPath(), unit).second) {
@@ -132,6 +124,29 @@ void TickSimulation::prepareClockTopology_() {
 }
 
 void TickSimulation::initializeClockRuntime_() {
+    auto& observation = observe::ObservationManager::instance();
+    if (observation.isEnabled()) {
+        const auto scheduler_file = config_.timeline_trace.file.empty()
+                                        ? std::filesystem::path("scheduler_timeline.pftrace")
+                                        : std::filesystem::path(config_.timeline_trace.file);
+        const auto model_file = observation.config().timeline.file.empty()
+                                    ? std::filesystem::path("timeline.pftrace")
+                                    : std::filesystem::path(observation.config().timeline.file);
+        if (config_.timeline_trace.enabled &&
+            scheduler_file.lexically_normal() == model_file.lexically_normal())
+            throw std::invalid_argument(
+                "scheduler and physical observation timelines require distinct files");
+        const ClockDomain* reference = &default_clock_;
+        const auto& name = observation.config().counters.reference_clock;
+        if (name != "default") {
+            reference = nullptr;
+            for (const auto& clock : clock_domains_)
+                if (clock.name() == name) reference = &clock;
+            if (!reference) throw std::invalid_argument("unknown counter reference_clock: " + name);
+        }
+        observation.configureClockObservation(*reference, config_.max_lookahead_cycles);
+        clock_observation_ = observation.backend();
+    }
     if (config_.profile_clock_scheduler)
         clock_scheduler_profile_.resize(shouldUseParallelExecution_() ? thread_units_.size() : 1);
     for (auto* unit : unit_ptrs_) {
@@ -184,6 +199,41 @@ void TickSimulation::requireClockRun_() {
     // All previous work is settled at public run entry. Publish the boundary
     // for an existing external stop even if the selected run attempts no batch.
     termination_ctrl_.setSettledTime(clock_time_);
+    if (clock_observation_ && !clock_observation_->isRunning())
+        throw std::logic_error("start observation backend before running a clock simulation");
+}
+
+void TickSimulation::flushClockObservationProducer_() {
+    if (!clock_observation_) return;
+    if (auto* producer = observe::ThreadContextManager::instance().getContext())
+        producer->queue().forceCommitWrite();
+}
+
+void TickSimulation::publishClockObservation_() {
+    if (!clock_observation_ || clock_calendar_->empty()) return;
+    const auto ns = clock_time_.floorNanoseconds();
+    clock_observation_retired_ns_.store(ns, std::memory_order_release);
+    clock_observation_->publishClockProgress(
+        observe::ObservationManager::instance().clockSafeFrontier(ns));
+}
+
+void TickSimulation::finishClockObservationRun_(std::optional<SimTime> limit) {
+    if (!clock_observation_ || clock_calendar_->empty()) return;
+    auto& observation = observe::ObservationManager::instance();
+    const auto boundary = limit && !wasTerminationRequested() ? *limit : clock_time_;
+    // A legal no-op may name an earlier exclusive limit than a prior run's
+    // cutoff. Keep the established time and before/after phase until new work.
+    if (current_cycle_ == observation.clockRunRevision() &&
+        boundary <= observation.clockRunBoundary()) {
+        clock_observation_->rethrowIfFailed();
+        return;
+    }
+    for (const auto owner : counter_owner_ids_) observation.sampleClockOwner(owner, boundary);
+    flushClockObservationProducer_();
+    observation.setClockRunBoundary(boundary, current_cycle_,
+                                    current_cycle_ != 0 && (!limit || wasTerminationRequested()));
+    publishClockObservation_();
+    clock_observation_->rethrowIfFailed();
 }
 
 bool TickSimulation::executeClockBatch_() {
@@ -196,6 +246,17 @@ bool TickSimulation::executeClockBatch_() {
                             : nullptr;
         if (profile) ++profile->sweeps;
         detail::ClockProfileScope calendar_profile(profile ? &profile->admission_ns : nullptr);
+        if (clock_observation_) {
+            while (!clock_observation_->tryAdmitClockTime(clock_calendar_->nextTime())) {
+                if (wasTerminationRequested()) return false;
+                if (host_services_) host_services_->poll(sequential_service_cursor_);
+                std::this_thread::yield();
+            }
+            if (wasTerminationRequested()) return false;
+            auto& observation = observe::ObservationManager::instance();
+            for (const auto owner : counter_owner_ids_)
+                observation.sampleClockOwner(owner, clock_calendar_->nextTime());
+        }
         const auto edges = clock_calendar_->pop();
         calendar_profile.finish();
         detail::ClockProfileScope actors_profile(profile ? &profile->actor_ns : nullptr);
@@ -260,12 +321,14 @@ bool TickSimulation::executeClockBatch_() {
         }
         actors_profile.finish();
         for (const auto& edge : edges) runtime_for(edge).next_cycle = edge.cycle + 1;
+        if (clock_observation_) flushClockObservationProducer_();
         clock_time_ = edges.front().time;
         ++current_cycle_;
         termination_ctrl_.setSettledTime(clock_time_);
         // All queues publish before this safe point, including every CDC commit.
         // Only observation time is quantized; the current ns bucket stays open.
         if (clock_trace_ && clock_trace_->needsProgress()) clock_trace_->endClockBatch();
+        if (clock_observation_) publishClockObservation_();
         return true;
     } catch (...) {
         for (auto* unit : unit_ptrs_) unit->clock_edge_executing_ = false;
@@ -278,9 +341,14 @@ uint64_t TickSimulation::runClockEvents(uint64_t max_event_batches) {
     requireClockRun_();
     if (shouldUseParallelExecution_()) return runClockEpochFree_(max_event_batches);
     // A predicate interval of one needs a single batch, with no counted loop.
-    if (max_event_batches == 1) return executeClockBatch_();
+    if (max_event_batches == 1) {
+        const auto count = executeClockBatch_();
+        finishClockObservationRun_();
+        return count;
+    }
     uint64_t count = 0;
     while (count < max_event_batches && executeClockBatch_()) ++count;
+    finishClockObservationRun_();
     return count;
 }
 
@@ -288,11 +356,16 @@ uint64_t TickSimulation::runUntilTime(SimTime exclusive_limit) {
     requireClockRun_();
     if (exclusive_limit < clock_time_)
         throw std::invalid_argument("cannot run backwards in physical time");
-    if (shouldUseParallelExecution_()) return runClockEpochFree_(UINT64_MAX, exclusive_limit);
+    if (shouldUseParallelExecution_()) {
+        const auto count = runClockEpochFree_(UINT64_MAX, exclusive_limit);
+        finishClockObservationRun_(exclusive_limit);
+        return count;
+    }
     uint64_t count = 0;
     while (!clock_calendar_->empty() && clock_calendar_->nextTime() < exclusive_limit &&
            executeClockBatch_())
         ++count;
+    finishClockObservationRun_(exclusive_limit);
     return count;
 }
 
@@ -307,6 +380,7 @@ uint64_t TickSimulation::runDomainCycles(ClockDomainId id, uint64_t additional_e
     uint64_t count = 0;
     while (!clock_calendar_->empty() && clock_calendar_->nextTime() <= end && executeClockBatch_())
         ++count;
+    finishClockObservationRun_();
     return count;
 }
 
@@ -327,6 +401,7 @@ uint64_t TickSimulation::drainCdc(uint64_t max_event_batches) {
         if (!runClockEvents(1)) break;
         ++count;
     }
+    finishClockObservationRun_();
     return count;
 }
 

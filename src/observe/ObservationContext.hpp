@@ -13,12 +13,14 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
 #include "../chronon/CpuPause.hpp"
+#include "../time/ClockDomain.hpp"
 #include "Counter.hpp"
 #include "DerivedCounter.hpp"
 #include "FormatRegistry.hpp"
@@ -284,6 +286,14 @@ public:
     const std::string& unitName() const noexcept { return unit_name_; }
     uint16_t sourceId() const noexcept { return source_id_; }
 
+    void setClockLifecycle(std::optional<SimTime> time, uint64_t phase = 0) noexcept {
+        clock_lifecycle_.reset();
+        if (time)
+            clock_lifecycle_ = ClockLifecycleStamp{time->numerator(), time->denominator(), phase};
+    }
+
+    void useThreadCycleOverride(bool enabled) noexcept { use_thread_cycle_override_ = enabled; }
+
     void setCycleProvider(CycleProvider provider) { cycle_provider_ = std::move(provider); }
 
     /**
@@ -300,13 +310,25 @@ public:
     void clearCycleOverride() noexcept { tls_use_cycle_override_ = false; }
 
     uint64_t currentCycle() const {
-        if (tls_use_cycle_override_) {
+        if (use_thread_cycle_override_ && tls_use_cycle_override_) {
             return tls_cycle_override_;
         }
         return cycle_provider_ ? cycle_provider_() : 0;
     }
 
 private:
+    size_t lifecycleBytes_() const noexcept {
+        return clock_lifecycle_ ? sizeof(ClockLifecycleStamp) : 0;
+    }
+    void stampLifecycle_(std::byte* record, size_t size) const noexcept {
+        if (!clock_lifecycle_) return;
+        auto* header = reinterpret_cast<ObservationQueue::RecordHeader*>(record);
+        header->flags |= CLOCK_LIFECYCLE_FLAG;
+        std::memcpy(record + size - sizeof(ClockLifecycleStamp), &*clock_lifecycle_,
+                    sizeof(ClockLifecycleStamp));
+    }
+    std::optional<ClockLifecycleStamp> clock_lifecycle_;
+    bool use_thread_cycle_override_ = true;
     static inline thread_local uint64_t tls_cycle_override_ = 0;
     static inline thread_local bool tls_use_cycle_override_ = false;
 
@@ -386,7 +408,7 @@ private:
         }
 
         const size_t record_size = sizeof(ObservationQueue::RecordHeader) + payload_size;
-        const size_t aligned_size = (record_size + 7) & ~7;
+        const size_t aligned_size = ((record_size + 7) & ~7) + lifecycleBytes_();
 
         auto* ptr = acquireQueueSpace_<ObservationChannel::Trace>(ctx, aligned_size);
         if (!ptr) {
@@ -405,6 +427,7 @@ private:
                             slot, name_id, payload, args, arg_count, flags);
         globalizePendingTimelineStrings_(ptr, aligned_size);
 
+        stampLifecycle_(ptr, aligned_size);
         ctx->queue().finishAndCommitWrite(aligned_size);
         stats_.recordEmit<ObservationChannel::Trace>();
         return true;
@@ -584,7 +607,7 @@ private:
                    FormatId fmt_id) noexcept {
         constexpr size_t record_size =
             sizeof(ObservationQueue::RecordHeader) + sizeof(StructuredRecord);
-        constexpr size_t aligned_size = (record_size + 7) & ~7;
+        const size_t aligned_size = ((record_size + 7) & ~7) + lifecycleBytes_();
 
         if (lookahead_mode_) {
             StructuredRecord rec{};
@@ -632,6 +655,7 @@ private:
             rec->source_id = source_id_;
             rec->arg_count = 0;
 
+            stampLifecycle_(ptr, aligned_size);
             ctx->queue().finishAndCommitWrite(aligned_size);
             stats_.recordEmit<Ch>();
         }
@@ -689,7 +713,7 @@ private:
 
             const size_t record_size =
                 sizeof(ObservationQueue::RecordHeader) + sizeof(StructuredRecord) + args_size;
-            const size_t aligned_size = (record_size + 7) & ~7;
+            const size_t aligned_size = ((record_size + 7) & ~7) + lifecycleBytes_();
 
             auto* ptr = acquireQueueSpace_<Ch>(ctx, aligned_size);
             if (!ptr) {
@@ -717,6 +741,7 @@ private:
             size_t offset = 0;
             ((offset += packArgCached(args_ptr + offset, cache, args)), ...);
 
+            stampLifecycle_(ptr, aligned_size);
             ctx->queue().finishAndCommitWrite(aligned_size);
             stats_.recordEmit<Ch>();
         }

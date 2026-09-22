@@ -106,7 +106,7 @@ check alone does not replace checking successful delivery.
 | Multiple simulations without observation | Independent port directories and lifetimes |
 | Overlapping managed observed sessions | Rejected before existing contexts are replaced |
 | Explicit clock domains | `configureClockTrace` and `clockEvent`, using exact physical time |
-| Explicit clock domains plus legacy ObservationManager | Rejected; legacy cycle timestamps cannot represent this contract |
+| Explicit clock domains plus ObservationManager | Existing event/log/counter/span APIs use domain-local edges and exact physical-time ordering; [reference-domain sampling and lifecycle semantics](observability.md#explicit-clock-domains) |
 
 The observed simulation finalizes units, stops the backend before unit destruction,
 and releases contexts afterward. Failed YAML builds also release their session.

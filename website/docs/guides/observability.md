@@ -8,11 +8,13 @@ sidebar_label: "Observability System"
 
 Chronon provides a unified observability system with three integrated capabilities:
 
-Explicit hardware clock domains use the separate native
-[ClockTraceRecorder](multiclock-cdc.md#native-recording), with exact time conversion,
-sequence-local Perfetto clocks and one text file per domain. The legacy backend
-and APIs below remain the default single-clock interface and are not silently
-reinterpreted as multi-clock records.
+The same unit APIs support both implicit single-clock simulations and explicit
+hardware clock domains. Explicit clocks retain domain/local-edge attribution and
+use exact rational physical time for ordering. The native
+[ClockTraceRecorder](multiclock-cdc.md#native-recording) remains available for
+`clockEvent` and CDC protocol events, including alongside unified observation.
+See [explicit clock semantics](#explicit-clock-domains) before interpreting
+counter intervals or comparing scheduler and model timelines.
 
 | Feature | Purpose | API | Hot Path |
 |---------|---------|-----|----------|
@@ -21,9 +23,145 @@ reinterpreted as multi-clock records.
 | Pipeline traces | Typed one-cycle pipeline slices | model-level `observe::pipeline<"STAGE">(...)` | fixed record + typed args |
 | Logs | Debug output | `debug<"fmt">(...)` | ~2ns disabled |
 
+## Explicit clock domains
+
+`event`, `debug`/`info`, `EventCounter`, named spans and `pipeStage` retain their
+existing signatures. Configure observation before `initialize()`, then register
+counters and start the backend after initialization. `SimulationApp` manages this
+lifecycle. Direct C++ callers can use:
+
+```cpp
+observe::ObservationYAMLConfig observation;
+observation.enabled = true;
+observation.unified_logging.trace_channel.enabled = true;
+observation.unified_logging.categories.push_back({"my_category", true, {}});
+observation.counters.reference_clock = "cpu";
+observation.counters.periodic_dump_cycles = 100;
+sim.configureObservation(observation);
+sim.initialize();
+auto& manager = observe::ObservationManager::instance();
+manager.reregisterAllCounters();
+manager.startBackend();
+sim.runUntilTime(SimTime::nanoseconds(10'000));
+sim.finalize();
+manager.dumpFinalCounterSnapshot(0); // Clock mode gets its cutoff from sim.
+sim.writeTimelineTrace();
+manager.stopBackend();
+```
+
+| API/output | Explicit-clock semantics |
+|---|---|
+| Structured events and spans | Domain ID, local edge and exact `ClockDomain::edge(n)` time; typed arguments, strings and flow IDs are preserved. |
+| `pipeStage` | Occupancy `[edge(n), edge(n+1))` in the owning hardware domain. |
+| Text logs | `domain`, `edge`, and exact rational `time` prefix. Category time filters use that source's local edge index. |
+| Periodic counters | A shared physical sampling grid defined by `reference_clock` and `periodic_dump_cycles`; `default` means the configured default tick frequency, regardless of unit domains. |
+| Scheduler diagnostics | Host monotonic nanoseconds; separate `scheduler_timeline.pftrace`. Cluster slices include domain, local edge and physical time in their detail. Migration logging never reads the coordinator's non-atomic calendar state. |
+| Native clock recording | Existing `configureClockTrace` interface, identities, protocol flows and output files remain unchanged. |
+
+The unified backend converts exact time to `floor(seconds * 1e9)` only for
+Perfetto display. Structured records also export `domain_id`, `local_cycle`,
+`time_num` and `time_den`, so distinct subnanosecond edges remain inspectable.
+Text timestamps and counter CSV retain exact rational seconds. Source identity
+and equal-time model-event ordering follow logical unit names, independent of
+worker placement and migration. Lifecycle records are ordered before/after model
+records at their boundary; same-phase lifecycle callbacks retain publication order. A worker may interleave unrelated hardware domains;
+its largest observed local cycle is never used as a global watermark.
+
+Each counter owner captures and resets its own counters **before** executing the
+first edge at or after a periodic cutoff. A slow/idle owner also services
+cutoffs reached by retired physical progress without executing extra model
+ticks. Rows therefore cover `[previous cutoff, cutoff)` even when the nominal
+cutoff falls between a domain's edges. Counter ownership and the next sampling
+index follow stable scheduler clusters across migration. Sequential execution
+keeps distinct owners for units from different domains.
+
+Clock CSV begins with `time_num,time_den,sample`. `periodic` rows share the
+reference grid. A successful `runUntilTime(t)` final snapshot is `final_before`
+at its exclusive cutoff `t`, including a no-work call before the first phased
+edge. Batch/domain limits and early termination use `final_after` at the last
+committed edge: this includes the work at that exact time. These phases keep
+before-edge and after-edge samples distinct when timestamps coincide. Repeated
+final dumps without new work are ignored; a final dump resets the residual
+interval, and subsequent runs retain the original periodic sampling phase. Legal
+no-work calls with an earlier or equal cutoff preserve the last observation
+boundary and its before/after phase, including for later finalization.
+Stopping and resuming preserves the scheduler's existing bounded settlement
+contract. Observations add no model ticks or CDC acceptance decisions.
+
+`initialize()` observations occur at time zero; `finalize()` observations use the
+last run's actual cutoff. Such structured events carry a `lifecycle` annotation,
+and logs label the callback explicitly. Their `local_cycle` is the unit's next
+edge index, not a claim that this edge executed. Finalize before the final
+counter dump to include counter changes made by that callback. If a caller has
+already dumped the same run cutoff, finalization permits one additional residual
+row at that cutoff; earlier counter values are not emitted again. At the same
+exact time, a pre-finalization snapshot precedes the finalize callback records,
+and the post-finalization residual follows them. This lifecycle ordering is
+independent of the hardware cutoff: CSV still reports `final_before` or
+`final_after` according to the last run.
+
+The backend reuses producer queues, source/format/track registries, counter
+plans, the reorder arena and isolated `HostServices` I/O lane. A rolling credit
+window bounds admitted observation timestamps. Before advancing the safe
+frontier it captures all queue heads after acquiring scheduler progress, then
+drains that complete prefix. Queue pressure obeys the existing channel policy;
+the backend never flushes an unsafe prefix merely to free space. If one open
+window exceeds `service_buffer_bytes`, it reports an error rather than silently
+misordering data. Increase that budget or reduce recording rate/lookahead for
+bursty models. Continuous drain and producer assistance prevent a quiet stream
+or several actors sharing a worker from blocking ingress draining.
+
+Unsupported combinations fail explicitly: starting the unified backend before
+clock initialization, unknown counter reference domains, speculative observation
+epochs attached to explicit clocks, pipeline occupancy in lifecycle callbacks,
+and submitting host-wall streams into the physical-time writer. Use a separate
+scheduler output file. Observation records emitted behind already published
+physical progress also fail explicitly. Unit observation calls and counter
+updates remain owner-thread operations; external threads must not mutate a
+running unit's observation state.
+
+`sender_test_multiclock_observation` exercises a phased 3 GHz/400 MHz FIFO model
+with existing APIs, serial/epoch-free/migrating state equivalence, segmented runs,
+termination/resume, native tracing alongside unified tracing, lifecycle callbacks,
+bounded-buffer saturation, backend failure and recovery. Real Perfetto import,
+flow, exact-time and interval-counter checks are available with:
+
+```bash
+python3 scripts/validate_multiclock_observation.py \
+  --trace-processor /path/to/trace_processor \
+  --binary build/test/sender/sender_test_multiclock_observation
+```
+
+Recording every edge incurs queueing, sorting, formatting, serialization and I/O
+costs. Compare disabled, counter-only and full-recording workloads separately;
+these APIs do not make per-edge tracing free.
+
+
+To reproduce a short overhead check with state equivalence outside the timer:
+
+```bash
+build/test/sender/sender_test_multiclock_observation --overhead /tmp/clock-observe-cost
+```
+
+The fixture runs three FIFO pairs for 3 µs (30,600 unit edges), emitting one
+structured event, pipeline slice and text log per edge in full mode. Counter mode
+samples every 128 fast-domain edges; native recording is off. Seven interleaved
+trials per mode on an Intel i9-14900K, GCC Release build, measured the following
+wall times including final snapshots and backend drain (initialization excluded):
+
+| Workers | Disabled median (range), ms | Counters median (range), ms | Full median (range), ms |
+|---|---|---|---|
+| 1 | 0.796 (0.762–3.929) | 4.316 (4.146–8.188) | 39.068 (37.478–40.654) |
+| 3 | 2.248 (2.206–2.305) | 7.341 (7.124–7.685) | 42.126 (40.757–43.371) |
+
+These are small, very cheap model ticks; admission, interval sampling and I/O
+costs dominate. The shared host had unrelated CPU load and no fixed affinity, so
+these measurements demonstrate recording cost rather than a throughput guarantee
+or regression claim. Re-run against the intended model and machine.
+
 ## Design Principles
 
-- **Zero overhead when disabled**: No runtime cost
+- **Cheap disabled path**: Existing enable checks bypass producer and backend work
 - **Minimal overhead when enabled**: Pre-registered format strings
 - **Lock-free hot path**: No mutex contention
 - **Lookahead-compatible**: Thread-local counters, buffered events
@@ -542,8 +680,9 @@ For an independently owned `ObservationBackend`, call
 `backend.attachScheduler(sim.hostServices())` before `backend.start()`.
 For a manually managed `ObservationManager`, initialize the simulation before
 `startBackend()` to share its scheduler. `SimulationApp` handles this order.
-An already-running backend retains its existing scheduler when a simulation
-initializes, preserving standalone callers without moving an active I/O job.
+For implicit single-clock simulations, an already-running backend retains its
+existing scheduler. Explicit-clock simulations require initialization before
+backend startup so source clocks and snapshot ownership are immutable.
 Native-clock simulations attach automatically through
 `sim.configureClockTrace(config)`. Both sorted and immediate output use this
 pipeline. The old `scheduler_service` C++ mode switch is removed; remove the
@@ -590,8 +729,8 @@ While I/O owns the only handoff batch, the registration rejects new claims befor
 taking its consumer lock or reading the timing clock. Publications still record
 readiness, and I/O completion restores eligibility without losing notifications.
 
-The ordinary reorder arena admits at most `service_buffer_bytes` live/retained
-bytes (64 KiB–1 GiB), then flushes the sorted retained records before admitting
+In implicit-clock mode, the ordinary reorder arena admits at most
+`service_buffer_bytes` live/retained bytes (64 KiB–1 GiB), then flushes the sorted retained records before admitting
 more. Its allocation may round up by less than 2×; record descriptors are
 separately bounded by `reorder_max_events + 1`. Together with the fixed handoff
 buffer and existing bounded producer queues, a slow sink cannot grow an
@@ -602,7 +741,8 @@ existing allocation policies; this is not a bound on whole-process memory.
 
 As with the existing count-based forced flush, the additional ordinary-backend byte limit
 can flush before the reorder watermark. Ordinary-backend ordering remains best effort
-under forced flushing; native-clock frontier ordering is exact. Existing
+under forced flushing. Both explicit-clock unified observation and native clock
+recording instead use exact frontier ordering, without pressure-triggered flushing. Existing
 `drop`, `bounded_wait` and `spin_wait` policies are unchanged. A lossless producer
 can still spend host time waiting for a slow sink, while assisting bounded
 ingress work. No file I/O executes inside the model callback.

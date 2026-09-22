@@ -382,6 +382,7 @@ private:
         LOAD_IF_PRESENT(node, config, enabled);
         LOAD_IF_PRESENT(node, config, csv_output);
         LOAD_IF_PRESENT(node, config, periodic_dump_cycles);
+        LOAD_IF_PRESENT(node, config, reference_clock);
         LOAD_IF_PRESENT(node, config, dump_on_shutdown);
 
 #undef LOAD_IF_PRESENT

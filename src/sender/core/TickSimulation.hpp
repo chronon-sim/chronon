@@ -57,7 +57,8 @@
 
 namespace chronon::observe {
 struct ObservationYAMLConfig;
-}
+class ObservationBackend;
+}  // namespace chronon::observe
 
 namespace chronon::sender {
 
@@ -176,7 +177,7 @@ public:
 
     void initialize();
     /// Own the process observation backend for this session. Configure before initialize().
-    /// Observed sessions are exclusive; multiclock uses configureClockTrace instead.
+    /// Observed sessions are exclusive; explicit clock domains retain the same unit APIs.
     void configureObservation(const observe::ObservationYAMLConfig& config);
 
     /// End this session. Calls every successfully initialized unit's finalize()
@@ -453,6 +454,9 @@ private:
                                 bool inclusive = false);
     bool executeClockBatch_();
     void requireClockRun_();
+    void finishClockObservationRun_(std::optional<SimTime> limit = {});
+    void flushClockObservationProducer_();
+    void publishClockObservation_();
     enum class ExecutionMode {
         Sequential,
         EpochFree,
@@ -833,6 +837,8 @@ private:
     std::deque<ClockDomain> clock_domains_;
     bool clock_mode_ = false;
     bool clock_failed_ = false;
+    observe::ObservationBackend* clock_observation_ = nullptr;
+    std::atomic<uint64_t> clock_observation_retired_ns_{0};
     std::vector<ClockSchedulerProfile> clock_scheduler_profile_;
     uint64_t clock_partition_time_ns_ = 0;
     SimTime clock_time_;
