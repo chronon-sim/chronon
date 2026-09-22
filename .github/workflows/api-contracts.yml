@@ -1,68 +1,58 @@
-name: API contracts and performance
-
+name: PR review wall-time reproduction
 on:
-  pull_request:
-    paths:
-      - 'src/**'
-      - 'test/**'
-      - 'examples/**'
-      - 'benchmark/**'
-      - 'scripts/**'
-      - 'CMakeLists.txt'
-      - 'cmake/**'
-      - '.github/workflows/**'
-      - 'README.md'
   workflow_dispatch:
     inputs:
-      base:
-        description: Immutable baseline commit SHA
-        required: true
-        default: '8563cea58fb0d84306c3252be1fd68044c07afbc'
-
+      pr158:
+        default: f9aca0fd3cc855523e87c3f1bf708a9715564f93
+      pr159:
+        default: 7181ad281436076d5ebd4a9e52cd83982b3585fc
+      pr160:
+        default: d4f9a00f1f3d9d6ea33459ee8e4b9355e5a49046
 permissions:
   contents: read
-
-concurrency:
-  group: api-contracts-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  differential-performance:
+  repeat:
     runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pr: 158
+            sha: ${{ inputs.pr158 }}
+            cases: nucleus-threads2,clock1-threads2-dynamic0-poll0
+          - pr: 159
+            sha: ${{ inputs.pr159 }}
+            cases: clock0-threads2-dynamic0-poll64,broadcast-threads1,memory-threads2
+          - pr: 160
+            sha: ${{ inputs.pr160 }}
+            cases: clock0-threads2-dynamic1-poll0
     steps:
       - uses: actions/checkout@v4
         with:
-          path: candidate
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: harness
       - uses: actions/checkout@v4
         with:
           path: baseline
-          ref: ${{ github.event.pull_request.base.sha || inputs.base }}
-      - name: Record exact commits
-        id: commits
-        run: |
-          echo "base=$(git -C baseline rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "head=$(git -C candidate rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Install identical build dependencies
-        run: |
+          ref: 0c8b6f2379f9c8bec09a7cbc258c8df72604b7e1
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          ref: ${{ matrix.sha }}
+      - run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build ccache g++-12 libyaml-cpp-dev libfmt-dev zlib1g-dev
       - uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: api-contracts-gcc12-release
-      - name: Configure both revisions
+      - name: Build identical workloads and record commits
         env:
           CXX: g++-12
           CPM_SOURCE_CACHE: ${{ github.workspace }}/dependencies
         run: |
-          for variant in baseline candidate; do
-            cmake -S "$variant" -B "$variant/build-perf" -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
-              -DCHRONON_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          done
-      - name: Verify identical benchmark sources
-        run: |
+          mkdir results
+          git -C baseline rev-parse HEAD > results/baseline.sha
+          git -C candidate rev-parse HEAD > results/candidate.sha
           for file in single_clock_regression.cpp scheduler_invocation_benchmark.cpp \
               SchedulerInvocationModel.hpp BenchmarkThreadAffinity.hpp \
               representative_workload_benchmark.cpp RepresentativeWorkload.hpp \
@@ -70,90 +60,31 @@ jobs:
               RepresentativeWorkloadReporting.hpp; do
             cmp "baseline/benchmark/$file" "candidate/benchmark/$file"
           done
-      - name: Build both measurements and candidate tests
+          for variant in baseline candidate; do
+            cmake -S "$variant" -B "$variant/build-perf" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
+              -DCHRONON_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            cmake --build "$variant/build-perf" --parallel 16 --target \
+              chronon_single_clock_regression_benchmark chronon_scheduler_invocation_benchmark \
+              chronon_representative_workload_benchmark
+          done
+      - name: Repeat all scenarios in serial balanced pairs
         run: |
-          cmake --build baseline/build-perf --parallel 16 --target \
-            chronon_single_clock_regression_benchmark \
-            chronon_scheduler_invocation_benchmark chronon_representative_workload_benchmark
-          cmake --build candidate/build-perf --parallel 16
-      - name: Run Release correctness and deterministic equivalence tests
-        run: ctest --test-dir candidate/build-perf --output-on-failure --parallel 16
-      - name: Validate benchmark scripts, measurement and reporting logic
-        run: python3 -m unittest discover -s candidate/test/scripts -p 'test_*.py'
-      - name: Measure all scenarios on disjoint physical CPU sets
-        timeout-minutes: 11
+          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
+          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
+            --baseline baseline/build-perf --candidate candidate/build-perf \
+            --output results/matrix --cpus "$CPUS" --repeats 6
+      - name: Repeat reported regressions with more samples
         env:
-          BASE_SHA: ${{ steps.commits.outputs.base }}
-          HEAD_SHA: ${{ steps.commits.outputs.head }}
+          CASES: ${{ matrix.cases }}
         run: |
-          python3 candidate/scripts/run_api_performance.py \
-            baseline/build-perf candidate/build-perf performance-results \
-            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
-            --workers 2 --jobs 8 --timeout 600
-      - name: Add wall times to the workflow summary
+          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
+          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
+            --baseline baseline/build-perf --candidate candidate/build-perf \
+            --output results/focused --cpus "$CPUS" --repeats 24 --cases "$CASES"
+      - uses: actions/upload-artifact@v4
         if: always()
-        run: |
-          if [[ -f performance-results/report.md ]]; then
-            cat performance-results/report.md >> "$GITHUB_STEP_SUMMARY"
-          fi
-      - name: Retain all performance evidence, including failed checks
-        if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: api-contracts-validation
-          path: performance-results/
-          if-no-files-found: ignore
+          name: review-walltime-${{ matrix.pr }}
+          path: results/
           retention-days: 30
-
-      - name: Retain correctness diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: api-contracts-tests
-          path: candidate/build-perf/Testing/Temporary/
-          retention-days: 30
-
-  performance-report:
-    needs: differential-performance
-    if: >-
-      always() && github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    permissions:
-      actions: read
-      pull-requests: write
-    steps:
-      - name: Download measured wall times
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: api-contracts-validation
-          path: performance-results
-      - name: Update PR performance comment
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const pr = context.payload.pull_request;
-            const repo = context.repo;
-            const current = await github.rest.pulls.get({...repo, pull_number: pr.number});
-            if (current.data.head.sha !== pr.head.sha) {
-              core.info('A newer commit is already on the PR; skip this outdated report.');
-              return;
-            }
-            const marker = '<!-- chronon-api-performance -->';
-            const file = 'performance-results/report.md';
-            const url = `${context.serverUrl}/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`;
-            let body = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') :
-              `${marker}\n## Performance wall time\n\nMeasurement did not complete for \`${pr.head.sha}\`; see the workflow logs.`;
-            body += `\n[Workflow run and raw artifacts](${url})\n`;
-            const comments = await github.paginate(github.rest.issues.listComments,
-              {...repo, issue_number: pr.number, per_page: 100});
-            const previous = comments.find(comment => comment.user?.login === 'github-actions[bot]' &&
-              comment.body?.includes(marker));
-            if (previous) {
-              await github.rest.issues.updateComment({...repo, comment_id: previous.id, body});
-            } else {
-              await github.rest.issues.createComment({...repo, issue_number: pr.number, body});
-            }
