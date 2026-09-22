@@ -58,7 +58,20 @@ void ReorderBuffer::ensureArenaCapacity_(size_t additional) {
     arena_.resize(new_size);
 }
 
-void ReorderBuffer::compactArena() { compactArenaImpl_(); }
+void ReorderBuffer::compactArena() {
+    compactArenaImpl_();
+    if (!time_resolver_ || time_keys_.size() <= size() * 2) return;
+    std::vector<TimeKey> keys;
+    keys.reserve(size());
+    const auto keep = [&](BufferedRecord& record) {
+        const auto key = time_keys_[record.time_index];
+        record.time_index = static_cast<uint32_t>(keys.size());
+        keys.push_back(key);
+    };
+    for (size_t i = sorted_start_; i < sorted_buffer_.size(); ++i) keep(sorted_buffer_[i]);
+    for (auto& record : unsorted_batch_) keep(record);
+    time_keys_ = std::move(keys);
+}
 
 void ReorderBuffer::compactArenaImpl_() {
     // sorted_buffer_ AND unsorted_batch_ may reference arena data — the caller
@@ -132,6 +145,13 @@ bool ReorderBuffer::bufferEvent(const ObservationQueue::RecordHeader* header, co
     }
 
     unsorted_batch_.emplace_back(cycle, header->type, offset, static_cast<uint32_t>(total_size));
+    if (time_resolver_) {
+        auto& record = unsorted_batch_.back();
+        const auto [time, source] = time_resolver_(header, data, data_size);
+        record.time_index = static_cast<uint32_t>(time_keys_.size());
+        time_keys_.push_back({time, source});
+        record.cycle = time.floorNanoseconds();
+    }
     return true;
 }
 
@@ -151,14 +171,15 @@ void ReorderBuffer::flushReady(std::vector<BufferedRecord>& out) {
     }
 
     // Safety valve against unbounded accumulation.
-    bool force_flush = size() > config_.max_buffer_events;
+    bool force_flush = !config_.strict_watermark && size() > config_.max_buffer_events;
 
     if (flush_threshold == 0 && !force_flush) {
         return;
     }
 
     if (!unsorted_batch_.empty()) {
-        std::stable_sort(unsorted_batch_.begin(), unsorted_batch_.end());
+        std::stable_sort(unsorted_batch_.begin(), unsorted_batch_.end(),
+                         [this](const auto& a, const auto& b) { return less_(a, b); });
 
         if (!has_sorted) {
             sorted_buffer_.clear();
@@ -177,7 +198,8 @@ void ReorderBuffer::flushReady(std::vector<BufferedRecord>& out) {
                                   std::make_move_iterator(unsorted_batch_.begin()),
                                   std::make_move_iterator(unsorted_batch_.end()));
             std::inplace_merge(sorted_buffer_.begin(), sorted_buffer_.begin() + merge_point,
-                               sorted_buffer_.end());
+                               sorted_buffer_.end(),
+                               [this](const auto& a, const auto& b) { return less_(a, b); });
         }
         unsorted_batch_.clear();
     }
@@ -218,7 +240,8 @@ void ReorderBuffer::flushReady(std::vector<BufferedRecord>& out) {
 void ReorderBuffer::flushAll(std::vector<BufferedRecord>& out) {
     out.clear();
 
-    std::stable_sort(unsorted_batch_.begin(), unsorted_batch_.end());
+    std::stable_sort(unsorted_batch_.begin(), unsorted_batch_.end(),
+                     [this](const auto& a, const auto& b) { return less_(a, b); });
 
     auto live_begin = sorted_buffer_.begin() + static_cast<std::ptrdiff_t>(sorted_start_);
     auto live_end = sorted_buffer_.end();
@@ -240,7 +263,8 @@ void ReorderBuffer::flushAll(std::vector<BufferedRecord>& out) {
                               std::make_move_iterator(unsorted_batch_.begin()),
                               std::make_move_iterator(unsorted_batch_.end()));
         std::inplace_merge(sorted_buffer_.begin(), sorted_buffer_.begin() + merge_point,
-                           sorted_buffer_.end());
+                           sorted_buffer_.end(),
+                           [this](const auto& a, const auto& b) { return less_(a, b); });
         std::swap(out, sorted_buffer_);
     }
 

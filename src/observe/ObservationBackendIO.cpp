@@ -74,7 +74,22 @@ void ObservationBackend::writeEventAsText_(const StructuredRecord* rec, const st
         source_name = source_name_cache_[rec->source_id];
     }
 
-    if (!source_name.empty()) {
+    if (clockMode()) {
+        if (const auto* clock = sourceClock_(rec->source_id)) {
+            const auto time = current_lifecycle_ ? SimTime(current_lifecycle_->numerator,
+                                                           current_lifecycle_->denominator)
+                                                 : clock->edge(rec->cycle);
+            fmt::format_to(std::back_inserter(sink.buffer),
+                           "[domain={} edge={} time={}/{}s] [{:>5}] {}: ", clock->id(), rec->cycle,
+                           time.numerator(), time.denominator(), level_str, source_name);
+            if (current_lifecycle_)
+                fmt::format_to(std::back_inserter(sink.buffer), "[lifecycle={}] ",
+                               current_lifecycle_->phase == 1 ? "initialize" : "finalize");
+        } else {
+            fmt::format_to(std::back_inserter(sink.buffer), "[host_ns={}] [{:>5}] {}: ", rec->cycle,
+                           level_str, source_name);
+        }
+    } else if (!source_name.empty()) {
         fmt::format_to(std::back_inserter(sink.buffer), "[{:>10}] [{:>5}] {}: ", rec->cycle,
                        level_str, source_name);
     } else {
@@ -166,6 +181,13 @@ void ObservationBackend::writeCounterToTimeline_(uint64_t cycle, std::string_vie
             perfetto_writer_->addCounterTrack(counter_name, /*unit_name=*/{}, group_it->second);
     }
 
+    if (clockMode()) {
+        for (const auto& [key, time, phase, sequence] : counter_times_)
+            if (key == cycle) {
+                cycle = time.floorNanoseconds();
+                break;
+            }
+    }
     perfetto_writer_->counterValue(it->second, cycle, static_cast<int64_t>(value));
     if (cycle > timeline_max_cycle_) {
         timeline_max_cycle_ = cycle;
@@ -285,9 +307,14 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
         return;
     }
 
-    if (rec.cycle > timeline_max_cycle_) {
-        timeline_max_cycle_ = rec.cycle;
-    }
+    const auto source = TimelineTrackRegistry::instance().get(rec.track_id).source_id;
+    const auto* clock = clockMode() ? sourceClock_(source) : nullptr;
+    const auto exact_time =
+        current_lifecycle_ ? SimTime(current_lifecycle_->numerator, current_lifecycle_->denominator)
+        : clock            ? clock->edge(rec.cycle)
+                           : SimTime{};
+    const uint64_t timestamp = clock ? exact_time.floorNanoseconds() : rec.cycle;
+    if (timestamp > timeline_max_cycle_) timeline_max_cycle_ = timestamp;
 
     const uint64_t span_key = (static_cast<uint64_t>(rec.track_id) << 16) | rec.slot;
 
@@ -298,7 +325,7 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
         (kind == TimelineEventKind::SpanEnd) ? 0 : timelineSlotTrack_(rec.track_id, rec.slot);
 
     // Decode typed args into writer annotations (keys resolved via registry).
-    PerfettoTraceWriter::Annotation annotations[MAX_TIMELINE_ARGS];
+    PerfettoTraceWriter::Annotation annotations[MAX_TIMELINE_ARGS + 5];
     const std::byte* arg_data = data + sizeof(TimelineRecord);
     for (size_t i = 0; i < rec.arg_count; ++i) {
         const TimelineArgValue arg = unpackTimelineArg(arg_data + i * TIMELINE_ARG_SIZE);
@@ -327,15 +354,32 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
                 break;
         }
     }
-    const std::span<const PerfettoTraceWriter::Annotation> ann_span(annotations, rec.arg_count);
+    size_t annotation_count = rec.arg_count;
+    if (clock) {
+        using A = PerfettoTraceWriter::Annotation;
+        annotations[annotation_count++] = {"domain_id", A::Kind::Uint, clock->id()};
+        annotations[annotation_count++] = {"local_cycle", A::Kind::Uint, rec.cycle};
+        annotations[annotation_count++] = {"time_num", A::Kind::Uint, exact_time.numerator()};
+        annotations[annotation_count++] = {"time_den", A::Kind::Uint, exact_time.denominator()};
+    }
+    if (current_lifecycle_) {
+        using A = PerfettoTraceWriter::Annotation;
+        annotations[annotation_count++] = {
+            "lifecycle", A::Kind::String, 0,
+            current_lifecycle_->phase == 1 ? "initialize" : "finalize"};
+    }
+    const std::span<const PerfettoTraceWriter::Annotation> ann_span(annotations, annotation_count);
 
     switch (kind) {
         case TimelineEventKind::PipelineSlice: {
+            if (current_lifecycle_)
+                throw std::logic_error("clock pipeline slices require an executing hardware edge");
             const auto& names =
                 pipelineSliceNames_(rec.payload, (rec.padding[0] & TIMELINE_FLAG_NAME_HEX) != 0);
             perfetto_writer_->sliceBeginWithFlow(track_uuid, names.category, names.event_name,
-                                                 rec.cycle, rec.payload, ann_span);
-            const uint64_t end_cycle = rec.cycle + 1;
+                                                 timestamp, rec.payload, ann_span);
+            const uint64_t end_cycle =
+                clock ? clock->edge(rec.cycle + 1).floorNanoseconds() : rec.cycle + 1;
             perfetto_writer_->sliceEnd(track_uuid, end_cycle);
             if (end_cycle > timeline_max_cycle_) {
                 timeline_max_cycle_ = end_cycle;
@@ -345,7 +389,7 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
 
         case TimelineEventKind::Instant:
             perfetto_writer_->instant(track_uuid, timelineCategoryName_(rec.category_bit),
-                                      timelineEventName_(rec.name_id), rec.cycle, rec.payload,
+                                      timelineEventName_(rec.name_id), timestamp, rec.payload,
                                       ann_span);
             break;
 
@@ -354,11 +398,11 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
             // closes the previous span at this cycle.
             auto [it, inserted] = open_spans_.try_emplace(span_key, track_uuid);
             if (!inserted) {
-                perfetto_writer_->sliceEnd(it->second, rec.cycle);
+                perfetto_writer_->sliceEnd(it->second, timestamp);
                 it->second = track_uuid;
             }
             perfetto_writer_->sliceBegin(track_uuid, timelineCategoryName_(rec.category_bit),
-                                         timelineEventName_(rec.name_id), rec.cycle, rec.payload,
+                                         timelineEventName_(rec.name_id), timestamp, rec.payload,
                                          ann_span);
             break;
         }
@@ -370,7 +414,7 @@ void ObservationBackend::processTimelineEvent_(const std::byte* data, size_t dat
             if (it == open_spans_.end()) {
                 break;
             }
-            perfetto_writer_->sliceEnd(it->second, rec.cycle);
+            perfetto_writer_->sliceEnd(it->second, timestamp);
             open_spans_.erase(it);
             break;
         }
@@ -660,6 +704,36 @@ void ObservationBackend::finalizeCounterColumns_() {
     resolveDerivedCounters_();
 }
 
+uint64_t ObservationBackend::counterTimeKey_(SimTime time, uint8_t phase, uint64_t sequence) {
+    if (counter_times_.empty() || counter_times_.back().time != time ||
+        counter_times_.back().phase != phase ||
+        (phase && counter_times_.back().sequence != sequence)) {
+        if (!counter_times_.empty() && time < counter_times_.back().time)
+            throw std::logic_error("counter snapshot arrived behind the safe physical frontier");
+        counter_times_.push_back({++counter_time_key_, time, phase, sequence});
+        // Only the current row and its predecessor can be awaiting CSV flush.
+        if (counter_times_.size() > 3) counter_times_.pop_front();
+    }
+    return counter_time_key_;
+}
+
+void ObservationBackend::formatCounterTime_(fmt::memory_buffer& buffer, uint64_t key) {
+    if (clockMode()) {
+        for (const auto& [candidate, time, phase, sequence] : counter_times_) {
+            if (candidate == key) {
+                fmt::format_to(std::back_inserter(buffer), "{},{},{}", time.numerator(),
+                               time.denominator(),
+                               phase == 2   ? "final_after"
+                               : phase == 1 ? "final_before"
+                                            : "periodic");
+                return;
+            }
+        }
+        throw std::logic_error("missing exact counter row time");
+    }
+    fmt::format_to(std::back_inserter(buffer), "{}", key);
+}
+
 void ObservationBackend::writeCounterCsvHeader_() {
     counter_file_.open(output_dir_ / "counters.csv");
     if (!counter_file_.is_open()) {
@@ -667,7 +741,8 @@ void ObservationBackend::writeCounterCsvHeader_() {
     }
 
     fmt::memory_buffer buf;
-    fmt::format_to(std::back_inserter(buf), "cycle");
+    fmt::format_to(std::back_inserter(buf), "{}",
+                   clockMode() ? "time_num,time_den,sample" : "cycle");
     for (const auto& col : counter_columns_) {
         fmt::format_to(std::back_inserter(buf), ",{}", col);
     }
@@ -688,7 +763,7 @@ void ObservationBackend::flushCounterRow_(uint64_t cycle) {
     }
 
     fmt::memory_buffer buf;
-    fmt::format_to(std::back_inserter(buf), "{}", cycle);
+    formatCounterTime_(buf, cycle);
     for (size_t i = 0; i < counter_columns_.size(); ++i) {
         fmt::format_to(std::back_inserter(buf), ",{}", current_counter_row_[i]);
     }
@@ -845,8 +920,9 @@ void ObservationBackend::emitLongDerivedValues_(uint64_t cycle) {
             vals.push_back(it != long_cycle_values_.end() ? it->second : 0);
         }
         double result = def.compute(std::span<const uint64_t>(vals));
-        fmt::format_to(std::back_inserter(counter_buffer_), "{},{},{},{:.6f}\n", cycle,
-                       def.unit_name, def.derived_name, result);
+        formatCounterTime_(counter_buffer_, cycle);
+        fmt::format_to(std::back_inserter(counter_buffer_), ",{},{},{:.6f}\n", def.unit_name,
+                       def.derived_name, result);
     }
 }
 
@@ -874,7 +950,8 @@ void ObservationBackend::initializeOutputDir_() {
 
     if (config_.enable_counter_csv && config_.counter_csv_format == CounterCsvFormat::Long) {
         counter_file_.open(output_dir_ / "counters.csv");
-        counter_file_ << "cycle,unit,counter_name,value\n";
+        counter_file_ << (clockMode() ? "time_num,time_den,sample,unit,counter_name,value\n"
+                                      : "cycle,unit,counter_name,value\n");
     }
 
     if (config_.timeline_enabled) {

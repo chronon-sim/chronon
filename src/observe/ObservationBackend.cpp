@@ -100,7 +100,7 @@ void ObservationBackend::stop() noexcept {
     try {
         waitForAsyncIO_();
         ThreadContextManager::instance().flushAll();
-        while (drainServiceBatch_(256)) {
+        while (clockMode() ? drainClockServiceBatch_(256) : drainServiceBatch_(256)) {
             processEventsAsync_();
             waitForAsyncIO_();
         }
@@ -192,6 +192,9 @@ void ObservationBackend::finalizeOutput_() {
 }
 
 void ObservationBackend::submitTimeline(TimelineStreamData&& data) {
+    if (clockMode())
+        throw std::logic_error(
+            "clock observation and host-wall timelines require separate output files");
     std::lock_guard<std::mutex> lock(timeline_submit_mutex_);
     submitted_timelines_.push_back(std::move(data));
 }
@@ -216,11 +219,17 @@ void ObservationBackend::runIO_() noexcept {
                 reorder_buffer_.reset();
                 if (config_.enable_reordering) {
                     ReorderBuffer::Config cfg;
-                    cfg.watermark_cycles = config_.reorder_watermark_cycles;
+                    cfg.watermark_cycles = clockMode() ? 0 : config_.reorder_watermark_cycles;
+                    cfg.strict_watermark = clockMode();
                     cfg.max_buffer_events = config_.reorder_max_events;
                     cfg.initial_arena_size =
                         std::min(cfg.initial_arena_size, config_.service_buffer_bytes);
                     reorder_buffer_ = std::make_unique<ReorderBuffer>(cfg);
+                    if (clockMode())
+                        reorder_buffer_->setTimeResolver(
+                            [this](auto* header, auto* data, size_t size) {
+                                return recordTime_(header, data, size);
+                            });
                 }
                 counter_buffer_.reserve(COUNTER_BUFFER_FLUSH_SIZE * 2);
                 break;
@@ -267,6 +276,14 @@ void ObservationBackend::runIO_() noexcept {
 void ObservationBackend::processEvent_(const ObservationQueue::RecordHeader* header,
                                        const std::byte* data) {
     size_t data_size = header->total_size - sizeof(ObservationQueue::RecordHeader);
+    current_lifecycle_.reset();
+    if (header->flags & CLOCK_LIFECYCLE_FLAG) {
+        if (data_size < sizeof(ClockLifecycleStamp))
+            throw std::logic_error("invalid lifecycle record");
+        ClockLifecycleStamp stamp;
+        std::memcpy(&stamp, data + data_size - sizeof(stamp), sizeof(stamp));
+        current_lifecycle_ = stamp;
+    }
     bool is_structured = (header->flags & 1) != 0;
 
     switch (header->type) {
@@ -290,10 +307,19 @@ void ObservationBackend::processEvent_(const ObservationQueue::RecordHeader* hea
                 }
                 const auto& columns = counter_snapshot_column_indices_[batch.plan_id];
                 const std::byte* values = data + sizeof(batch);
+                const uint64_t sample_key =
+                    batch.time_den
+                        ? counterTimeKey_(
+                              SimTime(batch.time_num, batch.time_den),
+                              (header->flags & COUNTER_SNAPSHOT_FINAL_FLAG)
+                                  ? ((header->flags & COUNTER_SNAPSHOT_AFTER_FLAG) ? 2 : 1)
+                                  : 0,
+                              batch.cycle)
+                        : batch.cycle;
                 for (size_t i = 0; i < metadata.size(); ++i) {
                     uint64_t value = 0;
                     std::memcpy(&value, values + i * sizeof(value), sizeof(value));
-                    processCounterSample_(batch.cycle, metadata[i].unit_name,
+                    processCounterSample_(sample_key, metadata[i].unit_name,
                                           metadata[i].counter_name, value, want_timeline,
                                           columns[i]);
                 }
@@ -453,8 +479,9 @@ void ObservationBackend::processCounterSample_(uint64_t cycle, std::string_view 
     }
 
     if (!counter_file_.is_open()) return;
-    fmt::format_to(std::back_inserter(counter_buffer_), "{},{},{},{}\n", cycle, unit_name,
-                   counter_name, value);
+    formatCounterTime_(counter_buffer_, cycle);
+    fmt::format_to(std::back_inserter(counter_buffer_), ",{},{},{}\n", unit_name, counter_name,
+                   value);
     local_bytes_written_ += unit_name.length() + counter_name.length() + 30;
 
     if (!derived_counter_defs_.empty()) {

@@ -156,7 +156,8 @@ void CounterRegistry::rebuildOwnerSnapshotPlans_(
 }
 
 bool CounterRegistry::pushOwnerSnapshots(uint64_t cycle, std::span<const size_t> owner_ids,
-                                         ThreadContext& thread_context) noexcept {
+                                         ThreadContext& thread_context, std::optional<SimTime> time,
+                                         bool final, bool after_edge) noexcept {
     auto& queue = thread_context.queue();
     bool all_pushed = true;
     for (size_t owner : owner_ids) {
@@ -174,11 +175,11 @@ bool CounterRegistry::pushOwnerSnapshots(uint64_t cycle, std::span<const size_t>
         // it. Claim the nominal cycle before touching the counter storage so
         // exactly one SPSC producer snapshots and resets this cluster.
         uint64_t prior = plan.last_pushed_cycle->load(std::memory_order_relaxed);
-        while ((prior == UINT64_MAX || prior < cycle) &&
+        while (!final && (prior == UINT64_MAX || prior < cycle) &&
                !plan.last_pushed_cycle->compare_exchange_weak(
                    prior, cycle, std::memory_order_acq_rel, std::memory_order_relaxed)) {
         }
-        if (prior != UINT64_MAX && prior >= cycle) continue;
+        if (!final && prior != UINT64_MAX && prior >= cycle) continue;
         const uint64_t claimed_from = prior;
 
         std::byte* ptr = queue.prepareWrite(plan.total_size);
@@ -210,11 +211,17 @@ bool CounterRegistry::pushOwnerSnapshots(uint64_t cycle, std::span<const size_t>
             auto* record = reinterpret_cast<ObservationQueue::RecordHeader*>(write_pos);
             record->total_size = static_cast<uint16_t>(batch.record_size);
             record->type = ObservationQueue::EventType::COUNTER_SNAPSHOT;
-            record->flags = COUNTER_SNAPSHOT_BATCH_FLAG;
+            record->flags = COUNTER_SNAPSHOT_BATCH_FLAG |
+                            (final ? COUNTER_SNAPSHOT_FINAL_FLAG : 0) |
+                            (after_edge ? COUNTER_SNAPSHOT_AFTER_FLAG : 0);
             record->padding = 0;
 
             CounterSnapshotBatchHeader batch_header{cycle, batch.plan_id,
                                                     static_cast<uint32_t>(batch.entry_count)};
+            if (time) {
+                batch_header.time_num = time->numerator();
+                batch_header.time_den = time->denominator();
+            }
             std::byte* data = write_pos + sizeof(ObservationQueue::RecordHeader);
             std::memcpy(data, &batch_header, sizeof(batch_header));
             auto* values = reinterpret_cast<uint64_t*>(data + sizeof(batch_header));
@@ -228,6 +235,10 @@ bool CounterRegistry::pushOwnerSnapshots(uint64_t cycle, std::span<const size_t>
             write_pos += batch.record_size;
         }
         queue.finishAndCommitWrite(plan.total_size);
+        if (time && !final) {
+            queue.forceCommitWrite();
+            plan.last_published_cycle->store(cycle, std::memory_order_release);
+        }
     }
     queue.forceCommitWrite();
     (void)ThreadContextManager::instance().wakeBackend();

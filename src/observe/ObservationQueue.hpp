@@ -19,6 +19,12 @@
 
 namespace chronon::observe {
 
+inline constexpr uint8_t CLOCK_LIFECYCLE_FLAG = 1u << 4;
+struct ClockLifecycleStamp {
+    uint64_t numerator = 0, denominator = 1;
+    uint64_t phase = 0;  // 1 initialization, 2 finalization
+};
+
 /**
  * @brief Lock-free SPSC ring buffer for observability events.
  *
@@ -156,6 +162,12 @@ public:
     [[nodiscard]] uint64_t droppedCount() const noexcept {
         return dropped_count_.load(std::memory_order_relaxed);
     }
+
+    /// Capture after acquiring scheduler progress; consumer drains this prefix.
+    size_t publishedPosition() const noexcept {
+        return atomic_writer_pos_.load(std::memory_order_acquire);
+    }
+    size_t readPosition() const noexcept { return reader_pos_; }
 
     [[nodiscard]] size_t bytesWritten() const noexcept {
         return atomic_writer_pos_.load(std::memory_order_relaxed);

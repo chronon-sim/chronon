@@ -86,6 +86,20 @@ public:
      */
     void reregisterAllCounters();
 
+    void bindClockSource(ObservationContext& context, const ClockDomain& clock);
+    void configureClockObservation(const ClockDomain& reference, size_t lookahead);
+    bool clockMode() const noexcept { return clock_reference_.has_value(); }
+    void sampleClockOwner(size_t owner, SimTime exclusive_limit);
+    uint64_t clockRunRevision() const noexcept { return clock_run_revision_; }
+    SimTime clockRunBoundary() const noexcept { return clock_run_boundary_; }
+    void markClockFinalized() noexcept { clock_final_revision_.reset(); }
+    uint64_t clockSafeFrontier(uint64_t exclusive_ns) const;
+    void setClockRunBoundary(SimTime time, uint64_t revision, bool after_edge) noexcept {
+        clock_run_boundary_ = time;
+        clock_run_revision_ = revision;
+        clock_final_after_edge_ = after_edge;
+    }
+
     void startBackend();
     /// Drains remaining events before stopping.
     /// Rethrows output failures after completing I/O and unfreezing source registration.
@@ -210,6 +224,13 @@ private:
 
     std::vector<std::unique_ptr<ObservationContext>> contexts_;
 
+    std::vector<std::optional<ClockDomain>> clock_sources_;
+    std::optional<ClockDomain> clock_reference_;
+    SimTime clock_run_boundary_;
+    bool clock_final_after_edge_ = false;
+    uint64_t clock_final_sequence_ = 0;
+    uint64_t clock_run_revision_ = 0;
+    std::optional<uint64_t> clock_final_revision_;
     CounterRegistry counter_registry_;
     SourceNameRegistry source_registry_;
 

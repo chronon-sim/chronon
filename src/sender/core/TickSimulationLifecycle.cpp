@@ -49,7 +49,6 @@ TickSimulation::~TickSimulation() {
 void TickSimulation::configureObservation(const observe::ObservationYAMLConfig& config) {
     if (initialization_started_ || finalized_)
         throw std::logic_error("configure observation before simulation initialization");
-    if (clock_mode_) throw std::logic_error("multiclock observation requires configureClockTrace");
     observe::ObservationManager::instance().acquireSession(config, this);
 }
 
@@ -91,10 +90,20 @@ void TickSimulation::finalize() {
         if (unit->state_ != UnitState::Initialized) continue;
         unit->state_ = UnitState::Finalized;
         try {
+            if (clock_observation_) {
+                auto* observable = dynamic_cast<observe::ObservableUnit*>(unit.get());
+                if (observable && observable->observationContext())
+                    observable->observationContext()->setClockLifecycle(
+                        observe::ObservationManager::instance().clockRunBoundary(), 2);
+            }
             unit->finalize();
         } catch (...) {
             if (!failure) failure = std::current_exception();
         }
+    }
+    if (clock_observation_) {
+        flushClockObservationProducer_();
+        observe::ObservationManager::instance().markClockFinalized();
     }
     if (failure) std::rethrow_exception(failure);
 }

@@ -174,6 +174,12 @@ public:
 
     [[nodiscard]] size_t capacity() const noexcept { return capacity_; }
 
+    /// Capture after acquiring scheduler progress; consumer drains this prefix.
+    size_t publishedPosition() const noexcept {
+        return atomic_writer_pos_.load(std::memory_order_acquire);
+    }
+    size_t readPosition() const noexcept { return reader_pos_; }
+
     [[nodiscard]] size_t bytesWritten() const noexcept {
         return atomic_writer_pos_.load(std::memory_order_relaxed);
     }
