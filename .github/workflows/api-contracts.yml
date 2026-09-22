@@ -18,12 +18,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - pr: 158
-            sha: ${{ inputs.pr158 }}
-            cases: nucleus-threads2,clock1-threads2-dynamic0-poll0,clock1-threads2-dynamic1-poll0,clock1-threads2-dynamic1-poll64
           - pr: 160
             sha: ${{ inputs.pr160 }}
-            cases: clock0-threads2-dynamic1-poll0
+            cases: broadcast-threads2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,20 +62,22 @@ jobs:
               chronon_single_clock_regression_benchmark chronon_scheduler_invocation_benchmark \
               chronon_representative_workload_benchmark
           done
-      - name: Repeat all scenarios in serial balanced pairs
-        run: |
-          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
-          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --candidate candidate/build-perf \
-            --output results/matrix --cpus "$CPUS" --repeats 6
-      - name: Repeat reported regressions with more samples
+      - name: Repeat the broadcast signal with exact CI work
         env:
           CASES: ${{ matrix.cases }}
         run: |
           CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
           python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
             --baseline baseline/build-perf --candidate candidate/build-perf \
-            --output results/focused --cpus "$CPUS" --repeats 24 --cases "$CASES"
+            --output results/matrix --cpus "$CPUS" --repeats 32 --cases "$CASES"
+      - name: Repeat with five times the work
+        env:
+          CASES: ${{ matrix.cases }}
+        run: |
+          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
+          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
+            --baseline baseline/build-perf --candidate candidate/build-perf \
+            --output results/focused --cpus "$CPUS" --repeats 24 --cases "$CASES" --cycle-scale 5
       - uses: actions/upload-artifact@v4
         if: always()
         with:
