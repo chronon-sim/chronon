@@ -446,32 +446,112 @@ buses or short pulses.
 
 ## Scheduler safety and compatibility
 
-The existing dependency graph, SCC analysis, lookahead progress counters,
-cross-thread queue headroom and termination accounting assume one comparable
-cycle scale. A CDC edge has state-dependent visibility and return credit delays;
-assigning it a fixed local-cycle weight would be unsound.
+Ordinary connections stay within one domain and use that domain's cycle scale.
+CDC components are stored separately and retain their clocked pointer, RAM and
+registered-output semantics; they are never assigned a guessed connection delay.
+Same-domain zero-delay ordering remains active and zero-delay cycles are rejected.
 
-CDC components are therefore stored separately from ordinary connections. The
-clock-domain mode gate runs before parallel partitioning/progress installation,
-selects single-thread queue adapters for same-domain ports, and never launches
-epoch-free workers or dynamic rebalancing. Canonical same-domain zero-delay
-ordering remains active; zero-delay cycles are rejected. All cross-domain
-visibility is evaluated on the physical-time calendar.
+Explicit clock mode supports both the sequential physical-time calendar and
+persistent epoch-free cluster/bridge workers. The scheduler chooses parallel
+execution when its safety and transport-headroom requirements hold;
+`useParallelExecution()` and `parallelFallbackReason()` report the actual choice.
+Frequency-aware placement and physical-time-normalized sampling and critical-wait
+attribution also support dynamic cluster/bridge migration. State and trace
+identities remain tied to the model, independently of worker placement.
+The initial implementation's requested-parallel fallback measurements in the
+[validation guide](./multiclock-validation.md) are historical results.
 
-`useParallelExecution()` is false, `epochFreeRunCount()` stays zero, and
-`parallelFallbackReason()` explains the policy. When parallelism was requested,
-initialization also writes the reason to `std::clog`, independently of tracing.
-Tests compare the independent reference, explicit serial execution and requested
-1/2/4-worker configurations including reversed unit/domain creation. This is
-fallback equivalence, **not a claim that parallel CDC simulation is implemented**.
+Default single-domain graphs keep their existing scheduling, ordinary-port delays
+and trace API. Native clock tracing uses `clockEvent` and `ClockTraceRecorder` as
+documented below; app clients can configure the recorder in `onPostBuild`.
+The YAML example disables unified observation; enable it with the domain-aware
+observation support in [#141](https://github.com/chronon-sim/chronon/issues/141).
+Existing `event<>`, `debug<>`, pipeline slices, periodic counter CSV and scheduler
+wall-time capture have a separate integration and are documented in the
+[observability guide](./observability.md).
 
-Default single-domain graphs keep their existing scheduling, ordinary port
-delays, phase behavior and trace API. Opting into clock-domain mode is explicit.
-Native clock tracing uses `ClockTraceRecorder`; combining this mode with the
-legacy `ObservationManager` backend is rejected because that backend's raw-cycle
-reorder logic is not domain aware. Legacy `event<>`, `debug<>`, pipeline slices,
-periodic counter CSV, YAML clock declarations and scheduler wall-time capture
-have not been migrated to the native clock recorder in this version.
+## YAML and SimulationApp
+
+[`examples/multiclock.yaml`](https://github.com/chronon-sim/chronon/blob/main/examples/multiclock.yaml)
+and `multiclock_yaml_example` construct a fast producer and slow peripheral using
+the existing factory, port directory and clock runtime:
+
+```yaml
+simulation:
+  num_workers: 2
+  clocks:
+    cpu: {frequency_hz: 1000000000}
+    peripheral: {period_s: 1/250000000, phase_s: 1/2000000000}
+  run: {domain_cycles: {clock: cpu, count: 2000}}
+  observation: {enabled: false}
+  unit:
+    fast:
+      type: FastUnit
+      clock: cpu
+      port:
+        requests:
+          to: peripheral.requests
+          cdc: {type: async_fifo, depth: 8, synchronizer_stages: 2}
+    peripheral:
+      type: SlowPeripheral
+      clock: peripheral
+```
+
+A clock declares **exactly one** of `frequency_hz` (Hz) or `period_s` (seconds).
+`phase_s` is the nonnegative time of edge zero in seconds and defaults to zero.
+All three accept unsigned decimal integers or exact `numerator/denominator`
+strings, including quoted strings. Decimal fractions and scientific notation are
+rejected; write `3/2` or `1/1000000000` instead. Zero periods/frequencies,
+zero denominators, duplicate names, invalid names and overflowing rational clock
+representations are errors. The existing `tick_frequency_hz` still specifies the
+built-in `default` domain (ID 0); its name cannot be redeclared. Named domains
+receive IDs 1..N in YAML declaration order. Units without `clock` remain on
+`default`; explicit unit bindings require a `clocks` declaration.
+
+A CDC connection binds an `AsyncWritePort<T>` to an `AsyncReadPort<T>` of the same
+payload type. These ports register automatically, just like ordinary ports. No
+YAML payload-type registry or manual registration is required; custom owned
+payloads use the existing C++ `CdcPayloadTraits<T>` opt-in. The only CDC type is
+`async_fifo`: depth defaults to 8 (a power of two in [2, 2^30]) and
+`synchronizer_stages` defaults to 2 (range [2, 64]). CDC connections receive IDs
+1..N in connection declaration order, counting CDC connections only. They cannot
+be mixed with ordinary `delay`, `capacity`, `destination_depth` or `rate` fields,
+cannot rebind an endpoint and cannot use ordinary `OutPort`/`InPort` endpoints.
+Ordinary connections across different domains are rejected during building with
+the complete source and destination paths. Bus expansion retains ordinary-port
+semantics and does not infer CDC hardware.
+
+`clocks` requires exactly one explicit `run` limit:
+
+| YAML | Meaning |
+| --- | --- |
+| `run: {until_time_s: 1/1000}` | Execute edges strictly before the absolute physical time, in exact seconds. |
+| `run: {event_batches: 1000}` | Execute up to 1000 batches; simultaneous domain edges form one batch. |
+| `run: {domain_cycles: {clock: cpu, count: 1000}}` | Execute 1000 additional edges of a named domain that has units, including its next edge. |
+
+Zero is a valid explicit limit. The three limits cannot be combined with one
+another or with `run_cycles`/`--run-cycles`. Existing YAML without `clocks` keeps
+its legacy `run_cycles` behavior and application default. All limits respect
+unit-initiated termination and its bounded settlement contract. App statistics
+show event batches, exact last committed edge time and per-domain edge counts;
+`Result::event_batches_executed` holds the batch count while its legacy
+`cycles_executed`/`mcycles_per_sec` fields stay zero in explicit clock mode.
+
+The existing `-p` option can replace the whole limit map without adding CLI flags:
+
+```bash
+./build/examples/multiclock_yaml_example examples/multiclock.yaml
+./build/examples/multiclock_yaml_example examples/multiclock.yaml \
+  -p 'simulation.run={until_time_s: 1/100000}'
+./build/examples/multiclock_yaml_example examples/multiclock.yaml \
+  -p 'simulation.run={event_batches: 4000}'
+```
+
+The example verifies 100 requests arrive in order and the bridge drains. Smaller
+limits can intentionally fail that example's final-state check. The configuration
+itself does not promise a speedup: host scheduling, model work and bridge density
+determine performance. Builder clients can use the existing run, stop/resume,
+`resetTermination()` and `drainCdc()` methods directly between bounded runs.
 
 ## Native recording
 

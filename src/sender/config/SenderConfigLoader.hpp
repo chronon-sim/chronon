@@ -10,8 +10,10 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <charconv>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -69,6 +71,118 @@ public:
     }
 
 private:
+    static void checkKeys(const YAML::Node& node, std::initializer_list<const char*> allowed,
+                          const std::string& path) {
+        if (!node.IsMap()) throw ConfigLoadError(path, "must be a map");
+        std::set<std::string> seen;
+        for (const auto& pair : node) {
+            const auto key = pair.first.as<std::string>();
+            if (!seen.insert(key).second)
+                throw ConfigLoadError(path, "duplicate key '" + key + "'");
+            if (std::none_of(allowed.begin(), allowed.end(),
+                             [&](const char* a) { return key == a; }))
+                throw ConfigLoadError(path, "unknown field '" + key + "'");
+        }
+    }
+
+    static uint64_t exactUnsigned(const std::string& value, const std::string& path) {
+        uint64_t result = 0;
+        const auto [end, error] =
+            std::from_chars(value.data(), value.data() + value.size(), result);
+        if (value.empty() || error != std::errc{} || end != value.data() + value.size())
+            throw ConfigLoadError(path, "expected an unsigned decimal integer within uint64 range");
+        return result;
+    }
+
+    static SimTime exactRational(const YAML::Node& node, const std::string& path) {
+        if (!node.IsScalar())
+            throw ConfigLoadError(path, "expected an integer or 'numerator/denominator'");
+        const auto value = node.Scalar();
+        const auto slash = value.find('/');
+        const auto numerator = exactUnsigned(value.substr(0, slash), path);
+        const auto denominator =
+            slash == std::string::npos ? 1 : exactUnsigned(value.substr(slash + 1), path);
+        if (!denominator) throw ConfigLoadError(path, "denominator must be positive");
+        return {numerator, denominator};
+    }
+
+    void parseClocksAndRun(const YAML::Node& sim, SimulationYAMLConfig& config,
+                           const std::string& source) {
+        if (const auto clocks = sim["clocks"]) {
+            if (!clocks.IsMap() || clocks.size() == 0)
+                throw ConfigLoadError(source, "simulation.clocks must be a nonempty map");
+            std::set<std::string> names{"default"};
+            for (const auto& pair : clocks) {
+                const auto name = pair.first.as<std::string>();
+                const auto path = source + ": simulation.clocks." + name;
+                if (!names.insert(name).second)
+                    throw ConfigLoadError(
+                        path, "duplicate or reserved clock name ('default' is built in)");
+                const auto& node = pair.second;
+                checkKeys(node, {"frequency_hz", "period_s", "phase_s"}, path);
+                if (bool(node["frequency_hz"]) == bool(node["period_s"]))
+                    throw ConfigLoadError(path, "specify exactly one of frequency_hz or period_s");
+                auto period =
+                    exactRational(node[node["frequency_hz"] ? "frequency_hz" : "period_s"], path);
+                if (!period.numerator())
+                    throw ConfigLoadError(path, "frequency/period must be positive");
+                if (node["frequency_hz"])
+                    period = SimTime(period.denominator(), period.numerator());
+                const auto phase =
+                    node["phase_s"] ? exactRational(node["phase_s"], path + ".phase_s") : SimTime{};
+                try {
+                    if (config.clocks.size() >= UINT32_MAX - 1)
+                        throw std::invalid_argument("too many clock domains");
+                    config.clocks.emplace_back(static_cast<ClockDomainId>(config.clocks.size() + 1),
+                                               name, period, phase);
+                } catch (const std::exception& error) {
+                    throw ConfigLoadError(path, error.what());
+                }
+            }
+        }
+        if (const auto run = sim["run"]) {
+            const auto path = source + ": simulation.run";
+            checkKeys(run, {"until_time_s", "event_batches", "domain_cycles"}, path);
+            if (run.size() != 1) throw ConfigLoadError(path, "specify exactly one run limit");
+            if (sim["run_cycles"])
+                throw ConfigLoadError(
+                    path,
+                    "cannot combine with run_cycles/--run-cycles; use an explicit clock run limit");
+            ClockRunLimit limit;
+            if (run["until_time_s"]) {
+                limit.kind = ClockRunLimit::Kind::UntilTime;
+                limit.until_time = exactRational(run["until_time_s"], path + ".until_time_s");
+            } else if (run["event_batches"]) {
+                limit.kind = ClockRunLimit::Kind::EventBatches;
+                limit.count =
+                    exactUnsigned(run["event_batches"].as<std::string>(), path + ".event_batches");
+            } else {
+                const auto domain = run["domain_cycles"];
+                checkKeys(domain, {"clock", "count"}, path + ".domain_cycles");
+                if (!domain["clock"] || !domain["count"])
+                    throw ConfigLoadError(path, "domain_cycles requires clock and count");
+                limit.kind = ClockRunLimit::Kind::DomainCycles;
+                limit.clock = domain["clock"].as<std::string>();
+                limit.count =
+                    exactUnsigned(domain["count"].as<std::string>(), path + ".domain_cycles.count");
+                try {
+                    (void)config.clockId(limit.clock);
+                } catch (const std::exception& error) {
+                    throw ConfigLoadError(path, error.what());
+                }
+            }
+            config.run = limit;
+        }
+        if (!config.clocks.empty() && !config.run)
+            throw ConfigLoadError(source,
+                                  "simulation.clocks requires an explicit simulation.run limit "
+                                  "(until_time_s, event_batches or domain_cycles)");
+        if (config.clocks.empty() && config.run)
+            throw ConfigLoadError(source,
+                                  "simulation.run requires simulation.clocks; use run_cycles for "
+                                  "legacy single-clock models");
+    }
+
     static std::optional<size_t> parseDestinationDepth(const YAML::Node& node,
                                                        const std::string& source) {
         std::optional<size_t> depth;
@@ -138,6 +252,8 @@ private:
             config.enable_parallel = policy == "auto";
             config.enable_lookahead = config.enable_epoch_free_lookahead = true;
         }
+
+        parseClocksAndRun(sim, config, source);
 
         if (sim["observation"]) {
             parseObservation(sim["observation"], config, source);
@@ -544,6 +660,20 @@ private:
         }
         unit_config.type_name = unit_node["type"].as<std::string>();
 
+        if (config.hasUnit(unit_name))
+            throw ConfigLoadError(source, "duplicate unit '" + unit_name + "'");
+        if (unit_node["clock"]) {
+            if (config.clocks.empty())
+                throw ConfigLoadError(source,
+                                      "unit.clock requires simulation.clocks and simulation.run");
+            unit_config.clock = unit_node["clock"].as<std::string>();
+            try {
+                (void)config.clockId(*unit_config.clock);
+            } catch (const std::exception& error) {
+                throw ConfigLoadError(source + ": unit '" + unit_name + "'", error.what());
+            }
+        }
+
         if (unit_node["params"]) {
             unit_config.params_yaml = unit_node["params"];
         }
@@ -608,6 +738,41 @@ private:
                 source, "Connection from '" + source_path + "' missing required 'to' field");
         }
         spec.dest_path = conn_node["to"].as<std::string>();
+
+        if (const auto cdc = conn_node["cdc"]) {
+            const auto path =
+                source + ": connection '" + source_path + "' -> '" + spec.dest_path + "'";
+            checkKeys(conn_node, {"to", "cdc", "delay", "capacity", "destination_depth", "rate"},
+                      path);
+            checkKeys(cdc, {"type", "depth", "synchronizer_stages"}, path + ".cdc");
+            if (!cdc["type"] || cdc["type"].as<std::string>() != "async_fifo")
+                throw ConfigLoadError(path, "cdc.type must be async_fifo");
+            for (const char* key : {"delay", "capacity", "destination_depth", "rate"})
+                if (conn_node[key])
+                    throw ConfigLoadError(
+                        path, "CDC cannot be combined with ordinary connection field '" +
+                                  std::string(key) + "'");
+            if (config.clocks.empty())
+                throw ConfigLoadError(path,
+                                      "CDC requires explicit simulation.clocks and simulation.run");
+            AsyncFifoConfig fifo;
+            const auto sizeValue = [&](const YAML::Node& value, const std::string& field) {
+                const auto parsed = exactUnsigned(value.as<std::string>(), path + field);
+                if (parsed > std::numeric_limits<size_t>::max())
+                    throw ConfigLoadError(path + field, "value exceeds size_t range");
+                return static_cast<size_t>(parsed);
+            };
+            if (cdc["depth"]) fifo.depth = sizeValue(cdc["depth"], ".cdc.depth");
+            if (cdc["synchronizer_stages"])
+                fifo.synchronizer_stages =
+                    sizeValue(cdc["synchronizer_stages"], ".cdc.synchronizer_stages");
+            if (fifo.depth < 2 || !std::has_single_bit(fifo.depth) ||
+                fifo.depth > (size_t{1} << 30))
+                throw ConfigLoadError(path, "CDC depth must be a power of two in [2, 2^30]");
+            if (fifo.synchronizer_stages < 2 || fifo.synchronizer_stages > 64)
+                throw ConfigLoadError(path, "CDC synchronizer_stages must be in [2, 64]");
+            spec.cdc = fifo;
+        }
 
         // Defaults to 1; 0 = tight coupling / INLINE.
         if (conn_node["delay"]) {

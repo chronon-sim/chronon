@@ -14,6 +14,7 @@
 
 #include "../core/TickableUnit.hpp"
 #include "../schedule/ClockCalendar.hpp"
+#include "PortDirectory.hpp"
 
 namespace chronon::sender {
 
@@ -254,7 +255,7 @@ class AsyncFifo;
 template <typename T>
 class AsyncWritePort : public PortBase {
 public:
-    AsyncWritePort(TickableUnit* owner, std::string name) : PortBase(owner, std::move(name)) {}
+    AsyncWritePort(TickableUnit* owner, std::string name);
     bool canSend() const {
         check_();
         return fifo_->circuit_.canWrite();
@@ -277,7 +278,7 @@ private:
 template <typename T>
 class AsyncReadPort : public PortBase {
 public:
-    AsyncReadPort(TickableUnit* owner, std::string name) : PortBase(owner, std::move(name)) {}
+    AsyncReadPort(TickableUnit* owner, std::string name);
     bool canRead() const {
         check_();
         return fifo_->circuit_.canRead();
@@ -408,5 +409,69 @@ private:
     observe::ClockTraceStream* write_trace_ = nullptr;
     observe::ClockTraceStream* read_trace_ = nullptr;
 };
+
+/// Internal type erasure for automatic YAML binding; payload types come from the ports.
+class IAsyncPortHandle : public IPortHandle {
+public:
+    ConnectionBase* connectTo(IPortHandle*, uint32_t) final {
+        throw std::invalid_argument(
+            "async ports require an explicit cdc: {type: async_fifo} connection");
+    }
+    virtual std::unique_ptr<CdcComponent> makeFifo(uint32_t id, IAsyncPortHandle& other,
+                                                   AsyncFifoConfig config) = 0;
+};
+
+template <typename T, bool Write>
+class AsyncPortHandle final : public IAsyncPortHandle {
+    using Port = std::conditional_t<Write, AsyncWritePort<T>, AsyncReadPort<T>>;
+
+public:
+    AsyncPortHandle(Port* port, std::string path) : port_(port), path_(std::move(path)) {}
+    const std::type_info& dataType() const override { return typeid(T); }
+    std::type_index dataTypeIndex() const override { return typeid(T); }
+    bool isInPort() const override { return !Write; }
+    bool isOutPort() const override { return Write; }
+    const std::string& name() const override { return port_->name(); }
+    const std::string& fullPath() const override { return path_; }
+    Unit* owner() const override { return port_->owner(); }
+    PortBase* portBase() const override { return port_; }
+    std::unique_ptr<CdcComponent> makeFifo(uint32_t id, IAsyncPortHandle& other,
+                                           AsyncFifoConfig config) override {
+        if constexpr (Write) {
+            if (auto* read = dynamic_cast<AsyncPortHandle<T, false>*>(&other))
+                return std::make_unique<AsyncFifo<T>>(id, *port_, *read->port_, config);
+        }
+        throw std::invalid_argument(
+            "CDC requires AsyncWritePort<T> -> AsyncReadPort<T> with matching payload types");
+    }
+
+private:
+    template <typename, bool>
+    friend class AsyncPortHandle;
+    Port* port_;
+    std::string path_;
+};
+
+template <typename T>
+AsyncWritePort<T>::AsyncWritePort(TickableUnit* owner, std::string name)
+    : PortBase(owner, std::move(name)) {
+    if (owner_)
+        addPortRegistrationToUnit(owner_, [this](const std::string& prefix,
+                                                 PortDirectory& directory) {
+            const auto path = prefix + "." + name_;
+            directory.registerPort(path, std::make_unique<AsyncPortHandle<T, true>>(this, path));
+        });
+}
+
+template <typename T>
+AsyncReadPort<T>::AsyncReadPort(TickableUnit* owner, std::string name)
+    : PortBase(owner, std::move(name)) {
+    if (owner_)
+        addPortRegistrationToUnit(owner_, [this](const std::string& prefix,
+                                                 PortDirectory& directory) {
+            const auto path = prefix + "." + name_;
+            directory.registerPort(path, std::make_unique<AsyncPortHandle<T, false>>(this, path));
+        });
+}
 
 }  // namespace chronon::sender

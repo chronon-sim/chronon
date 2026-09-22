@@ -23,6 +23,12 @@ add_executable(multiclock_cdc_example multiclock_cdc.cpp)
 target_link_libraries(multiclock_cdc_example PRIVATE chronon::core chronon_compile_options)
 add_test(NAME multiclock_cdc_example COMMAND multiclock_cdc_example)
 
+add_executable(multiclock_yaml_example multiclock_yaml.cpp)
+target_link_libraries(multiclock_yaml_example PRIVATE chronon::core yaml-cpp::yaml-cpp chronon_compile_options)
+add_test(NAME multiclock_yaml_example COMMAND multiclock_yaml_example ${CMAKE_CURRENT_SOURCE_DIR}/multiclock.yaml)
+set_tests_properties(multiclock_yaml_example PROPERTIES PROCESSORS 2 TIMEOUT 30)
+add_dependencies(regress multiclock_yaml_example)
+
 # ==============================================================================
 # CPU Pipeline Example (Tick-based with stdexec parallel execution)
 # ==============================================================================

@@ -49,7 +49,8 @@ public:
         std::unordered_map<std::string, sender::Unit*> unit_map;
         bool observation_enabled = false;
 
-        uint64_t cycles_executed = 0;
+        uint64_t cycles_executed = 0;  ///< Legacy single-clock cycles; zero in explicit clock mode.
+        uint64_t event_batches_executed = 0;  ///< Explicit clock mode scheduler batches.
         std::chrono::milliseconds wall_time{0};
         double mcycles_per_sec = 0.0;
 

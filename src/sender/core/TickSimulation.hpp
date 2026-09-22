@@ -212,14 +212,18 @@ public:
     template <typename T>
     AsyncFifo<T>* connectAsyncFifo(uint32_t id, AsyncWritePort<T>& write, AsyncReadPort<T>& read,
                                    AsyncFifoConfig config = {}) {
-        if (initialization_started_ || finalized_)
-            throw std::logic_error("cannot add CDC after initialization has started");
-        validateClockOwner_(write.owner());
-        validateClockOwner_(read.owner());
-        for (const auto& fifo : cdc_) {
-            if (fifo->id() == id) throw std::invalid_argument("duplicate CDC component ID");
-        }
+        prepareCdcBinding_(id, write.owner(), read.owner());
         auto fifo = std::make_unique<AsyncFifo<T>>(id, write, read, config);
+        auto* result = fifo.get();
+        cdc_.push_back(std::move(fifo));
+        clock_mode_ = true;
+        return result;
+    }
+    /// Type-erased equivalent for factory/port-directory based configuration.
+    CdcComponent* connectAsyncFifo(uint32_t id, IAsyncPortHandle& write, IAsyncPortHandle& read,
+                                   AsyncFifoConfig config = {}) {
+        prepareCdcBinding_(id, write.owner(), read.owner());
+        auto fifo = write.makeFifo(id, read, config);
         auto* result = fifo.get();
         cdc_.push_back(std::move(fifo));
         clock_mode_ = true;
@@ -393,6 +397,19 @@ public:
     /// @}
 
 private:
+    void prepareCdcBinding_(uint32_t id, Unit* write, Unit* read) {
+        if (initialization_started_ || finalized_)
+            throw std::logic_error("cannot add CDC after initialization has started");
+        validateClockOwner_(write);
+        validateClockOwner_(read);
+        for (const auto& fifo : cdc_)
+            if (fifo->id() == id) throw std::invalid_argument("duplicate CDC component ID");
+        // Constructors bind the endpoints. Allocate ownership storage first so
+        // an allocation failure cannot leave a port pointing at a destroyed FIFO.
+        if (cdc_.size() == cdc_.capacity())
+            cdc_.reserve(cdc_.size() + std::max(cdc_.size(), size_t{1}));
+    }
+
     /// Resolve per-lane progress only after topology and transport selection.
     void installMultiProducerProgress_();
     // Shared advancement after the caller checks initialization and clock mode.

@@ -192,25 +192,29 @@ int SimulationApp::run(int argc, char* argv[]) {
             obs_mgr.startBackend();
         }
 
-        uint64_t run_cycles = result.config.run_cycles;
-        if (run_cycles == 0 && default_cycles_ > 0) {
-            run_cycles = default_cycles_;
-        }
-        if (run_cycles == 0) {
-            run_cycles = 10'000'000;  // Safety upper bound when YAML didn't specify.
-            if (opts.verbose) {
-                std::cout << "\nRunning until termination request (max " << run_cycles
-                          << " cycles)...\n";
+        auto start = std::chrono::high_resolution_clock::now();
+        if (result.config.run) {
+            const auto& limit = *result.config.run;
+            using Kind = sender::config::ClockRunLimit::Kind;
+            switch (limit.kind) {
+                case Kind::UntilTime:
+                    result.event_batches_executed =
+                        result.simulation->runUntilTime(limit.until_time);
+                    break;
+                case Kind::EventBatches:
+                    result.event_batches_executed = result.simulation->runClockEvents(limit.count);
+                    break;
+                case Kind::DomainCycles:
+                    result.event_batches_executed = result.simulation->runDomainCycles(
+                        result.config.clockId(limit.clock), limit.count);
+                    break;
             }
         } else {
-            if (opts.verbose) {
-                std::cout << "\nRunning for " << run_cycles << " cycles...\n";
-            }
+            uint64_t run_cycles = result.config.run_cycles;
+            if (run_cycles == 0) run_cycles = default_cycles_ > 0 ? default_cycles_ : 10'000'000;
+            if (opts.verbose) std::cout << "\nRunning for at most " << run_cycles << " cycles...\n";
+            result.cycles_executed = result.simulation->runUntilTermination(run_cycles);
         }
-
-        // runUntilTermination supports unit-initiated termination.
-        auto start = std::chrono::high_resolution_clock::now();
-        result.cycles_executed = result.simulation->runUntilTermination(run_cycles);
         auto end = std::chrono::high_resolution_clock::now();
         result.wall_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
         result.simulation->finalize();
@@ -494,7 +498,7 @@ void SimulationApp::printUsage(std::ostream& os, const char* program) {
     os << "  -c, --config <path>       YAML configuration file\n";
     os << "  -p, --param KEY=VALUE     Override YAML value (repeatable)\n";
     os << "  -o, --output-dir <path>   Override observation output directory\n";
-    os << "  -n, --run-cycles <N>      Override cycle limit (0 = application default)\n";
+    os << "  -n, --run-cycles <N>      Legacy single-clock limit (0 = application default)\n";
     os << "  -t, --threads <N>         Override number of worker threads\n";
     os << "  --polling-interval-cycles <N>  Set host/Sequential polling interval\n";
     os << "  --epoch-size <N>          Compatibility alias for --polling-interval-cycles\n";
@@ -516,6 +520,9 @@ void SimulationApp::printUsage(std::ostream& os, const char* program) {
     os << "Override path format:\n";
     os << "  Use dot notation to specify nested YAML keys.\n";
     os << "  Example: simulation.unit.fetch.params.max_instructions=500000\n";
+    os << "  Clock limits: -p 'simulation.run={until_time_s: 1/1000}'\n";
+    os << "                -p 'simulation.run={event_batches: 1000}'\n";
+    os << "                -p 'simulation.run={domain_cycles: {clock: cpu, count: 1000}}'\n";
 
     if (!default_config_.empty()) {
         os << "\n";
@@ -530,9 +537,19 @@ void SimulationApp::printVersion(std::ostream& os) {
 
 void SimulationApp::printStatistics(const Result& result, std::ostream& os) {
     os << "\n=== Simulation Statistics ===\n";
-    os << "  Cycles executed: " << result.cycles_executed << "\n";
+    const bool clocks = result.simulation && result.simulation->usesClockDomains();
+    if (clocks) {
+        os << "  Event batches:  " << result.event_batches_executed << "\n";
+        os << "  Last committed edge: " << result.simulation->lastCommittedTime().str() << "\n";
+        os << "  Domain edges (default): " << result.simulation->domainCycleCount(0) << "\n";
+        for (const auto& clock : result.config.clocks)
+            os << "  Domain edges (" << clock.name()
+               << "): " << result.simulation->domainCycleCount(clock.id()) << "\n";
+    } else {
+        os << "  Cycles executed: " << result.cycles_executed << "\n";
+    }
 
-    if (result.simulation) {
+    if (result.simulation && !clocks) {
         uint64_t freq_hz = result.simulation->tickFrequencyHz();
         uint64_t freq_mhz = freq_hz / 1'000'000;
         double simulated_time_s =
@@ -550,7 +567,7 @@ void SimulationApp::printStatistics(const Result& result, std::ostream& os) {
     }
 
     os << "  Wall time:       " << result.wall_time.count() << " ms\n";
-    if (result.wall_time.count() > 0) {
+    if (result.wall_time.count() > 0 && !clocks) {
         os << "  Throughput:      " << std::fixed << std::setprecision(2) << result.mcycles_per_sec
            << " Mcycles/sec\n";
     }
@@ -560,6 +577,10 @@ void SimulationApp::printStatistics(const Result& result, std::ostream& os) {
         os << "  Reason:    " << result.termination.reasonString() << "\n";
         os << "  Exit code: " << result.termination.exit_code << "\n";
         os << "  Cycle:     " << result.termination.cycle << "\n";
+        if (result.termination.physical_time)
+            os << "  Requested time: " << result.termination.physical_time->str() << "\n";
+        if (result.termination.settled_time)
+            os << "  Settled time:   " << result.termination.settled_time->str() << "\n";
         if (!result.termination.unit_name.empty()) {
             os << "  Unit:      " << result.termination.unit_name << "\n";
         }

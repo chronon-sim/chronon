@@ -21,6 +21,7 @@
 
 #include "../../observe/ObservationYAMLConfig.hpp"
 #include "../core/TickSimulationConfig.hpp"
+#include "../port/AsyncFifo.hpp"
 
 namespace chronon::sender::config {
 
@@ -29,8 +30,9 @@ struct UnitConfig {
     std::string instance_name;
     std::string type_name;       ///< Factory type name, e.g. "FetchUnit".
     YAML::Node params_yaml;      ///< Raw YAML node for parameter deserialization.
-    uint32_t tick_interval = 1;  ///< Execute tick() only on global cycles divisible by this.
+    uint32_t tick_interval = 1;  ///< Execute tick() only on local domain cycles divisible by this.
     bool has_tick_interval = false;
+    std::optional<std::string> clock;  ///< Named static domain; omitted means default (ID 0).
 
     bool isValid() const { return !instance_name.empty() && !type_name.empty(); }
 };
@@ -47,8 +49,18 @@ struct PortConnectionSpec {
     uint32_t delay = 1;
     std::optional<size_t> capacity;
     std::optional<size_t> rate;
+    std::optional<AsyncFifoConfig> cdc;
 
     bool isValid() const { return !source_path.empty() && !dest_path.empty(); }
+};
+
+/// Explicit multi-clock limits; time is absolute and exclusive, counts are additional.
+struct ClockRunLimit {
+    enum class Kind { UntilTime, EventBatches, DomainCycles };
+    Kind kind = Kind::EventBatches;
+    SimTime until_time;
+    uint64_t count = 0;
+    std::string clock;
 };
 
 /**
@@ -112,6 +124,16 @@ struct SimulationYAMLConfig {
     std::vector<std::string> unit_order;
 
     std::vector<PortConnectionSpec> connections;
+    /// Declaration order defines stable IDs 1..N; default is reserved for ID 0.
+    std::vector<ClockDomain> clocks;
+    std::optional<ClockRunLimit> run;
+
+    ClockDomainId clockId(const std::string& name) const {
+        if (name == "default") return 0;
+        for (const auto& clock : clocks)
+            if (clock.name() == name) return clock.id();
+        throw std::invalid_argument("unknown clock domain '" + name + "'");
+    }
 
     /// One translation boundary for YAML compatibility names and runtime settings.
     TickSimulationConfig toRuntimeConfig() const {

@@ -95,6 +95,7 @@ private:
     void phaseBuild(Result& result) {
         try {
             result.simulation = std::make_unique<TickSimulation>(result.config.toRuntimeConfig());
+            for (const auto& clock : result.config.clocks) result.simulation->addClockDomain(clock);
         } catch (const std::invalid_argument& error) {
             throw BuildError("building", error.what());
         }
@@ -129,6 +130,14 @@ private:
             if (!unit) {
                 throw BuildError("CONFIGURING", "Factory returned null for unit '" + name + "'");
             }
+            if (unit_config.clock) {
+                try {
+                    result.simulation->assignClockDomain(*unit,
+                                                         result.config.clockId(*unit_config.clock));
+                } catch (const std::exception& error) {
+                    throw BuildError("CONFIGURING", "unit '" + name + "': " + error.what());
+                }
+            }
             if (unit_config.has_tick_interval) {
                 unit->setTickInterval(unit_config.tick_interval);
             }
@@ -140,6 +149,15 @@ private:
 
             result.unit_map[name] = unit;
             result.units_created++;
+        }
+
+        if (result.config.run && result.config.run->kind == ClockRunLimit::Kind::DomainCycles) {
+            const auto id = result.config.clockId(result.config.run->clock);
+            if (std::none_of(
+                    result.unit_map.begin(), result.unit_map.end(),
+                    [id](const auto& entry) { return entry.second->clockDomainId() == id; }))
+                throw BuildError("CONFIGURING", "run.domain_cycles clock '" +
+                                                    result.config.run->clock + "' has no units");
         }
 
         // Contexts depend on full unit set, so attach after all units are created.
@@ -180,6 +198,7 @@ private:
 
         std::string root_prefix = result.root_node->name() + ".";
 
+        uint32_t cdc_id = 1;
         for (const auto& conn_spec : result.config.connections) {
             std::string source_path = conn_spec.source_path;
             std::string dest_path = conn_spec.dest_path;
@@ -215,10 +234,32 @@ private:
                                                 "' (" + dest->dataType().name() + ")");
             }
 
-            auto* conn = bind_registry.bind(source, dest, conn_spec.delay);
-            conn->configureRegisteredEdge(conn_spec.capacity, conn_spec.rate);
-
-            result.simulation->registerConnection(conn);
+            try {
+                auto* async_source = dynamic_cast<IAsyncPortHandle*>(source);
+                auto* async_dest = dynamic_cast<IAsyncPortHandle*>(dest);
+                if (conn_spec.cdc) {
+                    if (!async_source || !async_dest)
+                        throw std::invalid_argument(
+                            "cdc requires AsyncWritePort<T> -> AsyncReadPort<T>; ordinary ports "
+                            "cannot cross a CDC bridge");
+                    result.simulation->connectAsyncFifo(cdc_id++, *async_source, *async_dest,
+                                                        *conn_spec.cdc);
+                } else {
+                    if (async_source || async_dest)
+                        throw std::invalid_argument(
+                            "async endpoints require explicit cdc: {type: async_fifo}");
+                    if (source->owner()->clockDomainId() != dest->owner()->clockDomainId())
+                        throw std::invalid_argument(
+                            "ordinary connection crosses clock domains; use "
+                            "AsyncWritePort/AsyncReadPort and cdc: {type: async_fifo}");
+                    auto* conn = bind_registry.bind(source, dest, conn_spec.delay);
+                    conn->configureRegisteredEdge(conn_spec.capacity, conn_spec.rate);
+                    result.simulation->registerConnection(conn);
+                }
+            } catch (const std::exception& error) {
+                throw BuildError("BINDING",
+                                 "'" + source_path + "' -> '" + dest_path + "': " + error.what());
+            }
             result.connections_made++;
         }
     }
