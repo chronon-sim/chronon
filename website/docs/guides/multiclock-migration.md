@@ -16,7 +16,12 @@ are combined with the activity ratio in that window. Four fresh samples of each
 activity state present in a window are required. Two windows whose estimated
 costs differ by at most 25% establish a usable estimate. This is a noise filter,
 not a statistical confidence interval. Historical samples therefore cannot hide
-a new expensive phase inside a lifetime average. The initial placement still
+a new expensive phase inside a lifetime average. A partially sampled window
+revokes admission while retaining its sampling baseline and last complete
+comparison window. Two compatible complete windows may be separated by incomplete
+checks, allowing sparse actors to regain confidence; old sample counts alone
+cannot restore it. Counter resets rebase the window and clear comparison history.
+The initial placement still
 uses the existing supplied/precomputed costs; it never executes speculative ticks.
 
 Every actor resident on the proposed source and target must have a usable cost.

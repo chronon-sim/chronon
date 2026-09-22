@@ -261,7 +261,8 @@ struct DynamicMigrationTestAccess {
         assert(policy.planning_calls >= 2);
         assert(policy.windows.size() ==
                sim.unit_ptrs_.size() + sim.clock_parallel_->bridges.size());
-        for (const auto& window : policy.windows) assert(window.ready && window.samples >= 4);
+        for (const auto& window : policy.windows)
+            assert(window.samples >= 4 && window.previous.cycles >= 4);
         bool moved = false;
         for (size_t a = 0; a < sim.dynamic_runtime_cluster_count_; ++a) moved |= owner(sim, a) != 0;
         assert(moved == (sim.rebalanceCount() != 0));
@@ -270,17 +271,24 @@ struct DynamicMigrationTestAccess {
     static size_t planActor(TickSimulation& sim, bool bridge_actor,
                             bool finite_coincident = false) {
         placeAllOnWorkerZero(sim);
-        for (size_t u = 0; u < sim.unit_ptrs_.size(); ++u) {
-            sim.dynamic_unit_active_sample_time_ns_[u].store(bridge_actor ? 4 : 400'000);
-            sim.dynamic_unit_active_sample_count_[u].store(4);
-            sim.dynamic_unit_observed_cycles_[u].store(1024);
-            sim.dynamic_unit_observed_active_ticks_[u].store(1024);
-        }
-        for (size_t b = sim.clusters_.numClusters(); b < sim.dynamic_runtime_cluster_count_; ++b) {
-            sim.cluster_sample_time_ns_[b].store(bridge_actor ? 400'000 : 4);
-            sim.cluster_sample_count_[b].store(4);
-            sim.cluster_active_sample_count_[b].store(4);
-        }
+        const size_t unknown = sim.unit_ptrs_.size() - 1;
+        const auto publish_samples = [&](uint64_t round, bool source_ready) {
+            for (size_t u = 0; u < sim.unit_ptrs_.size(); ++u) {
+                const uint64_t samples = u == unknown && !source_ready ? 4 : 4 * round;
+                sim.dynamic_unit_active_sample_time_ns_[u].store(samples *
+                                                                 (bridge_actor ? 1 : 100'000));
+                sim.dynamic_unit_active_sample_count_[u].store(samples);
+                sim.dynamic_unit_observed_cycles_[u].store(256 * samples);
+                sim.dynamic_unit_observed_active_ticks_[u].store(256 * samples);
+            }
+            for (size_t b = sim.clusters_.numClusters(); b < sim.dynamic_runtime_cluster_count_;
+                 ++b) {
+                sim.cluster_sample_time_ns_[b].store(4 * round * (bridge_actor ? 100'000 : 1));
+                sim.cluster_sample_count_[b].store(4 * round);
+                sim.cluster_active_sample_count_[b].store(4 * round);
+            }
+        };
+        publish_samples(1, false);
         sim.clock_parallel_->migration_max_batches = UINT64_MAX;
         if (finite_coincident) {
             auto& runtime = *sim.clock_parallel_;
@@ -296,31 +304,19 @@ struct DynamicMigrationTestAccess {
         }
         sim.clock_parallel_->migration_benefit.startRun(0, detail::MigrationBenefit::now());
         assert(!sim.maybeRequestEpochFreeMigration_(100'000));  // First window is not confidence.
-        for (size_t u = 0; u < sim.unit_ptrs_.size(); ++u) {
-            sim.dynamic_unit_active_sample_time_ns_[u].store(bridge_actor ? 8 : 800'000);
-            sim.dynamic_unit_active_sample_count_[u].store(8);
-            sim.dynamic_unit_observed_cycles_[u].store(2048);
-            sim.dynamic_unit_observed_active_ticks_[u].store(2048);
-        }
-        for (size_t b = sim.clusters_.numClusters(); b < sim.dynamic_runtime_cluster_count_; ++b) {
-            sim.cluster_sample_time_ns_[b].store(bridge_actor ? 800'000 : 8);
-            sim.cluster_sample_count_[b].store(8);
-            sim.cluster_active_sample_count_[b].store(8);
-        }
         // The expensive candidate is ready, but one resident source actor still
         // has unknown fresh cost. It must not be treated as a free background.
-        const size_t unknown = sim.unit_ptrs_.size() - 1;
-        sim.dynamic_unit_active_sample_count_[unknown].store(4);
         const auto cadence = std::max(sim.config_.rebalance_check_interval_cycles,
                                       4 * detail::kDynamicTickSampleInterval);
         uint64_t cycle = 200'000;
         for (size_t attempt = 0; attempt < 6; ++attempt, cycle += cadence) {
+            publish_samples(attempt + 2, false);
             assert(!sim.maybeRequestEpochFreeMigration_(cycle));
             assert(sim.clock_parallel_->migration_benefit.backoff == 1);
             assert(sim.next_dynamic_rebalance_check_cycle_.load() == cycle + cadence);
         }
-        sim.dynamic_unit_active_sample_count_[unknown].store(8);
-        assert(sim.maybeRequestEpochFreeMigration_(cycle));  // Ready at the very next check.
+        publish_samples(8, true);
+        assert(sim.maybeRequestEpochFreeMigration_(cycle));  // Fresh compatible window after gap.
         const size_t actor = sim.migration_request_.cluster.load();
         assert((actor >= sim.clusters_.numClusters()) == bridge_actor);
         return actor;

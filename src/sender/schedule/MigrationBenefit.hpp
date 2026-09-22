@@ -24,11 +24,15 @@ struct MigrationBenefit {
         uint64_t samples = 0;
         bool stable = false;
         bool observe(double next, uint64_t count, bool ready) {
-            if (!ready || !std::isfinite(next)) {
-                *this = {};
+            const bool finite = std::isfinite(next);
+            if (!finite || count < samples) *this = {};
+            if (!ready || !finite) {
+                // Revoke admission, but retain the last complete comparison
+                // window so sparse actors can recover across incomplete checks.
+                stable = false;
                 return false;
             }
-            if (!samples || count < samples) {
+            if (!samples) {
                 cost = next;
                 samples = count;
                 stable = false;
@@ -36,6 +40,8 @@ struct MigrationBenefit {
                 stable = std::abs(next - cost) <= 0.25 * std::max(next, cost);
                 cost = next;
                 samples = count;
+            } else {
+                stable = false;
             }
             return stable;
         }
@@ -50,12 +56,20 @@ struct MigrationBenefit {
         uint64_t samples = 0;
         bool ready = false;
         void observe(Sample now) {
-            if (now.active < previous.active || now.inactive < previous.inactive ||
-                now.cycles < previous.cycles)
+            ready = false;  // A partial new window cannot inherit old confidence.
+            if (now.active_ns < previous.active_ns || now.active < previous.active ||
+                now.inactive_ns < previous.inactive_ns || now.inactive < previous.inactive ||
+                now.cycles < previous.cycles || now.active_cycles < previous.active_cycles) {
                 *this = {};
+                previous = now;
+                return;
+            }
             const auto cycles = now.cycles - previous.cycles;
             if (cycles < 4) return;
-            const auto active_cycles = std::min(cycles, now.active_cycles - previous.active_cycles);
+            const auto active_cycles = now.active_cycles - previous.active_cycles;
+            // Independent relaxed counters may straddle an activity publication.
+            // Keep the baseline until a coherent snapshot can be sampled.
+            if (active_cycles > cycles) return;
             const auto active = now.active - previous.active;
             const auto inactive = now.inactive - previous.inactive;
             if ((active_cycles && active < 4) || (active_cycles < cycles && inactive < 4)) return;

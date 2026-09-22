@@ -230,6 +230,97 @@ void pendingAtRunBoundary() {
     assert(!sim.rebalanceCount());
 }
 
+void freshCostWindows() {
+    using Benefit = sender::detail::MigrationBenefit;
+    using Sample = Benefit::Sample;
+    Benefit::Window window;
+    Benefit::Confidence confidence;
+    const auto observe = [&](Sample sample) {
+        window.observe(sample);
+        return confidence.observe(window.cost, window.samples, window.ready);
+    };
+    assert(!observe({400, 4, 0, 0, 100, 100}));
+    assert(observe({800, 8, 0, 0, 200, 200}));
+    assert(!observe({800, 8, 0, 0, 200, 200}));  // No new progress is not a fresh window.
+    assert(!window.ready);
+    assert(!confidence.observe(window.cost, window.samples, true));  // Cannot reuse the count.
+    assert(!observe({800, 8, 0, 0, 203, 203}));                      // Too few fresh cycles.
+    assert(window.previous.cycles == 200);
+    assert(observe({1200, 12, 0, 0, 300, 300}));
+    assert(observe({1600, 16, 0, 0, 400, 400}));
+
+    assert(!observe({1600, 16, 30, 3, 500, 400}));  // Active -> inactive, partial timing.
+    assert(!window.ready);
+    assert(!observe({1600, 16, 30, 3, 600, 400}));  // Preserve the baseline while sparse.
+    assert(window.previous.cycles == 400);
+    assert(!observe({1600, 16, 40, 4, 700, 400}));
+    assert(window.ready && window.cost == 10);
+    assert(observe({1600, 16, 80, 8, 800, 400}));
+    assert(!observe({1900, 19, 80, 8, 900, 500}));  // Inactive -> active, partial timing.
+    assert(!window.ready);
+    assert(!observe({2000, 20, 80, 8, 1000, 600}));
+    assert(window.ready && window.cost == 100);
+    assert(observe({2400, 24, 80, 8, 1100, 700}));
+
+    assert(!observe({2800, 28, 120, 12, 1200, 850}));  // Inconsistent activity snapshot.
+    assert(!window.ready && window.previous.cycles == 1100);
+    assert(observe({2800, 28, 120, 12, 1300, 850}));
+    assert(window.ready && window.cost == 77.5);
+    assert(observe({3200, 32, 160, 16, 1500, 1000}));
+
+    window = {};
+    confidence = {};
+    assert(!observe({400, 4, 40, 4, 100, 50}));
+    assert(observe({800, 8, 80, 8, 200, 100}));
+    assert(!observe({1100, 11, 120, 12, 300, 150}));  // Mixed phase lacks active samples.
+    assert(!window.ready);
+    assert(observe({1200, 12, 120, 12, 400, 200}));
+    assert(window.cost == 55);
+    assert(!observe({1600, 16, 150, 15, 500, 250}));  // Mixed phase lacks inactive samples.
+    assert(!window.ready);
+    assert(observe({1600, 16, 160, 16, 600, 300}));
+
+    // Slow actors always have incomplete checks between complete windows. They
+    // can still regain confidence; a changed cost needs a compatible new pair.
+    window = {};
+    confidence = {};
+    Sample slow;
+    for (unsigned round = 0; round < 4; ++round) {
+        for (unsigned sample = 1; sample <= 4; ++sample) {
+            slow.active_ns += round < 2 ? 100 : 1000;
+            ++slow.active;
+            ++slow.cycles;
+            ++slow.active_cycles;
+            assert(observe(slow) == (sample == 4 && round % 2 == 1));
+            assert(window.ready == (sample == 4));
+        }
+    }
+
+    // Every cumulative field may reset/wrap. Rebase without subtracting across
+    // that discontinuity, then allow two new consistent windows to recover.
+    for (auto field : {&Sample::active_ns, &Sample::active, &Sample::inactive_ns, &Sample::inactive,
+                       &Sample::cycles, &Sample::active_cycles}) {
+        window = {};
+        confidence = {};
+        assert(!observe({400, 4, 40, 4, 100, 50}));
+        Sample current{800, 8, 80, 8, 200, 100};
+        assert(observe(current));
+        --(current.*field);
+        assert(!observe(current));
+        assert(!window.ready && window.samples == 0 && window.previous.*field == current.*field);
+        for (unsigned round = 0; round < 2; ++round) {
+            current.active_ns += 400;
+            current.active += 4;
+            current.inactive_ns += 40;
+            current.inactive += 4;
+            current.cycles += 100;
+            current.active_cycles += 50;
+            assert(observe(current) == (round == 1));
+            assert(window.ready && window.cost == 55);
+        }
+    }
+}
+
 void benefitPolicy() {
     using Benefit = sender::detail::MigrationBenefit;
     Benefit::Confidence confidence;
@@ -237,8 +328,13 @@ void benefitPolicy() {
     assert(!confidence.observe(100, 4, true));
     assert(!confidence.observe(100, 7, true));
     assert(confidence.observe(101, 8, true));
+    assert(!confidence.observe(101, 9, true));  // Stable does not bypass the fresh-sample count.
     assert(!confidence.observe(1000, 12, true));
     assert(!confidence.observe(100, 2, true));  // Sample reset cannot inherit confidence.
+    assert(!confidence.observe(std::numeric_limits<double>::quiet_NaN(), 6, true));
+    assert(confidence.samples == 0);
+    assert(!confidence.observe(100, 4, true));
+    assert(confidence.observe(100, 8, true));
 
     Benefit::Window window;
     window.observe({400, 4, 40, 4, 100, 20});
@@ -279,6 +375,7 @@ void benefitPolicy() {
 }
 
 int main() {
+    freshCostWindows();
     benefitPolicy();
     batchHorizon();
     {
