@@ -20,10 +20,7 @@ jobs:
         include:
           - pr: 158
             sha: ${{ inputs.pr158 }}
-            cases: nucleus-threads2,clock1-threads2-dynamic0-poll0
-          - pr: 159
-            sha: ${{ inputs.pr159 }}
-            cases: clock0-threads2-dynamic0-poll64,broadcast-threads1,memory-threads2
+            cases: nucleus-threads2,clock1-threads2-dynamic0-poll0,clock1-threads2-dynamic1-poll0,clock1-threads2-dynamic1-poll64
           - pr: 160
             sha: ${{ inputs.pr160 }}
             cases: clock0-threads2-dynamic1-poll0
