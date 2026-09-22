@@ -819,8 +819,6 @@ private:
     std::deque<ClockDomain> clock_domains_;
     bool clock_mode_ = false;
     bool clock_failed_ = false;
-    observe::ObservationBackend* clock_observation_ = nullptr;
-    std::atomic<uint64_t> clock_observation_retired_ns_{0};
     std::vector<ClockSchedulerProfile> clock_scheduler_profile_;
     uint64_t clock_partition_time_ns_ = 0;
     SimTime clock_time_;
@@ -856,6 +854,9 @@ private:
     uint64_t epoch_free_run_count_ = 0;
 
     TerminationController termination_ctrl_;
+
+    observe::ObservationBackend* clock_observation_ = nullptr;
+    std::atomic<uint64_t> clock_observation_retired_ns_{0};
 
     ::exec::static_thread_pool pool_;
 
