@@ -15,6 +15,10 @@
 
 using namespace chronon;
 using Access = sender::DynamicMigrationTestAccess;
+// Existing positional initialization retains its original member order.
+static_assert(observe::ReorderBufferConfig{1000, 100000, 4096}.initial_arena_size == 4096);
+static_assert(!observe::ReorderBufferConfig{1000, 100000, 4096}.strict_watermark);
+static_assert(sizeof(observe::BufferedRecord) == 24);
 inline const auto CLOCK_OBS = Category<"clock_observation", "Unified clock observation test">{};
 
 struct Endpoint : TickableUnit, ObservableUnit {

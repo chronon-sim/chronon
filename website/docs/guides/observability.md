@@ -155,7 +155,7 @@ or regression claim. Re-run against the intended model and machine.
 
 ## Design Principles
 
-- **Zero overhead when disabled**: No runtime cost
+- **Cheap disabled path**: Existing enable checks bypass producer and backend work
 - **Minimal overhead when enabled**: Pre-registered format strings
 - **Lock-free hot path**: No mutex contention
 - **Lookahead-compatible**: Thread-local counters, buffered events

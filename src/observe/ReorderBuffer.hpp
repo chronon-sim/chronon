@@ -58,8 +58,8 @@ struct ArenaSnapshot {
 struct ReorderBufferConfig {
     uint64_t watermark_cycles = 1000;   ///< Flush delay (cycles behind min).
     size_t max_buffer_events = 100000;  ///< Force-flush threshold.
-    bool strict_watermark = false;
     size_t initial_arena_size = 4 * 1024 * 1024;
+    bool strict_watermark = false;
 };
 
 /**
