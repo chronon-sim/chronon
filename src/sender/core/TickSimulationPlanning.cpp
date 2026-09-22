@@ -168,10 +168,11 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
             dynamic_cluster_blocker_wait_ns_[c].load(std::memory_order_relaxed);
     }
 
-    assessed = !benefit || (std::any_of(thread_cost_ready.begin(), thread_cost_ready.end(),
-                                        [](uint8_t ready) { return ready != 0; }) &&
-                            std::any_of(cluster_cost_ready.begin(), cluster_cost_ready.end(),
-                                        [](uint8_t ready) { return ready != 0; }));
+    // A fully sampled balanced workload is assessed even if it has no source.
+    // Otherwise only a complete source/target pair below can justify backoff;
+    // an empty worker alone says nothing about an unknown-cost source.
+    assessed = !benefit || std::all_of(thread_cost_ready.begin(), thread_cost_ready.end(),
+                                       [](uint8_t ready) { return ready != 0; });
     double total_cost = 0.0;
     for (double cost : thread_cost) total_cost += cost;
     if (total_cost <= 0.0) {
@@ -235,10 +236,8 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                dynamic_cluster_last_target_thread_[c] == candidate_source &&
                cycle < saturatingCycleAdd(last_cycle, pingpong_cooldown);
     };
-    const auto profitable = [&](size_t actor, size_t from, size_t to,
-                                const epoch_free_cost::MoveBreakdown& move) {
+    const auto profitable = [&](size_t actor, const epoch_free_cost::MoveBreakdown& move) {
         if (!benefit) return true;
-        if (!thread_cost_ready[from] || !thread_cost_ready[to]) return false;
         const double horizon =
             std::min(clock_parallel_->migrationHorizon(cycle),
                      double(detail::MigrationBenefit::multiply(benefit_interval, 8)));
@@ -268,6 +267,10 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                 if (candidate_target == candidate_source) continue;
                 if (in_pingpong_cooldown(c, candidate_source, candidate_target, last_cycle))
                     continue;
+                if (benefit &&
+                    (!thread_cost_ready[candidate_source] || !thread_cost_ready[candidate_target]))
+                    continue;
+                assessed = true;
 
                 const double churn =
                     last_cycle == kNoMigrationCycle ? 0.0 : std::max(0.001, cluster_cost[c] * 0.05);
@@ -277,9 +280,7 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                 if (breakdown.score >= best_breakdown.score - prepared.roundoff())
                     breakdown =
                         prepared.scoreFull(c, candidate_target, config_.rebalance_min_gain, churn);
-                if (!breakdown.valid ||
-                    !profitable(c, candidate_source, candidate_target, breakdown))
-                    continue;
+                if (!breakdown.valid || !profitable(c, breakdown)) continue;
                 if (breakdown.score > best_breakdown.score ||
                     (breakdown.score == best_breakdown.score && c < cluster)) {
                     best_breakdown = breakdown;

@@ -68,7 +68,9 @@ than 2% resets the check interval; a failed or noisy result increases it. Failed
 planning attempts also double their interval, up to 32 times the normal
 confidence interval. This prevents cheap, balanced workloads from repeatedly
 paying for full candidate enumeration. Cold sampling waits do not exponentially
-back off before any usable estimates exist.
+back off until a candidate's source and destination have complete cost data. A
+fully sampled balanced workload also backs off, even when it has no overloaded
+source.
 
 The minimum confidence interval is four existing sparse-sampler intervals, or
 `rebalance_check_interval_cycles`, whichever is larger. Existing per-actor

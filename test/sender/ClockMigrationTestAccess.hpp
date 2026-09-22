@@ -311,9 +311,16 @@ struct DynamicMigrationTestAccess {
         // has unknown fresh cost. It must not be treated as a free background.
         const size_t unknown = sim.unit_ptrs_.size() - 1;
         sim.dynamic_unit_active_sample_count_[unknown].store(4);
-        assert(!sim.maybeRequestEpochFreeMigration_(200'000));
+        const auto cadence = std::max(sim.config_.rebalance_check_interval_cycles,
+                                      4 * detail::kDynamicTickSampleInterval);
+        uint64_t cycle = 200'000;
+        for (size_t attempt = 0; attempt < 6; ++attempt, cycle += cadence) {
+            assert(!sim.maybeRequestEpochFreeMigration_(cycle));
+            assert(sim.clock_parallel_->migration_benefit.backoff == 1);
+            assert(sim.next_dynamic_rebalance_check_cycle_.load() == cycle + cadence);
+        }
         sim.dynamic_unit_active_sample_count_[unknown].store(8);
-        assert(sim.maybeRequestEpochFreeMigration_(300'000));
+        assert(sim.maybeRequestEpochFreeMigration_(cycle));  // Ready at the very next check.
         const size_t actor = sim.migration_request_.cluster.load();
         assert((actor >= sim.clusters_.numClusters()) == bridge_actor);
         return actor;
