@@ -14,9 +14,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: receive-1
+          - label: fresh-1
             sha: ${{ inputs.receive }}
-          - label: receive-2
+          - label: fresh-2
             sha: ${{ inputs.receive }}
     steps:
       - uses: actions/checkout@v4
@@ -67,54 +67,12 @@ jobs:
             cmake --build "$variant/build-perf" --parallel 16 --target \
               chronon_representative_workload_benchmark
           done
-      - name: Prepare same-path, hardlink and separate-inode controls
-        run: |
-          python3 harness/scripts/review_inode_controls.py original/build-perf results/inode-controls.json
-      - name: Choose equal-length executable paths
-        run: |
-          if [[ "${{ matrix.label }}" == aa-* ]]; then
-            echo "REVIEW_ORIGINAL_BUILD=aa-first/build-perf" >> "$GITHUB_ENV"
-            echo "REVIEW_CANDIDATE_BUILD=aa-other/build-perf" >> "$GITHUB_ENV"
-          else
-            echo "REVIEW_ORIGINAL_BUILD=original/build-perf" >> "$GITHUB_ENV"
-            echo "REVIEW_CANDIDATE_BUILD=candidate/build-perf" >> "$GITHUB_ENV"
-          fi
-      - name: Uninstrumented three-way comparison
+      - name: Compare revisions across randomized fresh executable instances
         run: |
           CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
-          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --original "$REVIEW_ORIGINAL_BUILD" --candidate "$REVIEW_CANDIDATE_BUILD" \
-            --output results/uninstrumented --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
-      - name: Compare original backing file with an identical fresh copy
-        run: |
-          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
-          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --original aa-first/build-perf --candidate aa-other/build-perf \
-            --output results/aa-anchored-copy --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
-      - name: Repeat identical original path as both labels
-        run: |
-          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
-          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --original aa-first/build-perf --candidate aa-first/build-perf \
-            --output results/aa-samepath --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
-      - name: Repeat equal-length hardlink alias
-        run: |
-          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
-          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --original aa-first/build-perf --candidate aa-links/build-perf \
-            --output results/aa-hardlink --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
-      - name: Representative workload matrix
-        run: |
-          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
-          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
+          python3 harness/scripts/review_fresh_instances.py --scripts baseline/scripts \
             --baseline baseline/build-perf --original original/build-perf --candidate candidate/build-perf \
-            --output results/representative-matrix --cpus "$CPUS" --repeats 6 \
-            --cases nucleus-threads1,nucleus-threads2,port-threads1,port-threads2,broadcast-threads1,broadcast-threads2,backpressure-threads1,backpressure-threads2,memory-threads1,memory-threads2
-      - name: Profile original compiler layout
-        continue-on-error: true
-        run: |
-          python3 harness/scripts/review_broadcast_profile.py \
-            baseline/build-perf "$REVIEW_ORIGINAL_BUILD" "$REVIEW_CANDIDATE_BUILD" results/profiles --perf "$PERF_BINARY"
+            --output results/fresh-instances --instances fresh-executables --cpus "$CPUS"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
