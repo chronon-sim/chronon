@@ -135,6 +135,23 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
     const auto token = stop_source_->get_token();
     auto* trace = clock_trace_ && clock_trace_->parallelActive() ? clock_trace_.get() : nullptr;
     const bool dynamic = config_.enable_dynamic_rebalance;
+    double batches_per_reference_cycle = 0;
+    if (dynamic) {
+        for (auto* domain : runtime.indexed_domains)
+            batches_per_reference_cycle +=
+                static_cast<double>(domain->clock->period().denominator()) /
+                domain->clock->period().numerator() / config_.tick_frequency_hz;
+        runtime.migration_benefit.startRun(dynamicMigrationCycle_(),
+                                           detail::MigrationBenefit::now());
+        runtime.migration_requested_ns.store(0, std::memory_order_relaxed);
+    }
+    if (dynamic) {
+        runtime.migration_max_batches = max_batches;
+        runtime.migration_window = window_limit;
+        runtime.migration_limit = limit ? clockRebalanceCycle_(*limit) : UINT64_MAX;
+        runtime.migration_batch_rate = batches_per_reference_cycle;
+        runtime.migration_completed_batches.store(0, std::memory_order_relaxed);
+    }
     if (dynamic) {
         epoch_free_dynamic_runtime_active_.store(true, std::memory_order_release);
         resetDynamicSchedulerMarkers_();
@@ -188,9 +205,11 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             --runtime.pending_size;
             progress = true;
         }
-        if (dynamic && progress)
+        if (dynamic && progress) {
             runtime.rebalance_cycle.store(clockRebalanceCycle_(clock_time_),
                                           std::memory_order_release);
+            runtime.migration_completed_batches.store(completed, std::memory_order_relaxed);
+        }
         // Retirement observes both unit and bridge completion with acquire.
         // Publish without waiting: actors sharing this worker must keep running
         // while the backend drains its bounded observation window.

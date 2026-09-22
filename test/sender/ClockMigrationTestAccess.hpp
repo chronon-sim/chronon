@@ -192,6 +192,20 @@ struct DynamicMigrationTestAccess {
         sim.finishClockMigrationRun_();
     }
 
+    static void verifyBudget(TickSimulation& sim) {
+        auto& runtime = *sim.clock_parallel_;
+        runtime.migration_max_batches = UINT64_MAX;
+        runtime.migration_completed_batches.store(UINT64_MAX - 3);
+        runtime.migration_window = 16;
+        assert(runtime.migrationHorizon(0) == 0);
+        runtime.migration_completed_batches.store(0);
+        runtime.migration_window = 0;
+        runtime.migration_limit = 100;
+        assert(runtime.migrationHorizon(99) == 1);
+        assert(runtime.migrationHorizon(101) == 0);
+        runtime.migration_limit = UINT64_MAX;
+    }
+
     static void assertCostsReady(TickSimulation& sim, bool ready) {
         for (size_t c = 0; c < sim.clusters_.numClusters(); ++c)
             assert(sim.dynamicClockActorCost_(c).ready == ready);
@@ -210,7 +224,27 @@ struct DynamicMigrationTestAccess {
             sim.cluster_sample_count_[b].store(4);
             sim.cluster_active_sample_count_[b].store(4);
         }
-        assert(sim.maybeRequestEpochFreeMigration_(100'000));
+        sim.clock_parallel_->migration_max_batches = UINT64_MAX;
+        sim.clock_parallel_->migration_benefit.startRun(0, detail::MigrationBenefit::now());
+        assert(!sim.maybeRequestEpochFreeMigration_(100'000));  // First window is not confidence.
+        for (size_t u = 0; u < sim.unit_ptrs_.size(); ++u) {
+            sim.dynamic_unit_active_sample_time_ns_[u].store(8);
+            sim.dynamic_unit_active_sample_count_[u].store(8);
+            sim.dynamic_unit_observed_cycles_[u].store(2048);
+            sim.dynamic_unit_observed_active_ticks_[u].store(2048);
+        }
+        for (size_t b = sim.clusters_.numClusters(); b < sim.dynamic_runtime_cluster_count_; ++b) {
+            sim.cluster_sample_time_ns_[b].store(800'000);
+            sim.cluster_sample_count_[b].store(8);
+            sim.cluster_active_sample_count_[b].store(8);
+        }
+        // The expensive bridge is ready, but one resident source actor still
+        // has unknown fresh cost. It must not be treated as a free background.
+        const size_t unknown = sim.unit_ptrs_.size() - 1;
+        sim.dynamic_unit_active_sample_count_[unknown].store(4);
+        assert(!sim.maybeRequestEpochFreeMigration_(200'000));
+        sim.dynamic_unit_active_sample_count_[unknown].store(8);
+        assert(sim.maybeRequestEpochFreeMigration_(300'000));
         const size_t actor = sim.migration_request_.cluster.load();
         assert(actor >= sim.clusters_.numClusters());
         return actor;

@@ -104,6 +104,15 @@ void TickSimulation::recordClockWaitSample_(size_t worker, const BlockedClusterI
 void TickSimulation::initializeClockMigration_() {
     auto& runtime = *clock_parallel_;
     const size_t clusters = clusters_.numClusters();
+    // Calibrate only the timer overhead; never execute a model tick here.
+    uint64_t timer = UINT64_MAX;
+    auto before = detail::MigrationBenefit::now();
+    for (unsigned i = 0; i < 32; ++i) {
+        const auto after = detail::MigrationBenefit::now();
+        timer = std::min(timer, after - before);
+        before = after;
+    }
+    runtime.migration_benefit.timer_ns = timer;
     initDynamicMigrationRuntime_();
     for (size_t worker = 0; worker < runtime.worker_bridges.size(); ++worker)
         for (const size_t b : runtime.worker_bridges[worker])
@@ -154,7 +163,8 @@ void TickSimulation::initializeClockMigration_() {
                                               std::memory_order_relaxed);
 }
 
-TickSimulation::DynamicRuntimeCostEstimate TickSimulation::dynamicClockActorCost_(size_t actor) {
+TickSimulation::DynamicRuntimeCostEstimate TickSimulation::dynamicClockActorCost_(size_t actor,
+                                                                                  bool window) {
     DynamicRuntimeCostEstimate estimate;
     if (actor < clusters_.numClusters()) {
         estimate = dynamicClusterRuntimeCost_(actor);
@@ -171,12 +181,68 @@ TickSimulation::DynamicRuntimeCostEstimate TickSimulation::dynamicClockActorCost
                     : static_cast<double>(
                           clock_parallel_->bridges[actor - clusters_.numClusters()]->lanes.size());
     }
+    if (window) {
+        auto& windows = clock_parallel_->migration_benefit.windows;
+        windows.resize(unit_ptrs_.size() + clock_parallel_->bridges.size());
+        const double fallback = estimate.cost;
+        estimate = {};
+        estimate.ready = true;
+        estimate.samples = UINT64_MAX;
+        const auto consume = [&](size_t slot, detail::MigrationBenefit::Sample sample) {
+            auto& value = windows[slot];
+            value.observe(sample);
+            estimate.cost += value.cost;
+            estimate.samples = std::min(estimate.samples, value.samples);
+            estimate.ready &= value.ready;
+        };
+        if (actor < clusters_.numClusters()) {
+            for (size_t u : clusters_.clusters[actor]) {
+                consume(u,
+                        {dynamic_unit_active_sample_time_ns_[u].load(std::memory_order_relaxed),
+                         dynamic_unit_active_sample_count_[u].load(std::memory_order_relaxed),
+                         dynamic_unit_inactive_sample_time_ns_[u].load(std::memory_order_relaxed),
+                         dynamic_unit_inactive_sample_count_[u].load(std::memory_order_relaxed),
+                         dynamic_unit_observed_cycles_[u].load(std::memory_order_relaxed),
+                         dynamic_unit_observed_active_ticks_[u].load(std::memory_order_relaxed)});
+            }
+        } else {
+            // The numerator includes both phases, the denominator participating
+            // edges; use transaction count for confidence only.
+            const auto transactions =
+                cluster_active_sample_count_[actor].load(std::memory_order_relaxed);
+            const auto edges = cluster_sample_count_[actor].load(std::memory_order_relaxed);
+            consume(unit_ptrs_.size() + actor - clusters_.numClusters(),
+                    {cluster_sample_time_ns_[actor].load(std::memory_order_relaxed), edges, 0, 0,
+                     transactions, transactions});
+        }
+        if (!estimate.ready) estimate.cost = fallback;
+    }
     estimate.cost *= clock_parallel_->actor_rates.at(actor);
     return estimate;
 }
 
+void TickSimulation::recordClockMigrationHandoff_() {
+    auto& runtime = *clock_parallel_;
+    const auto requested = runtime.migration_requested_ns.load(std::memory_order_relaxed);
+    if (requested) {
+        const auto elapsed = detail::MigrationBenefit::now() - requested;
+        runtime.migration_handoff_ns.store(elapsed, std::memory_order_relaxed);
+        runtime.migration_handoff_total_ns.fetch_add(elapsed, std::memory_order_relaxed);
+    }
+}
+
 void TickSimulation::finishClockMigrationRun_() {
     if (!config_.enable_dynamic_rebalance) return;
+    if (config_.profile_clock_scheduler && !clock_scheduler_profile_.empty()) {
+        const auto& benefit = clock_parallel_->migration_benefit;
+        auto& profile = clock_scheduler_profile_.front();
+        profile.migration_plans = benefit.planning_calls;
+        profile.migration_planning_ns = benefit.planning_total_ns;
+        profile.migration_handoff_ns =
+            clock_parallel_->migration_handoff_total_ns.load(std::memory_order_relaxed);
+        profile.migration_feedback_good = benefit.feedback_good;
+        profile.migration_feedback_bad = benefit.feedback_bad;
+    }
     // Workers have joined. A fence beyond this call's admission/stop boundary
     // must not leave a pending request blocking settlement or the next run.
     const size_t actor = migration_request_.cluster.load(std::memory_order_relaxed);

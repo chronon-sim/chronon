@@ -17,6 +17,10 @@ struct alignas(64) ClockSchedulerProfile {
     uint64_t tick_ns = 0, bridge_ns = 0, wait_ns = 0;
     uint64_t cluster_polls = 0, bridge_polls = 0, cluster_ticks = 0, bridge_commits = 0;
     uint64_t allowance_waits = 0, dependency_waits = 0, completion_loads = 0;
+    // Unlike sweep samples above, these count every migration planning attempt.
+    // Handoff time is request-to-commit wall elapsed, including overlapped work.
+    uint64_t migration_plans = 0, migration_planning_ns = 0, migration_handoff_ns = 0;
+    uint64_t migration_feedback_good = 0, migration_feedback_bad = 0;
 };
 
 namespace detail {

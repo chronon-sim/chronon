@@ -5,6 +5,7 @@
 #include <algorithm>
 
 #include "TickSimulation.hpp"
+#include "sender/schedule/MigrationBenefit.hpp"
 
 namespace chronon::sender {
 
@@ -95,6 +96,19 @@ struct TickSimulation::ClockParallelRuntime {
     // never incomparable actor-local cycles or calendar batch counts.
     std::atomic<uint64_t> rebalance_cycle{0};
     std::vector<double> actor_rates;
+    detail::MigrationBenefit migration_benefit;  // Exclusive planner, or joined workers.
+    std::atomic<uint64_t> migration_completed_batches{0};
+    uint64_t migration_max_batches = 0, migration_window = 0, migration_limit = UINT64_MAX;
+    double migration_batch_rate = 1;
+    double migrationHorizon(uint64_t cycle) const {
+        const auto completed = migration_completed_batches.load(std::memory_order_relaxed);
+        const auto left = migration_max_batches - std::min(completed, migration_max_batches);
+        const auto batches = left - std::min(left, migration_window);
+        return std::min(double(batches) / migration_batch_rate,
+                        double(migration_limit - std::min(cycle, migration_limit)));
+    }
+    std::atomic<uint64_t> migration_requested_ns{0}, migration_handoff_ns{0};
+    std::atomic<uint64_t> migration_handoff_total_ns{0};
 };
 
 }  // namespace chronon::sender

@@ -212,7 +212,56 @@ void pendingAtRunBoundary() {
     assert(!sim.rebalanceCount());
 }
 
+void benefitPolicy() {
+    using Benefit = sender::detail::MigrationBenefit;
+    Benefit::Confidence confidence;
+    assert(!confidence.observe(100, 3, false));
+    assert(!confidence.observe(100, 4, true));
+    assert(!confidence.observe(100, 7, true));
+    assert(confidence.observe(101, 8, true));
+    assert(!confidence.observe(1000, 12, true));
+    assert(!confidence.observe(100, 2, true));  // Sample reset cannot inherit confidence.
+
+    Benefit::Window window;
+    window.observe({400, 4, 40, 4, 100, 20});
+    assert(window.ready && window.cost == 28);  // Conditional activity, not raw timing mean.
+    window.observe({40400, 8, 80, 8, 200, 40});
+    assert(window.cost == 2008);  // Fresh phase is not diluted by historical samples.
+    window.observe({40400, 8, 120, 12, 300, 40});
+    assert(window.cost == 10);  // Entirely inactive window needs no active sample.
+
+    Benefit policy;
+    assert(!policy.profitable(100, -100, 100, 1000, 10000, 100, 20, 8, 1000, 0.01));
+    assert(!policy.profitable(100, 0, 100, 1000, 1, 100, 20, 8, 1000, 0.01));
+    assert(!policy.profitable(1, 1000, 10, 100, 100000, 100, 20, 8, 1000, 0.01));
+    assert(policy.profitable(1000, -100, 1000, 10000, 10000, 100, 20, 8, 1000, 0.01));
+    assert(!policy.profitable(1000, 0, 1000, 10000, 10000, 100, 20, 8, 0, 0.01));
+    assert(!policy.profitable(17, -2.25, 17, 139, 100000, 100, 20, 12, 300, 0.01));
+    assert(policy.profitable(3000, -5, 3000, 27000, 10000, 100, 20, 48, 27000, 0.01));
+    for (double horizon : {1.0, 100.0, 10000.0}) {
+        assert(policy.profitable(1000, -100, 1000, 10000, horizon, 100, 20, 8, 10000, 0.01) ==
+               policy.profitable(500, -50, 1000, 5000, horizon * 2, 100, 20, 8, 5000, 0.01));
+    }  // Changing reference frequency cannot change an otherwise identical decision.
+    assert(Benefit::add(UINT64_MAX - 1, 100) == UINT64_MAX);
+    assert(Benefit::multiply(UINT64_MAX, 4) == UINT64_MAX);
+    policy.startRun(100, 1000);
+    policy.before_ns_per_cycle = 10;
+    policy.pending_generation = 1;
+    policy.pending_cycle = 100;
+    policy.pending = true;
+    assert(!policy.feedback(200, 2000, 1, 10));  // Handoff hasn't committed.
+    assert(!policy.feedback(120, 2000, 2, 10));  // Too little physical progress.
+    assert(policy.feedback(200, 2100, 2, 10));   // Negative feedback increases cooldown.
+    assert(policy.feedback_bad == 1 && policy.backoff == 2);
+    for (unsigned i = 0; i < 10; ++i) policy.defer();
+    assert(policy.backoff == 32);
+    policy.pending = true;
+    policy.startRun(200, 1000000);  // A stopped host interval is excluded.
+    assert(!policy.pending && policy.rate(300, 1000500) == 5);
+}
+
 int main() {
+    benefitPolicy();
     {
         auto cfg = config();
         cfg.tick_frequency_hz = 250'000'000;
@@ -222,6 +271,7 @@ int main() {
         Access::verifyPlacementAndWaits(sim);
         Access::verifyRates(sim);
         Access::verifySafePoints(sim);
+        Access::verifyBudget(sim);
     }
     autonomousMigration();
     physicalSampleCadence();

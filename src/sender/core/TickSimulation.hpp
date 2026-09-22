@@ -540,7 +540,7 @@ private:
     };
     DynamicRuntimeCostEstimate dynamicUnitRuntimeCost_(size_t unit, double fallback) const;
     DynamicRuntimeCostEstimate dynamicClusterRuntimeCost_(size_t cluster);
-    DynamicRuntimeCostEstimate dynamicClockActorCost_(size_t actor);
+    DynamicRuntimeCostEstimate dynamicClockActorCost_(size_t actor, bool window = false);
 
     /**
      * Topology-only cluster-aware placement (no cost profiling). Used as
@@ -783,6 +783,7 @@ private:
     void recordClockWaitSample_(size_t worker, const BlockedClusterInfo& blocker, SimTime edge_time,
                                 uint64_t elapsed_ns);
     void finishClockMigrationRun_();
+    void recordClockMigrationHandoff_();
     void rebuildThreadUnitsFromClusterOwners_();
     bool maybeRequestEpochFreeMigration_(uint64_t cycle);
     void serviceEpochFreeMigration_(size_t worker_thread);

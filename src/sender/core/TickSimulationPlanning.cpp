@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-#include "TickSimulation.hpp"
+#include "TickSimulationClockRuntime.hpp"
 #include "sender/schedule/PreparedTopologyCost.hpp"
 #include "sender/schedule/SmallPlacementCost.hpp"
 
@@ -21,7 +21,7 @@ struct TickSimulation::PlanningScratch {
     epoch_free_cost::ObjectiveSummary fallback;
     std::vector<double> thread_cost;
     std::vector<size_t> thread_active_clusters, assignment, source_threads;
-    std::vector<uint8_t> cluster_cost_ready;
+    std::vector<uint8_t> cluster_cost_ready, thread_cost_ready;
     std::vector<uint64_t> thread_floor_wait, thread_dep_wait, thread_no_ready_wait,
         cluster_blocked_wait, cluster_blocker_wait;
 };
@@ -63,6 +63,50 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     const uint64_t planning_generation =
         cluster_assignment_generation_.load(std::memory_order_acquire);
 
+    auto* benefit = clock_mode_ ? &clock_parallel_->migration_benefit : nullptr;
+    const uint64_t planning_started = benefit ? detail::MigrationBenefit::now() : 0;
+    const uint64_t benefit_interval = std::max(interval, 4 * detail::kDynamicTickSampleInterval);
+    bool published = false, assessed = false;
+    struct BenefitGuard {
+        detail::MigrationBenefit* benefit;
+        std::atomic<uint64_t>& next;
+        uint64_t start, cycle, interval;
+        bool& published;
+        bool& assessed;
+        ~BenefitGuard() {
+            if (!benefit) return;
+            const uint64_t elapsed = detail::MigrationBenefit::now() - start;
+            benefit->planning_ns = std::max(double(elapsed), benefit->planning_ns * 0.875);
+            ++benefit->planning_calls;
+            benefit->planning_total_ns += elapsed;
+            if (!published && !benefit->pending) {
+                if (assessed) benefit->defer();
+                // Compare the next candidate against recent physical progress,
+                // not a lifetime rate that could hide a workload phase change.
+                benefit->window_cycle = cycle;
+                benefit->window_ns = start;
+            }
+            const uint64_t check =
+                detail::MigrationBenefit::add(cycle, benefit->interval(interval));
+            auto old = next.load(std::memory_order_relaxed);
+            while (old < check &&
+                   !next.compare_exchange_weak(old, check, std::memory_order_relaxed)) {
+            }
+        }
+    } benefit_guard{benefit,          next_dynamic_rebalance_check_cycle_,
+                    planning_started, gate_cycle,
+                    benefit_interval, published,
+                    assessed};
+    if (benefit) {
+        benefit->handoff_ns =
+            std::max(benefit->handoff_ns,
+                     double(clock_parallel_->migration_handoff_ns.load(std::memory_order_relaxed)));
+        if (!benefit->feedback(cycle, planning_started, planning_generation, benefit_interval))
+            return false;
+        if (clock_parallel_->migrationHorizon(cycle) < benefit_interval) return false;
+        benefit->confidence.resize(dynamic_runtime_cluster_count_);
+    }
+
     const size_t num_threads = thread_units_.size();
     const size_t num_clusters = dynamic_runtime_cluster_count_;
     auto& planning = schedulerScratch_().planning;
@@ -89,18 +133,23 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     assignment.assign(num_clusters, 0);
     auto& cluster_cost_ready = scratch.cluster_cost_ready;
     cluster_cost_ready.assign(num_clusters, 0);
+    auto& thread_cost_ready = scratch.thread_cost_ready;
+    thread_cost_ready.assign(num_threads, 1);
 
     for (size_t c = 0; c < num_clusters; ++c) {
         const auto estimate =
-            clock_mode_ ? dynamicClockActorCost_(c) : dynamicClusterRuntimeCost_(c);
+            clock_mode_ ? dynamicClockActorCost_(c, true) : dynamicClusterRuntimeCost_(c);
         cluster_cost[c] = estimate.cost;
-        cluster_cost_ready[c] = estimate.ready ? 1 : 0;
+        cluster_cost_ready[c] = benefit ? benefit->confidence[c].observe(
+                                              estimate.cost, estimate.samples, estimate.ready)
+                                        : estimate.ready;
 
         size_t owner = cluster_runtime_owner_[c].load(std::memory_order_acquire);
         if (owner >= num_threads) owner = 0;
         assignment[c] = owner;
         if (owner < num_threads) {
             thread_cost[owner] += cluster_cost[c];
+            thread_cost_ready[owner] &= cluster_cost_ready[c];
             if (cluster_cost[c] > 0.0) {
                 ++thread_active_clusters[owner];
             }
@@ -119,6 +168,10 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
             dynamic_cluster_blocker_wait_ns_[c].load(std::memory_order_relaxed);
     }
 
+    assessed = !benefit || (std::any_of(thread_cost_ready.begin(), thread_cost_ready.end(),
+                                        [](uint8_t ready) { return ready != 0; }) &&
+                            std::any_of(cluster_cost_ready.begin(), cluster_cost_ready.end(),
+                                        [](uint8_t ready) { return ready != 0; }));
     double total_cost = 0.0;
     for (double cost : thread_cost) total_cost += cost;
     if (total_cost <= 0.0) {
@@ -161,8 +214,10 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                                         &cluster_blocked_wait, &cluster_blocker_wait};
     auto& prepared = scratch.prepared;
     prepared.prepare(input, assignment, waits, planning_generation);
-    const uint64_t history_cooldown = std::max(config_.rebalance_cooldown_cycles, interval * 2);
-    const uint64_t pingpong_cooldown = std::max(history_cooldown, interval * 4);
+    const uint64_t history_cooldown = std::max(config_.rebalance_cooldown_cycles,
+                                               detail::MigrationBenefit::multiply(interval, 2));
+    const uint64_t pingpong_cooldown =
+        std::max(history_cooldown, detail::MigrationBenefit::multiply(interval, 4));
     auto last_migration_cycle = [&](size_t c) -> uint64_t {
         return c < dynamic_cluster_last_migration_cycle_.size()
                    ? dynamic_cluster_last_migration_cycle_[c]
@@ -179,6 +234,19 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                dynamic_cluster_last_source_thread_[c] == candidate_target &&
                dynamic_cluster_last_target_thread_[c] == candidate_source &&
                cycle < saturatingCycleAdd(last_cycle, pingpong_cooldown);
+    };
+    const auto profitable = [&](size_t actor, size_t from, size_t to,
+                                const epoch_free_cost::MoveBreakdown& move) {
+        if (!benefit) return true;
+        if (!thread_cost_ready[from] || !thread_cost_ready[to]) return false;
+        const double horizon =
+            std::min(clock_parallel_->migrationHorizon(cycle),
+                     double(detail::MigrationBenefit::multiply(benefit_interval, 8)));
+        return benefit->profitable(
+            move.active_gain, move.topology_delta,
+            cluster_cost[actor] / clock_parallel_->actor_rates[actor], move.old_max_active, horizon,
+            detail::MigrationBenefit::now() - planning_started, benefit->timer_ns, num_clusters,
+            benefit->rate(cycle, planning_started), config_.rebalance_min_gain);
     };
     size_t source = SIZE_MAX;
     size_t cluster = SIZE_MAX;
@@ -209,7 +277,9 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
                 if (breakdown.score >= best_breakdown.score - prepared.roundoff())
                     breakdown =
                         prepared.scoreFull(c, candidate_target, config_.rebalance_min_gain, churn);
-                if (!breakdown.valid) continue;
+                if (!breakdown.valid ||
+                    !profitable(c, candidate_source, candidate_target, breakdown))
+                    continue;
                 if (breakdown.score > best_breakdown.score ||
                     (breakdown.score == best_breakdown.score && c < cluster)) {
                     best_breakdown = breakdown;
@@ -221,7 +291,7 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
             }
         }
     }
-    if (source == SIZE_MAX) {
+    if (source == SIZE_MAX && !benefit) {
         size_t fallback_source = source_threads.front();
         for (size_t t : source_threads) {
             if (thread_cost[t] > thread_cost[fallback_source]) fallback_source = t;
@@ -345,6 +415,16 @@ bool TickSimulation::maybeRequestEpochFreeMigration_(uint64_t cycle) {
     recordDynamicSchedulerMarker_("Chronon epoch-free rebalance requested", cycle,
                                   last_rebalance_detail_);
 
+    if (benefit) {
+        benefit->before_ns_per_cycle = benefit->rate(cycle, planning_started);
+        benefit->window_cycle = benefit->pending_cycle = cycle;
+        benefit->window_ns = planning_started;
+        benefit->pending_generation = planning_generation;
+        benefit->pending = true;
+        published = true;
+        clock_parallel_->migration_requested_ns.store(detail::MigrationBenefit::now(),
+                                                      std::memory_order_relaxed);
+    }
     migration_request_.cluster.store(cluster, std::memory_order_relaxed);
     migration_request_.source_thread.store(source, std::memory_order_relaxed);
     migration_request_.target_thread.store(target, std::memory_order_relaxed);
