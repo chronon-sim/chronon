@@ -231,6 +231,12 @@ void lifecycle(const std::filesystem::path& path) {
     manager.startBackend();
     assert(simulation.runUntilTime(SimTime::nanoseconds(20)) == 0);
     manager.dumpFinalCounterSnapshot(0);  // Before finalize: initialization residual only.
+    assert(simulation.runClockEvents(0) == 0);
+    assert(manager.clockRunBoundary() == SimTime::nanoseconds(20));
+    // These calls are legal no-ops: the first hardware edge is still at 50 ns.
+    assert(simulation.runUntilTime(SimTime::nanoseconds(10)) == 0);
+    assert(manager.clockRunBoundary() == SimTime::nanoseconds(20));
+    assert(simulation.runUntilTime(SimTime::nanoseconds(20)) == 0);
     simulation.finalize();
     simulation.finalize();
     manager.dumpFinalCounterSnapshot(0);
@@ -296,6 +302,7 @@ void namedSpanAndFreshSession(const std::filesystem::path& path) {
         manager.reregisterAllCounters();
         manager.startBackend();
         assert(simulation.runClockEvents(fresh ? 0 : 5) == (fresh ? 0 : 5));
+        assert(simulation.runUntilTime(manager.clockRunBoundary()) == 0);
         manager.dumpFinalCounterSnapshot(0);
         const auto output = manager.backend()->outputDir();
         manager.stopBackend();
@@ -322,6 +329,11 @@ void namedSpanAndFreshSession(const std::filesystem::path& path) {
                 }
             }
             assert(track && ended == 1);
+            std::ifstream csv(output / "counters.csv");
+            std::string header, row;
+            std::getline(csv, header);
+            std::getline(csv, row);
+            assert(row.starts_with("4411,3000000000000,final_after,"));
         }
     }
 }

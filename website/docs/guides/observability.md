@@ -82,7 +82,9 @@ edge. Batch/domain limits and early termination use `final_after` at the last
 committed edge: this includes the work at that exact time. These phases keep
 before-edge and after-edge samples distinct when timestamps coincide. Repeated
 final dumps without new work are ignored; a final dump resets the residual
-interval, and subsequent runs retain the original periodic sampling phase.
+interval, and subsequent runs retain the original periodic sampling phase. Legal
+no-work calls with an earlier or equal cutoff preserve the last observation
+boundary and its before/after phase, including for later finalization.
 Stopping and resuming preserves the scheduler's existing bounded settlement
 contract. Observations add no model ticks or CDC acceptance decisions.
 

@@ -220,11 +220,14 @@ void TickSimulation::publishClockObservation_() {
 void TickSimulation::finishClockObservationRun_(std::optional<SimTime> limit) {
     if (!clock_observation_ || clock_calendar_->empty()) return;
     auto& observation = observe::ObservationManager::instance();
-    if (!limit && current_cycle_ == observation.clockRunRevision()) {
+    const auto boundary = limit && !wasTerminationRequested() ? *limit : clock_time_;
+    // A legal no-op may name an earlier exclusive limit than a prior run's
+    // cutoff. Keep the established time and before/after phase until new work.
+    if (current_cycle_ == observation.clockRunRevision() &&
+        boundary <= observation.clockRunBoundary()) {
         clock_observation_->rethrowIfFailed();
         return;
     }
-    const auto boundary = limit && !wasTerminationRequested() ? *limit : clock_time_;
     for (const auto owner : counter_owner_ids_) observation.sampleClockOwner(owner, boundary);
     flushClockObservationProducer_();
     observation.setClockRunBoundary(boundary, current_cycle_,
