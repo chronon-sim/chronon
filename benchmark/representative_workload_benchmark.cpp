@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 
+#include "BenchmarkThreadAffinity.hpp"
 #include "RepresentativeWorkload.hpp"
 #include "RepresentativeWorkloadCalibration.hpp"
 #include "RepresentativeWorkloadOptions.hpp"
@@ -684,6 +685,7 @@ template <typename UnitType>
     config.max_lookahead_cycles = options.max_lookahead;
 
     TickSimulation simulation(config);
+    const auto worker_cpus = pinBenchmarkWorkers(workers);
     std::vector<UnitType*> units;
     units.reserve(scenario.units.size());
     for (uint32_t id = 0; id < scenario.units.size(); ++id) {
@@ -699,6 +701,7 @@ template <typename UnitType>
     simulation.initialize();
     const auto setup_end = std::chrono::steady_clock::now();
 
+    warmBenchmarkCpus(worker_cpus);
     const auto warmup_begin = std::chrono::steady_clock::now();
     // Representative units allocate without touching their backing pages, then
     // initialize on their execution worker's first tick. Preserve that

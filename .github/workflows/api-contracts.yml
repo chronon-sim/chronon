@@ -20,10 +20,12 @@ jobs:
         include:
           - pr: 158
             sha: ${{ inputs.pr158 }}
-            cases: broadcast-threads2,clock1-threads2-dynamic1-poll1
+            cases: clock1-threads2-dynamic1-poll0,clock1-threads2-dynamic1-poll1,clock1-threads2-dynamic1-poll64
+            repeats: 16
           - pr: 160
             sha: ${{ inputs.pr160 }}
-            cases: clock0-threads2-dynamic0-poll0,clock0-threads2-dynamic1-poll64,clock1-threads1-dynamic0-poll64,clock1-threads2-dynamic1-poll0,clock1-threads2-dynamic1-poll64,port-threads2,broadcast-threads1,clock1-threads2-dynamic0-poll1
+            cases: broadcast-threads2
+            repeats: 32
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,6 +50,9 @@ jobs:
           CPM_SOURCE_CACHE: ${{ github.workspace }}/dependencies
         run: |
           mkdir results
+          for variant in baseline candidate; do
+            cp harness/benchmark/representative_workload_benchmark.cpp "$variant/benchmark/representative_workload_benchmark.cpp"
+          done
           git -C baseline rev-parse HEAD > results/baseline.sha
           git -C candidate rev-parse HEAD > results/candidate.sha
           for file in single_clock_regression.cpp scheduler_invocation_benchmark.cpp \
@@ -65,14 +70,23 @@ jobs:
               chronon_single_clock_regression_benchmark chronon_scheduler_invocation_benchmark \
               chronon_representative_workload_benchmark
           done
-      - name: Repeat all remaining final-report outliers
+      - name: Repeat with identical worker pinning and warmup
         env:
           CASES: ${{ matrix.cases }}
         run: |
           CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
           python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
             --baseline baseline/build-perf --candidate candidate/build-perf \
-            --output results/focused --cpus "$CPUS" --repeats 24 --cases "$CASES"
+            --output results/focused --cpus "$CPUS" --repeats ${{ matrix.repeats }} --cases "$CASES"
+      - name: Repeat controlled broadcast with five times the work
+        if: matrix.pr == 160
+        env:
+          CASES: ${{ matrix.cases }}
+        run: |
+          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
+          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
+            --baseline baseline/build-perf --candidate candidate/build-perf \
+            --output results/long --cpus "$CPUS" --repeats 24 --cases "$CASES" --cycle-scale 5
       - uses: actions/upload-artifact@v4
         if: always()
         with:
