@@ -50,9 +50,14 @@ overlap on other workers, so charging all of it is conservative.
 All recurring costs and benefit windows use reference-clock cycles of physical
 time. One-off costs use host nanoseconds. The available window is also clipped
 by this public run call's remaining batch/time/domain-cycle limit, excluding the
-admitted batch window. Summed domain edge rates deliberately underestimate the
-physical duration represented by coincident batches. Budget calculation occurs
-only when the planner's existing gate opens.
+admitted batch window. The coordinator measures retired batches per reference
+cycle, counting coincident edges once, and publishes that density at intervals
+of at least four sparse-sampler intervals. Measurement starts after every domain's
+phase has begun and restarts at each public run call; until a complete interval
+is available, summed edge rates provide a conservative fallback. Remaining batch
+duration is a forecast from that observed density, not an exact safety bound for
+arbitrary phase patterns. Budget calculation occurs only when the planner's
+existing gate opens; ordinary retirement adds no floating-point calculation.
 
 ## Feedback and overhead
 

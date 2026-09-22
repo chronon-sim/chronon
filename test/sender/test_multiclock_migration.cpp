@@ -44,9 +44,10 @@ TickSimulationConfig config() {
     return result;
 }
 
-std::vector<Endpoint*> populate(TickSimulation& sim, unsigned work = 0) {
+std::vector<Endpoint*> populate(TickSimulation& sim, unsigned work = 0, bool coincident = false) {
     sim.addClockDomain(ClockDomain::fromHz(1, "fast", 2'000'000'000));
-    sim.addClockDomain(ClockDomain::fromHz(2, "slow", 100'000'000, 1, SimTime::picoseconds(137)));
+    sim.addClockDomain(ClockDomain::fromHz(2, "slow", coincident ? 2'000'000'000 : 100'000'000, 1,
+                                           coincident ? SimTime{} : SimTime::picoseconds(137)));
     std::vector<Endpoint*> units;
     for (size_t i = 0; i < 3; ++i) {
         auto* writer =
@@ -149,15 +150,31 @@ void bridgeServiceAccounting() {
     }
 }
 
-void actorPlanner(bool bridge) {
+void actorPlanner(bool bridge, bool finite_coincident = false) {
     TickSimulation sim(config());
-    populate(sim);
-    const auto actor = Access::planActor(sim, bridge);
+    populate(sim, 0, finite_coincident);
+    const auto actor = Access::planActor(sim, bridge, finite_coincident);
     assert(Access::owner(sim, actor) == 0);
     assert(sim.runClockEvents(100) == 100);
     assert(Access::owner(sim, actor) != 0);
     assert(sim.rebalanceCount() == 1);
     Access::assertIdle(sim);
+}
+
+void batchHorizon() {
+    const auto fast = ClockDomain::fromHz(1, "fast", 1'000'000'000);
+    const std::array peers{
+        ClockDomain::fromHz(2, "identical", 1'000'000'000),
+        ClockDomain::fromHz(2, "harmonic", 500'000'000),
+        ClockDomain::fromHz(2, "partial", 2'000'000'000, 3),
+        ClockDomain::fromHz(2, "phased", 1'000'000'000, 1, SimTime::picoseconds(500)),
+        ClockDomain::fromHz(2, "delayed", 2'000'000'000, 1, SimTime::nanoseconds(10'000))};
+    for (const auto& peer : peers) {
+        const std::array clocks{&fast, &peer};
+        Access::verifyBatchHorizon(clocks);
+        Access::verifyBatchHorizon(clocks, 50'000);  // Resume away from the phase origin.
+        Access::verifyBatchHorizon(clocks, 0, 250'000'000);
+    }
 }
 
 void stopWithPending(bool fail) {
@@ -263,6 +280,7 @@ void benefitPolicy() {
 
 int main() {
     benefitPolicy();
+    batchHorizon();
     {
         auto cfg = config();
         cfg.tick_frequency_hz = 250'000'000;
@@ -287,6 +305,8 @@ int main() {
     }
     actorPlanner(false);
     actorPlanner(true);
+    actorPlanner(false, true);
+    actorPlanner(true, true);
     stopWithPending(false);
     stopWithPending(true);
     pendingAtRunBoundary();

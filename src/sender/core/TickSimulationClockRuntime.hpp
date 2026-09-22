@@ -99,12 +99,35 @@ struct TickSimulation::ClockParallelRuntime {
     detail::MigrationBenefit migration_benefit;  // Exclusive planner, or joined workers.
     std::atomic<uint64_t> migration_completed_batches{0};
     uint64_t migration_max_batches = 0, migration_window = 0, migration_limit = UINT64_MAX;
-    double migration_batch_rate = 1;
+    std::atomic<double> migration_batch_rate{1};
+    // Coordinator-private samples; workers consume only the published density.
+    uint64_t migration_rate_cycle = 0, migration_rate_batches = 0, migration_rate_next = 0;
+    bool migration_rate_started = false;
+    void resetMigrationBatchRate(double edge_rate, uint64_t last_phase_cycle) {
+        migration_batch_rate.store(edge_rate, std::memory_order_relaxed);
+        migration_rate_started = false;
+        migration_rate_next = detail::MigrationBenefit::add(last_phase_cycle, 1);
+    }
+    void observeMigrationBatches(uint64_t cycle, uint64_t completed) {
+        if (cycle < migration_rate_next) return;
+        if (!migration_rate_started) {
+            // Exclude startup gaps, including phases later than the first clock.
+            migration_rate_cycle = cycle;
+            migration_rate_batches = completed;
+            migration_rate_started = true;
+        } else if (cycle > migration_rate_cycle && completed > migration_rate_batches) {
+            migration_batch_rate.store(
+                double(completed - migration_rate_batches) / double(cycle - migration_rate_cycle),
+                std::memory_order_relaxed);
+        }
+        migration_rate_next =
+            detail::MigrationBenefit::add(cycle, 4 * detail::kDynamicTickSampleInterval);
+    }
     double migrationHorizon(uint64_t cycle) const {
         const auto completed = migration_completed_batches.load(std::memory_order_relaxed);
         const auto left = migration_max_batches - std::min(completed, migration_max_batches);
         const auto batches = left - std::min(left, migration_window);
-        return std::min(double(batches) / migration_batch_rate,
+        return std::min(double(batches) / migration_batch_rate.load(std::memory_order_relaxed),
                         double(migration_limit - std::min(cycle, migration_limit)));
     }
     std::atomic<uint64_t> migration_requested_ns{0}, migration_handoff_ns{0};

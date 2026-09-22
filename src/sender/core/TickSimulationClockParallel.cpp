@@ -135,12 +135,17 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
     const auto token = stop_source_->get_token();
     auto* trace = clock_trace_ && clock_trace_->parallelActive() ? clock_trace_.get() : nullptr;
     const bool dynamic = config_.enable_dynamic_rebalance;
-    double batches_per_reference_cycle = 0;
     if (dynamic) {
-        for (auto* domain : runtime.indexed_domains)
-            batches_per_reference_cycle +=
+        double edges_per_reference_cycle = 0;
+        uint64_t last_phase_cycle = 0;
+        for (auto* domain : runtime.indexed_domains) {
+            edges_per_reference_cycle +=
                 static_cast<double>(domain->clock->period().denominator()) /
                 domain->clock->period().numerator() / config_.tick_frequency_hz;
+            last_phase_cycle =
+                std::max(last_phase_cycle, clockRebalanceCycle_(domain->clock->phase()));
+        }
+        runtime.resetMigrationBatchRate(edges_per_reference_cycle, last_phase_cycle);
         runtime.migration_benefit.startRun(dynamicMigrationCycle_(),
                                            detail::MigrationBenefit::now());
         runtime.migration_requested_ns.store(0, std::memory_order_relaxed);
@@ -149,7 +154,6 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         runtime.migration_max_batches = max_batches;
         runtime.migration_window = window_limit;
         runtime.migration_limit = limit ? clockRebalanceCycle_(*limit) : UINT64_MAX;
-        runtime.migration_batch_rate = batches_per_reference_cycle;
         runtime.migration_completed_batches.store(0, std::memory_order_relaxed);
     }
     if (dynamic) {
@@ -206,9 +210,10 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             progress = true;
         }
         if (dynamic && progress) {
-            runtime.rebalance_cycle.store(clockRebalanceCycle_(clock_time_),
-                                          std::memory_order_release);
+            const auto cycle = clockRebalanceCycle_(clock_time_);
+            runtime.observeMigrationBatches(cycle, completed);
             runtime.migration_completed_batches.store(completed, std::memory_order_relaxed);
+            runtime.rebalance_cycle.store(cycle, std::memory_order_release);
         }
         // Retirement observes both unit and bridge completion with acquire.
         // Publish without waiting: actors sharing this worker must keep running
