@@ -491,7 +491,9 @@ clockEvent(ClockEventKind::User, transaction_id, value);
 sim.closeClockTrace();
 ```
 
-Define additional event names before initialization with
+Repeated `configureClockTrace()` calls before initialization replace the previous
+recorder. Only the final recorder registers with the scheduler during initialization.
+Define additional event names on that recorder before initialization with
 `clockTraceRecorder()->defineEvent(static_cast<ClockEventKind>(257), "sm.issue")`.
 Metadata names are bounded printable ASCII strings. Record construction carries
 40 bytes of integers/enums, no payload references, string formatting, heap

@@ -71,13 +71,37 @@ void writerCollisions(const std::filesystem::path& root) {
 }
 
 int main(int argc, char** argv) {
+    const bool service_option = argc == 2 && std::string_view(argv[1]) == "--service";
     auto root =
-        argc > 1
+        argc > 1 && !service_option
             ? std::filesystem::path(argv[1])
             : std::filesystem::temp_directory_path() /
                   ("chronon-clock-recorder-" +
                    std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    const bool keep = argc > 1;
+    const bool keep = argc > 1 && !service_option;
+    const bool service = service_option || (argc > 2 && std::string_view(argv[2]) == "service");
+    {
+        HostServices scheduler;
+        {
+            ClockTraceRecorder recorder({});
+            recorder.attachScheduler(scheduler);
+        }
+        // Destroying an attached but unstarted recorder must retire its callback.
+        size_t cursor = 0;
+        scheduler.poll(cursor);
+    }
+    {
+        ClockTraceRecorder::Config disabled;
+        disabled.text = disabled.perfetto = false;
+        HostServices scheduler;
+        ClockTraceRecorder recorder(disabled);
+        recorder.attachScheduler(scheduler);
+        recorder.start();
+        size_t cursor = 0;
+        scheduler.poll(cursor);
+        recorder.close();
+        assert(recorder.stats().events == 0);
+    }
     for (unsigned variant = 0; variant < 4; ++variant) {
         ClockTraceRecorder::Config config;
         config.output_dir = root / ("workers-" + std::to_string(variant));
@@ -87,7 +111,9 @@ int main(int argc, char** argv) {
         config.perfetto_options.compress = variant & 2;
         config.perfetto_options.checkpoint_interval_packets = 13;
         config.perfetto_options.clock_buffer_records = 256;
+        chronon::HostServices scheduler;
         ClockTraceRecorder recorder(config);
+        if (service) recorder.attachScheduler(scheduler);
         auto sm = ClockDomain::fromHz(1, "sm", 914'000'000);
         auto lts = ClockDomain::fromHz(2, "lts", 1'326'000'000, 1, SimTime::picoseconds(137));
         ClockTraceStream* streams[4];
@@ -164,7 +190,9 @@ int main(int argc, char** argv) {
         ClockTraceRecorder::Config config;
         config.output_dir = root / "progress";
         config.perfetto_options.clock_buffer_records = 8;
+        chronon::HostServices scheduler;
         ClockTraceRecorder recorder(config);
+        if (service) recorder.attachScheduler(scheduler);
         auto* stream =
             recorder.addStream(ClockDomain::fromHz(1, "progress", 1'000'000'000), 1, "progress");
         auto* sleeping =

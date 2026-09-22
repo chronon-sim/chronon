@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cstdint>
 
+#include "../../chronon/HostServices.hpp"
+
 namespace chronon::sender {
 
 /// Opt-in host diagnostics, accumulated by one worker and read only between runs.
@@ -22,20 +24,27 @@ namespace detail {
 class ClockProfileScope {
 public:
     explicit ClockProfileScope(uint64_t* total) : total_(total) {
-        if (total_) begin_ = std::chrono::steady_clock::now();
+        if (total_) {
+            service_begin_ = HostServiceRegistration::thread_service_ns;
+            begin_ = std::chrono::steady_clock::now();
+        }
     }
     ~ClockProfileScope() { finish(); }
     void finish() {
         if (!total_) return;
-        *total_ += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                             std::chrono::steady_clock::now() - begin_)
-                                             .count());
+        const auto elapsed =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - begin_)
+                                      .count());
+        const auto service = HostServiceRegistration::thread_service_ns - service_begin_;
+        *total_ += elapsed > service ? elapsed - service : 0;
         total_ = nullptr;
     }
 
 private:
     uint64_t* total_;
     std::chrono::steady_clock::time_point begin_;
+    uint64_t service_begin_ = 0;
 };
 }  // namespace detail
 }  // namespace chronon::sender

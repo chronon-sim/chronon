@@ -7,7 +7,8 @@
 #include <csignal>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
+#include <mutex>
+#include <streambuf>
 #include <string>
 #include <thread>
 
@@ -186,7 +187,8 @@ void testParallelClock(const std::filesystem::path& root) {
     CHECK(rejected);
 }
 
-void testBackend(const std::filesystem::path& root, bool reorder, bool pressure) {
+void testBackend(const std::filesystem::path& root, bool reorder, bool pressure,
+                 bool service = false) {
     auto& threads = ThreadContextManager::instance();
     threads.setQueueCapacity(4096);
     threads.setBackpressurePolicy(BackpressurePolicy::SpinWait);
@@ -198,7 +200,9 @@ void testBackend(const std::filesystem::path& root, bool reorder, bool pressure)
     config.reorder_watermark_cycles = 0;
     config.reorder_max_events = 64;
     config.timeline_compress = reorder;
+    chronon::HostServices scheduler;
     ObservationBackend backend(queue, config);
+    if (service) backend.attachScheduler(scheduler);
     ObservationContext context(&queue, [] { return 0ULL; }, 0, "producer", 1);
     context.enableCategory(category::TRACE);
     const auto track = TimelineTrackRegistry::instance().registerTrack(
@@ -228,6 +232,7 @@ void testBackend(const std::filesystem::path& root, bool reorder, bool pressure)
                 } catch (const std::runtime_error&) {
                     failed = true;
                 }
+                if (service) threads.helpService();
                 std::this_thread::yield();
             }
             for (uint64_t i = 100'000; i < 104'096; ++i) (void)emit(i, name);
@@ -283,6 +288,34 @@ struct AppUnit : chronon::sender::TickableUnit {
     }
 };
 
+// App diagnostics and the I/O lane can report failures concurrently. Redirecting
+// cerr to a plain stringbuf removes the standard stream's synchronized buffer.
+// Keep no put area, so every write goes through one of these locked overrides.
+class SynchronizedCapture : public std::streambuf {
+public:
+    std::string str() const {
+        std::lock_guard lock(mutex_);
+        return text_;
+    }
+
+protected:
+    std::streamsize xsputn(const char* data, std::streamsize count) override {
+        std::lock_guard lock(mutex_);
+        text_.append(data, static_cast<size_t>(count));
+        return count;
+    }
+    int_type overflow(int_type ch) override {
+        std::lock_guard lock(mutex_);
+        if (!traits_type::eq_int_type(ch, traits_type::eof()))
+            text_.push_back(traits_type::to_char_type(ch));
+        return traits_type::not_eof(ch);
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::string text_;
+};
+
 void testApp(const std::filesystem::path& root, bool crash) {
     const auto config_path = root / "config.yaml";
     {
@@ -294,9 +327,9 @@ void testApp(const std::filesystem::path& root, bool crash) {
                << "\n    counters:\n      enabled: false\n      csv_output: false\n"
                   "    timeline:\n      enabled: true\nunits: []\n";
     }
-    std::ostringstream output, errors;
-    auto* old_out = std::cout.rdbuf(output.rdbuf());
-    auto* old_err = std::cerr.rdbuf(errors.rdbuf());
+    SynchronizedCapture output, errors;
+    auto* old_out = std::cout.rdbuf(&output);
+    auto* old_err = std::cerr.rdbuf(&errors);
     bool built = false, completed = false;
     {
         FileSizeLimit limit(1);
@@ -349,6 +382,8 @@ int main(int argc, char** argv) {
         testFullDevice();
     } else if (mode == "parallel_clock") {
         testParallelClock(root);
+    } else if (mode == "service" || mode == "service_final_flush") {
+        testBackend(root, true, mode == "service", true);
     } else if (mode == "immediate" || mode == "async" || mode == "final_flush") {
         testBackend(root, mode != "immediate", mode != "final_flush");
     } else if (mode == "manager_stop" || mode == "manager_shutdown") {

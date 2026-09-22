@@ -74,6 +74,10 @@ void TickSimulation::initialize() {
 
     auto& obs_mgr = observe::ObservationManager::instance();
     if (obs_mgr.isEnabled()) {
+        // Standalone callers may have started observation before initialization.
+        // Preserve their active scheduler and I/O jobs; attach only before startup.
+        if (auto* backend = obs_mgr.backend(); backend && !backend->isRunning())
+            backend->attachScheduler(hostServices());
         observe_ctx_ =
             obs_mgr.createContextForUnit("simulation", [this]() { return current_cycle_; }, 0);
         if (observe_ctx_) {
@@ -351,6 +355,8 @@ template <bool PushPeriodicCounters>
 uint64_t TickSimulation::runSequentialImpl_(uint64_t num_cycles) {
     // In single-thread mode, per-cycle execution avoids lookahead
     // bookkeeping overhead without changing execution semantics.
+    auto* services = host_services_.get();
+    auto& service_cursor = sequential_service_cursor_;
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;
     const uint64_t run_target = current_cycle_ + num_cycles;
@@ -362,6 +368,7 @@ uint64_t TickSimulation::runSequentialImpl_(uint64_t num_cycles) {
     }
     try {
         for (uint64_t i = 0; i < num_cycles; ++i) {
+            if (services && (i & 63u) == 0) services->poll(service_cursor);
             for (auto* unit : unit_ptrs_) {
                 executeUnitCycle_(unit, unit->localCycle());
             }

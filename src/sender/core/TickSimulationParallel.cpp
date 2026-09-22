@@ -395,6 +395,10 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
         ready_through = retained.data();
     }
     std::fill_n(ready_through, thread_progress_count_, 0);
+    auto* services = host_services_.get();
+    // Rotate the first service across workers/runs, including repeated run(1).
+    size_t service_cursor = thread_idx + epoch_free_run_count_;
+    uint64_t service_sequence = 0;
     observe::ThreadContext* counter_producer = nullptr;
     uint64_t next_counter_cycle = UINT64_MAX;
     if constexpr (PushPeriodicCounters) {
@@ -403,6 +407,7 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
     }
 
     while (true) {
+        if (services && (service_sequence++ & 63u) == 0) services->poll(service_cursor);
         bool all_done = true;
         bool made_progress = false;
         BlockedClusterInfo blocker{};
@@ -539,6 +544,7 @@ void TickSimulation::executeThreadRunImpl_(size_t thread_idx, uint64_t end_cycle
         // (kFloorRefreshSpinMask) so the tight spin doesn't hammer the scan.
         uint64_t spin = 0;
         while (!token.stop_requested()) {
+            if (services && (spin & 255u) == 0) services->poll(service_cursor);
             if ((spin++ & kFloorRefreshSpinMask) == 0) {
                 refreshLookaheadFloor_();
             }
@@ -822,12 +828,14 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
             if (cpu_scratch.size() < num_units + 1) cpu_scratch.resize(num_units + 1);
             cpu_points = cpu_scratch.data();
         }
+        points[0].service_ns = HostServiceRegistration::thread_service_ns;
         points[0].time = SchedulerTimelineTrace::Clock::now();
         if (cpu_points) {
             cpu_points[0] = threadTraceCpuPoint_();
         }
         for (size_t u = 0; u < num_units; ++u) {
             points[u].active = execute(units[u]);
+            points[u + 1].service_ns = HostServiceRegistration::thread_service_ns;
             points[u + 1].time = SchedulerTimelineTrace::Clock::now();
             if (cpu_points) {
                 cpu_points[u + 1] = threadTraceCpuPoint_();
@@ -845,7 +853,9 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                               points[u + 1].time - points[u].time)
                                               .count());
-                record_cost_sample(unit, points[u].active != 0, elapsed_ns);
+                const auto service_ns = points[u + 1].service_ns - points[u].service_ns;
+                record_cost_sample(unit, points[u].active != 0,
+                                   elapsed_ns - std::min(elapsed_ns, service_ns));
                 record_activity(unit, points[u].active != 0);
             }
         }
@@ -870,13 +880,16 @@ void TickSimulation::executeClusterOneCycle_(size_t thread_idx, size_t cluster, 
                 }
             }
             SchedulerTimelineTrace::TimePoint begin{};
+            const auto service_before_tick = HostServiceRegistration::thread_service_ns;
             if (time_sample) begin = SchedulerTimelineTrace::Clock::now();
             const bool active = execute(units[u]);
             if (time_sample && active == expected_active) {
                 const auto end = SchedulerTimelineTrace::Clock::now();
                 const uint64_t elapsed_ns = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
-                record_cost_sample(unit, active, elapsed_ns);
+                const auto service_ns =
+                    HostServiceRegistration::thread_service_ns - service_before_tick;
+                record_cost_sample(unit, active, elapsed_ns - std::min(elapsed_ns, service_ns));
             }
             record_activity(unit, active);
         }

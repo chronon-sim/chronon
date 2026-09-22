@@ -15,6 +15,7 @@ add_library(chronon_observe
     DerivedCounter.cpp
     LocalCounter.cpp
     ObservationBackend.cpp
+    ObservationBackendService.cpp
     ObservationBackendIO.cpp
     ObservationContext.cpp
     ObservationManager.cpp

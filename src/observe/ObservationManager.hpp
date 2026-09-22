@@ -43,6 +43,8 @@ class ThreadContext;
  *   obs.initialize(config);
  *   auto* ctx = obs.createContextForUnit("my_unit", cycle_provider);
  *   unit->setObservationContext(ctx);
+ *   sim.initialize();  // Attach the backend and initialize unit counters.
+ *   obs.reregisterAllCounters();
  *   obs.startBackend();
  *   // ... run simulation ...
  *   obs.stopBackend();
@@ -86,7 +88,7 @@ public:
 
     void startBackend();
     /// Drains remaining events before stopping.
-    /// Rethrows output failures after joining workers and unfreezing source registration.
+    /// Rethrows output failures after completing I/O and unfreezing source registration.
     void stopBackend();
     bool isBackendRunning() const noexcept;
 

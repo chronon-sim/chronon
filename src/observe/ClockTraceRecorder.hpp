@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "../chronon/HostServices.hpp"
 #include "../time/ClockDomain.hpp"
 #include "PerfettoTraceWriter.hpp"
 
@@ -55,7 +56,9 @@ public:
 
 private:
     friend class ClockTraceRecorder;
+    friend struct ClockTraceStreamTestAccess;
     ClockTraceRecorder* coordinator_ = nullptr;
+    HostServiceRegistration* service_ = nullptr;
     size_t record_base_bytes_ = 0;
     ClockTraceStream(size_t capacity, bool lossless, bool perfetto, ClockDomain clock,
                      std::atomic<bool>* failed);
@@ -104,6 +107,8 @@ public:
         uint64_t first_output_ns = 0;          // Host time since native writer open().
         uint64_t allocated_staging_bytes = 0;  // Record + bucket descriptor array allocation bytes.
         uint64_t peak_staging_records = 0;
+        // Scheduler poll work only; excludes I/O continuations and the final drain.
+        uint64_t service_calls = 0, service_records = 0, service_ns = 0, service_max_poll_ns = 0;
     };
 
     explicit ClockTraceRecorder(Config config);
@@ -111,6 +116,7 @@ public:
     ClockTraceRecorder(const ClockTraceRecorder&) = delete;
     ClockTraceRecorder& operator=(const ClockTraceRecorder&) = delete;
     void defineEvent(ClockEventKind kind, std::string name);
+    void attachScheduler(HostServices& scheduler);
     ClockTraceStream* addStream(const ClockDomain& domain, uint32_t unit_id, std::string unit_name);
     /// Independent actor, same logical unit/track. Stable nonzero producer_order
     /// breaks commit ties (CDC uses FIFO ID + 1), never a host worker identity.

@@ -91,6 +91,63 @@ void physicalSampleCadence() {
     Access::assertCostsReady(sim, true);  // Both 2 GHz and 100 MHz, not 1024 local edges.
 }
 
+// Inject a reported service duration larger than either sampled interval. This
+// makes the expected net sample exactly zero, without host-speed thresholds or
+// sleeps. Calls still pass through the normal registration and the real FIFO.
+struct AccountedService : HostService {
+    size_t poll(size_t) noexcept override {
+        HostServiceRegistration::thread_service_ns += uint64_t{1} << 40;
+        return 1;
+    }
+};
+
+struct AssistedBridge : sender::CdcComponent {
+    TickSimulation& sim;
+    sender::CdcComponent*& slot;
+    sender::CdcComponent& fifo;
+    AccountedService service;
+    HostServiceRegistration registration{service};
+    AssistedBridge(TickSimulation& sim)
+        : sim(sim), slot(Access::bridgeCircuit(sim, 0)), fifo(*slot) {
+        slot = this;
+    }
+    ~AssistedBridge() override { slot = &fifo; }
+    uint32_t id() const noexcept override { return fifo.id(); }
+    Unit* writeOwner() const noexcept override { return fifo.writeOwner(); }
+    Unit* readOwner() const noexcept override { return fifo.readOwner(); }
+    void setClockTraceStreams(observe::ClockTraceStream* write,
+                              observe::ClockTraceStream* read) noexcept override {
+        fifo.setClockTraceStreams(write, read);
+    }
+    bool endpointEdgesOnly() const noexcept override { return fifo.endpointEdgesOnly(); }
+    bool drained() const noexcept override { return fifo.drained(); }
+    void begin(std::span<const sender::ClockEdge> edges) override {
+        fifo.begin(edges);
+        registration.poll(true);
+    }
+    void commit() override {
+        Access::assertBridgeBeginServiceExcluded(sim, 0);
+        fifo.commit();
+        registration.poll(true);
+    }
+};
+
+void bridgeServiceAccounting() {
+    for (bool profile : {false, true}) {
+        auto cfg = config();
+        cfg.profile_clock_scheduler = profile;
+        cfg.rebalance_check_interval_cycles = UINT64_MAX;
+        TickSimulation sim(cfg);
+        const auto units = populate(sim);
+        AssistedBridge bridge(sim);
+        assert(sim.runClockEvents(1200) == 1200);
+        Access::assertBridgeServiceExcluded(sim, 0);
+        assert(bridge.registration.stats().calls == 2400);  // Both phases, all batches.
+        for (auto* unit : units) assert(unit->ticks == sim.domainCycleCount(unit->clockDomainId()));
+        Access::assertIdle(sim);
+    }
+}
+
 void bridgePlanner() {
     TickSimulation sim(config());
     populate(sim);
@@ -168,6 +225,7 @@ int main() {
     }
     autonomousMigration();
     physicalSampleCadence();
+    bridgeServiceAccounting();
     {
         auto cfg = config();
         cfg.partition_solver = TickSimulationConfig::PartitionSolverType::SA;

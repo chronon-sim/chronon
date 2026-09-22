@@ -120,6 +120,7 @@ void ObservationManager::initializeLocked_(const ObservationYAMLConfig& config) 
 
     ObservationBackend::Config backend_config;
     backend_config.output_dir = config.output_dir;
+    backend_config.service_buffer_bytes = config.service_buffer_bytes;
     backend_config.enable_counter_csv = config.counters.csv_output;
     backend_config.counter_csv_format = config.counters.csv_format;
 
@@ -460,6 +461,12 @@ void ObservationManager::printReport(std::ostream& out) const {
         out << "  Running: " << (backend_->isRunning() ? "yes" : "no") << "\n";
         out << "  Events processed: " << backend_->eventsProcessed() << "\n";
         out << "  Bytes written: " << backend_->bytesWritten() << "\n";
+        {
+            const auto service = backend_->serviceStats();
+            out << "  Scheduler service: " << service.calls << " polls, " << service.records
+                << " records, " << service.elapsed_ns << " host ns, max " << service.max_poll_ns
+                << " ns/poll (scheduler-managed I/O)\n";
+        }
     }
 }
 

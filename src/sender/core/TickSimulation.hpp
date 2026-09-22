@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "../../chronon/HostServices.hpp"
 #include "../../observe/ObservableUnit.hpp"
 #include "../../params/ParameterSet.hpp"
 #include "../port/AsyncFifo.hpp"
@@ -355,8 +356,13 @@ public:
 
     uint64_t totalStagingOverflowEvents() const noexcept { return totalTransportOverflowEvents(); }
 
-    /// Used by observation async I/O.
+    /// Simulation worker pool. Blocking observation I/O belongs to hostServices().
     exec::static_thread_pool& pool() noexcept { return pool_; }
+    /// Register host services between runs; never while worker loops execute.
+    HostServices& hostServices() {
+        if (!host_services_) host_services_ = std::make_unique<HostServices>();
+        return *host_services_;
+    }
     bool hasTightConnectionsInGraph() const noexcept { return has_tight_connections_; }
     bool isParallelBeneficial() const noexcept { return parallel_beneficial_; }
     bool useParallelExecution() const noexcept { return shouldUseParallelExecution_(); }
@@ -748,6 +754,7 @@ private:
     std::string formatBlockerDetail_(const BlockedClusterInfo& blocker) const;
     struct ThreadTracePoint {
         SchedulerTimelineTrace::TimePoint time{};
+        uint64_t service_ns = 0;
         bool active = false;
     };
     struct ThreadTraceCpuPoint {
@@ -956,6 +963,7 @@ private:
 
     struct DynamicSchedulerMarker {
         SchedulerTimelineTrace::TimePoint time{};
+        uint64_t service_ns = 0;
         uint64_t cycle = 0;
         std::string name;
         std::string detail;
@@ -994,6 +1002,8 @@ private:
     bool initialization_started_ = false;
     bool finalized_ = false;
     bool observation_registered_ = false;
+    std::unique_ptr<HostServices> host_services_;
+    size_t sequential_service_cursor_ = 0;  // Retain rotation across short runs of any length.
     mutable std::unique_ptr<PortDirectory> port_directory_;
 };
 

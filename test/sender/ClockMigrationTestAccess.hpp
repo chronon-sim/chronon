@@ -20,6 +20,18 @@ struct DynamicMigrationTestAccess {
         assert(index < sim.clock_parallel_->bridges.size());
         return sim.clusters_.numClusters() + index;
     }
+    static CdcComponent*& bridgeCircuit(TickSimulation& sim, size_t index) {
+        return sim.clock_parallel_->bridges.at(index)->lanes.at(0).circuit;
+    }
+    static void assertBridgeBeginServiceExcluded(const TickSimulation& sim, size_t index) {
+        const auto& state = *sim.clock_parallel_->bridges.at(index);
+        if (state.sample) assert(state.sample_ns == 0);
+    }
+    static void assertBridgeServiceExcluded(const TickSimulation& sim, size_t index) {
+        const auto actor = bridge(sim, index);
+        assert(sim.cluster_active_sample_count_[actor].load() >= 4);
+        assert(sim.cluster_sample_time_ns_[actor].load() == 0);
+    }
     static size_t owner(const TickSimulation& sim, size_t actor) {
         return sim.cluster_runtime_owner_[actor].load(std::memory_order_acquire);
     }

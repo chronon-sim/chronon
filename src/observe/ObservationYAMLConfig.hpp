@@ -197,6 +197,9 @@ struct ObservationYAMLConfig {
     /// Key = unit instance name.
     std::unordered_map<std::string, UnitObservationOverride> unit_overrides;
 
+    /// Append new fields to preserve existing positional aggregate initializers.
+    size_t service_buffer_bytes = 16 * 1024 * 1024;
+
     [[nodiscard]] CountersYAMLConfig getCountersConfig(const std::string& unit_name) const {
         auto it = unit_overrides.find(unit_name);
         if (it != unit_overrides.end() && it->second.counters.has_value()) {

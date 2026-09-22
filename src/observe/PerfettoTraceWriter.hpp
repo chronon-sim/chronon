@@ -52,8 +52,8 @@ namespace chronon::observe {
  * written incrementally and remains parseable after a crash (Perfetto traces
  * need no footer). With Options::compress, each flushed batch is wrapped in a
  * TracePacket.compressed_packets (zlib deflate) — handled natively by
- * ui.perfetto.dev and trace_processor. NOT thread-safe; intended for a single
- * backend thread.
+ * ui.perfetto.dev and trace_processor. NOT thread-safe; the caller serializes
+ * access. Observation backends use the scheduler I/O lane.
  */
 class PerfettoTraceWriter {
 public:

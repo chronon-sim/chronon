@@ -131,11 +131,30 @@ void TickSimulation::writeTimelineTrace() {
         return;
     }
     auto& obs = observe::ObservationManager::instance();
-    if (obs.isBackendRunning() && obs.backend()) {
-        timeline_trace_.write(obs.backend()->outputDir());
-    } else {
-        timeline_trace_.write();
-    }
+    struct Write {
+        SchedulerTimelineTrace& trace;
+        std::filesystem::path directory;
+        std::exception_ptr error;
+    } output{timeline_trace_,
+             obs.isBackendRunning() && obs.backend() ? obs.backend()->outputDir()
+                                                     : std::filesystem::path{},
+             {}};
+    // The standalone scheduler timeline has no observation backend to submit
+    // to, but its file I/O still belongs to the same scheduler-owned lane.
+    auto job = hostServices().addIO({}, &output, [](void* context) noexcept {
+        auto& output = *static_cast<Write*>(context);
+        try {
+            if (output.directory.empty())
+                output.trace.write();
+            else
+                output.trace.write(output.directory);
+        } catch (...) {
+            output.error = std::current_exception();
+        }
+    });
+    job->submit();
+    job->wait();
+    if (output.error) std::rethrow_exception(output.error);
 }
 
 TickableUnit* TickSimulation::getUnit(const std::string& name) {

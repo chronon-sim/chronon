@@ -221,6 +221,10 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     uint64_t seen_generation = 0;
     uint64_t priority_refresh = 0;
     uint64_t wait_sample_sequence = 0;
+    auto* services = host_services_.get();
+    // Rotate the first service across workers/runs, including repeated run(1).
+    size_t service_cursor = thread_idx + epoch_free_run_count_;
+    uint64_t service_sequence = 0;
     observe::ThreadContext* counter_producer = nullptr;
     if constexpr (PushPeriodicCounters) {
         counter_producer = observe::ObservationManager::instance().periodicCounterProducer();
@@ -333,6 +337,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
     };
 
     while (!token.stop_requested()) {
+        if (services && (service_sequence++ & 63u) == 0) services->poll(service_cursor);
         bool ownership_refreshed = false;
         const bool stable_sweep = prepare_stable_sweep(ownership_refreshed);
         if (ownership_refreshed) {
@@ -458,6 +463,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                     const bool sample_tick =
                         !sample_units && detail::shouldSampleDynamicTick(cycle, last_sample);
                     SchedulerTimelineTrace::TimePoint begin{};
+                    const auto service_before_tick = HostServiceRegistration::thread_service_ns;
                     if (sample_tick) begin = SchedulerTimelineTrace::Clock::now();
                     if constexpr (CheckTraceWindow) {
                         trace_units = trace_cycle(trace_units_enabled, cycle);
@@ -476,6 +482,9 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
                         uint64_t elapsed_ns = static_cast<uint64_t>(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
                                 .count());
+                        elapsed_ns -=
+                            std::min(elapsed_ns, HostServiceRegistration::thread_service_ns -
+                                                     service_before_tick);
                         recordClusterTickSample_(cluster, elapsed_ns, true);
                         last_sample = cycle;
                         dynamic_cluster_last_tick_sample_cycle_[cluster] = last_sample;
@@ -592,6 +601,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
         SchedulerTimelineTrace::TimePoint wait_begin{};
         if (sample_wait) wait_begin = SchedulerTimelineTrace::Clock::now();
 
+        const uint64_t service_before_wait = HostServiceRegistration::thread_service_ns;
         uint64_t spin = 0;
         const uint64_t thread_yield_spin_mask =
             detail::dynamicWaitThreadYieldSpinMask(blocker.pred_cluster == SIZE_MAX);
@@ -610,6 +620,7 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
         };
         while (!token.stop_requested()) {
             const uint64_t spin_iteration = spin++;
+            if (services && (spin_iteration & 255u) == 0) services->poll(service_cursor);
             if ((spin_iteration & kFloorRefreshSpinMask) == 0) {
                 if (blocked_floor_needed > lookahead_floor_.load(std::memory_order_relaxed)) {
                     refreshLookaheadFloor_();
@@ -669,9 +680,12 @@ void TickSimulation::executeThreadRunDynamicImpl_(size_t thread_idx, uint64_t en
 
         if (!token.stop_requested() && sample_wait) {
             auto wait_end = SchedulerTimelineTrace::Clock::now();
-            const uint64_t raw_wait_ns = static_cast<uint64_t>(
+            const uint64_t elapsed_wait_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_begin)
                     .count());
+            const auto service_ns =
+                HostServiceRegistration::thread_service_ns - service_before_wait;
+            const uint64_t raw_wait_ns = elapsed_wait_ns - std::min(elapsed_wait_ns, service_ns);
             const uint64_t wait_ns =
                 trace_waits ||
                         raw_wait_ns > std::numeric_limits<uint64_t>::max() / (kWaitSampleMask + 1)

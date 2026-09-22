@@ -187,6 +187,7 @@ bool CounterRegistry::pushOwnerSnapshots(uint64_t cycle, std::span<const size_t>
             (void)ThreadContextManager::instance().wakeBackend();
             constexpr uint32_t max_spins = 4096;
             for (uint32_t spin = 0; spin < max_spins && !ptr; ++spin) {
+                if ((spin & 0xFFu) == 0u) ThreadContextManager::instance().helpService();
                 if (spin > 64) {
                     std::this_thread::yield();
                 } else {
@@ -341,6 +342,7 @@ void CounterRegistry::dumpFinalSnapshot(
                 cpuPause();
             }
             if ((spins & 0xFFu) == 0u) {
+                ThreadContextManager::instance().helpService();
                 (void)ThreadContextManager::instance().wakeBackend();
             }
             ptr = queue->prepareWrite(total_size);

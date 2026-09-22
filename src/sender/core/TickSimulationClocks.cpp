@@ -164,6 +164,8 @@ void TickSimulation::initializeClockRuntime_() {
     clock_calendar_ = std::make_unique<ClockCalendar>(clocks);
     if (shouldUseParallelExecution_()) initializeClockParallel_();
     if (clock_trace_) {
+        // Only the final pre-initialization configuration needs a service slot.
+        clock_trace_->attachScheduler(hostServices());
         if (shouldUseParallelExecution_())
             clock_trace_->startParallel(config_.max_lookahead_cycles);
         else
@@ -185,6 +187,7 @@ void TickSimulation::requireClockRun_() {
 }
 
 bool TickSimulation::executeClockBatch_() {
+    if (host_services_) host_services_->poll(sequential_service_cursor_);
     if (clock_calendar_->empty() || wasTerminationRequested()) return false;
     if (current_cycle_ == UINT64_MAX) throw std::overflow_error("scheduler progress overflow");
     try {

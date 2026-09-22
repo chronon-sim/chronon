@@ -76,9 +76,10 @@ void checkTrace(const DecodedTrace& trace, const std::string& source, uint64_t s
 }  // namespace
 
 int main(int argc, char** argv) {
-    CHECK(argc <= 2);
+    CHECK(argc <= 3);
+    const bool service = argc == 3 && std::string_view(argv[2]) == "service";
     const auto root =
-        argc == 2
+        argc >= 2
             ? std::filesystem::path(argv[1])
             : std::filesystem::temp_directory_path() /
                   ("chronon-registry-backend-" +
@@ -126,10 +127,12 @@ int main(int argc, char** argv) {
         ObservationBackend::Config cfg;
         cfg.output_dir = (root / std::to_string(session)).string();
         cfg.enable_counter_csv = false;
-        cfg.enable_reordering = false;
+        cfg.enable_reordering = service;
         cfg.timeline_enabled = true;
         cfg.timeline_compress = session % 2 != 0;
+        chronon::HostServices scheduler;
         ObservationBackend backend(queue, cfg);
+        if (service) backend.attachScheduler(scheduler);
         backend.setSourceNameLookup([&](uint16_t id) -> std::string_view {
             return id == 1 ? std::string_view(source) : std::string_view{};
         });

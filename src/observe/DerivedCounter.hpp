@@ -23,7 +23,7 @@ class ObservableUnit;
 class ObservationContext;
 
 /// Receives snapshotted delta values for each source counter (declaration order) and
-/// returns the derived value. Invoked on the backend thread at CSV dump time.
+/// returns the derived value. Invoked on the scheduler I/O lane at CSV dump time.
 using ComputeFn = std::function<double(std::span<const uint64_t>)>;
 
 /** @brief Transport struct carrying a derived-counter formula from unit to backend. */
@@ -67,7 +67,7 @@ inline constexpr auto PerKilo = [](std::span<const uint64_t> v) -> double {
 /**
  * @brief Computed counter declared as a unit member alongside aggregate counters.
  *
- * Computation runs on the backend thread at CSV dump time, so there is no
+ * Computation runs on the scheduler I/O lane at CSV dump time, so there is no
  * simulation hot-path overhead.
  *
  * Source counters are supplied as EventCounter references. Their names are

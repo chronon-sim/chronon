@@ -13,7 +13,6 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -21,7 +20,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -32,6 +30,7 @@
 #include <stdexec/stop_token.hpp>
 #pragma GCC diagnostic pop
 
+#include "../chronon/HostServices.hpp"
 #include "CounterSnapshot.hpp"
 #include "DerivedCounter.hpp"
 #include "FormatRegistry.hpp"
@@ -47,11 +46,11 @@
 namespace chronon::observe {
 
 /**
- * @brief Background worker that drains observability queues and writes output files.
+ * @brief Scheduler service that drains observability queues and submits output jobs.
  *
  * Drains per-thread SPSC queues (traces/logs) and the shared queue (counter
  * snapshots, lookahead commits), then routes each event to the text and/or
- * Perfetto timeline sinks.
+ * Perfetto timeline sinks on the scheduler's shared I/O lane.
  *
  * Output files:
  * - events.log       — text output (debug/info/warn/error, optional trace mirror).
@@ -59,13 +58,14 @@ namespace chronon::observe {
  *                      scheduler execution timeline submitted at shutdown).
  * - counters.csv     — performance counter snapshots.
  */
-class ObservationBackend {
+class ObservationBackend : public HostService {
 public:
     using EventHandler =
         std::function<void(ObservationQueue::EventType type, const std::byte* data, size_t size)>;
 
     struct Config {
         std::string output_dir = "out";
+        /// Legacy source-compatibility field; ignored. HostServices controls polling.
         std::chrono::microseconds poll_interval{100};
         bool enable_counter_csv = true;
         CounterCsvFormat counter_csv_format = CounterCsvFormat::Pivoted;
@@ -85,6 +85,8 @@ public:
         size_t reorder_max_events = 100000;
 
         std::string simulation_name;
+
+        size_t service_buffer_bytes = 16 * 1024 * 1024;
     };
 
     explicit ObservationBackend(ObservationQueue& queue);
@@ -95,6 +97,13 @@ public:
     ObservationBackend& operator=(const ObservationBackend&) = delete;
 
     void start();
+
+    /// Register before start(), with simulation workers quiescent.
+    void attachScheduler(HostServices& scheduler);
+    size_t poll(size_t record_budget) noexcept override;
+    HostServiceRegistration::Stats serviceStats() const {
+        return service_ ? service_->stats() : HostServiceRegistration::Stats{};
+    }
 
     /// Drains remaining events before stopping; discards them if output failed.
     /// PRECONDITION: producers have stopped submitting records.
@@ -112,7 +121,7 @@ public:
      */
     void setStopToken(stdexec::inplace_stop_token token) noexcept { stop_token_ = token; }
 
-    /// Set the wake flag; the spin-wait loop picks it up. Safe from any producer.
+    /// Publish ingress readiness. Safe from any producer.
     void wakeUp() noexcept;
 
     bool isRunning() const noexcept { return running_.load(std::memory_order_relaxed); }
@@ -130,7 +139,7 @@ public:
      * @brief Submit recorded timeline streams for inclusion in timeline.pftrace.
      *
      * Thread-safe; intended for end-of-run handoff (e.g. the scheduler execution
-     * timeline). The data is written by the worker thread during stop(), after
+     * timeline). The data is written on the scheduler I/O lane during stop(), after
      * the final event drain, so callers must submit before stopping the backend.
      */
     void submitTimeline(TimelineStreamData&& data);
@@ -198,14 +207,12 @@ private:
     };
 
     void recordFailure_(std::exception_ptr error) noexcept;
-    void run_();
-    size_t drainQueue_();
-    size_t drainPerThreadQueues_();
-    size_t drainAllQueues_();
-    size_t drainToReorderBuffer_();
-    void processReorderBuffer_(bool flush_all);
+    void runIO_() noexcept;
+    void finalizeOutput_();
+    size_t drainServiceBatch_(size_t record_budget);
+    void processServiceBatch_();
+    void flushServiceReorder_(bool all);
     void processEventsAsync_();
-    void ioWorkerLoop_();
     void waitForAsyncIO_();
     void processEvent_(const ObservationQueue::RecordHeader* header, const std::byte* data);
     void processCounterSample_(uint64_t cycle, std::string_view unit_name,
@@ -297,24 +304,20 @@ private:
     std::array<std::unordered_map<uint64_t, PipelineSliceNames>, 2> pipeline_slice_name_cache_;
     PipelineSliceNames pipeline_slice_name_scratch_;
 
-    std::thread worker_thread_;
-    std::thread io_worker_thread_;
+    std::unique_ptr<HostServices> standalone_scheduler_;
+    std::shared_ptr<HostServiceRegistration> service_;
+    static constexpr size_t SERVICE_BATCH_BYTES = 256 * 1024;
+    std::vector<std::byte> service_batch_;
+    size_t service_batch_size_ = 0;
+    size_t service_queue_cursor_ = 0;
+    uint64_t service_min_cycle_ = 0;
+    std::unique_ptr<HostIOJob> io_job_;
+    enum class IOPhase { Open, Batch, Close };
+    IOPhase io_phase_ = IOPhase::Open;
     std::atomic<bool> running_{false};
     std::atomic<bool> should_stop_{false};
 
     stdexec::inplace_stop_token stop_token_{};
-
-    // Drain thread wakeup: atomic flag for lock-free spin checks plus mutex+condvar for
-    // blocking. Can't use atomic::wait because GCC 12's implementation uses a shared
-    // 16-bucket proxy pool for non-trivially-waitable types (sizeof(bool) != sizeof(int)),
-    // which causes missed wakeups when other atomics hash to the same bucket.
-    std::atomic<bool> wake_flag_{false};
-    std::mutex wake_mutex_;
-    std::condition_variable wake_cv_;
-
-    static constexpr int SPIN_HOT_ITERS = 256;
-    static constexpr int SPIN_YIELD_ITERS = 64;
-    static constexpr std::chrono::microseconds SPIN_SLEEP_US{50};
 
     // Buffer writes always happen; file.flush() only runs every OS_FLUSH_INTERVAL
     // to reduce syscall overhead.
@@ -375,18 +378,9 @@ private:
 
     std::vector<BufferedRecord> ready_buffer_;
 
-    std::vector<BufferedRecord> io_buffer_;
-    ArenaSnapshot io_arena_;
     std::atomic<bool> io_in_flight_{false};
-    std::mutex io_dispatch_mutex_;
-    std::condition_variable io_dispatch_cv_;
-    bool io_work_ready_ = false;
-    bool io_worker_stop_ = false;
-    std::mutex io_wait_mutex_;
-    std::condition_variable io_wait_cv_;
+    std::mutex error_mutex_;
     std::exception_ptr output_error_{};
-    uint32_t io_wait_timeout_count_ = 0;
-    static constexpr std::chrono::milliseconds ASYNC_IO_WAIT_TIMEOUT{250};
 
     static constexpr size_t TEXT_BUFFER_FLUSH_SIZE = 1024 * 1024;
 

@@ -294,14 +294,15 @@ is transparent to ui.perfetto.dev and `trace_processor`:
   disables it). Microarchitecture traces are highly repetitive, so this is
   where most of the size win comes from: on the bundled CPU pipeline example
   the timeline shrinks from ~115 MB to ~17 MB (~7×) with no measurable change
-  in simulation wall time (encoding runs on the backend thread).
+  in simulation wall time in that measurement. Encoding now runs on the
+  scheduler I/O lane; performance depends on the workload and CPU allocation.
 
 ### Output failures
 
 Trace write, flush, and close failures (for example, a full filesystem) report the
 output path. The backend retains its first failure and releases producers waiting
 on full queues. `ObservationManager::stopBackend()` and `shutdown()` rethrow the
-failure after stopping the workers; `shutdown()` also releases the manager's
+failure after completing output jobs; `shutdown()` also releases the manager's
 resources before throwing. `SimulationApp` returns a nonzero status when trace
 output fails.
 
@@ -404,7 +405,7 @@ The vocabulary is deliberately SQL-shaped:
 Semantics under the existing machinery:
 
 - Producers write fixed-size records to their SPSC queue without allocation;
-  all Perfetto encoding happens on the backend thread. With observation
+  all Perfetto encoding happens on the scheduler I/O lane. With observation
   disabled, calls are a null-check.
 - Category and temporal filters apply to `begin` and `instant`.
   `end()` skips temporal filters so a span begun inside an observation window
@@ -448,7 +449,10 @@ auto* ctx = obs.createContextForUnit(
 );
 unit->setObservationContext(ctx);
 
-// Start backend thread
+// Initialize model counters and attach the backend to the simulation scheduler
+sim.initialize();
+obs.reregisterAllCounters();
+// Start observation services and open output files
 obs.startBackend();
 
 // ... run simulation ...
@@ -462,7 +466,7 @@ obs.shutdown();
 
 - **YAML configuration initialization**: Parses config and sets up queues/backend
 - **Context creation**: Creates `ObservationContext` per unit with filtering rules
-- **Backend lifecycle**: Manages start/stop of background worker thread
+- **Backend lifecycle**: Starts services, drains pending records and completes output jobs
 - **Counter registration**: Central registry for sparse counter pull model
 
 ## ObservationQueue
@@ -521,6 +525,105 @@ discards records. `activeThreadCount()` reports currently attached producers;
 Emission attempted by another TLS destructor after the observation producer has
 retired is rejected instead of creating an attachment that cannot be retired.
 
+## Scheduler service
+
+Both observation backends use simulation worker time for bounded ingress
+draining when owned by `TickSimulation`. For a YAML-driven
+single-clock simulation, the corresponding settings are:
+
+```yaml
+simulation:
+  observation:
+    enabled: true
+    service_buffer_bytes: 16777216
+```
+
+For an independently owned `ObservationBackend`, call
+`backend.attachScheduler(sim.hostServices())` before `backend.start()`.
+For a manually managed `ObservationManager`, initialize the simulation before
+`startBackend()` to share its scheduler. `SimulationApp` handles this order.
+An already-running backend retains its existing scheduler when a simulation
+initializes, preserving standalone callers without moving an active I/O job.
+Native-clock simulations attach automatically through
+`sim.configureClockTrace(config)`. Both sorted and immediate output use this
+pipeline. The old `scheduler_service` C++ mode switch is removed; remove the
+corresponding YAML key (`false` is rejected with a migration error, while `true`
+is accepted for existing configurations).
+
+`HostServices` owns one shared I/O lane for its outputs. Each backend registers
+one reusable `HostIOJob`, with at most one outstanding batch. The executor visits
+pending jobs round-robin and resumes ingress only after that job's slot becomes
+reusable. Opening files, sorting, encoding, compression, writing, final flush and
+closing all run there. Standalone scheduler timeline export also uses this lane.
+A blocked file write keeps other I/O jobs pending and
+applies the configured bounded producer backpressure; it does not execute in a
+model worker. This lane cannot preempt an operating-system file write.
+
+A standalone backend creates a small `HostServices` driver that polls the same
+ingress on its I/O lane. There is no separate backend consumer implementation or
+private backend thread pool. Its idle readiness scan sleeps up to 50 microseconds.
+`ObservationBackend::Config::poll_interval` is retained for source compatibility
+but is ignored; it does not change either scheduler polling or standalone waiting.
+New configuration members are appended to preserve existing positional aggregate
+initializers. Class layouts have changed, so rebuild downstream C++ binaries;
+binary ABI compatibility is not provided.
+
+The scheduler visits ready host services between model sweeps and during
+dependency waits. Services have no simulated clock, dependency edges or
+lookahead frontier. A registration serializes consumers with a nonblocking
+claim; producer assistance uses the same registration when a synchronous tick
+fills its queue. Records remain owned copies, including after worker migration.
+Dynamic scheduling cost samples exclude time spent executing host-service polls,
+including producer assistance inside native-clock bridge begin/commit intervals.
+
+Each ordinary-backend poll copies at most 256 records / 256 KiB into a preallocated
+handoff buffer. A native-clock poll copies at most 256 fixed-size records and
+preserves a snapshot of all producer heads across partial polls. Its frontier
+is acknowledged only after all those heads reach the I/O lane. Queue
+publication, progress and I/O completion signal readiness; no dedicated
+drain thread is created. Sorting, arena allocation,
+encoding, compression and file output run on the scheduler I/O lane.
+Serial native-clock recording signals readiness after every completed clock batch,
+including sparse batches and small lossy queues. This ingress notification does
+not advance the Perfetto watermark or close the current timestamp bucket.
+While I/O owns the only handoff batch, the registration rejects new claims before
+taking its consumer lock or reading the timing clock. Publications still record
+readiness, and I/O completion restores eligibility without losing notifications.
+
+The ordinary reorder arena admits at most `service_buffer_bytes` live/retained
+bytes (64 KiB–1 GiB), then flushes the sorted retained records before admitting
+more. Its allocation may round up by less than 2×; record descriptors are
+separately bounded by `reorder_max_events + 1`. Together with the fixed handoff
+buffer and existing bounded producer queues, a slow sink cannot grow an
+unbounded raw-record backlog. Native mode accounts its handoff and head snapshot
+storage within the existing ingress/staging budget. Sink dictionaries, interned
+strings, compression buffers and scheduler timeline capture retain their own
+existing allocation policies; this is not a bound on whole-process memory.
+
+As with the existing count-based forced flush, the additional ordinary-backend byte limit
+can flush before the reorder watermark. Ordinary-backend ordering remains best effort
+under forced flushing; native-clock frontier ordering is exact. Existing
+`drop`, `bounded_wait` and `spin_wait` policies are unchanged. A lossless producer
+can still spend host time waiting for a slow sink, while assisting bounded
+ingress work. No file I/O executes inside the model callback.
+
+Stop producers and finish scheduler calls before stopping/reconfiguring a
+backend. Final snapshots and scheduler timelines precede detach, final drain,
+in-flight I/O completion and close. Detached registrations safely ignore cached
+assistance calls. Register custom host services only between runs and detach
+their registration before destroying the service object. I/O jobs retain the
+executor until their final completion, so an observer can close after the
+simulation has been destroyed. Detach ingress and wait for I/O before destroying
+its callback owner. Registering a job does not add model dependencies or advance
+simulated time.
+
+Service statistics report poll count, records, total host elapsed nanoseconds
+and maximum poll duration. These are wall times (including preemption), not CPU
+time or hard latency deadlines. Dynamic model-cost samples exclude time spent
+executing service polls. Native `clock-stats.json` contains the same service
+statistics. Performance depends on CPU availability and the observation mix;
+compare identical worker counts, CPU affinity, outputs and loss policies.
+
 ## ReorderBuffer
 
 The backend can reorder events by cycle for deterministic output:
@@ -560,14 +663,20 @@ Full configuration structure:
 ```cpp
 struct Config {
     std::string output_dir = "out";
-    std::chrono::microseconds poll_interval{100};
+    std::chrono::microseconds poll_interval{100};  // Legacy compatibility field; ignored
     bool enable_counter_csv = true;
     CounterCsvFormat counter_csv_format = CounterCsvFormat::Pivoted;
+
+    std::string debug_file;
+    std::string info_file;
+    std::string warn_file;
+    std::string error_file;
 
     // Unified Perfetto timeline (timeline.pftrace)
     bool timeline_enabled = true;
     std::string timeline_file = "timeline.pftrace";
     bool timeline_counters = true;
+    bool timeline_compress = true;
 
     // Reorder buffer
     bool enable_reordering = true;
@@ -576,6 +685,8 @@ struct Config {
 
     // Simulation metadata
     std::string simulation_name;
+
+    size_t service_buffer_bytes = 16 * 1024 * 1024;
 };
 ```
 
@@ -584,35 +695,25 @@ struct Config {
 Log channels (debug/info/warn/error) are text-only and write to `events.log`.
 Structured timeline events and lanes go to `timeline.pftrace`.
 
-## Debug Build Backpressure (No-Drop Guarantee)
+## Backpressure
 
-In **debug builds** (`NDEBUG` not defined), the no-drop guarantee applies when:
+Log and trace queues use the configured policy in both Debug and Release builds:
 
-- The backend is running (wake callback registered by `ObservationBackend::start()`)
+- **`drop`**: reject the record immediately when the producer queue is full.
+- **`bounded_wait`**: publish pending writes, notify the backend and assist bounded
+  ingress while retrying up to `backpressure_max_spins` (default 4096), then drop
+  if space is still unavailable. This is the default policy.
+- **`spin_wait`**: keep retrying while the backend is available, assisting bounded
+  ingress and yielding during prolonged waits. A slow sink can stall the producer.
 
-Under those conditions, when a per-thread SPSC queue is full, the producer thread:
+Assistance uses the same scheduler registration as regular polling and never
+runs file I/O inside a model callback. Waiting producers stop retrying if the
+backend stops or fails; records larger than queue capacity are rejected. Therefore
+`spin_wait` preserves records under pressure only while the backend can make
+progress and each record fits its queue.
 
-1. Wakes the backend immediately (bypassing the 100us poll sleep)
-2. Spin-waits with architecture-specific pause instructions until space is available
-3. Yields to the OS scheduler every 64 iterations to avoid starving the backend
-
-This ensures complete trace/log output during debugging sessions, at the cost of brief producer stalls under extreme event pressure.
-
-If the backend is not running (or the record is larger than queue capacity), debug builds fall back to dropping the event rather than spinning forever.
-
-In **release builds**, the original fire-and-forget behavior is preserved — events are silently dropped when queues are full, with zero additional overhead.
-
-The backend also uses **eager read commits** in all builds, making freed queue space visible to producers immediately rather than waiting for the 4KB batch threshold. This reduces the stale-free-space window that causes unnecessary drops.
-
-```
-Debug build event flow:
-  Producer → prepareWrite() → nullptr?
-    → wakeBackend() → spin-yield → prepareWrite() → success → write
-
-Release build event flow:
-  Producer → prepareWrite() → nullptr?
-    → incrementDropped() → return (fire-and-forget)
-```
+The consumer publishes freed queue space after each bounded drain, so producers
+can reuse it without waiting for a larger read-commit batch.
 
 ## Emergency Flush on Crash
 

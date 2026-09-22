@@ -239,8 +239,9 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     return false;
                 }
             }
-            SchedulerTimelineTrace::TimePoint begin{};
-            if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
+            // Producer assistance may drain observations inside commit/endEdge.
+            // Use the same net host-time accounting as unit and profile samples.
+            detail::ClockProfileScope sample(bridge.sample ? &bridge.sample_ns : nullptr);
             {
                 detail::ClockProfileScope commit_profile(profile ? &profile->bridge_ns : nullptr);
                 // Commit EVERY lane before publishing completion or allowing
@@ -259,11 +260,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     endpoint.completed.store(endpoint.next, std::memory_order_release);
                 }
             }
+            sample.finish();
             if (bridge.sample) {
-                bridge.sample_ns +=
-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                              SchedulerTimelineTrace::Clock::now() - begin)
-                                              .count());
                 cluster_sample_time_ns_[actor].fetch_add(bridge.sample_ns,
                                                          std::memory_order_relaxed);
                 cluster_sample_count_[actor].fetch_add(bridge.edge_count,
@@ -295,8 +293,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
         }
         bridge.sample = Dynamic && detail::shouldSampleDynamicTick(
                                        cycle, dynamic_cluster_last_tick_sample_cycle_[actor]);
-        SchedulerTimelineTrace::TimePoint begin{};
-        if (bridge.sample) begin = SchedulerTimelineTrace::Clock::now();
+        if (bridge.sample) bridge.sample_ns = 0;
+        detail::ClockProfileScope sample(bridge.sample ? &bridge.sample_ns : nullptr);
         {
             detail::ClockProfileScope begin_profile(profile ? &profile->bridge_ns : nullptr);
             // All lanes snapshot old state before either endpoint cluster is
@@ -304,12 +302,9 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
             for (auto& lane : bridge.lanes)
                 lane.circuit->begin(std::span(bridge.edges.data(), bridge.edge_count));
         }
+        sample.finish();
         if (bridge.sample) {
             dynamic_cluster_last_tick_sample_cycle_[actor] = cycle;
-            bridge.sample_ns =
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          SchedulerTimelineTrace::Clock::now() - begin)
-                                          .count());
         }
         for (size_t side = 0; side < 2; ++side) {
             auto& endpoint = bridge.endpoints[side];
@@ -342,6 +337,10 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                         scratch->ownership.clear();
                     }
                     uint64_t seen_generation = 0;
+                    auto* services = host_services_.get();
+                    // Short runs must also give later registrations a first-sweep visit.
+                    size_t service_cursor = worker + epoch_free_run_count_;
+                    uint64_t service_sequence = 0;
                     uint64_t idle_sweeps = 0;
                     uint64_t wait_sequence = 0;
                     uint64_t profile_sequence = worker;
@@ -366,6 +365,8 @@ uint64_t TickSimulation::runClockEpochFree_(uint64_t max_batches, std::optional<
                     while (!failed.load(std::memory_order_acquire) &&
                            !done.load(std::memory_order_acquire) &&
                            (settling || !token.stop_requested())) {
+                        if (services && (service_sequence++ & 63u) == 0)
+                            services->poll(service_cursor);
                         auto* profile =
                             config_.profile_clock_scheduler && (profile_sequence++ & 63) == 0
                                 ? &clock_scheduler_profile_[worker]
