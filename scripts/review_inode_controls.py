@@ -11,7 +11,9 @@ for alias in ('aa-first','aa-other','aa-links'):
     (build/'benchmark').mkdir(parents=True,exist_ok=False)
     shutil.copy2(source/'CMakeCache.txt',build/'CMakeCache.txt')
     binary=build/'benchmark'/name
-    if alias=='aa-links':
+    if alias=='aa-first':
+        os.link(source_binary,binary)
+    elif alias=='aa-links':
         os.link(Path('aa-first/build-perf/benchmark')/name,binary)
     else:
         shutil.copy2(source_binary,binary)
@@ -19,6 +21,9 @@ for alias in ('aa-first','aa-other','aa-links'):
     digest=hashlib.sha256(binary.read_bytes()).hexdigest()
     assert digest==expected
     records[alias]={'path':str(binary.resolve()),'sha256':digest,'device':stat.st_dev,'inode':stat.st_ino}
+assert records['aa-first']['inode']==source_binary.stat().st_ino
+assert records['aa-first']['device']==source_binary.stat().st_dev
+records['source']={'path':str(source_binary),'sha256':expected,'device':source_binary.stat().st_dev,'inode':source_binary.stat().st_ino}
 assert records['aa-first']['inode']!=records['aa-other']['inode']
 assert records['aa-first']['inode']==records['aa-links']['inode']
 assert len({len(v['path']) for v in records.values()})==1

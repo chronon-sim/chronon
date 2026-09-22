@@ -2,7 +2,7 @@ name: PR review wall-time reproduction
 on:
   workflow_dispatch:
     inputs:
-      floor:
+      receive:
         required: true
 permissions:
   contents: read
@@ -14,14 +14,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: floor-1
-            sha: ${{ inputs.floor }}
-          - label: floor-2
-            sha: ${{ inputs.floor }}
-          - label: aa-1
-            sha: 7829ac985c461c12ba7bada0c560efb850ce4823
-          - label: aa-2
-            sha: 7829ac985c461c12ba7bada0c560efb850ce4823
+          - label: receive-1
+            sha: ${{ inputs.receive }}
+          - label: receive-2
+            sha: ${{ inputs.receive }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,7 +68,6 @@ jobs:
               chronon_representative_workload_benchmark
           done
       - name: Prepare same-path, hardlink and separate-inode controls
-        if: startsWith(matrix.label, 'aa-')
         run: |
           python3 harness/scripts/review_inode_controls.py original/build-perf results/inode-controls.json
       - name: Choose equal-length executable paths
@@ -90,20 +85,31 @@ jobs:
           python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
             --baseline baseline/build-perf --original "$REVIEW_ORIGINAL_BUILD" --candidate "$REVIEW_CANDIDATE_BUILD" \
             --output results/uninstrumented --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
+      - name: Compare original backing file with an identical fresh copy
+        run: |
+          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
+          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
+            --baseline baseline/build-perf --original aa-first/build-perf --candidate aa-other/build-perf \
+            --output results/aa-anchored-copy --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
       - name: Repeat identical original path as both labels
-        if: startsWith(matrix.label, 'aa-')
         run: |
           CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
           python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
             --baseline baseline/build-perf --original aa-first/build-perf --candidate aa-first/build-perf \
             --output results/aa-samepath --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
       - name: Repeat equal-length hardlink alias
-        if: startsWith(matrix.label, 'aa-')
         run: |
           CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
           python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
             --baseline baseline/build-perf --original aa-first/build-perf --candidate aa-links/build-perf \
             --output results/aa-hardlink --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
+      - name: Representative workload matrix
+        run: |
+          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
+          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
+            --baseline baseline/build-perf --original original/build-perf --candidate candidate/build-perf \
+            --output results/representative-matrix --cpus "$CPUS" --repeats 6 \
+            --cases nucleus-threads1,nucleus-threads2,port-threads1,port-threads2,broadcast-threads1,broadcast-threads2,backpressure-threads1,backpressure-threads2,memory-threads1,memory-threads2
       - name: Profile original compiler layout
         continue-on-error: true
         run: |
