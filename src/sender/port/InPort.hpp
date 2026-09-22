@@ -563,6 +563,7 @@ public:
                 return tryReceiveUnfilteredFromConsumableQueue_(*multi_producer_queue_raw_,
                                                                 current_cycle);
             }
+            if (!queue_->hasReady(current_cycle)) return std::nullopt;
         }
         return tryReceiveFiltered(current_cycle, [](const T&) noexcept { return true; });
     }
