@@ -3,11 +3,9 @@ on:
   workflow_dispatch:
     inputs:
       pr158:
-        default: f9aca0fd3cc855523e87c3f1bf708a9715564f93
-      pr159:
-        default: 7181ad281436076d5ebd4a9e52cd83982b3585fc
+        default: efe61ccd6f07dcddd8a796dd216ab9e446788ee0
       pr160:
-        default: d4f9a00f1f3d9d6ea33459ee8e4b9355e5a49046
+        default: 3d2c42f1b1ffe2821d0e043a956adbb00c3af2a4
 permissions:
   contents: read
 jobs:
@@ -18,10 +16,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - pr: 158
+            sha: ${{ inputs.pr158 }}
+            cases: clock1-threads2-dynamic1-poll0,clock1-threads2-dynamic1-poll1,clock1-threads2-dynamic1-poll64
           - pr: 160
             sha: ${{ inputs.pr160 }}
             cases: broadcast-threads2
-            repeats: 32
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,31 +34,34 @@ jobs:
         with:
           path: candidate
           ref: ${{ matrix.sha }}
+      - uses: actions/checkout@v4
+        if: matrix.pr == 160
+        with:
+          path: original
+          ref: 7829ac985c461c12ba7bada0c560efb850ce4823
       - run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build ccache g++-12 libyaml-cpp-dev libfmt-dev zlib1g-dev
       - uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: api-contracts-gcc12-release
-      - name: Build identical workloads and record commits
+      - name: Build revisions with the identical controlled harness
         env:
           CXX: g++-12
           CPM_SOURCE_CACHE: ${{ github.workspace }}/dependencies
         run: |
           mkdir results
-          for variant in baseline candidate; do
+          for variant in baseline candidate original; do
+            if [[ ! -d "$variant" ]]; then continue; fi
+            git -C "$variant" rev-parse HEAD > "results/$variant.sha"
             cp harness/benchmark/representative_workload_benchmark.cpp "$variant/benchmark/representative_workload_benchmark.cpp"
-          done
-          git -C baseline rev-parse HEAD > results/baseline.sha
-          git -C candidate rev-parse HEAD > results/candidate.sha
-          for file in single_clock_regression.cpp scheduler_invocation_benchmark.cpp \
-              SchedulerInvocationModel.hpp BenchmarkThreadAffinity.hpp \
-              representative_workload_benchmark.cpp RepresentativeWorkload.hpp \
-              RepresentativeWorkloadCalibration.hpp RepresentativeWorkloadOptions.hpp \
-              RepresentativeWorkloadReporting.hpp; do
-            cmp "baseline/benchmark/$file" "candidate/benchmark/$file"
-          done
-          for variant in baseline candidate; do
+            for file in single_clock_regression.cpp scheduler_invocation_benchmark.cpp \
+                SchedulerInvocationModel.hpp BenchmarkThreadAffinity.hpp \
+                representative_workload_benchmark.cpp RepresentativeWorkload.hpp \
+                RepresentativeWorkloadCalibration.hpp RepresentativeWorkloadOptions.hpp \
+                RepresentativeWorkloadReporting.hpp; do
+              cmp "baseline/benchmark/$file" "$variant/benchmark/$file"
+            done
             cmake -S "$variant" -B "$variant/build-perf" -G Ninja \
               -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
               -DCHRONON_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
@@ -66,37 +69,42 @@ jobs:
               chronon_single_clock_regression_benchmark chronon_scheduler_invocation_benchmark \
               chronon_representative_workload_benchmark
           done
-      - name: Repeat with identical worker pinning and warmup
+      - name: Final migration matrix and focused samples
+        if: matrix.pr == 158
         env:
           CASES: ${{ matrix.cases }}
         run: |
           CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
           python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
             --baseline baseline/build-perf --candidate candidate/build-perf \
-            --output results/focused --cpus "$CPUS" --repeats ${{ matrix.repeats }} --cases "$CASES"
-      - name: Repeat controlled broadcast with five times the work
+            --output results/matrix --cpus "$CPUS" --repeats 6
+          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
+            --baseline baseline/build-perf --candidate candidate/build-perf \
+            --output results/focused --cpus "$CPUS" --repeats 16 --cases "$CASES"
+      - name: Interleave baseline, original and restored-layout binaries
         if: matrix.pr == 160
         env:
           CASES: ${{ matrix.cases }}
         run: |
           CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
           python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --candidate candidate/build-perf \
+            --baseline baseline/build-perf --original original/build-perf --candidate candidate/build-perf \
+            --output results/short --cpus "$CPUS" --repeats 24 --cases "$CASES"
+          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
+            --baseline baseline/build-perf --original original/build-perf --candidate candidate/build-perf \
             --output results/long --cpus "$CPUS" --repeats 24 --cases "$CASES" --cycle-scale 5
-      - name: Disable controls on exactly the same binaries
-        env:
-          CASES: ${{ matrix.cases }}
-        run: |
-          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
-          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --candidate candidate/build-perf \
-            --output results/uncontrolled --cpus "$CPUS" --repeats 32 --cases "$CASES" --thread-controls off
-          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --candidate candidate/build-perf \
-            --output results/uncontrolled-long --cpus "$CPUS" --repeats 24 --cases "$CASES" --cycle-scale 5 --thread-controls off
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: review-walltime-${{ matrix.pr }}
           path: results/
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: matrix.pr == 160
+        with:
+          name: review-broadcast-binaries
+          path: |
+            baseline/build-perf/benchmark/chronon_representative_workload_benchmark
+            original/build-perf/benchmark/chronon_representative_workload_benchmark
+            candidate/build-perf/benchmark/chronon_representative_workload_benchmark
           retention-days: 30

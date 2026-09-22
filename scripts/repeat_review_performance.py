@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import importlib.util
+import itertools
 import io
 import json
 import os
@@ -19,6 +20,7 @@ p = argparse.ArgumentParser()
 p.add_argument('--scripts', default='/home/changyun/projects/chronon_pub/scripts')
 p.add_argument('--baseline', type=Path, required=True)
 p.add_argument('--candidate', type=Path, required=True)
+p.add_argument('--original', type=Path)
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--cases', default='all')
 p.add_argument('--repeats', type=int, default=16)
@@ -38,9 +40,12 @@ if args.cases != 'all':
 for c in matrix:
     c['cycles'] *= args.cycle_scale
 builds = {'baseline':args.baseline.resolve(), 'candidate':args.candidate.resolve()}
+if args.original:
+    builds = {'baseline':args.baseline.resolve(), 'original':args.original.resolve(),
+              'candidate':args.candidate.resolve()}
 args.output.mkdir(parents=True, exist_ok=False)
-meta = {'args':vars(args)|{'baseline':str(args.baseline),'candidate':str(args.candidate),'output':str(args.output)},
-        'method':'sequential fresh processes, same CPU pair, alternating AB/BA; no discarded samples',
+meta = {'args':{k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items()},
+        'method':'sequential fresh processes, same CPU pair, balanced permutations; no discarded samples',
         'platform':platform.platform(),'lscpu':subprocess.check_output(['lscpu'],text=True),
         'case_definitions':matrix,'builds':{}}
 for v,b in builds.items():
@@ -57,7 +62,8 @@ for rep in range(args.repeats):
     order_cases=list(matrix)
     random.Random(149+rep).shuffle(order_cases)
     for case in order_cases:
-        order=['baseline','candidate'] if rep%2==0 else ['candidate','baseline']
+        orders=list(itertools.permutations(builds))
+        order=orders[rep%len(orders)]
         pair={}
         for variant in order:
             cmd=ci.command(builds[variant],case,cpus)
@@ -80,7 +86,7 @@ for rep in range(args.repeats):
                 row['scheduler_metrics']=next(csv.DictReader(io.StringIO('\n'.join(proc.stdout.strip().splitlines()[-2:]))))
             with (args.output/'runs.jsonl').open('a') as f:f.write(json.dumps(row)+'\n')
             allrows.append(row); pair[variant]=row
-        print(f'{rep+1}/{args.repeats} {case["name"]}: {pair["baseline"]["wall_seconds"]:.6f} -> {pair["candidate"]["wall_seconds"]:.6f}',flush=True)
+        print(f'{rep+1}/{args.repeats} {case["name"]}: '+', '.join(f'{v}={pair[v]["wall_seconds"]:.6f}' for v in builds),flush=True)
 
 def pct(values,q):
     v=sorted(values); pos=(len(v)-1)*q; i=int(pos)
@@ -88,18 +94,21 @@ def pct(values,q):
 summary=[]
 for case in matrix:
     rows={v:[r for r in allrows if r['case']==case['name'] and r['variant']==v] for v in builds}
-    entry={'case':case['name'],'repeats':args.repeats,'state_matches':True}
-    for key in ('wall_seconds','benchmark_seconds'):
-        a=[r[key] for r in rows['baseline']]; b=[r[key] for r in rows['candidate']]
-        ratio=[y/x for x,y in zip(a,b)]; rng=random.Random(149)
-        bootstrap=[statistics.median(rng.choices(ratio,k=len(ratio))) for _ in range(10000)]
-        entry[key]={'baseline_median':statistics.median(a),'candidate_median':statistics.median(b),
-                    'ratio_of_medians':statistics.median(b)/statistics.median(a),
-                    'paired_median_ratio':statistics.median(ratio),
-                    'paired_median_ratio_bootstrap95':[pct(bootstrap,.025),pct(bootstrap,.975)],
-                    'baseline_range':[min(a),max(a)],'candidate_range':[min(b),max(b)]}
-    summary.append(entry)
+    comparisons=[('baseline','candidate')]
+    if args.original: comparisons += [('baseline','original'),('original','candidate')]
+    for left,right in comparisons:
+        entry={'case':case['name'],'repeats':args.repeats,'state_matches':True,'comparison':[left,right]}
+        for key in ('wall_seconds','benchmark_seconds'):
+            a=[r[key] for r in rows[left]]; b=[r[key] for r in rows[right]]
+            ratio=[y/x for x,y in zip(a,b)]; rng=random.Random(149)
+            bootstrap=[statistics.median(rng.choices(ratio,k=len(ratio))) for _ in range(10000)]
+            entry[key]={'baseline_median':statistics.median(a),'candidate_median':statistics.median(b),
+                        'ratio_of_medians':statistics.median(b)/statistics.median(a),
+                        'paired_median_ratio':statistics.median(ratio),
+                        'paired_median_ratio_bootstrap95':[pct(bootstrap,.025),pct(bootstrap,.975)],
+                        'baseline_range':[min(a),max(a)],'candidate_range':[min(b),max(b)]}
+        summary.append(entry)
 (args.output/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
 for s in summary:
     w=s['wall_seconds']; lo,hi=w['paired_median_ratio_bootstrap95']
-    print(f"SUMMARY {s['case']}: median {w['baseline_median']:.6f} -> {w['candidate_median']:.6f}; paired {(w['paired_median_ratio']-1)*100:+.2f}% CI [{(lo-1)*100:+.2f}%,{(hi-1)*100:+.2f}%]",flush=True)
+    print(f"SUMMARY {s['case']} {s['comparison']}: median {w['baseline_median']:.6f} -> {w['candidate_median']:.6f}; paired {(w['paired_median_ratio']-1)*100:+.2f}% CI [{(lo-1)*100:+.2f}%,{(hi-1)*100:+.2f}%]",flush=True)
