@@ -363,6 +363,7 @@ void ObservationManager::shutdownLocked_() {
     clock_run_revision_ = 0;
     clock_final_sequence_ = 0;
     clock_final_after_edge_ = false;
+    clock_finalized_ = false;
     clock_run_boundary_ = {};
     source_registry_.clear();
     backend_.reset();
@@ -429,7 +430,7 @@ void ObservationManager::dumpFinalCounterSnapshot(uint64_t cycle) {
             sampleClockOwner(owner, clock_run_boundary_);
             if (!counter_registry_.pushOwnerSnapshots(clock_final_sequence_, std::span(&owner, 1),
                                                       *producer, clock_run_boundary_, true,
-                                                      clock_final_after_edge_))
+                                                      clock_final_after_edge_, clock_finalized_))
                 throw std::runtime_error("clock final snapshot queue exhausted");
         }
         clock_final_revision_ = clock_run_revision_;

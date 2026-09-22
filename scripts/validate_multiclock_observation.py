@@ -162,6 +162,60 @@ def verify_counters(directory, events):
         raise AssertionError(f"{directory}: incomplete periodic/final counter coverage")
 
 
+
+def verify_lifecycle(processor, root, case, after_edge, initial_snapshot):
+    traces = sorted({trace.resolve() for trace in (root / case).glob("*/timeline.pftrace")})
+    if len(traces) != 1:
+        raise AssertionError(f"{root / case}: expected one lifecycle trace")
+    trace = traces[0]
+    for table in ("slice", "counter", "track", "stats"):
+        query(processor, trace, f"SELECT * FROM {table} LIMIT 0")
+    errors = query(processor, trace,
+                   "SELECT name,value FROM stats WHERE severity='error' AND value != 0")
+    if errors:
+        raise AssertionError(f"{case}: import errors: {errors}")
+    cutoff_ns = 50 if after_edge else 20
+    events = query(processor, trace, """
+        SELECT ts,name,EXTRACT_ARG(arg_set_id, 'debug.lifecycle') AS lifecycle,
+               EXTRACT_ARG(arg_set_id, 'debug.time_num') AS time_num,
+               EXTRACT_ARG(arg_set_id, 'debug.time_den') AS time_den
+        FROM slice WHERE name IN ('initialized', 'finalized') ORDER BY id
+    """)
+    expected = [("initialized", "initialize", 0), ("finalized", "finalize", cutoff_ns)]
+    if len(events) != len(expected):
+        raise AssertionError(f"{case}: missing/extra lifecycle events")
+    for row, (name, phase, timestamp) in zip(events, expected):
+        exact_ns = Fraction(int(row["time_num"]), int(row["time_den"])) * 1_000_000_000
+        if (row["name"], row["lifecycle"], int(row["ts"]), exact_ns) != (
+                name, phase, timestamp, timestamp):
+            raise AssertionError(f"{case}: incorrect lifecycle attribution {row}")
+    spans = query(processor, trace,
+                  "SELECT ts,dur FROM slice WHERE name='lifecycle_span'")
+    if [(int(row["ts"]), int(row["dur"])) for row in spans] != [(0, cutoff_ns)]:
+        raise AssertionError(f"{case}: incorrect lifecycle span boundary {spans}")
+    # The C++ decoder checks cross-kind order in the actual Perfetto packets.
+    # SQL imports slice/counter into distinct tables, so verify counter order,
+    # values and matching exact cutoff independently here.
+    counters = query(processor, trace, """
+        SELECT c.ts,c.value FROM counter c JOIN track t ON c.track_id=t.id
+        WHERE t.name='callbacks' ORDER BY c.id
+    """)
+    expected_values = ([2 if after_edge else 1, 1] if initial_snapshot
+                       else [3 if after_edge else 2])
+    if [(int(row["ts"]), float(row["value"])) for row in counters] != [
+            (cutoff_ns, value) for value in expected_values]:
+        raise AssertionError(f"{case}: wrong imported lifecycle counter sequence {counters}")
+    with (trace.parent / "counters.csv").open() as file:
+        rows = list(csv.DictReader(file))
+    phase = "final_after" if after_edge else "final_before"
+    actual = [(Fraction(int(row["time_num"]), int(row["time_den"])), row["sample"],
+               int(row["lifecycle.callbacks"])) for row in rows]
+    if actual != [(Fraction(cutoff_ns, 1_000_000_000), phase, value)
+                  for value in expected_values]:
+        raise AssertionError(f"{case}: lifecycle changed hardware cutoff semantics {rows}")
+    print(f"PASS {case}: lifecycle/counter import order, exact cutoff and residual values")
+
+
 def validate(processor, root):
     baseline = None
     for case in CASES:
@@ -180,6 +234,10 @@ def validate(processor, root):
         verify_logs(directory, result[0])
         verify_counters(directory, result[0])
         print(f"PASS {case}: {len(result[0])} exact edge events, pipeline spans, flows, logs, counter intervals")
+    for case, after_edge, initial_snapshot in (
+            ("lifecycle", False, True), ("lifecycle-after", True, True),
+            ("lifecycle-final-only", False, False), ("lifecycle-after-final-only", True, False)):
+        verify_lifecycle(processor, root, case, after_edge, initial_snapshot)
 
 
 def main():

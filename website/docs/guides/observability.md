@@ -94,7 +94,11 @@ and logs label the callback explicitly. Their `local_cycle` is the unit's next
 edge index, not a claim that this edge executed. Finalize before the final
 counter dump to include counter changes made by that callback. If a caller has
 already dumped the same run cutoff, finalization permits one additional residual
-row at that cutoff; earlier counter values are not emitted again.
+row at that cutoff; earlier counter values are not emitted again. At the same
+exact time, a pre-finalization snapshot precedes the finalize callback records,
+and the post-finalization residual follows them. This lifecycle ordering is
+independent of the hardware cutoff: CSV still reports `final_before` or
+`final_after` according to the last run.
 
 The backend reuses producer queues, source/format/track registries, counter
 plans, the reorder arena and isolated `HostServices` I/O lane. A rolling credit

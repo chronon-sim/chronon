@@ -92,12 +92,16 @@ public:
     void sampleClockOwner(size_t owner, SimTime exclusive_limit);
     uint64_t clockRunRevision() const noexcept { return clock_run_revision_; }
     SimTime clockRunBoundary() const noexcept { return clock_run_boundary_; }
-    void markClockFinalized() noexcept { clock_final_revision_.reset(); }
+    void markClockFinalized() noexcept {
+        clock_final_revision_.reset();
+        clock_finalized_ = true;
+    }
     uint64_t clockSafeFrontier(uint64_t exclusive_ns) const;
     void setClockRunBoundary(SimTime time, uint64_t revision, bool after_edge) noexcept {
         clock_run_boundary_ = time;
         clock_run_revision_ = revision;
         clock_final_after_edge_ = after_edge;
+        clock_finalized_ = false;
     }
 
     void startBackend();
@@ -228,6 +232,7 @@ private:
     std::optional<ClockDomain> clock_reference_;
     SimTime clock_run_boundary_;
     bool clock_final_after_edge_ = false;
+    bool clock_finalized_ = false;
     uint64_t clock_final_sequence_ = 0;
     uint64_t clock_run_revision_ = 0;
     std::optional<uint64_t> clock_final_revision_;

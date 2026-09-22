@@ -19,6 +19,9 @@ using Access = sender::DynamicMigrationTestAccess;
 static_assert(observe::ReorderBufferConfig{1000, 100000, 4096}.initial_arena_size == 4096);
 static_assert(!observe::ReorderBufferConfig{1000, 100000, 4096}.strict_watermark);
 static_assert(sizeof(observe::BufferedRecord) == 24);
+static_assert((observe::COUNTER_SNAPSHOT_POST_FINALIZE_FLAG &
+               (observe::COUNTER_SNAPSHOT_BATCH_FLAG | observe::COUNTER_SNAPSHOT_FINAL_FLAG |
+                observe::COUNTER_SNAPSHOT_AFTER_FLAG | observe::CLOCK_LIFECYCLE_FLAG)) == 0);
 inline const auto CLOCK_OBS = Category<"clock_observation", "Unified clock observation test">{};
 
 struct Endpoint : TickableUnit, ObservableUnit {
@@ -206,17 +209,20 @@ struct LifecycleUnit : TickableUnit, ObservableUnit {
     void initialize() override {
         ++callbacks;
         event<"initialized">(CLOCK_OBS);
+        spanBegin<"lifecycle_work">(CLOCK_OBS, "lifecycle_span"_ev);
         info<"initialized">();
     }
     void tick() override { ++callbacks; }
     void finalize() override {
         ++callbacks;
+        spanEnd<"lifecycle_work">();
         event<"finalized">(CLOCK_OBS);
         info<"finalized">();
     }
 };
 
-void lifecycle(const std::filesystem::path& path) {
+void lifecycle(const std::filesystem::path& path, bool after_edge = false,
+               bool initial_snapshot = true) {
     TickSimulationConfig config;
     config.num_threads = 1;
     config.enable_parallel = false;
@@ -229,14 +235,20 @@ void lifecycle(const std::filesystem::path& path) {
     auto& manager = observe::ObservationManager::instance();
     manager.reregisterAllCounters();
     manager.startBackend();
-    assert(simulation.runUntilTime(SimTime::nanoseconds(20)) == 0);
-    manager.dumpFinalCounterSnapshot(0);  // Before finalize: initialization residual only.
+    const auto cutoff = SimTime::nanoseconds(after_edge ? 50 : 20);
+    if (after_edge)
+        assert(simulation.runClockEvents(1) == 1);
+    else
+        assert(simulation.runUntilTime(cutoff) == 0);
+    if (initial_snapshot) manager.dumpFinalCounterSnapshot(0);
     assert(simulation.runClockEvents(0) == 0);
-    assert(manager.clockRunBoundary() == SimTime::nanoseconds(20));
-    // These calls are legal no-ops: the first hardware edge is still at 50 ns.
-    assert(simulation.runUntilTime(SimTime::nanoseconds(10)) == 0);
-    assert(manager.clockRunBoundary() == SimTime::nanoseconds(20));
-    assert(simulation.runUntilTime(SimTime::nanoseconds(20)) == 0);
+    assert(manager.clockRunBoundary() == cutoff);
+    if (!after_edge) {
+        // These calls are legal no-ops: the first hardware edge is still at 50 ns.
+        assert(simulation.runUntilTime(SimTime::nanoseconds(10)) == 0);
+        assert(manager.clockRunBoundary() == cutoff);
+    }
+    assert(simulation.runUntilTime(cutoff) == 0);
     simulation.finalize();
     simulation.finalize();
     manager.dumpFinalCounterSnapshot(0);
@@ -244,15 +256,46 @@ void lifecycle(const std::filesystem::path& path) {
     const auto output = manager.backend()->outputDir();
     manager.stopBackend();
     const auto trace = pftrace_test::decodeFile(output / "timeline.pftrace");
+    uint64_t counter_track = 0, span_track = 0;
+    for (const auto& track : trace.tracks)
+        if (track.is_counter && track.name == "callbacks") counter_track = track.uuid;
+    assert(counter_track);
+    std::vector<std::string> order;
+    std::vector<int64_t> values;
     size_t found = 0;
     for (const auto& event : trace.events) {
+        if (event.name == "lifecycle_span") {
+            span_track = event.track_uuid;
+            assert(event.timestamp == 0 && event.type == 1);
+            order.push_back("span_begin");
+        }
+        if (span_track && event.track_uuid == span_track && event.type == 2) {
+            assert(event.timestamp == cutoff.floorNanoseconds());
+            order.push_back("span_end");
+        }
+        if (event.track_uuid == counter_track && event.counter_value) {
+            assert(event.timestamp == cutoff.floorNanoseconds());
+            order.push_back("counter");
+            values.push_back(*event.counter_value);
+        }
         if (event.name != "initialized" && event.name != "finalized") continue;
+        order.push_back(event.name);
         const bool initial = event.name == "initialized";
-        assert(event.timestamp == (initial ? 0 : 20));
+        assert(event.timestamp == (initial ? 0 : cutoff.floorNanoseconds()));
         assert(event.string_annotations.at("lifecycle") == (initial ? "initialize" : "finalize"));
         ++found;
     }
     assert(found == 2);
+    // Inspect the actual Perfetto packet order, not merely the sorting key.
+    const std::vector<std::string> expected_order =
+        initial_snapshot ? std::vector<std::string>{"initialized", "span_begin", "counter",
+                                                    "span_end",    "finalized",  "counter"}
+                         : std::vector<std::string>{"initialized", "span_begin", "span_end",
+                                                    "finalized", "counter"};
+    const std::vector<int64_t> expected_values = initial_snapshot
+                                                     ? std::vector<int64_t>{after_edge ? 2 : 1, 1}
+                                                     : std::vector<int64_t>{after_edge ? 3 : 2};
+    assert(order == expected_order && values == expected_values);
     std::ifstream csv(output / "counters.csv");
     std::string header, row;
     std::getline(csv, header);
@@ -261,7 +304,8 @@ void lifecycle(const std::filesystem::path& path) {
     uint64_t total = 0;
     size_t rows = 0;
     do {
-        assert(row.starts_with("1,50000000,final_before,"));
+        assert(
+            row.starts_with(after_edge ? "1,20000000,final_after," : "1,50000000,final_before,"));
         std::stringstream names(header), values(row);
         std::string name, value;
         bool counted = false;
@@ -274,7 +318,7 @@ void lifecycle(const std::filesystem::path& path) {
         assert(counted);
         ++rows;
     } while (std::getline(csv, row));
-    assert(rows == 2 && total == 2);
+    assert(rows == (initial_snapshot ? 2 : 1) && total == (after_edge ? 3 : 2));
 }
 
 struct SpanUnit : TickableUnit, ObservableUnit {
@@ -467,6 +511,9 @@ int main(int argc, char** argv) {
     namedSpanAndFreshSession(root / "named-span");
     phaseGap(root / "phase-gap");
     lifecycle(root / "lifecycle");
+    lifecycle(root / "lifecycle-after", true);
+    lifecycle(root / "lifecycle-final-only", false, false);
+    lifecycle(root / "lifecycle-after-final-only", true, false);
     failure(root / "budget-failure", true);
     failure(root / "output-failure", false);
     failure(root / "parallel-budget-failure", true, 3);

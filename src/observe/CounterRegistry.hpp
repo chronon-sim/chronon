@@ -70,7 +70,8 @@ public:
      */
     bool pushOwnerSnapshots(uint64_t cycle, std::span<const size_t> owner_ids,
                             ThreadContext& thread_context, std::optional<SimTime> time = {},
-                            bool final = false, bool after_edge = false) noexcept;
+                            bool final = false, bool after_edge = false,
+                            bool post_finalize = false) noexcept;
 
     /**
      * Return the next nominal periodic cycle for one stable scheduler owner.

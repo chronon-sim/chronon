@@ -14,6 +14,8 @@ namespace chronon::observe {
 inline constexpr uint8_t COUNTER_SNAPSHOT_BATCH_FLAG = 1u << 1;
 inline constexpr uint8_t COUNTER_SNAPSHOT_FINAL_FLAG = 1u << 2;
 inline constexpr uint8_t COUNTER_SNAPSHOT_AFTER_FLAG = 1u << 3;
+// Independent of the hardware cutoff: callbacks precede their residual sample.
+inline constexpr uint8_t COUNTER_SNAPSHOT_POST_FINALIZE_FLAG = 1u << 5;
 
 /**
  * Fixed prefix for a batched counter snapshot. It is followed by @c count

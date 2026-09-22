@@ -157,7 +157,7 @@ void CounterRegistry::rebuildOwnerSnapshotPlans_(
 
 bool CounterRegistry::pushOwnerSnapshots(uint64_t cycle, std::span<const size_t> owner_ids,
                                          ThreadContext& thread_context, std::optional<SimTime> time,
-                                         bool final, bool after_edge) noexcept {
+                                         bool final, bool after_edge, bool post_finalize) noexcept {
     auto& queue = thread_context.queue();
     bool all_pushed = true;
     for (size_t owner : owner_ids) {
@@ -213,7 +213,8 @@ bool CounterRegistry::pushOwnerSnapshots(uint64_t cycle, std::span<const size_t>
             record->type = ObservationQueue::EventType::COUNTER_SNAPSHOT;
             record->flags = COUNTER_SNAPSHOT_BATCH_FLAG |
                             (final ? COUNTER_SNAPSHOT_FINAL_FLAG : 0) |
-                            (after_edge ? COUNTER_SNAPSHOT_AFTER_FLAG : 0);
+                            (after_edge ? COUNTER_SNAPSHOT_AFTER_FLAG : 0) |
+                            (post_finalize ? COUNTER_SNAPSHOT_POST_FINALIZE_FLAG : 0);
             record->padding = 0;
 
             CounterSnapshotBatchHeader batch_header{cycle, batch.plan_id,

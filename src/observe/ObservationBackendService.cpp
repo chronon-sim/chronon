@@ -61,11 +61,14 @@ std::pair<SimTime, uint32_t> ObservationBackend::recordTime_(
         CounterSnapshotBatchHeader batch;
         if (size < sizeof(batch)) throw std::logic_error("invalid clock counter snapshot");
         std::memcpy(&batch, data, sizeof(batch));
+        // Lifecycle order is independent of whether the hardware cutoff is
+        // inclusive: a callback's residual sample always follows its records.
         return {batch.time_den ? SimTime(batch.time_num, batch.time_den)
                                : reference_clock_->edge(cycle),
-                (header->flags & COUNTER_SNAPSHOT_AFTER_FLAG)   ? UINT32_MAX
-                : (header->flags & COUNTER_SNAPSHOT_FINAL_FLAG) ? 1
-                                                                : 0};
+                (header->flags & COUNTER_SNAPSHOT_POST_FINALIZE_FLAG) ? UINT32_MAX
+                : (header->flags & COUNTER_SNAPSHOT_AFTER_FLAG)       ? UINT32_MAX - 2
+                : (header->flags & COUNTER_SNAPSHOT_FINAL_FLAG)       ? 1
+                                                                      : 0};
     }
     const auto source = recordSource_(header, data, size);
     const auto* clock = sourceClock_(source);
