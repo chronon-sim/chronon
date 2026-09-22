@@ -24,6 +24,7 @@ p.add_argument('--cases', default='all')
 p.add_argument('--repeats', type=int, default=16)
 p.add_argument('--cpus', default='4,6')
 p.add_argument('--cycle-scale', type=int, default=1)
+p.add_argument('--thread-controls', choices=('on','off'), default='on')
 args = p.parse_args()
 spec = importlib.util.spec_from_file_location('ci', Path(args.scripts)/'check_api_performance.py')
 ci = importlib.util.module_from_spec(spec)
@@ -46,7 +47,10 @@ for v,b in builds.items():
     meta['builds'][v]={'path':str(b),'cache':(b/'CMakeCache.txt').read_text(),
         'sha256':{n:hashlib.sha256((b/'benchmark'/n).read_bytes()).hexdigest() for n in {ci.executable(c) for c in matrix}}}
 (args.output/'metadata.json').write_text(json.dumps(meta,indent=2)+'\n')
-env = os.environ|{'CHRONON_BENCH_PIN_WORKERS':'1','CHRONON_BENCH_WARM_CPUS':'1'}
+env = dict(os.environ)
+for key in ('CHRONON_BENCH_PIN_WORKERS','CHRONON_BENCH_WARM_CPUS'):
+    env.pop(key, None)
+    if args.thread_controls == 'on': env[key]='1'
 allrows=[]
 oracles={}
 for rep in range(args.repeats):
