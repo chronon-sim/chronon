@@ -107,6 +107,7 @@ public:
         uint64_t first_output_ns = 0;          // Host time since native writer open().
         uint64_t allocated_staging_bytes = 0;  // Record + bucket descriptor array allocation bytes.
         uint64_t peak_staging_records = 0;
+        // Scheduler poll work only; excludes I/O continuations and the final drain.
         uint64_t service_calls = 0, service_records = 0, service_ns = 0, service_max_poll_ns = 0;
     };
 

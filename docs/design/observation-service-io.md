@@ -16,6 +16,17 @@ records; ordinary records also have a 256 KiB byte limit). A preallocated
 round-robin. Each output has at most one outstanding job and one handoff buffer.
 No task allocation occurs during dispatch.
 
+When the initial batch is full, native clock output reuses its handoff buffer on
+the I/O lane for up to 16 batches per job (including the worker's initial batch),
+stopping sooner when no work is available. Partial initial batches return without
+an extra scan. Its ingress registration stays paused throughout, so there is still
+one queue consumer and no concurrent access to that buffer. Each continuation
+uses the same snapshot/frontier rules as worker ingress. The job then yields to
+other outputs; it never waits for producers. This avoids a worker/I/O round trip
+for every 256 records when native trace output is backlogged, without adding
+buffers or increasing the worker's record budget. Native `service_*` statistics
+measure scheduler polls only, excluding I/O continuations and final draining.
+
 Opening files, sorting, formatting, encoding, compression, writing, flushing,
 closing, native manifests and native statistics reports all execute on this lane.
 The standalone scheduler timeline export also uses it. The executor marks the job

@@ -360,6 +360,18 @@ struct ClockTraceRecorder::Impl : HostService {
                     break;
                 case IOPhase::Batch:
                     processBatch();
+                    // Ingress stays paused until this job returns, so I/O can
+                    // reuse the handoff buffer without racing scheduler polls.
+                    // A full batch indicates backlog. Drain available work
+                    // without a worker round trip per batch, but yield after
+                    // 16 batches to other jobs. Sparse output needs no extra scan.
+                    if (ingress_size == std::min(ingress.size(), config.drain_batch)) {
+                        for (size_t batch = 1; batch < 16; ++batch) {
+                            collectIngress(ingress.size());
+                            if (!batch_ready) break;
+                            processBatch();
+                        }
+                    }
                     break;
                 case IOPhase::Close:
                     if (!failed.load(std::memory_order_acquire) && !buckets.empty())

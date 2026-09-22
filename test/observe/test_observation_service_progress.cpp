@@ -38,6 +38,9 @@ struct ObservationBackendTestAccess {
 };
 struct ClockTraceStreamTestAccess {
     static HostServiceRegistration& service(ClockTraceStream& stream) { return *stream.service_; }
+    static uint64_t consumed(const ClockTraceStream& stream) {
+        return stream.tail_.load(std::memory_order_acquire);
+    }
 };
 }  // namespace chronon::observe
 
@@ -309,6 +312,48 @@ void clockWakeup(const std::filesystem::path& root) {
     }
 }
 
+void clockIOContinuation(const std::filesystem::path& root) {
+    HostServices scheduler;
+    ClockTraceRecorder::Config config;
+    config.output_dir = root;
+    config.perfetto = false;
+    config.stream_capacity = 8192;
+    ClockTraceRecorder recorder(config);
+    recorder.attachScheduler(scheduler);
+    const auto clock = ClockDomain::fromHz(1, "clock", 1'000'000'000);
+    auto* stream = recorder.addStream(clock, 1, "producer");
+    recorder.addStream(clock, 2, "quiet");
+    recorder.start();
+    constexpr uint64_t count = 5000;
+    for (uint64_t n = 0; n < count; ++n) stream->record(n, ClockEventKind::User);
+    auto& service = ClockTraceStreamTestAccess::service(*stream);
+    size_t cursor = 0;
+    scheduler.poll(cursor);
+    CHECK(service.stats().records == 256);  // Worker ingress keeps its small budget.
+    const auto consumed = [&] { return ClockTraceStreamTestAccess::consumed(*stream); };
+    // No further worker polls: I/O must make progress beyond the first handoff.
+    awaitProgress([&] { return consumed() > 256; }, [] {});
+    // The first callback has now started. A second job on the same lane fences
+    // its completion and must get a turn before the whole backlog is consumed.
+    auto witness = scheduler.addIO({}, nullptr, [](void*) noexcept {});
+    witness->submit();
+    witness->wait();
+    CHECK(consumed() < count);
+    scheduler.poll(cursor);
+    awaitProgress([&] { return consumed() == count; }, [] {});
+    witness->submit();
+    witness->wait();
+    // The old snapshot ends in an empty stream. A later publication must still
+    // wake ingress; close must also retain records that never received a poll.
+    stream->record(count, ClockEventKind::User);
+    scheduler.poll(cursor);
+    awaitProgress([&] { return consumed() == count + 1; }, [] {});
+    stream->record(count + 1, ClockEventKind::User);
+    recorder.close();
+    CHECK(recorder.stats().events == count + 2);
+    CHECK(recorder.stats().dropped == 0);
+}
+
 struct ClockProducer : TickableUnit {
     size_t burst = 0;
     explicit ClockProducer(std::string name) : TickableUnit(std::move(name)) {}
@@ -380,6 +425,8 @@ int main(int argc, char** argv) {
                        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     if (mode == "clock-wakeup")
         clockWakeup(root);
+    else if (mode == "clock-io-continuation")
+        clockIOContinuation(root);
     else if (mode == "clock-reconfigure")
         coordinatedClockWakeup(root, 2, 33);
     else if (mode.starts_with("clock-coordinated-"))
