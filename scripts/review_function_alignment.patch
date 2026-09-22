@@ -1,0 +1,22 @@
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -53,6 +53,8 @@
+ 
+ # C++20 required
+ target_compile_features(chronon PUBLIC cxx_std_20)
++# Common baseline/candidate diagnostic: keep hot function entry alignment fixed.
++target_compile_options(chronon PRIVATE -falign-functions=64)
+ 
+ # Port templates are instantiated by downstream models, so this definition
+ # must be PUBLIC. The default remains the fully compatible cancellation path;
+--- a/benchmark/CMakeLists.txt
++++ b/benchmark/CMakeLists.txt
+@@ -134,6 +134,8 @@
+ )
+ 
+ target_compile_features(chronon_representative_workload_benchmark PRIVATE cxx_std_20)
++# Common baseline/candidate diagnostic: keep hot function entry alignment fixed.
++target_compile_options(chronon_representative_workload_benchmark PRIVATE -falign-functions=64)
+ 
+ if(CHRONON_BUILD_TESTS)
+     add_test(NAME benchmark_multiclock_scaling_smoke

@@ -47,7 +47,11 @@ jobs:
           ref: 7829ac985c461c12ba7bada0c560efb850ce4823
       - run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build ccache g++-12 libyaml-cpp-dev libfmt-dev zlib1g-dev
+          sudo apt-get install -y cmake ninja-build ccache g++-12 libyaml-cpp-dev libfmt-dev zlib1g-dev linux-tools-generic
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          for PERF_PATH in /usr/lib/linux-tools/*/perf /usr/lib/linux-tools-*/perf; do
+            if [[ -x "$PERF_PATH" ]]; then echo "PERF_BINARY=$PERF_PATH" >> "$GITHUB_ENV"; break; fi
+          done
       - uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: api-contracts-gcc12-release
@@ -72,7 +76,6 @@ jobs:
               -DCMAKE_BUILD_TYPE=Release -DCHRONON_ENABLE_WERROR=ON \
               -DCHRONON_BUILD_BENCHMARKS=ON -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
             cmake --build "$variant/build-perf" --parallel 16 --target \
-              chronon_single_clock_regression_benchmark chronon_scheduler_invocation_benchmark \
               chronon_representative_workload_benchmark
           done
       - name: Uninstrumented three-way comparison
@@ -81,23 +84,33 @@ jobs:
           python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
             --baseline baseline/build-perf --original original/build-perf --candidate candidate/build-perf \
             --output results/uninstrumented --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
-      - name: Add identical invocation-entry placement diagnostics
+      - name: Profile original compiler layout
+        continue-on-error: true
+        run: |
+          python3 harness/scripts/review_broadcast_profile.py \
+            baseline/build-perf original/build-perf candidate/build-perf results/profiles --perf "$PERF_BINARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: review-profile-raw-${{ matrix.replica }}
+          path: results/
+          retention-days: 30
+      - name: Align functions identically in all three revisions
         run: |
           for variant in baseline candidate original; do
-            git -C "$variant" apply "$GITHUB_WORKSPACE/harness/scripts/review_worker_placement.patch"
+            git -C "$variant" apply "$GITHUB_WORKSPACE/harness/scripts/review_function_alignment.patch"
+            cmake -S "$variant" -B "$variant/build-perf"
             cmake --build "$variant/build-perf" --parallel 16 --target chronon_representative_workload_benchmark
+            nm -SC "$variant/build-perf/benchmark/chronon_representative_workload_benchmark" > "results/aligned-$variant-symbols.txt"
           done
-      - name: Record logical worker and actual CPU placement
-        env:
-          CHRONON_BENCH_DIAG_WORKERS: 1
+      - name: Repeat with common function alignment
         run: |
           CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
           python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
             --baseline baseline/build-perf --original original/build-perf --candidate candidate/build-perf \
-            --output results/placement --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
+            --output results/aligned --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: review-placement-${{ matrix.replica }}
+          name: review-profile-${{ matrix.replica }}
           path: results/
           retention-days: 30
