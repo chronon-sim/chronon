@@ -16,10 +16,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - pr: 158
-            sha: ${{ inputs.pr158 }}
-            cases: clock1-threads2-dynamic1-poll0,clock1-threads2-dynamic1-poll1,clock1-threads2-dynamic1-poll64
           - pr: 160
+            replica: 1
+            sha: ${{ inputs.pr160 }}
+            cases: broadcast-threads2
+          - pr: 160
+            replica: 2
+            sha: ${{ inputs.pr160 }}
+            cases: broadcast-threads2
+          - pr: 160
+            replica: 3
             sha: ${{ inputs.pr160 }}
             cases: broadcast-threads2
     steps:
@@ -69,42 +75,29 @@ jobs:
               chronon_single_clock_regression_benchmark chronon_scheduler_invocation_benchmark \
               chronon_representative_workload_benchmark
           done
-      - name: Final migration matrix and focused samples
-        if: matrix.pr == 158
-        env:
-          CASES: ${{ matrix.cases }}
-        run: |
-          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
-          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --candidate candidate/build-perf \
-            --output results/matrix --cpus "$CPUS" --repeats 6
-          python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
-            --baseline baseline/build-perf --candidate candidate/build-perf \
-            --output results/focused --cpus "$CPUS" --repeats 16 --cases "$CASES"
-      - name: Interleave baseline, original and restored-layout binaries
-        if: matrix.pr == 160
-        env:
-          CASES: ${{ matrix.cases }}
+      - name: Uninstrumented three-way comparison
         run: |
           CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
           python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
             --baseline baseline/build-perf --original original/build-perf --candidate candidate/build-perf \
-            --output results/short --cpus "$CPUS" --repeats 24 --cases "$CASES"
+            --output results/uninstrumented --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
+      - name: Add identical invocation-entry placement diagnostics
+        run: |
+          for variant in baseline candidate original; do
+            git -C "$variant" apply "$GITHUB_WORKSPACE/harness/scripts/review_worker_placement.patch"
+            cmake --build "$variant/build-perf" --parallel 16 --target chronon_representative_workload_benchmark
+          done
+      - name: Record logical worker and actual CPU placement
+        env:
+          CHRONON_BENCH_DIAG_WORKERS: 1
+        run: |
+          CPUS=$(PYTHONPATH=baseline/scripts python3 -c 'from check_api_performance import physical_cpus; print(",".join(map(str,physical_cpus(2))))')
           python3 harness/scripts/repeat_review_performance.py --scripts baseline/scripts \
             --baseline baseline/build-perf --original original/build-perf --candidate candidate/build-perf \
-            --output results/long --cpus "$CPUS" --repeats 24 --cases "$CASES" --cycle-scale 5
+            --output results/placement --cpus "$CPUS" --repeats 24 --cases broadcast-threads2 --cycle-scale 5
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: review-walltime-${{ matrix.pr }}
+          name: review-placement-${{ matrix.replica }}
           path: results/
-          retention-days: 30
-      - uses: actions/upload-artifact@v4
-        if: matrix.pr == 160
-        with:
-          name: review-broadcast-binaries
-          path: |
-            baseline/build-perf/benchmark/chronon_representative_workload_benchmark
-            original/build-perf/benchmark/chronon_representative_workload_benchmark
-            candidate/build-perf/benchmark/chronon_representative_workload_benchmark
           retention-days: 30

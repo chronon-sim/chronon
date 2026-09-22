@@ -1,0 +1,59 @@
+--- a/src/sender/core/TickSimulationParallel.cpp
++++ b/src/sender/core/TickSimulationParallel.cpp
+@@ -14,6 +14,7 @@
+ #include <bit>
+ #include <cassert>
+ #include <chrono>
++#include <cstdio>
+ #include <cstdlib>
+ #include <ctime>
+ #include <exception>
+@@ -308,6 +309,14 @@
+         run_begin = SchedulerTimelineTrace::Clock::now();
+     }
+ 
++    // Diagnostic-only, invocation-entry sampling. Never sampled inside tick loops.
++    struct alignas(64) WorkerPlacement {
++        long tid = 0;
++        int cpu = -1;
++    };
++    std::vector<WorkerPlacement> placements;
++    if (std::getenv("CHRONON_BENCH_DIAG_WORKERS")) placements.resize(nthreads);
++
+     std::exception_ptr captured;
+     std::atomic_flag captured_set = ATOMIC_FLAG_INIT;
+ 
+@@ -316,6 +325,13 @@
+     auto work =
+         stdexec::bulk(stdexec::schedule(sched), stdexec::par, nthreads,
+                       [&, token](std::size_t thread_idx) noexcept {
++#if defined(__linux__)
++                          if (!placements.empty()) {
++                              auto& placement = placements[thread_idx];
++                              placement.tid = static_cast<long>(syscall(SYS_gettid));
++                              placement.cpu = sched_getcpu();
++                          }
++#endif
+                           // Drive this worker's clusters straight to run_target. The try-catch
+                           // captures the first exception and requests stop so peers leave their
+                           // dependency spin-waits; sync_wait below is the sole join.
+@@ -335,6 +351,19 @@
+                       });
+ 
+     stdexec::sync_wait(std::move(work));
++
++    for (size_t thread_idx = 0; thread_idx < placements.size(); ++thread_idx) {
++        const auto& placement = placements[thread_idx];
++        std::fprintf(stderr,
++                     "BENCH_WORKER simulation=%p begin=%llu end=%llu logical=%zu tid=%ld "
++                     "cpu=%d units=",
++                     static_cast<void*>(this), static_cast<unsigned long long>(run_start),
++                     static_cast<unsigned long long>(run_target), thread_idx, placement.tid,
++                     placement.cpu);
++        for (const auto* unit : thread_unit_ptrs_[thread_idx])
++            std::fprintf(stderr, "%s@%p,", unit->name().c_str(), static_cast<const void*>(unit));
++        std::fputc('\n', stderr);
++    }
+ 
+     if (captured) std::rethrow_exception(captured);
+ 
