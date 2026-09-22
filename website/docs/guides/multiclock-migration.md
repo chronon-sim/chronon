@@ -96,8 +96,10 @@ or static execution even when dynamic execution makes no migrations.
 Deterministic tests cover fresh conditional windows, rare/inactive activity,
 phase changes, unknown costs, communication penalties, short benefit windows,
 saturating arithmetic, reference-frequency invariance, negative feedback and
-stopped-time exclusion. Existing serial/parallel state, forced bridge handoff,
-trace identity, termination and resume differential tests remain applicable.
+stopped-time exclusion. The live-sampling test permits conservative rejection
+on slow or instrumented hosts; controlled samples separately require unit and
+bridge admission and real handoff. Existing serial/parallel state, forced bridge
+handoff, trace identity, termination and resume differential tests remain applicable.
 
 ## Measurements on 2026-09-22
 
@@ -150,9 +152,9 @@ parentheses over three runs. Ranges are not statistical confidence intervals.
 | p4-d2-w0-s1 | 5.65 | 45.88 (44.60–51.56) | 731.65 (352.61–1293.04) | 65.73 (64.00–90.38) | 5 → 0 |
 
 The final policy admits no light-case moves at four workers in either budget;
-it still admits a long skewed move and passes the deliberately imbalanced heavy
-workload's autonomous-migration test. This is selective admission, not disabling
-migration globally. Nevertheless, final long light dynamic remains slower than
+it still admits a long skewed move. Controlled unit and bridge planner tests
+exercise positive admission and actual ownership handoff. Migration remains
+available for useful moves. Nevertheless, final long light dynamic remains slower than
 candidate static despite zero moves. Sampling, dynamic ownership checks,
 coordinator/polling work and external host scheduling are not eliminated by a
 migration policy. These measurements do not separate their causal contributions.
